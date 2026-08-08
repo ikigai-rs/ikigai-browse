@@ -44,9 +44,11 @@ async-trait = "0.1"
 futures = "0.3"
 # Validates the Turtle face in tests — the graph must actually parse.
 oxttl = "0.2"
-# The real-model demo (examples/explain-demo.rs): mounts the actual LLM module
-# over a blocking ureq transport so `cargo run --example explain-demo` derives
-# genuine explanations of this repo against local Ollama models.
-ikigai-llm = "0.9"
+# The real-model demo (examples/explain-demo.rs) and the identity tests: mounts
+# the actual LLM module so `cargo run --example explain-demo` derives genuine
+# explanations against local Ollama models, and the tests exercise version-tag
+# resolution against real endpoints. 0.10 is the true minimum: it introduced
+# urn:llm:{provider}:model, the identity resource the tags fold.
+ikigai-llm = "0.10"
 ikigai-http = "0.1.7"
 ureq = "2"

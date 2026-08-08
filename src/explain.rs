@@ -22,6 +22,22 @@
 //! fetches an older one, and `urn:repo:{repo}:explain-versions:{path}` lists
 //! what the archive holds.
 //!
+//! ## Model identity in the tag
+//!
+//! The `@model` half of the tag is resolved, in precedence order: an explicit
+//! [`ExplainConfig::file_model_label`] / [`ExplainConfig::dir_model_label`]
+//! (the operator's override) → the provider's `urn:llm:{provider}:model`
+//! resource sourced through the kernel (ikigai-llm ≥ 0.10 — the TRUE
+//! configured model id, so a model swap re-keys the archive without any
+//! browse-side config) → the provider-IRI heuristic (`urn:llm:coder:ask` ⇒
+//! `coder`) when neither exists. Resolution failure never fails the explain —
+//! tags degrade to the heuristic. CAVEAT: `:model` reports the provider's
+//! CONFIGURED default, not necessarily the model that answered a specific ask
+//! (an explicit `model=` arg or ikigai-llm's cheapest-installed 404 fallback
+//! can differ); for version tags the configured identity is the intended
+//! semantics — per-response truth lives in the ask's `as=application/json`
+//! envelope.
+//!
 //! ## Hierarchical grains, merkle keys
 //!
 //! A directory's explanation derives from its entry list plus its CHILDREN'S
@@ -172,15 +188,20 @@ impl ExplainConfig {
     }
 
     /// The model identity folded into file-grain version tags (e.g.
-    /// `"qwen3-coder:30b"` ⇒ tag `code-v1@qwen3-coder:30b`). Default: derived
-    /// from the provider IRI (`urn:llm:coder:ask` ⇒ `coder`) — set the real
-    /// model id so a model swap re-keys the archive.
+    /// `"qwen3-coder:30b"` ⇒ tag `code-v1@qwen3-coder:30b`) — the OPERATOR'S
+    /// OVERRIDE, taking precedence over the resolved
+    /// `urn:llm:{provider}:model` identity. Unset (the default), the true
+    /// configured model id is resolved through the kernel at explain time, so
+    /// a model swap re-keys the archive with no browse-side config; set a
+    /// label only to pin tags independently of what the llm module reports.
     pub fn file_model_label(mut self, label: impl Into<String>) -> Self {
         self.file_model_label = Some(label.into());
         self
     }
 
-    /// The model identity folded into directory-grain version tags.
+    /// The model identity folded into directory-grain version tags — the
+    /// operator's override, with the same precedence as
+    /// [`Self::file_model_label`].
     pub fn dir_model_label(mut self, label: impl Into<String>) -> Self {
         self.dir_model_label = Some(label.into());
         self
@@ -221,26 +242,49 @@ impl ExplainConfig {
         self.max_prompt_bytes = bytes;
         self
     }
-
-    fn file_label(&self) -> String {
-        self.file_model_label
-            .clone()
-            .unwrap_or_else(|| provider_label(&self.file_provider))
-    }
-
-    fn dir_label(&self) -> String {
-        self.dir_model_label
-            .clone()
-            .unwrap_or_else(|| provider_label(&self.dir_provider))
-    }
 }
 
-/// The default model label when none is configured: the provider IRI's middle
-/// segment (`urn:llm:coder:ask` ⇒ `coder`, `urn:llm:ask` ⇒ `ask`), else the
-/// whole IRI.
+/// The last-resort model label when nothing resolves: the provider IRI's
+/// middle segment (`urn:llm:coder:ask` ⇒ `coder`, `urn:llm:ask` ⇒ `ask`),
+/// else the whole IRI.
 fn provider_label(provider: &str) -> String {
     let tail = provider.strip_prefix("urn:llm:").unwrap_or(provider);
     tail.strip_suffix(":ask").unwrap_or(tail).to_string()
+}
+
+/// The TRUE model identity for an ask IRI, through the kernel — `None` when
+/// it cannot be determined (llm module absent, a pre-0.10 host without
+/// `:model`, an unrecognized provider IRI).
+///
+/// `urn:llm:{p}:ask` ⇒ one resolve of `urn:llm:{p}:model` (ikigai-llm 0.10's
+/// identity face — cacheable on the llm side, so per-child repeats during a
+/// rollup are kernel cache hits). The bare facade `urn:llm:ask` has no
+/// provider segment and 0.10 binds no `urn:llm:model` — for it the default
+/// provider name is read from `urn:llm:config` (also cacheable) and THAT
+/// provider's `:model` resolved: two cheap hops instead of one.
+async fn resolve_model(inv: &Invocation<'_>, provider: &str) -> Option<String> {
+    if let Some(p) = provider
+        .strip_prefix("urn:llm:")
+        .and_then(|tail| tail.strip_suffix(":ask"))
+    {
+        return source_str(inv, &format!("urn:llm:{p}:model")).await;
+    }
+    if provider == "urn:llm:ask" {
+        let config = source_str(inv, "urn:llm:config").await?;
+        let parsed: serde_json::Value = serde_json::from_str(&config).ok()?;
+        let default = parsed.get("default")?.as_str()?;
+        return source_str(inv, &format!("urn:llm:{default}:model")).await;
+    }
+    None
+}
+
+/// Source an IRI and return its trimmed UTF-8 body — `None` on any failure or
+/// an empty body (an empty model id must not produce `code-v1@` tags).
+async fn source_str(inv: &Invocation<'_>, iri: &str) -> Option<String> {
+    let iri = Iri::parse(iri).ok()?;
+    let repr = inv.source(&iri).await.ok()?;
+    let text = String::from_utf8_lossy(&repr.bytes).trim().to_string();
+    (!text.is_empty()).then_some(text)
 }
 
 // --- grains and classification ----------------------------------------------
@@ -300,15 +344,17 @@ fn classify_file(rel: &str, utf8: bool) -> Grain {
 }
 
 /// The archive version tag for a grain: `{prompt-version}@{model-label}`
-/// (binary stubs involve no model, so no `@`).
-fn version_tag(grain: Grain, config: &ExplainConfig) -> String {
+/// (binary stubs involve no model, so no `@`). The model half is resolved
+/// once per explain request ([`ExplainEndpoint::model_label`]) and passed in
+/// — the same value keys the archive lookup and stamps any new entry.
+fn version_tag(grain: Grain, model: &str) -> String {
     match grain {
-        Grain::Code => format!("{CODE_PROMPT_VERSION}@{}", config.file_label()),
-        Grain::Note => format!("{NOTE_PROMPT_VERSION}@{}", config.file_label()),
-        Grain::Skill => format!("{SKILL_PROMPT_VERSION}@{}", config.file_label()),
-        Grain::Text => format!("{TEXT_PROMPT_VERSION}@{}", config.file_label()),
+        Grain::Code => format!("{CODE_PROMPT_VERSION}@{model}"),
+        Grain::Note => format!("{NOTE_PROMPT_VERSION}@{model}"),
+        Grain::Skill => format!("{SKILL_PROMPT_VERSION}@{model}"),
+        Grain::Text => format!("{TEXT_PROMPT_VERSION}@{model}"),
         Grain::Binary => BINARY_TAG.to_string(),
-        Grain::Directory => format!("{DIR_PROMPT_VERSION}@{}", config.dir_label()),
+        Grain::Directory => format!("{DIR_PROMPT_VERSION}@{model}"),
     }
 }
 
@@ -645,7 +691,15 @@ impl Endpoint for ExplainEndpoint {
             (grain, file_iri(repo, &rel), Some((content, text)))
         };
 
-        let current_tag = version_tag(grain, config);
+        // The model identity in the tag — resolved ONCE per request; the same
+        // value serves the archive lookup (hit path) and stamps a new entry
+        // (miss path). Binary stubs involve no model.
+        let model = match grain {
+            Grain::Binary => None,
+            Grain::Directory => Some(self.model_label(inv, Tier::Dir).await),
+            _ => Some(self.model_label(inv, Tier::File).await),
+        };
+        let current_tag = version_tag(grain, model.as_deref().unwrap_or(""));
         let requested = inv.inline_str("version").ok().map(str::to_string);
         let tag = requested.clone().unwrap_or_else(|| current_tag.clone());
 
@@ -686,11 +740,7 @@ impl Endpoint for ExplainEndpoint {
                 self.derive_file(inv, repo, &rel, grain, text).await?
             }
         };
-        let model = match grain {
-            Grain::Directory => config.dir_label(),
-            Grain::Binary => "none".to_string(),
-            _ => config.file_label(),
-        };
+        let model = model.unwrap_or_else(|| "none".to_string());
         let entry = ArchiveEntry {
             iri,
             repo: repo.to_string(),
@@ -724,7 +774,36 @@ impl Endpoint for ExplainEndpoint {
     }
 }
 
+/// Which model tier a grain asks — file grain vs directory rollup, each with
+/// its own provider and label override.
+#[derive(Clone, Copy)]
+enum Tier {
+    File,
+    Dir,
+}
+
 impl ExplainEndpoint {
+    /// The model identity folded into this request's version tag, in
+    /// precedence order: the explicit config label (the operator's override)
+    /// → the provider's `urn:llm:…:model` resolved through the kernel
+    /// ([`resolve_model`] — the true configured id) → the provider-IRI
+    /// heuristic ([`provider_label`]). Infallible by design: a host without
+    /// the llm module (or a pre-0.10 one) still explains, with heuristic tags.
+    async fn model_label(&self, inv: &Invocation<'_>, tier: Tier) -> String {
+        let config = &self.config;
+        let (provider, explicit) = match tier {
+            Tier::File => (&config.file_provider, &config.file_model_label),
+            Tier::Dir => (&config.dir_provider, &config.dir_model_label),
+        };
+        if let Some(label) = explicit {
+            return label.clone();
+        }
+        match resolve_model(inv, provider).await {
+            Some(model) => model,
+            None => provider_label(provider),
+        }
+    }
+
     /// Derive a file-grain explanation: the grain's versioned prompt plus the
     /// (truncated) content, asked of the configured file provider under the
     /// mandatory token ceiling.
@@ -1450,6 +1529,112 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("urn:ikigai:browse:explain:demo:sha256:"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A canned OpenAI-shaped completion transport for tests that mount the
+    /// REAL ikigai-llm space (the `:model` identity resolution goes through
+    /// genuine 0.10 endpoints; only the network hop is faked).
+    struct CannedTransport;
+
+    #[async_trait]
+    impl ikigai_http::HttpTransport for CannedTransport {
+        async fn send(
+            &self,
+            _request: ikigai_http::HttpRequest,
+        ) -> std::result::Result<ikigai_http::HttpResponse, String> {
+            Ok(ikigai_http::HttpResponse {
+                status: 200,
+                headers: vec![],
+                body: br#"{"model":"m","choices":[{"message":{"role":"assistant","content":"An explanation."},"finish_reason":"stop"}]}"#.to_vec(),
+            })
+        }
+    }
+
+    /// The bake-off registry shape against real ikigai-llm: `coder` binds
+    /// urn:llm:coder:ask (the file grain's provider), `rollup` is the registry
+    /// default so the facade urn:llm:ask (the dir grain's provider) routes to
+    /// it — each with a known model id for the tags to fold.
+    fn real_llm_space() -> EndpointSpace {
+        let mut coder = ikigai_llm::OpenAiConfig::ollama("qwen-test:9b");
+        coder.provider = "coder".to_string();
+        let mut rollup = ikigai_llm::OpenAiConfig::ollama("big-test:70b");
+        rollup.provider = "rollup".to_string();
+        let registry = ikigai_llm::Registry {
+            default: "rollup".to_string(),
+            providers: vec![coder, rollup],
+        };
+        ikigai_llm::space(Arc::new(CannedTransport), registry)
+    }
+
+    fn kernel_with_real_llm(root: &Path, config: ExplainConfig) -> Kernel {
+        let browse =
+            crate::space_with_explain(vec![("demo".to_string(), root.to_path_buf())], config);
+        Kernel::new(Arc::new(Fallback::new(vec![
+            Arc::new(browse),
+            Arc::new(real_llm_space()),
+        ])))
+    }
+
+    #[test]
+    fn version_tags_fold_the_true_model_identity_from_the_llm_module() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "// a\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        // NO explicit labels: the tags must come from urn:llm:{provider}:model.
+        let k = kernel_with_real_llm(&root, ExplainConfig::new(Arc::clone(&store)));
+
+        // File grain: urn:llm:coder:ask ⇒ one resolve of urn:llm:coder:model.
+        let file = json(&k, "urn:repo:demo:explain:a.rs", &[]);
+        assert_eq!(file["version_tag"], "code-v1@qwen-test:9b");
+        assert_eq!(file["model"], "qwen-test:9b");
+
+        // Dir grain: the bare facade urn:llm:ask has no :model of its own —
+        // the default provider comes from urn:llm:config, then ITS :model.
+        let dir = json(&k, "urn:repo:demo:explain", &[]);
+        assert_eq!(dir["version_tag"], "dir-v1@big-test:70b");
+        assert_eq!(dir["model"], "big-test:70b");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_explicit_label_overrides_the_resolved_model_identity() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "// a\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        // urn:llm:coder:model would say qwen-test:9b — the operator's label wins.
+        let k = kernel_with_real_llm(
+            &root,
+            ExplainConfig::new(Arc::clone(&store)).file_model_label("pinned"),
+        );
+        let file = json(&k, "urn:repo:demo:explain:a.rs", &[]);
+        assert_eq!(file["version_tag"], "code-v1@pinned");
+        assert_eq!(file["model"], "pinned");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn without_a_model_resource_tags_fall_back_to_the_provider_heuristic() {
+        // fake_llm_space binds only the :ask endpoints — the pre-0.10 shape
+        // (no :model, no :config). Resolution failure must degrade the tag to
+        // the provider-IRI heuristic, never fail the explain.
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "// a\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let browse = crate::space_with_explain(
+            vec![("demo".to_string(), root.clone())],
+            ExplainConfig::new(Arc::clone(&store)), // no labels either
+        );
+        let k = Kernel::new(Arc::new(Fallback::new(vec![
+            Arc::new(browse),
+            Arc::new(fake_llm_space(&log)),
+        ])));
+
+        let file = json(&k, "urn:repo:demo:explain:a.rs", &[]);
+        assert_eq!(file["version_tag"], "code-v1@coder");
+        let dir = json(&k, "urn:repo:demo:explain", &[]);
+        assert_eq!(dir["version_tag"], "dir-v1@ask");
         std::fs::remove_dir_all(&root).ok();
     }
 
