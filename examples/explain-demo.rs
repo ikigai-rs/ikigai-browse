@@ -82,10 +82,12 @@ fn main() {
 
     // ONE shared store — in-memory here, so the archive lives for the run;
     // a host wanting it to outlive the process injects a persistent handle.
+    // No model labels: the version tags fold the TRUE configured ids by
+    // resolving urn:llm:{provider}:model through the kernel (this demo once
+    // hand-labeled the rollup "llama3.3:70b" while actually running
+    // llama3.3:latest — exactly the drift the resolved identity removes).
     let store = Arc::new(Store::new().expect("store"));
-    let config = ikigai_browse::ExplainConfig::new(Arc::clone(&store))
-        .file_model_label("qwen3-coder:30b")
-        .dir_model_label("llama3.3:70b");
+    let config = ikigai_browse::ExplainConfig::new(Arc::clone(&store));
 
     let browse = ikigai_browse::space_with_explain(
         [(
