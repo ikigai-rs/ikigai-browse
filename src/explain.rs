@@ -384,9 +384,9 @@ fn truncate(text: &str, max_bytes: usize) -> String {
 
 // --- the archive (RDF in the shared store) ----------------------------------
 
-const IK: &str = "https://ikigai-rs.dev/ns#";
+pub(crate) const IK: &str = "https://ikigai-rs.dev/ns#";
 
-fn ik(term: &str) -> NamedNode {
+pub(crate) fn ik(term: &str) -> NamedNode {
     NamedNode::new(format!("{IK}{term}")).expect("ik terms are valid IRIs")
 }
 
@@ -586,7 +586,7 @@ fn list_versions(store: &Store, target_iri: &str) -> Result<Vec<ArchiveEntry>> {
 
 /// Epoch milliseconds → ISO 8601 UTC (`2026-08-08T17:00:00.000Z`), for
 /// `ik:derivedAt`. Civil-from-days (Hinnant); no leap-second pretensions.
-fn iso8601(millis: u64) -> String {
+pub(crate) fn iso8601(millis: u64) -> String {
     let secs = millis / 1000;
     let ms = millis % 1000;
     let (h, m, s) = (secs / 3600 % 24, secs / 60 % 60, secs % 60);
@@ -911,7 +911,7 @@ impl ExplainEndpoint {
     }
 }
 
-fn parse_iri(iri: &str) -> Result<Iri> {
+pub(crate) fn parse_iri(iri: &str) -> Result<Iri> {
     Iri::parse(iri).map_err(|e| Error::Endpoint(format!("browse: bad IRI `{iri}`: {e}")))
 }
 

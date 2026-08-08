@@ -13,6 +13,8 @@ pairs), and each root answers three resource families:
 | `urn:repo:{repo}:hash[:{path}]` | the **content hash** (S1) — `sha256:{hex}` of a file's bytes, or the **merkle** construction over a directory's entries (ignore-filtered), so one edit re-keys exactly the path to the root |
 | `urn:repo:{repo}:explain[:{path}]` | an **LLM-derived orientation explanation** (S1), archived by `(path, content-hash, version-tag)` — derived once per content version, reused forever; `as=application/json` adds `{content_hash, version_tag, derived}`, `as=text/html` the page face with provenance, `as=text/turtle` the archive entry's graph; `version=` addresses an older tag |
 | `urn:repo:{repo}:explain-versions[:{path}]` | what the archive holds for a path — one row per entry (tag, hash, model, derived-at), across content versions and tags; a pure store read (no net capability) |
+| `urn:annotation[:{id}]` | a **W3C Web Annotation** (S2) on a file — Sink creates/updates (anchoring the quoted text; the bare `urn:annotation` mints a uuid id), Source reads with drift **re-anchoring**, Delete removes; faces: `text/plain` (the body), `as=application/json`, `as=text/turtle` |
+| `urn:repo:{repo}:annotations[:{path}]` | every annotation on one file (or the whole repo, path omitted) in reading order, drift-reconciled on each read; faces: `application/json` (default), `as=text/html` (panel fragment), `as=text/turtle` |
 
 **Resolution is the access model.** A `{repo}` that is not a configured root is
 a clean resolution *miss* (the grammar refuses to match; other mounted spaces
@@ -84,7 +86,38 @@ server-driven house style. Entries and breadcrumbs `hx-get`
 `/k/source <iri> as=text/html` into a `#browse` container the host provides;
 the host's adapter maps `/k/<command>` onto its engine. File views wrap each
 line in `<span id="L{n}">` with a self-linking gutter number, so `#L42`
-deep-links a line — the anchor surface later annotation stages target.
+deep-links a line — the anchor surface annotations target. With the
+annotation store mounted, the file view marks annotated lines
+(`browse-line-annotated`) and appends an annotations panel: one card per
+annotation at its `#L{n}` anchor (orphans visually flagged) plus a create
+form that `hx-post`s a Sink of `urn:annotation` through the host's `/k/`
+adapter (form fields become sink args — htmx only, no scripts).
+
+## Annotations (S2)
+
+`space_with_annotations(roots, store)` mounts W3C Web Annotations over the
+same host-injected Oxigraph store the explanation archive uses
+(`space_with_explain` includes both families — ONE shared graph, queryable
+together). The shape is skolemized `oa:` — stable IRIs, no blank nodes, and
+the W3C target node flattened to `ik:target` — with BOTH selector kinds
+stored per annotation: `oa:TextQuoteSelector` (`oa:prefix`/`oa:exact`/
+`oa:suffix`, context derived from the anchored occurrence) and
+`oa:TextPositionSelector` (`oa:start`/`oa:end`, character offsets), keyed to
+the annotated content version by `ik:contentHash`.
+
+**Re-anchoring under drift.** Every read reconciles each annotation against
+the target's current content: hash unchanged → served as stored; content
+moved → the quote is re-searched (context-scored, first match wins ties)
+and BOTH selectors plus the recorded hash update in place (`ik:reanchored
+true`); quote gone → `ik:orphaned true`, still rendered and flagged, never
+silently dropped — and a later read that finds the quote again (an edit
+reverted) heals it. The store is only written when something changed.
+
+**Capabilities.** Per-verb `ActionSpec`s: Source requires
+`urn:cap:browse:read:*` (checked against the annotation's root, like every
+browse read); Sink and Delete require `urn:cap:annotate`; Sink also declares
+the browse wildcard because anchoring sources the target through the kernel —
+a capability that cannot read a file cannot annotate it.
 
 ## Vocabulary (Turtle face)
 
@@ -94,8 +127,13 @@ graph is diffable, SPARQL-able, *and navigable*. It uses these `ik:`
 (`https://ikigai-rs.dev/ns#`) terms: `ik:Directory`, `ik:File`, `ik:Symlink`,
 `ik:Explanation` (classes), `ik:entry`, `ik:fileName`, `ik:path`, `ik:repo`,
 `ik:byteSize`, `ik:target`, `ik:contentHash`, `ik:versionTag`, `ik:model`,
-`ik:promptKind`, `ik:explanation`, `ik:derivedAt` (properties). These are
-pending addition to the published vocabulary (`ik:model` already exists).
+`ik:promptKind`, `ik:explanation`, `ik:derivedAt`, and (S2) `ik:reanchored`,
+`ik:orphaned` (properties). These are pending addition to the published
+vocabulary (`ik:model` already exists). The annotation graphs additionally
+use the external `oa:` (`http://www.w3.org/ns/oa#`) terms `oa:Annotation`,
+`oa:TextQuoteSelector`, `oa:TextPositionSelector`, `oa:bodyValue`,
+`oa:hasSelector`, `oa:prefix`, `oa:exact`, `oa:suffix`, `oa:start`, `oa:end`,
+and `dcterms:created`.
 
 ## License
 

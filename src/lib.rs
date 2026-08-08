@@ -16,7 +16,7 @@
 //!   an extension-mapped media type (`application/octet-stream` fallback, with
 //!   a UTF-8 sniff to `text/plain`); `as=text/html` renders a
 //!   syntax-highlighted, line-numbered view whose lines carry `id="L{n}"`
-//!   anchors (S2's annotations will target them).
+//!   anchors (the surface S2's annotations target).
 //! - `urn:repo:{repo}:state` — the **freshness oracle**: the git HEAD sha plus
 //!   a short-status digest, one line; `as=application/json` yields
 //!   `{head, dirty: [paths]}`. Uncacheable by design — it exists to be the
@@ -28,6 +28,12 @@
 //!   S1 **explanation archive** ([`space_with_explain`]): LLM-derived
 //!   orientation, derived once per `(path, content-hash, version-tag)` and
 //!   persisted in a host-injected Oxigraph store.
+//! - `urn:annotation:{id}` + `urn:repo:{repo}:annotations[:{path}]` — S2 **Web
+//!   Annotations** (`oa:`) on files ([`space_with_annotations`], and included
+//!   by [`space_with_explain`] — one shared store): quote + position selectors
+//!   that RE-ANCHOR when the target drifts and are orphan-flagged (never
+//!   dropped) when the quote is gone. The file HTML face gains an annotations
+//!   panel and marks annotated lines.
 //!
 //! ## Resolution is the access model
 //!
@@ -52,7 +58,7 @@
 //! platform data it fronts, like `ikigai-repo`) and shells out to `git` for
 //! the state oracle (argument vector, never a shell string). No wasm face.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
@@ -61,15 +67,18 @@ use ikigai_core::{
     ArgSpec, Bindings, Description, EndpointSpace, Error, FnEndpoint, Grammar, Invocation, Iri,
     ReprType, Representation, Result, UriTemplate, Verb,
 };
+use oxigraph::store::Store;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::html::{styled_line_to_highlighted_html, IncludeBackground};
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
+mod annotate;
 mod explain;
 mod hash;
 
+pub use annotate::CAP_ANNOTATE;
 pub use explain::ExplainConfig;
 
 /// The wildcard capability every browse action declares: an agent is offered
@@ -97,7 +106,22 @@ pub(crate) type Roots = Arc<BTreeMap<String, PathBuf>>;
 /// duplicate name.
 pub fn space(roots: impl IntoIterator<Item = (String, PathBuf)>) -> EndpointSpace {
     let roots = build_roots(roots);
-    base_space(&roots, &Arc::new(hash::default_ignore()))
+    base_space(&roots, &Arc::new(hash::default_ignore()), None)
+}
+
+/// [`space`] plus the S2 **annotation** family over a host-injected Oxigraph
+/// store — no LLM anywhere: `urn:annotation:{id}` (Sink creates/updates,
+/// Source reads with drift re-anchoring, Delete removes) and
+/// `urn:repo:{repo}:annotations[:{path}]` (the per-target listing), and the
+/// file HTML face gains its annotations panel. [`space_with_explain`] includes
+/// this family too, over the SAME store as the explanation archive.
+pub fn space_with_annotations(
+    roots: impl IntoIterator<Item = (String, PathBuf)>,
+    store: Arc<Store>,
+) -> EndpointSpace {
+    let roots = build_roots(roots);
+    let space = base_space(&roots, &Arc::new(hash::default_ignore()), Some(&store));
+    annotate::bind(space, &roots, &store)
 }
 
 /// [`space`] plus the S1 **explanation** family: `urn:repo:{repo}:explain[:{path}]`
@@ -105,15 +129,19 @@ pub fn space(roots: impl IntoIterator<Item = (String, PathBuf)>) -> EndpointSpac
 /// Oxigraph store) and `urn:repo:{repo}:explain-versions[:{path}]` (what the
 /// archive holds for a path). See [`ExplainConfig`] for the knobs: providers,
 /// token ceilings, model labels, and the ignore policy (which also governs the
-/// directory hashes the archive keys on).
+/// directory hashes the archive keys on). The S2 **annotation** family rides
+/// along over the same shared store ([`space_with_annotations`] gets it
+/// without the LLM machinery).
 pub fn space_with_explain(
     roots: impl IntoIterator<Item = (String, PathBuf)>,
     config: ExplainConfig,
 ) -> EndpointSpace {
     let roots = build_roots(roots);
     let ignore = Arc::new(config.ignore.clone());
-    let space = base_space(&roots, &ignore);
-    explain::bind(space, &roots, config)
+    let store = Arc::clone(&config.store);
+    let space = base_space(&roots, &ignore, Some(&store));
+    let space = explain::bind(space, &roots, config);
+    annotate::bind(space, &roots, &store)
 }
 
 fn build_roots(roots: impl IntoIterator<Item = (String, PathBuf)>) -> Roots {
@@ -132,7 +160,13 @@ fn build_roots(roots: impl IntoIterator<Item = (String, PathBuf)>) -> Roots {
 }
 
 /// The families S0 shipped plus the S1 content-hash oracle, over shared roots.
-fn base_space(roots: &Roots, ignore: &Arc<std::collections::BTreeSet<String>>) -> EndpointSpace {
+/// `store` (present when the host mounted the annotation/explanation store)
+/// lets the file HTML face render its annotations overlay.
+fn base_space(
+    roots: &Roots,
+    ignore: &Arc<std::collections::BTreeSet<String>>,
+    store: Option<&Arc<Store>>,
+) -> EndpointSpace {
     EndpointSpace::new()
         .bind(
             KnownRepo::new(
@@ -148,7 +182,7 @@ fn base_space(roots: &Roots, ignore: &Arc<std::collections::BTreeSet<String>>) -
                 "urn:repo:{repo}:file:{path}",
                 roots,
             ),
-            file_endpoint(roots),
+            file_endpoint(roots, store),
         )
         .bind(
             KnownRepo::new(&["urn:repo:{repo}:state"], "urn:repo:{repo}:state", roots),
@@ -650,8 +684,9 @@ fn tree_turtle(repo: &str, rel: &str, entries: &[Entry]) -> String {
 
 // --- file endpoint ----------------------------------------------------------
 
-fn file_endpoint(roots: &Roots) -> FnEndpoint {
+fn file_endpoint(roots: &Roots, store: Option<&Arc<Store>>) -> FnEndpoint {
     let held = Arc::clone(roots);
+    let store = store.map(Arc::clone);
     FnEndpoint::new("browse-file", move |inv: &Invocation<'_>| {
         let (repo, root) = repo_root(inv, &held)?;
         granted(inv, repo)?;
@@ -669,9 +704,10 @@ fn file_endpoint(roots: &Roots) -> FnEndpoint {
         let bytes = std::fs::read(&target)
             .map_err(|e| Error::Endpoint(format!("browse: read `{rel}`: {e}")))?;
         match inv.inline_str("as").unwrap_or("") {
-            t if t.starts_with("text/html") => {
-                Ok(repr_utf8("text/html", file_html(repo, &rel, &bytes)))
-            }
+            t if t.starts_with("text/html") => Ok(repr_utf8(
+                "text/html",
+                file_html(repo, &rel, &bytes, store.as_deref())?,
+            )),
             _ => Ok(Representation::new(media_type_for(&target, &bytes), bytes)),
         }
     })
@@ -686,7 +722,9 @@ fn file_description(roots: &Roots) -> Description {
              urn:repo:{repo}:file:{path}. Raw bytes by default, under an extension-mapped \
              media type (application/octet-stream fallback, UTF-8 sniffed to text/plain); \
              as=text/html renders a syntax-highlighted, line-numbered view whose lines \
-             carry id=\"L{n}\" anchors. Live and uncacheable.",
+             carry id=\"L{n}\" anchors — and, when the annotation store is mounted, marks \
+             annotated lines and appends the annotations panel with its create form. \
+             Live and uncacheable.",
         )
         .verb(Verb::Source)
         .verb(Verb::Meta)
@@ -765,7 +803,7 @@ fn theme() -> &'static Theme {
     })
 }
 
-fn file_html(repo: &str, rel: &str, bytes: &[u8]) -> String {
+fn file_html(repo: &str, rel: &str, bytes: &[u8], store: Option<&Store>) -> Result<String> {
     let mut out = String::from("<div class=\"browse\">");
     out.push_str(&crumbs_html(repo, rel));
     match std::str::from_utf8(bytes) {
@@ -774,16 +812,28 @@ fn file_html(repo: &str, rel: &str, bytes: &[u8]) -> String {
             human_size(bytes.len() as u64),
             esc(&media_type_for(Path::new(rel), bytes).media_type),
         )),
-        Ok(text) => out.push_str(&highlight_html(rel, text)),
+        Ok(text) => {
+            // The S2 overlay, when the annotation store is mounted: which
+            // lines carry a live anchor (marked in the view) plus the
+            // annotations panel with its create affordance. The drift pass
+            // runs against the very content being rendered.
+            let overlay = store
+                .map(|store| annotate::file_overlay(store, repo, rel, text))
+                .transpose()?;
+            let (marked, panel) = overlay.unwrap_or_default();
+            out.push_str(&highlight_html(rel, text, &marked));
+            out.push_str(&panel);
+        }
     }
     out.push_str("</div>");
-    out
+    Ok(out)
 }
 
 /// The highlighted, line-numbered code view. Every line is a span with
 /// `id="L{n}"` and a self-link gutter number, so `#L42` deep-links a line —
-/// the anchor surface S2's annotations will target.
-fn highlight_html(rel: &str, text: &str) -> String {
+/// the anchor surface S2's annotations target; lines in `annotated` carry the
+/// `browse-line-annotated` mark.
+fn highlight_html(rel: &str, text: &str, annotated: &BTreeSet<u64>) -> String {
     let syntaxes = syntaxes();
     let syntax = Path::new(rel)
         .extension()
@@ -808,8 +858,13 @@ fn highlight_html(rel: &str, text: &str) -> String {
                 styled_line_to_highlighted_html(&regions, IncludeBackground::No).ok()
             })
             .unwrap_or_else(|| esc(line));
+        let class = if annotated.contains(&(n as u64)) {
+            "browse-line browse-line-annotated"
+        } else {
+            "browse-line"
+        };
         out.push_str(&format!(
-            "<span class=\"browse-line\" id=\"L{n}\"><a class=\"browse-ln\" \
+            "<span class=\"{class}\" id=\"L{n}\"><a class=\"browse-ln\" \
              href=\"#L{n}\">{n}</a>{html}</span>"
         ));
     }
@@ -1306,7 +1361,7 @@ mod tests {
         let roots: Roots = Arc::new(BTreeMap::from([("demo".to_string(), root.clone())]));
         for (endpoint, wants_path) in [
             (tree_endpoint(&roots), true),
-            (file_endpoint(&roots), true),
+            (file_endpoint(&roots, None), true),
             (state_endpoint(&roots), false),
         ] {
             use ikigai_core::Endpoint;

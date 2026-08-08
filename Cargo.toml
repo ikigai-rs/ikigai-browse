@@ -1,7 +1,7 @@
 [package]
 name = "ikigai-browse"
-description = "Repository browsing as ikigai resources: per-root tree / file / git-state endpoints (urn:repo:{repo}:tree | :file | :state), capability-gated, with text, htmx-HTML, and Turtle faces."
-version = "0.1.0"
+description = "Repository browsing as ikigai resources: per-root tree / file / git-state / hash endpoints, an archived LLM explanation layer, and W3C Web Annotations that re-anchor under drift - capability-gated, with text, htmx-HTML, and Turtle faces."
+version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -39,6 +39,9 @@ oxigraph = { version = "0.5", default-features = false }
 # async trait objects for the explain endpoint (it must await sub-requests —
 # FnEndpoint is sync-only), matching ikigai-core's own endpoint plumbing.
 async-trait = "0.1"
+# Minted annotation ids (S2): a Sink of the bare urn:annotation creates the
+# annotation under a fresh v4 uuid.
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 futures = "0.3"
