@@ -10,6 +10,9 @@ pairs), and each root answers three resource families:
 | `urn:repo:{repo}:tree` / `urn:repo:{repo}:tree:{path}` | a directory listing — `text/plain` (default; `name`⇥`kind`⇥`size` per line), `as=text/html` (htmx-navigable), `as=text/turtle` (the skolemized graph) |
 | `urn:repo:{repo}:file:{path}` | file content — raw bytes under an extension-mapped media type; `as=text/html` for a syntax-highlighted, line-numbered view with `#L{n}` anchors |
 | `urn:repo:{repo}:state` | the **freshness oracle** — HEAD sha + `clean`/`dirty:{n}` on one line; `as=application/json` for `{head, dirty: [paths]}` |
+| `urn:repo:{repo}:hash[:{path}]` | the **content hash** (S1) — `sha256:{hex}` of a file's bytes, or the **merkle** construction over a directory's entries (ignore-filtered), so one edit re-keys exactly the path to the root |
+| `urn:repo:{repo}:explain[:{path}]` | an **LLM-derived orientation explanation** (S1), archived by `(path, content-hash, version-tag)` — derived once per content version, reused forever; `as=application/json` adds `{content_hash, version_tag, derived}`, `as=text/html` the page face with provenance, `as=text/turtle` the archive entry's graph; `version=` addresses an older tag |
+| `urn:repo:{repo}:explain-versions[:{path}]` | what the archive holds for a path — one row per entry (tag, hash, model, derived-at), across content versions and tags; a pure store read (no net capability) |
 
 **Resolution is the access model.** A `{repo}` that is not a configured root is
 a clean resolution *miss* (the grammar refuses to match; other mounted spaces
@@ -26,9 +29,26 @@ roots: `urn:cap:browse:read:{repo}` grants one root; the literal
 baseline-checks the wildcard before dispatch, and the endpoint checks the
 target's root against the grant.
 
-**Live, uncacheable.** All three families are live reads — cheap by design.
-The caching economics arrive in S1 (explanations archived by content hash,
-keyed on `state`); S0 does not fake freshness.
+**The explanation archive (S1).** `space_with_explain` takes an
+`ExplainConfig` around a host-injected Oxigraph store handle (`Arc<Store>`) —
+ONE shared store; later stages (annotations) join it. Explanations are derived
+THROUGH the kernel (`urn:repo:…:hash`, `:file`/`:tree`, the children's own
+`:explain`, and `urn:llm:{provider}:ask` are all sub-requests) and persist as
+skolemized RDF (`ik:Explanation` entries keyed by content hash + version tag).
+Directory explanations synthesize their children's — the merkle hash cascade
+means one edit re-derives exactly the path to the root, and everything else is
+an archive hit. Model tiers are config: file grain defaults to
+`urn:llm:coder:ask` (400-token ceiling), rollups to `urn:llm:ask` (600),
+`temperature=0.2` — per-call `max_tokens` ceilings are mandatory, and an empty
+model answer is an error, never archived. Prompts are type-aware (code /
+note / skill-or-agent definition / plain text, by extension + path heuristics)
+and individually versioned: a prompt edit bumps its version constant, which
+lazily re-derives while old tags stay addressable via `version=`.
+
+**Live, uncacheable reads.** The browsing families are live reads — cheap by
+design; the hash is the probe the archive keys on. `ExplainConfig` model
+labels (`file_model_label` / `dir_model_label`) should name the real model ids
+so a model swap re-keys the archive.
 
 **Non-git roots work.** `state` answers `not a git repository` (JSON:
 `{"head": null, "dirty": []}`) while `tree` and `file` are unaffected — future
@@ -51,7 +71,11 @@ let kernel = Kernel::new(Arc::new(ikigai_browse::space([
 // source urn:repo:core:state as=application/json
 ```
 
-Run `cargo run --example browse-demo` to watch it browse its own repository.
+Run `cargo run --example browse-demo` to watch it browse its own repository,
+and `cargo run --example explain-demo` (needs a local Ollama with
+`qwen3-coder:30b` and `llama3.3` pulled) to watch it explain itself with real
+models — the second pass serves every explanation from the archive in
+milliseconds.
 
 ## The HTML face (house style)
 
@@ -67,9 +91,11 @@ deep-links a line — the anchor surface later annotation stages target.
 The graph face skolemizes everything under the same `urn:repo:…` IRIs that
 resolve — directory children as `tree:` IRIs, files as `file:` IRIs — so the
 graph is diffable, SPARQL-able, *and navigable*. It uses these `ik:`
-(`https://ikigai-rs.dev/ns#`) terms: `ik:Directory`, `ik:File`, `ik:Symlink`
-(classes), `ik:entry`, `ik:fileName`, `ik:path`, `ik:repo`, `ik:byteSize`
-(properties). These are pending addition to the published vocabulary.
+(`https://ikigai-rs.dev/ns#`) terms: `ik:Directory`, `ik:File`, `ik:Symlink`,
+`ik:Explanation` (classes), `ik:entry`, `ik:fileName`, `ik:path`, `ik:repo`,
+`ik:byteSize`, `ik:target`, `ik:contentHash`, `ik:versionTag`, `ik:model`,
+`ik:promptKind`, `ik:explanation`, `ik:derivedAt` (properties). These are
+pending addition to the published vocabulary (`ik:model` already exists).
 
 ## License
 

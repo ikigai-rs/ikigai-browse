@@ -23,8 +23,30 @@ syntect = { version = "5.3", default-features = false, features = ["default-fanc
 # The `as=application/json` face of urn:repo:{repo}:state (correct escaping of
 # arbitrary dirty-file paths).
 serde_json = "1"
+# The content hash behind urn:repo:{repo}:hash:{path} and the explanation
+# archive key. sha2 over blake3 because it is pure Rust — CI never needs a C
+# toolchain (the same reason S0 picked syntect's fancy-regex engine).
+sha2 = "0.10"
+# The explanation ARCHIVE (S1): derived-once explanations persist as RDF in an
+# Oxigraph store whose handle the host injects (one shared store — S2's
+# annotations join it). default-features = false: in-memory engine, no RocksDB
+# C++ build; a host wanting persistence enables oxigraph's storage features
+# itself (feature unification makes the injected handle just work).
+# NOTE: the brief named `ikigai-store`, but that crate is unpublished (checked
+# crates.io 2026-08-08) and `ikigai-sparql` does not expose a shared-store
+# handle — so the config takes Arc<oxigraph::store::Store> directly.
+oxigraph = { version = "0.5", default-features = false }
+# async trait objects for the explain endpoint (it must await sub-requests —
+# FnEndpoint is sync-only), matching ikigai-core's own endpoint plumbing.
+async-trait = "0.1"
 
 [dev-dependencies]
 futures = "0.3"
 # Validates the Turtle face in tests — the graph must actually parse.
 oxttl = "0.2"
+# The real-model demo (examples/explain-demo.rs): mounts the actual LLM module
+# over a blocking ureq transport so `cargo run --example explain-demo` derives
+# genuine explanations of this repo against local Ollama models.
+ikigai-llm = "0.9"
+ikigai-http = "0.1.7"
+ureq = "2"
