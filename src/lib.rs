@@ -1,8 +1,9 @@
 //! `ikigai-browse` — repository browsing as ikigai resources.
 //!
 //! A standalone **ikigai module crate** (like `ikigai-fs` / `ikigai-repo`): a
-//! host links it in and mounts [`space`] over a set of named **roots** —
-//! `(name, directory)` pairs. Each root then answers three resource families:
+//! host links it in and mounts [`space`] (or [`space_with_explain`]) over a
+//! set of named **roots** — `(name, directory)` pairs. Each root then answers
+//! these resource families:
 //!
 //! - `urn:repo:{repo}:tree` / `urn:repo:{repo}:tree:{path}` — a directory
 //!   listing. Faces: `text/plain` (default; one `name<TAB>kind<TAB>size` entry
@@ -20,6 +21,13 @@
 //!   a short-status digest, one line; `as=application/json` yields
 //!   `{head, dirty: [paths]}`. Uncacheable by design — it exists to be the
 //!   cheap "has anything changed?" probe that later stages key caches on.
+//! - `urn:repo:{repo}:hash[:{path}]` — the **content hash** (S1): sha-256 of a
+//!   file's bytes, or the merkle construction over a directory's entries, so
+//!   one edit re-keys exactly the path to the root.
+//! - `urn:repo:{repo}:explain[:{path}]` + `:explain-versions[:{path}]` — the
+//!   S1 **explanation archive** ([`space_with_explain`]): LLM-derived
+//!   orientation, derived once per `(path, content-hash, version-tag)` and
+//!   persisted in a host-injected Oxigraph store.
 //!
 //! ## Resolution is the access model
 //!
@@ -59,6 +67,11 @@ use syntect::html::{styled_line_to_highlighted_html, IncludeBackground};
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
+mod explain;
+mod hash;
+
+pub use explain::ExplainConfig;
+
 /// The wildcard capability every browse action declares: an agent is offered
 /// these resources iff it holds *some* grant under this prefix. Held literally,
 /// it is an all-roots grant.
@@ -67,7 +80,7 @@ pub const CAP_WILDCARD: &str = "urn:cap:browse:read:*";
 /// The grant prefix: `urn:cap:browse:read:{repo}` grants one configured root.
 pub const CAP_PREFIX: &str = "urn:cap:browse:read:";
 
-type Roots = Arc<BTreeMap<String, PathBuf>>;
+pub(crate) type Roots = Arc<BTreeMap<String, PathBuf>>;
 
 /// Mount the browse module over `roots` — `(name, directory)` pairs.
 ///
@@ -83,6 +96,27 @@ type Roots = Arc<BTreeMap<String, PathBuf>>;
 /// containing `:` or `/` (it must embed cleanly in the URN grammar), or a
 /// duplicate name.
 pub fn space(roots: impl IntoIterator<Item = (String, PathBuf)>) -> EndpointSpace {
+    let roots = build_roots(roots);
+    base_space(&roots, &Arc::new(hash::default_ignore()))
+}
+
+/// [`space`] plus the S1 **explanation** family: `urn:repo:{repo}:explain[:{path}]`
+/// (LLM-derived orientation, archived per content version in the injected
+/// Oxigraph store) and `urn:repo:{repo}:explain-versions[:{path}]` (what the
+/// archive holds for a path). See [`ExplainConfig`] for the knobs: providers,
+/// token ceilings, model labels, and the ignore policy (which also governs the
+/// directory hashes the archive keys on).
+pub fn space_with_explain(
+    roots: impl IntoIterator<Item = (String, PathBuf)>,
+    config: ExplainConfig,
+) -> EndpointSpace {
+    let roots = build_roots(roots);
+    let ignore = Arc::new(config.ignore.clone());
+    let space = base_space(&roots, &ignore);
+    explain::bind(space, &roots, config)
+}
+
+fn build_roots(roots: impl IntoIterator<Item = (String, PathBuf)>) -> Roots {
     let mut map = BTreeMap::new();
     for (name, dir) in roots {
         assert!(
@@ -94,27 +128,39 @@ pub fn space(roots: impl IntoIterator<Item = (String, PathBuf)>) -> EndpointSpac
             "browse: duplicate root name `{name}`"
         );
     }
-    let roots: Roots = Arc::new(map);
+    Arc::new(map)
+}
+
+/// The families S0 shipped plus the S1 content-hash oracle, over shared roots.
+fn base_space(roots: &Roots, ignore: &Arc<std::collections::BTreeSet<String>>) -> EndpointSpace {
     EndpointSpace::new()
         .bind(
             KnownRepo::new(
                 &["urn:repo:{repo}:tree:{path}", "urn:repo:{repo}:tree"],
                 "urn:repo:{repo}:tree[:{path}]",
-                &roots,
+                roots,
             ),
-            tree_endpoint(&roots),
+            tree_endpoint(roots),
         )
         .bind(
             KnownRepo::new(
                 &["urn:repo:{repo}:file:{path}"],
                 "urn:repo:{repo}:file:{path}",
-                &roots,
+                roots,
             ),
-            file_endpoint(&roots),
+            file_endpoint(roots),
         )
         .bind(
-            KnownRepo::new(&["urn:repo:{repo}:state"], "urn:repo:{repo}:state", &roots),
-            state_endpoint(&roots),
+            KnownRepo::new(&["urn:repo:{repo}:state"], "urn:repo:{repo}:state", roots),
+            state_endpoint(roots),
+        )
+        .bind(
+            KnownRepo::new(
+                &["urn:repo:{repo}:hash:{path}", "urn:repo:{repo}:hash"],
+                "urn:repo:{repo}:hash[:{path}]",
+                roots,
+            ),
+            hash::hash_endpoint(roots, ignore),
         )
 }
 
@@ -123,14 +169,14 @@ pub fn space(roots: impl IntoIterator<Item = (String, PathBuf)>) -> EndpointSpac
 /// A URI-template grammar that additionally requires the captured `{repo}` to
 /// name a configured root — so an unconfigured repo is a clean resolution
 /// MISS (falling through to other mounted spaces), never an error from here.
-struct KnownRepo {
+pub(crate) struct KnownRepo {
     templates: Vec<UriTemplate>,
     pattern: String,
     roots: Roots,
 }
 
 impl KnownRepo {
-    fn new(templates: &[&str], pattern: &str, roots: &Roots) -> Self {
+    pub(crate) fn new(templates: &[&str], pattern: &str, roots: &Roots) -> Self {
         KnownRepo {
             templates: templates
                 .iter()
@@ -167,7 +213,7 @@ impl Grammar for KnownRepo {
 /// The repo binding and its configured root directory. The grammar only
 /// matches configured roots, so the lookup failing means a caller reached the
 /// endpoint outside resolution — still answered honestly.
-fn repo_root<'a>(
+pub(crate) fn repo_root<'a>(
     inv: &'a Invocation<'_>,
     roots: &'a BTreeMap<String, PathBuf>,
 ) -> Result<(&'a str, &'a Path)> {
@@ -184,7 +230,7 @@ fn repo_root<'a>(
 /// The per-root capability check (the declared wildcard's enforcement): the
 /// capability must grant this root (`urn:cap:browse:read:{repo}`) or all roots
 /// (the literal wildcard); root capability passes via [`Capability::allows`].
-fn granted(inv: &Invocation<'_>, repo: &str) -> Result<()> {
+pub(crate) fn granted(inv: &Invocation<'_>, repo: &str) -> Result<()> {
     let scope = format!("{CAP_PREFIX}{repo}");
     if inv.capability.allows(&scope) || inv.capability.allows(CAP_WILDCARD) {
         return Ok(());
@@ -199,7 +245,7 @@ fn granted(inv: &Invocation<'_>, repo: &str) -> Result<()> {
 /// The decoded `path` binding, or `""` (the root) when the grammar captured
 /// none. IRIs carry percent-encoded paths (a space is not IRI-legal), so the
 /// binding is decoded before it touches the filesystem.
-fn path_binding(inv: &Invocation<'_>) -> Result<String> {
+pub(crate) fn path_binding(inv: &Invocation<'_>) -> Result<String> {
     match inv.bindings.get("path") {
         Some(path) => iri_decode(path),
         None => Ok(String::new()),
@@ -210,7 +256,7 @@ fn path_binding(inv: &Invocation<'_>) -> Result<String> {
 /// jail**. `..` and absolute segments are rejected lexically; the target is
 /// then canonicalized (it must exist — browsing is a read) and required to sit
 /// within the canonical root, so a symlink component cannot escape.
-fn resolve(root: &Path, rel: &str) -> Result<PathBuf> {
+pub(crate) fn resolve(root: &Path, rel: &str) -> Result<PathBuf> {
     for component in Path::new(rel).components() {
         match component {
             Component::Normal(_) | Component::CurDir => {}
@@ -244,11 +290,11 @@ fn bad_path(detail: &str) -> Error {
     }
 }
 
-fn repr(media: &str, body: String) -> Representation {
+pub(crate) fn repr(media: &str, body: String) -> Representation {
     Representation::new(ReprType::new(media), body.into_bytes())
 }
 
-fn repr_utf8(media: &str, body: String) -> Representation {
+pub(crate) fn repr_utf8(media: &str, body: String) -> Representation {
     Representation::new(
         ReprType::new(media).with_param("charset", "utf-8"),
         body.into_bytes(),
@@ -256,7 +302,7 @@ fn repr_utf8(media: &str, body: String) -> Representation {
 }
 
 /// Minimal HTML escaping for names and paths embedded in attributes and text.
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -267,7 +313,7 @@ fn esc(s: &str) -> String {
 /// `/` and the URN-safe punctuation stay literal; everything else (spaces,
 /// `%`, non-ASCII) is encoded so the emitted IRI is RFC 3987-valid and the
 /// encode/decode pair round-trips any UTF-8 filename.
-fn iri_encode(path: &str) -> String {
+pub(crate) fn iri_encode(path: &str) -> String {
     const SAFE: &[u8] = b"-._~/!$&'()*+,;=:@";
     let mut out = String::with_capacity(path.len());
     for byte in path.bytes() {
@@ -282,7 +328,7 @@ fn iri_encode(path: &str) -> String {
 
 /// Percent-decode a `{path}` binding. Malformed escapes pass through
 /// literally; the decoded bytes must be UTF-8.
-fn iri_decode(s: &str) -> Result<String> {
+pub(crate) fn iri_decode(s: &str) -> Result<String> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -311,7 +357,7 @@ fn iri_decode(s: &str) -> Result<String> {
 }
 
 /// A Turtle string literal (quote-and-escape).
-fn ttl_str(s: &str) -> String {
+pub(crate) fn ttl_str(s: &str) -> String {
     format!(
         "\"{}\"",
         s.replace('\\', "\\\\")
@@ -322,7 +368,7 @@ fn ttl_str(s: &str) -> String {
 }
 
 /// The tree IRI for a repo + root-relative directory path (`""` = the root).
-fn tree_iri(repo: &str, rel: &str) -> String {
+pub(crate) fn tree_iri(repo: &str, rel: &str) -> String {
     if rel.is_empty() {
         format!("urn:repo:{repo}:tree")
     } else {
@@ -330,14 +376,14 @@ fn tree_iri(repo: &str, rel: &str) -> String {
     }
 }
 
-fn file_iri(repo: &str, rel: &str) -> String {
+pub(crate) fn file_iri(repo: &str, rel: &str) -> String {
     format!("urn:repo:{repo}:file:{}", iri_encode(rel))
 }
 
 // --- directory listing ------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Kind {
+pub(crate) enum Kind {
     Dir,
     File,
     Link,
@@ -353,7 +399,7 @@ impl Kind {
     }
 }
 
-struct Entry {
+pub(crate) struct Entry {
     name: String,
     kind: Kind,
     /// Byte size — files only (a directory's disk size is not its meaning).
@@ -362,7 +408,7 @@ struct Entry {
 
 /// List a directory: directories first, then files and links, each
 /// alphabetical. Non-UTF-8 names are skipped rather than mangled.
-fn list_entries(dir: &Path) -> Result<Vec<Entry>> {
+pub(crate) fn list_entries(dir: &Path) -> Result<Vec<Entry>> {
     let read = std::fs::read_dir(dir)
         .map_err(|e| Error::Endpoint(format!("browse: read {}: {e}", dir.display())))?;
     let mut entries = Vec::new();
@@ -475,7 +521,7 @@ fn tree_text(entries: &[Entry]) -> String {
 
 /// The breadcrumb strip: the repo name and every ancestor directory `hx-get`
 /// their tree face; the final segment (the current dir or file) is inert text.
-fn crumbs_html(repo: &str, rel: &str) -> String {
+pub(crate) fn crumbs_html(repo: &str, rel: &str) -> String {
     let mut out = String::from("<nav class=\"browse-crumbs\">");
     let segments: Vec<&str> = if rel.is_empty() {
         Vec::new()
@@ -534,7 +580,7 @@ fn tree_html(repo: &str, rel: &str, entries: &[Entry]) -> String {
     out
 }
 
-fn human_size(bytes: u64) -> String {
+pub(crate) fn human_size(bytes: u64) -> String {
     match bytes {
         0..=1023 => format!("{bytes} B"),
         1024..=1048575 => format!("{:.1} KB", bytes as f64 / 1024.0),
@@ -668,7 +714,7 @@ fn file_description(roots: &Roots) -> Description {
 
 /// The extension→media-type map for the raw face; unknown extensions fall back
 /// to a UTF-8 sniff (`text/plain`) and finally `application/octet-stream`.
-fn media_type_for(path: &Path, bytes: &[u8]) -> ReprType {
+pub(crate) fn media_type_for(path: &Path, bytes: &[u8]) -> ReprType {
     let media = match path.extension().and_then(|e| e.to_str()) {
         Some("txt") => "text/plain",
         Some("md") => "text/markdown",
