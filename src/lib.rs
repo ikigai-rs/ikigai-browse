@@ -16,7 +16,8 @@
 //!   an extension-mapped media type (`application/octet-stream` fallback, with
 //!   a UTF-8 sniff to `text/plain`); `as=text/html` renders a
 //!   syntax-highlighted, line-numbered view whose lines carry `id="L{n}"`
-//!   anchors (the surface S2's annotations target).
+//!   anchors (the surface S2's annotations target), inline markers at
+//!   annotated lines, and — explanations mounted — an explain link.
 //! - `urn:repo:{repo}:state` — the **freshness oracle**: the git HEAD sha plus
 //!   a short-status digest, one line; `as=application/json` yields
 //!   `{head, dirty: [paths]}`. Uncacheable by design — it exists to be the
@@ -118,7 +119,7 @@ pub(crate) type Roots = Arc<BTreeMap<String, PathBuf>>;
 /// duplicate name.
 pub fn space(roots: impl IntoIterator<Item = (String, PathBuf)>) -> EndpointSpace {
     let roots = build_roots(roots);
-    base_space(&roots, &Arc::new(hash::default_ignore()), None)
+    base_space(&roots, &Arc::new(hash::default_ignore()), None, false)
 }
 
 /// [`space`] plus the S2 **annotation** family over a host-injected Oxigraph
@@ -132,7 +133,12 @@ pub fn space_with_annotations(
     store: Arc<Store>,
 ) -> EndpointSpace {
     let roots = build_roots(roots);
-    let space = base_space(&roots, &Arc::new(hash::default_ignore()), Some(&store));
+    let space = base_space(
+        &roots,
+        &Arc::new(hash::default_ignore()),
+        Some(&store),
+        false,
+    );
     annotate::bind(space, &roots, &store)
 }
 
@@ -151,7 +157,7 @@ pub fn space_with_explain(
     let roots = build_roots(roots);
     let ignore = Arc::new(config.ignore.clone());
     let store = Arc::clone(&config.store);
-    let space = base_space(&roots, &ignore, Some(&store));
+    let space = base_space(&roots, &ignore, Some(&store), true);
     let space = explain::bind(space, &roots, config);
     annotate::bind(space, &roots, &store)
 }
@@ -175,14 +181,18 @@ fn build_roots(roots: impl IntoIterator<Item = (String, PathBuf)>) -> Roots {
 
 /// The families S0 shipped plus the S1 content-hash oracle, over shared roots.
 /// `store` (present when the host mounted the annotation/explanation store)
-/// lets the file HTML face render its annotations overlay.
+/// lets the file HTML face render its annotations overlay; `explain` (the
+/// explanation family is mounted) lets the tree and file HTML faces render
+/// their explain affordances — on a plain mount the link would dangle (no
+/// bound grammar answers it), so it is simply not rendered.
 fn base_space(
     roots: &Roots,
-    ignore: &Arc<std::collections::BTreeSet<String>>,
+    ignore: &Arc<BTreeSet<String>>,
     store: Option<&Arc<Store>>,
+    explain: bool,
 ) -> EndpointSpace {
-    let tree: Arc<dyn Endpoint> = Arc::new(tree_endpoint(roots));
-    let file: Arc<dyn Endpoint> = Arc::new(file_endpoint(roots, store));
+    let tree: Arc<dyn Endpoint> = Arc::new(tree_endpoint(roots, explain));
+    let file: Arc<dyn Endpoint> = Arc::new(file_endpoint(roots, store, explain));
     let state: Arc<dyn Endpoint> = Arc::new(state_endpoint(roots));
     let hash: Arc<dyn Endpoint> = Arc::new(hash::hash_endpoint(roots, ignore));
     let space = EndpointSpace::new();
@@ -533,7 +543,7 @@ pub(crate) fn list_entries(dir: &Path) -> Result<Vec<Entry>> {
 
 // --- tree endpoint ----------------------------------------------------------
 
-fn tree_endpoint(roots: &Roots) -> FnEndpoint {
+fn tree_endpoint(roots: &Roots, explain: bool) -> FnEndpoint {
     let held = Arc::clone(roots);
     FnEndpoint::new("browse-tree", move |inv: &Invocation<'_>| {
         let (repo, root) = repo_root(inv, &held)?;
@@ -551,13 +561,14 @@ fn tree_endpoint(roots: &Roots) -> FnEndpoint {
             t if t.starts_with("text/turtle") => {
                 Ok(repr("text/turtle", tree_turtle(repo, &rel, &entries)))
             }
-            t if t.starts_with("text/html") => {
-                Ok(repr_utf8("text/html", tree_html(repo, &rel, &entries)))
-            }
+            t if t.starts_with("text/html") => Ok(repr_utf8(
+                "text/html",
+                tree_html(repo, &rel, &entries, explain),
+            )),
             _ => Ok(repr_utf8("text/plain", tree_text(&entries))),
         }
     })
-    .with_description(tree_description())
+    .with_description(tree_description(explain))
 }
 
 /// NOTE (the manifold contract): `repo` is deliberately NOT an ArgSpec. Every
@@ -565,17 +576,24 @@ fn tree_endpoint(roots: &Roots) -> FnEndpoint {
 /// there is no `{repo}` variable left to declare — declaring one would make
 /// MCP/validate demand an argument no row can substitute. The `repo` binding
 /// the endpoint reads is injected by [`RootRow`], not supplied by callers.
-fn tree_description() -> Description {
+fn tree_description(explain: bool) -> Description {
+    let mut summary = String::from(
+        "A directory listing of a configured browse root — urn:repo:{repo}:tree is the \
+         top, urn:repo:{repo}:tree:{path} a subdirectory. text/plain (default) is one \
+         name<TAB>kind<TAB>size entry per line; as=text/html is an htmx-navigable \
+         fragment (entries hx-get child tree/file resources into #browse); \
+         as=text/turtle is the skolemized graph (ik:Directory/ik:File nodes under \
+         stable urn:repo: IRIs, no blank nodes). Live and uncacheable.",
+    );
+    if explain {
+        summary.push_str(
+            " The html face links the directory's explain resource and each entry's \
+             (urn:repo:{repo}:explain[:{path}]).",
+        );
+    }
     Description::new("browse-tree")
         .title("Repository tree")
-        .summary(
-            "A directory listing of a configured browse root — urn:repo:{repo}:tree is the \
-             top, urn:repo:{repo}:tree:{path} a subdirectory. text/plain (default) is one \
-             name<TAB>kind<TAB>size entry per line; as=text/html is an htmx-navigable \
-             fragment (entries hx-get child tree/file resources into #browse); \
-             as=text/turtle is the skolemized graph (ik:Directory/ik:File nodes under \
-             stable urn:repo: IRIs, no blank nodes). Live and uncacheable.",
-        )
+        .summary(summary)
         .verb(Verb::Source)
         .verb(Verb::Meta)
         .requires(CAP_WILDCARD)
@@ -641,9 +659,38 @@ pub(crate) fn crumbs_html(repo: &str, rel: &str) -> String {
     out
 }
 
-fn tree_html(repo: &str, rel: &str, entries: &[Entry]) -> String {
+/// The explain affordance (rendered only when the explanation family is
+/// mounted): a button that hx-gets the target's explain face into #browse,
+/// like every other navigation here. `title` names the target for the
+/// compact per-row `?` form; the header form is self-evident and passes
+/// none.
+fn explain_button(repo: &str, rel: &str, label: &str, title: Option<&str>) -> String {
+    let title = title
+        .map(|t| format!(" title=\"{}\"", esc(t)))
+        .unwrap_or_default();
+    format!(
+        "<button class=\"browse-explain-link\"{title} hx-get=\"/k/source {iri} \
+         as=text/html\" hx-target=\"#browse\" hx-swap=\"innerHTML\">{label}</button>",
+        iri = explain::explain_iri(repo, rel),
+    )
+}
+
+/// The header strip under the crumbs: face-level actions (today just the
+/// explain link, when that family is mounted; empty otherwise).
+fn actions_html(repo: &str, rel: &str, explain: bool) -> String {
+    if !explain {
+        return String::new();
+    }
+    format!(
+        "<nav class=\"browse-actions\">{}</nav>",
+        explain_button(repo, rel, "explain", None)
+    )
+}
+
+fn tree_html(repo: &str, rel: &str, entries: &[Entry], explain: bool) -> String {
     let mut out = String::from("<div class=\"browse\">");
     out.push_str(&crumbs_html(repo, rel));
+    out.push_str(&actions_html(repo, rel, explain));
     out.push_str("<ul class=\"browse-entries\">");
     for e in entries {
         let child = if rel.is_empty() {
@@ -659,9 +706,21 @@ fn tree_html(repo: &str, rel: &str, entries: &[Entry]) -> String {
             .size
             .map(|s| format!(" <span class=\"browse-size\">{}</span>", human_size(s)))
             .unwrap_or_default();
+        // The per-row explain affordance: one compact `?` per entry (its
+        // tooltip names the target) — the archive answers instantly once
+        // derived, so the row stays honest about cost only on first click.
+        let explain_link = if explain {
+            format!(
+                " {}",
+                explain_button(repo, &child, "?", Some(&format!("explain {}", e.name)))
+            )
+        } else {
+            String::new()
+        };
         out.push_str(&format!(
             "<li><button class=\"browse-{kind}\" hx-get=\"/k/source {iri} as=text/html\" \
-             hx-target=\"#browse\" hx-swap=\"innerHTML\">{label}</button>{size}</li>",
+             hx-target=\"#browse\" hx-swap=\"innerHTML\">{label}</button>{size}\
+             {explain_link}</li>",
             kind = e.kind.label(),
         ));
     }
@@ -739,7 +798,7 @@ fn tree_turtle(repo: &str, rel: &str, entries: &[Entry]) -> String {
 
 // --- file endpoint ----------------------------------------------------------
 
-fn file_endpoint(roots: &Roots, store: Option<&Arc<Store>>) -> FnEndpoint {
+fn file_endpoint(roots: &Roots, store: Option<&Arc<Store>>, explain: bool) -> FnEndpoint {
     let held = Arc::clone(roots);
     let store = store.map(Arc::clone);
     let has_store = store.is_some();
@@ -765,7 +824,7 @@ fn file_endpoint(roots: &Roots, store: Option<&Arc<Store>>) -> FnEndpoint {
             // store is mounted — `annotations=include` changes nothing there.
             t if t.starts_with("text/html") => Ok(repr_utf8(
                 "text/html",
-                file_html(repo, &rel, &bytes, store.as_deref())?,
+                file_html(repo, &rel, &bytes, store.as_deref(), explain)?,
             )),
             _ if include => {
                 // One resolution = content + human margin notes (the
@@ -799,24 +858,31 @@ fn file_endpoint(roots: &Roots, store: Option<&Arc<Store>>) -> FnEndpoint {
             _ => Ok(Representation::new(media_type_for(&target, &bytes), bytes)),
         }
     })
-    .with_description(file_description(has_store))
+    .with_description(file_description(has_store, explain))
 }
 
 /// `repo` is not an ArgSpec — see [`tree_description`]'s note.
-fn file_description(has_store: bool) -> Description {
+fn file_description(has_store: bool, explain: bool) -> Description {
+    let mut summary = String::from(
+        "The content of one file within a configured browse root — \
+         urn:repo:{repo}:file:{path}. Raw bytes by default, under an extension-mapped \
+         media type (application/octet-stream fallback, UTF-8 sniffed to text/plain); \
+         as=text/html renders a syntax-highlighted, line-numbered view whose lines \
+         carry id=\"L{n}\" anchors — and, when the annotation store is mounted, marks \
+         annotated lines with inline markers anchored to their cards and appends the \
+         annotations panel with its create form. annotations=include (store mounted, \
+         textual content) serves the text plus a compact margin-notes section — \
+         content and human annotations in one resolution. Live and uncacheable.",
+    );
+    if explain {
+        summary.push_str(
+            " The html face links the file's explain resource \
+             (urn:repo:{repo}:explain:{path}).",
+        );
+    }
     let mut description = Description::new("browse-file")
         .title("Repository file")
-        .summary(
-            "The content of one file within a configured browse root — \
-             urn:repo:{repo}:file:{path}. Raw bytes by default, under an extension-mapped \
-             media type (application/octet-stream fallback, UTF-8 sniffed to text/plain); \
-             as=text/html renders a syntax-highlighted, line-numbered view whose lines \
-             carry id=\"L{n}\" anchors — and, when the annotation store is mounted, marks \
-             annotated lines and appends the annotations panel with its create form. \
-             annotations=include (store mounted, textual content) serves the text plus a \
-             compact margin-notes section — content and human annotations in one \
-             resolution. Live and uncacheable.",
-        )
+        .summary(summary)
         .verb(Verb::Source)
         .verb(Verb::Meta)
         .requires(CAP_WILDCARD)
@@ -919,9 +985,16 @@ fn theme() -> &'static Theme {
     })
 }
 
-fn file_html(repo: &str, rel: &str, bytes: &[u8], store: Option<&Store>) -> Result<String> {
+fn file_html(
+    repo: &str,
+    rel: &str,
+    bytes: &[u8],
+    store: Option<&Store>,
+    explain: bool,
+) -> Result<String> {
     let mut out = String::from("<div class=\"browse\">");
     out.push_str(&crumbs_html(repo, rel));
+    out.push_str(&actions_html(repo, rel, explain));
     match std::str::from_utf8(bytes) {
         Err(_) => out.push_str(&format!(
             "<p class=\"browse-binary\">binary file — {} ({})</p>",
@@ -947,9 +1020,17 @@ fn file_html(repo: &str, rel: &str, bytes: &[u8], store: Option<&Store>) -> Resu
 
 /// The highlighted, line-numbered code view. Every line is a span with
 /// `id="L{n}"` and a self-link gutter number, so `#L42` deep-links a line —
-/// the anchor surface S2's annotations target; lines in `annotated` carry the
-/// `browse-line-annotated` mark.
-fn highlight_html(rel: &str, text: &str, annotated: &BTreeSet<u64>) -> String {
+/// the anchor surface S2's annotations target. Lines in `annotated` carry
+/// the `browse-line-annotated` mark plus one inline marker per anchored
+/// annotation, between the gutter number and the code (hosts may style it as
+/// a margin dot): an anchor down to the annotation's card whose native
+/// `title` tooltip reveals the note — no scripts, and inline flow keeps the
+/// pre's line layout intact.
+fn highlight_html(
+    rel: &str,
+    text: &str,
+    annotated: &BTreeMap<u64, Vec<annotate::Marker>>,
+) -> String {
     let syntaxes = syntaxes();
     let path = Path::new(rel);
     let syntax = path
@@ -982,14 +1063,28 @@ fn highlight_html(rel: &str, text: &str, annotated: &BTreeSet<u64>) -> String {
                 styled_line_to_highlighted_html(&regions, IncludeBackground::No).ok()
             })
             .unwrap_or_else(|| esc(line));
-        let class = if annotated.contains(&(n as u64)) {
+        let markers = annotated.get(&(n as u64));
+        let class = if markers.is_some() {
             "browse-line browse-line-annotated"
         } else {
             "browse-line"
         };
+        let marks = markers.map_or_else(String::new, |markers| {
+            markers
+                .iter()
+                .map(|m| {
+                    format!(
+                        "<a class=\"browse-annotation-marker\" href=\"#annotation-{}\" \
+                         title=\"{}\">●</a>",
+                        esc(&m.id),
+                        esc(&m.note)
+                    )
+                })
+                .collect()
+        });
         out.push_str(&format!(
             "<span class=\"{class}\" id=\"L{n}\"><a class=\"browse-ln\" \
-             href=\"#L{n}\">{n}</a>{html}</span>"
+             href=\"#L{n}\">{n}</a>{marks}{html}</span>"
         ));
     }
     out.push_str("</code></pre>");
@@ -1310,6 +1405,56 @@ mod tests {
     }
 
     #[test]
+    fn explain_affordances_render_only_when_the_family_is_mounted() {
+        let root = demo_root();
+        // A plain space(): no explain family, so no affordance anywhere — a
+        // rendered link would dangle.
+        let k = kernel(vec![("demo".to_string(), root.clone())]);
+        for iri in ["urn:repo:demo:tree", "urn:repo:demo:file:src/lib.rs"] {
+            let html = body(&source(&k, iri, &[("as", "text/html")], &demo_cap()).unwrap());
+            assert!(!html.contains("browse-explain-link"), "{iri}: {html}");
+        }
+
+        // space_with_explain: the tree face links the directory's explain and
+        // each entry's; the file face links its own.
+        let store = Arc::new(oxigraph::store::Store::new().unwrap());
+        let k = Kernel::new(Arc::new(space_with_explain(
+            vec![("demo".to_string(), root.clone())],
+            ExplainConfig::new(store),
+        )));
+        let html = body(
+            &source(
+                &k,
+                "urn:repo:demo:tree",
+                &[("as", "text/html")],
+                &demo_cap(),
+            )
+            .unwrap(),
+        );
+        for target in [
+            "hx-get=\"/k/source urn:repo:demo:explain as=text/html\"",
+            "hx-get=\"/k/source urn:repo:demo:explain:src as=text/html\"",
+            "hx-get=\"/k/source urn:repo:demo:explain:README.md as=text/html\"",
+        ] {
+            assert!(html.contains(target), "missing {target}: {html}");
+        }
+        let html = body(
+            &source(
+                &k,
+                "urn:repo:demo:file:src/lib.rs",
+                &[("as", "text/html")],
+                &demo_cap(),
+            )
+            .unwrap(),
+        );
+        assert!(
+            html.contains("hx-get=\"/k/source urn:repo:demo:explain:src/lib.rs as=text/html\""),
+            "{html}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn file_raw_face_passes_binary_through_with_a_mapped_type() {
         let root = demo_root();
         let k = kernel(vec![("demo".to_string(), root.clone())]);
@@ -1536,8 +1681,8 @@ mod tests {
         let root = demo_root();
         let roots: Roots = Arc::new(BTreeMap::from([("demo".to_string(), root.clone())]));
         for (endpoint, wants_path) in [
-            (tree_endpoint(&roots), true),
-            (file_endpoint(&roots, None), true),
+            (tree_endpoint(&roots, false), true),
+            (file_endpoint(&roots, None, false), true),
             (state_endpoint(&roots), false),
         ] {
             use ikigai_core::Endpoint;
@@ -1560,10 +1705,10 @@ mod tests {
         // declaring it on a plain space() would make the manifold over-offer.
         {
             use ikigai_core::Endpoint;
-            let bare = file_endpoint(&roots, None).describe();
+            let bare = file_endpoint(&roots, None, false).describe();
             assert!(!bare.inputs.iter().any(|i| i.name == "annotations"));
             let store = Arc::new(oxigraph::store::Store::new().unwrap());
-            let with_store = file_endpoint(&roots, Some(&store)).describe();
+            let with_store = file_endpoint(&roots, Some(&store), false).describe();
             let ann = with_store
                 .inputs
                 .iter()

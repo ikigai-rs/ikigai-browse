@@ -1,7 +1,7 @@
 [package]
 name = "ikigai-browse"
 description = "Repository browsing as ikigai resources: per-root tree / file / git-state / hash endpoints, an archived LLM explanation layer, and W3C Web Annotations that re-anchor under drift - capability-gated, with text, htmx-HTML, and Turtle faces."
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
