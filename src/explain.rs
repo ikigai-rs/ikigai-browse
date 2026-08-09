@@ -70,8 +70,8 @@ use crate::annotate::{self, Included, TargetFilter};
 use crate::hash::hash_iri;
 use crate::{
     crumbs_html, esc, file_iri, granted, human_size, include_annotations, iri_encode,
-    media_type_for, path_binding, repo_root, repr, repr_utf8, resolve, tree_iri, ttl_str,
-    KnownRepo, Roots, CAP_WILDCARD,
+    media_type_for, path_binding, repo_root, repr, repr_utf8, resolve, tree_iri, ttl_str, Roots,
+    CAP_WILDCARD,
 };
 
 /// The network capability the explain action declares (wildcard offering
@@ -623,29 +623,25 @@ pub(crate) fn iso8601(millis: u64) -> String {
 
 pub(crate) fn bind(space: EndpointSpace, roots: &Roots, config: ExplainConfig) -> EndpointSpace {
     let config = Arc::new(config);
-    space
-        .bind(
-            KnownRepo::new(
-                &[
-                    "urn:repo:{repo}:explain-versions:{path}",
-                    "urn:repo:{repo}:explain-versions",
-                ],
-                "urn:repo:{repo}:explain-versions[:{path}]",
-                roots,
-            ),
-            versions_endpoint(roots, &config),
-        )
-        .bind(
-            KnownRepo::new(
-                &["urn:repo:{repo}:explain:{path}", "urn:repo:{repo}:explain"],
-                "urn:repo:{repo}:explain[:{path}]",
-                roots,
-            ),
-            ExplainEndpoint {
-                roots: Arc::clone(roots),
-                config,
-            },
-        )
+    let versions: Arc<dyn Endpoint> = Arc::new(versions_endpoint(roots, &config));
+    let explain: Arc<dyn Endpoint> = Arc::new(ExplainEndpoint {
+        roots: Arc::clone(roots),
+        config,
+    });
+    let space = crate::bind_family(
+        space,
+        roots,
+        versions,
+        Some("explain-versions"),
+        Some("explain-versions:{path}"),
+    );
+    crate::bind_family(
+        space,
+        roots,
+        explain,
+        Some("explain"),
+        Some("explain:{path}"),
+    )
 }
 
 pub(crate) fn explain_iri(repo: &str, rel: &str) -> String {
@@ -795,7 +791,7 @@ impl Endpoint for ExplainEndpoint {
     }
 
     fn describe(&self) -> Description {
-        explain_description(&self.roots)
+        explain_description()
     }
 }
 
@@ -1058,7 +1054,9 @@ fn explain_turtle(entry: &ArchiveEntry) -> String {
     )
 }
 
-fn explain_description(roots: &Roots) -> Description {
+/// `repo` is not an ArgSpec: every advertised row fixes the root in its
+/// pattern (see `crate::bind_family`); the binding is grammar-injected.
+fn explain_description() -> Description {
     Description::new("browse-explain")
         .title("Repository explanation (archived derivation)")
         .summary(
@@ -1079,12 +1077,6 @@ fn explain_description(roots: &Roots) -> Description {
         .verb(Verb::Meta)
         .requires(CAP_WILDCARD)
         .requires(CAP_NET)
-        .input(
-            ArgSpec::new("repo")
-                .binding()
-                .summary("a configured root name")
-                .one_of(roots.keys().cloned()),
-        )
         .input(
             ArgSpec::new("path")
                 .binding()
@@ -1171,10 +1163,11 @@ fn versions_endpoint(roots: &Roots, config: &Arc<ExplainConfig>) -> FnEndpoint {
             }
         }
     })
-    .with_description(versions_description(roots))
+    .with_description(versions_description())
 }
 
-fn versions_description(roots: &Roots) -> Description {
+/// `repo` is not an ArgSpec — see [`explain_description`]'s note.
+fn versions_description() -> Description {
     Description::new("browse-explain-versions")
         .title("Archived explanation versions")
         .summary(
@@ -1189,12 +1182,6 @@ fn versions_description(roots: &Roots) -> Description {
         .verb(Verb::Source)
         .verb(Verb::Meta)
         .requires(CAP_WILDCARD)
-        .input(
-            ArgSpec::new("repo")
-                .binding()
-                .summary("a configured root name")
-                .one_of(roots.keys().cloned()),
-        )
         .input(
             ArgSpec::new("path")
                 .binding()
@@ -1855,8 +1842,10 @@ mod tests {
         let description = explain.describe();
         assert!(description.requires.contains(&CAP_WILDCARD.to_string()));
         assert!(description.requires.contains(&CAP_NET.to_string()));
+        // No `repo` ArgSpec: every advertised row fixes the root in its
+        // pattern; the binding is grammar-injected.
         let names: Vec<&str> = description.inputs.iter().map(|i| i.name.as_str()).collect();
-        assert_eq!(names, ["repo", "path", "version", "annotations", "as"]);
+        assert_eq!(names, ["path", "version", "annotations", "as"]);
 
         // The versions listing never derives — it must NOT demand net.
         use ikigai_core::Endpoint as _;

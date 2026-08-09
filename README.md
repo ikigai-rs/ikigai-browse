@@ -24,6 +24,16 @@ target must stay inside the canonicalized root, so a symlink cannot escape.
 Paths in IRIs are percent-encoded (`hello%20world.txt`); bindings are decoded
 before they touch the filesystem.
 
+**Manifold citizenship.** Roots are known at bind time, so the space
+enumerates **per-configured-root rows**: for each root, the concrete resources
+(`urn:repo:{name}:tree`, `:state`, `:hash`, `:explain`, …) and the
+`{path}`-templated ones (`urn:repo:{name}:file:{path}`, …) are separate
+entries. The catalog and the capability-scoped action manifold
+(`urn:kernel:actions`) therefore advertise exactly the repos an agent can
+actually browse, and every templated row survives the kernel's
+probe-expansion. `urn:annotation:{id}` is the annotation family's row; the
+bare `urn:annotation` (Sink mints a uuid id) stays resolvable but unlisted.
+
 **Capabilities.** Every action declares `urn:cap:browse:read:*` — the wildcard
 *offering* form ("holds some grant under this prefix"). A **grant** names
 roots: `urn:cap:browse:read:{repo}` grants one root; the literal

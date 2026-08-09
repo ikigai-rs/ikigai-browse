@@ -121,10 +121,12 @@ pub(crate) fn hash_endpoint(roots: &Roots, ignore: &Arc<BTreeSet<String>>) -> Fn
             _ => Ok(repr_utf8("text/plain", hash)),
         }
     })
-    .with_description(hash_description(roots))
+    .with_description(hash_description())
 }
 
-fn hash_description(roots: &Roots) -> Description {
+/// `repo` is not an ArgSpec: every advertised row fixes the root in its
+/// pattern (see `crate::bind_family`); the binding is grammar-injected.
+fn hash_description() -> Description {
     Description::new("browse-hash")
         .title("Content hash (archive key oracle)")
         .summary(
@@ -139,12 +141,6 @@ fn hash_description(roots: &Roots) -> Description {
         .verb(Verb::Source)
         .verb(Verb::Meta)
         .requires(CAP_WILDCARD)
-        .input(
-            ArgSpec::new("repo")
-                .binding()
-                .summary("a configured root name")
-                .one_of(roots.keys().cloned()),
-        )
         .input(
             ArgSpec::new("path")
                 .binding()

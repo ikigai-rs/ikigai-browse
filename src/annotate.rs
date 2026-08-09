@@ -87,7 +87,7 @@ use sha2::{Digest, Sha256};
 use crate::explain::{ik, iso8601, parse_iri, IK};
 use crate::{
     crumbs_html, esc, file_iri, granted, iri_decode, path_binding, repo_root, repr, repr_utf8,
-    ttl_str, KnownRepo, Roots, CAP_WILDCARD,
+    ttl_str, Roots, CAP_WILDCARD,
 };
 
 /// The capability Sink and Delete require: authority to create, update, and
@@ -782,28 +782,24 @@ async fn current_content(inv: &Invocation<'_>, repo: &str, rel: &str) -> Result<
 // --- binding ----------------------------------------------------------------
 
 pub(crate) fn bind(space: EndpointSpace, roots: &Roots, store: &Arc<Store>) -> EndpointSpace {
-    space
-        .bind(
-            AnnotationGrammar::new(),
-            AnnotationEndpoint {
-                roots: Arc::clone(roots),
-                store: Arc::clone(store),
-            },
-        )
-        .bind(
-            KnownRepo::new(
-                &[
-                    "urn:repo:{repo}:annotations:{path}",
-                    "urn:repo:{repo}:annotations",
-                ],
-                "urn:repo:{repo}:annotations[:{path}]",
-                roots,
-            ),
-            AnnotationsEndpoint {
-                roots: Arc::clone(roots),
-                store: Arc::clone(store),
-            },
-        )
+    let space = space.bind(
+        AnnotationGrammar::new(),
+        AnnotationEndpoint {
+            roots: Arc::clone(roots),
+            store: Arc::clone(store),
+        },
+    );
+    let listing: Arc<dyn Endpoint> = Arc::new(AnnotationsEndpoint {
+        roots: Arc::clone(roots),
+        store: Arc::clone(store),
+    });
+    crate::bind_family(
+        space,
+        roots,
+        listing,
+        Some("annotations"),
+        Some("annotations:{path}"),
+    )
 }
 
 /// `urn:annotation:{id}`, plus the bare `urn:annotation` (Sink mints an id).
@@ -829,7 +825,14 @@ impl Grammar for AnnotationGrammar {
     }
 
     fn pattern(&self) -> String {
-        "urn:annotation[:{id}]".to_string()
+        // The advertised row is the template — a real pattern a probe can
+        // expand and every verb can drive (Sink's `id` is optional there, and
+        // the description documents the minting form). The bare
+        // `urn:annotation` stays resolvable but UNLISTED: as a row of its own
+        // it would offer Source/Delete actions that cannot succeed without an
+        // id, and `[:{id}]` display sugar is not a template any grammar
+        // matches (it kept every annotation row out of every manifold).
+        "urn:annotation:{id}".to_string()
     }
 }
 
@@ -1133,11 +1136,13 @@ impl Endpoint for AnnotationsEndpoint {
     }
 
     fn describe(&self) -> Description {
-        annotations_description(&self.roots)
+        annotations_description()
     }
 }
 
-fn annotations_description(roots: &Roots) -> Description {
+/// `repo` is not an ArgSpec: every advertised row fixes the root in its
+/// pattern (see `crate::bind_family`); the binding is grammar-injected.
+fn annotations_description() -> Description {
     Description::new("browse-annotations")
         .title("Annotations on a browse target")
         .summary(
@@ -1152,12 +1157,6 @@ fn annotations_description(roots: &Roots) -> Description {
         .verb(Verb::Source)
         .verb(Verb::Meta)
         .requires(CAP_WILDCARD)
-        .input(
-            ArgSpec::new("repo")
-                .binding()
-                .summary("a configured root name")
-                .one_of(roots.keys().cloned()),
-        )
         .input(
             ArgSpec::new("path")
                 .binding()
@@ -2184,11 +2183,7 @@ mod tests {
         assert_eq!(delete.requires, vec![CAP_ANNOTATE.to_string()]);
 
         // The listing is a plain single-verb read.
-        let roots: Roots = Arc::new(BTreeMap::from([(
-            "demo".to_string(),
-            std::path::PathBuf::from("/tmp"),
-        )]));
-        let listing = annotations_description(&roots);
+        let listing = annotations_description();
         assert!(listing.requires.contains(&CAP_WILDCARD.to_string()));
         assert!(!listing.requires.contains(&CAP_ANNOTATE.to_string()));
     }
