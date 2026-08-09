@@ -552,11 +552,17 @@ fn prs_html(repo: &str, listing: &str, embed: bool) -> String {
         let Ok(n) = number.parse::<u64>() else {
             continue;
         };
-        let branch = cols.next().unwrap_or("");
+        // The 0.1.4 text contract inserts state THIRD (number⇥title⇥state⇥
+        // branch⇥updated); gh's uppercase keywords are the discriminator, so
+        // a 0.1.3 four-column line (a branch name here) parses as stateless
+        // with its remaining columns intact.
+        let third = cols.next().unwrap_or("");
+        let (state, branch) = if matches!(third, "OPEN" | "CLOSED" | "MERGED") {
+            (third, cols.next().unwrap_or(""))
+        } else {
+            ("", third)
+        };
         let updated = cols.next().unwrap_or("");
-        // The 0.1.4 text contract's fifth column; absent on an older facade,
-        // and an empty state simply renders no badge.
-        let state = cols.next().unwrap_or("");
         let state_span = if state.is_empty() {
             String::new()
         } else {
@@ -1492,12 +1498,13 @@ mod tests {
         assert!(html.contains("feature/beta"), "{html}");
 
         // The 0.1.4 facade args are forwarded ONLY when supplied: the calls
-        // above carried neither, this one carries both — and the fifth
-        // (state) column renders as a badge.
+        // above carried neither, this one carries both — and the third
+        // (state) column, discriminated by gh's uppercase keyword, renders
+        // as a badge.
         assert!(!calls[0].contains_key("state"), "{:?}", calls[0]);
         assert!(!calls[0].contains_key("limit"), "{:?}", calls[0]);
         *state.list.lock().unwrap() =
-            "3\tAdd beta\tfeature/beta\t2026-08-09T12:00:00Z\tmerged\n".to_string();
+            "3\tAdd beta\tMERGED\tfeature/beta\t2026-08-09T12:00:00Z\n".to_string();
         let html = body(
             &source(
                 &k,
@@ -1507,7 +1514,7 @@ mod tests {
             .unwrap(),
         );
         assert!(
-            html.contains("<span class=\"browse-pr-state\">merged</span>"),
+            html.contains("<span class=\"browse-pr-state\">MERGED</span>"),
             "{html}"
         );
         let forwarded = state.calls_to(FACADE_LIST).pop().unwrap();
