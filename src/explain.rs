@@ -988,7 +988,7 @@ fn face(
         }
         t if t.starts_with("text/html") => Ok(repr_utf8(
             "text/html",
-            explain_html(repo, rel, entry, served.derived),
+            explain_html(repo, rel, entry, served.derived, included),
         )),
         t if t.starts_with("text/turtle") => Ok(repr("text/turtle", explain_turtle(entry))),
         _ => {
@@ -1002,12 +1002,34 @@ fn face(
     }
 }
 
-/// The S0 page style: crumbs, the explanation as paragraphs, and the
-/// provenance line — "explained by {model} · {tag}" — that makes derivation
-/// citable at a glance.
-fn explain_html(repo: &str, rel: &str, entry: &ArchiveEntry, derived: bool) -> String {
+/// The S0 page style: crumbs, a backlink to the explained resource, the
+/// explanation as paragraphs, and the provenance line — "explained by
+/// {model} · {tag}" — that makes derivation citable at a glance. With
+/// `annotations=include`, the target's annotation cards follow, the same
+/// markup the file face's panel renders.
+fn explain_html(
+    repo: &str,
+    rel: &str,
+    entry: &ArchiveEntry,
+    derived: bool,
+    included: Option<&Included>,
+) -> String {
     let mut out = String::from("<div class=\"browse\">");
     out.push_str(&crumbs_html(repo, rel));
+    // The backlink: an explanation is ABOUT a resource, and the face says so
+    // navigably — a directory's target is its tree face, a file's its view.
+    let is_dir = entry.target_iri == tree_iri(repo, rel);
+    out.push_str(&format!(
+        "<nav class=\"browse-actions\"><button class=\"browse-view-link\" \
+         hx-get=\"/k/source {} as=text/html\" hx-target=\"#browse\" \
+         hx-swap=\"innerHTML\">{}</button></nav>",
+        entry.target_iri,
+        if is_dir {
+            "view directory"
+        } else {
+            "view file"
+        },
+    ));
     out.push_str("<div class=\"browse-explain\">");
     for paragraph in entry.text.split("\n\n").filter(|p| !p.trim().is_empty()) {
         out.push_str(&format!("<p>{}</p>", esc(paragraph.trim())));
@@ -1025,6 +1047,9 @@ fn explain_html(repo: &str, rel: &str, entry: &ArchiveEntry, derived: bool) -> S
             "from the archive"
         },
     ));
+    if let Some(included) = included {
+        out.push_str(&included.panel_html((!is_dir).then_some(entry.target_iri.as_str())));
+    }
     out.push_str("</div>");
     out
 }
@@ -1070,8 +1095,8 @@ fn explain_description() -> Description {
              renders the page face with provenance; as=text/turtle emits the archive \
              entry's graph. annotations=include folds the target's annotations in \
              (drift-reconciled like the listing): the json face gains an annotations \
-             array, the text face appends a margin-notes section; a directory rollup \
-             folds its subtree's.",
+             array, the text face appends a margin-notes section, the html face renders \
+             the annotation cards; a directory rollup folds its subtree's.",
         )
         .verb(Verb::Source)
         .verb(Verb::Meta)
@@ -1090,8 +1115,8 @@ fn explain_description() -> Description {
             ArgSpec::new("annotations")
                 .optional()
                 .summary(
-                    "include folds the target's annotations into the json and text faces \
-                     (a directory rollup folds its subtree's)",
+                    "include folds the target's annotations into the json, text, and \
+                     html faces (a directory rollup folds its subtree's)",
                 )
                 .one_of(["include", "true", "false"])
                 .default_value("false"),
@@ -1562,6 +1587,87 @@ mod tests {
 
         // The versions listing is a pure archive read — no net required.
         assert!(source(&k, "urn:repo:demo:explain-versions:a.rs", &[], &browse_only).is_ok());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_html_face_backlinks_its_target_and_folds_annotations() {
+        let root = temp_dir();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "fn main() {}\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, |c| c);
+        let cap = Capability::scoped([
+            "urn:cap:browse:read:demo",
+            "urn:cap:net:localhost",
+            crate::CAP_ANNOTATE,
+        ]);
+        // An annotation on the file, created through the kernel.
+        let mut req = Request::new(Verb::Sink, Iri::parse("urn:annotation:n1").unwrap());
+        for (name, value) in [
+            ("target", "urn:repo:demo:file:src/lib.rs"),
+            ("exact", "fn main()"),
+            ("body", "the entrypoint"),
+        ] {
+            req = req.with_arg(name, ArgRef::Inline(value.as_bytes().to_vec()));
+        }
+        block_on(k.issue(req, &cap)).unwrap();
+
+        // The file explain backlinks its file…
+        let html = body(
+            &source(
+                &k,
+                "urn:repo:demo:explain:src/lib.rs",
+                &[("as", "text/html")],
+                &cap,
+            )
+            .unwrap(),
+        );
+        assert!(
+            html.contains("hx-get=\"/k/source urn:repo:demo:file:src/lib.rs as=text/html\""),
+            "{html}"
+        );
+        assert!(html.contains("view file"), "{html}");
+        // …and folds no annotations unless asked.
+        assert!(!html.contains("browse-annotations"), "{html}");
+
+        // annotations=include folds the file's cards in, create form and all
+        // — the same markup the file face's panel renders.
+        let html = body(
+            &source(
+                &k,
+                "urn:repo:demo:explain:src/lib.rs",
+                &[("as", "text/html"), ("annotations", "include")],
+                &cap,
+            )
+            .unwrap(),
+        );
+        assert!(html.contains("browse-annotation"), "{html}");
+        assert!(html.contains("the entrypoint"), "{html}");
+        assert!(
+            html.contains("hx-post=\"/k/sink urn:annotation\""),
+            "{html}"
+        );
+
+        // A directory rollup backlinks its tree; its subtree cards carry
+        // their paths and no create form (a create needs one target).
+        let html = body(
+            &source(
+                &k,
+                "urn:repo:demo:explain:src",
+                &[("as", "text/html"), ("annotations", "include")],
+                &cap,
+            )
+            .unwrap(),
+        );
+        assert!(
+            html.contains("hx-get=\"/k/source urn:repo:demo:tree:src as=text/html\""),
+            "{html}"
+        );
+        assert!(html.contains("view directory"), "{html}");
+        assert!(html.contains("browse-annotation-path"), "{html}");
+        assert!(!html.contains("hx-post"), "{html}");
         std::fs::remove_dir_all(&root).ok();
     }
 

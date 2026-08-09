@@ -7,11 +7,11 @@ pairs), and each root answers three resource families:
 
 | resource | what it is |
 |----------|------------|
-| `urn:repo:{repo}:tree` / `urn:repo:{repo}:tree:{path}` | a directory listing — `text/plain` (default; `name`⇥`kind`⇥`size` per line), `as=text/html` (htmx-navigable), `as=text/turtle` (the skolemized graph) |
-| `urn:repo:{repo}:file:{path}` | file content — raw bytes under an extension-mapped media type; `as=text/html` for a syntax-highlighted, line-numbered view with `#L{n}` anchors; `annotations=include` (S3, store mounted) serves the text plus a compact, drift-reconciled margin-notes section — content and human annotations in one resolution |
+| `urn:repo:{repo}:tree` / `urn:repo:{repo}:tree:{path}` | a directory listing — `text/plain` (default; `name`⇥`kind`⇥`size` per line), `as=text/html` (htmx-navigable; with the explanation family mounted, an explain link for the directory and one per entry), `as=text/turtle` (the skolemized graph) |
+| `urn:repo:{repo}:file:{path}` | file content — raw bytes under an extension-mapped media type; `as=text/html` for a syntax-highlighted, line-numbered view with `#L{n}` anchors, inline markers at annotated lines, and (explanations mounted) an explain link; `annotations=include` (S3, store mounted) serves the text plus a compact, drift-reconciled margin-notes section — content and human annotations in one resolution |
 | `urn:repo:{repo}:state` | the **freshness oracle** — HEAD sha + `clean`/`dirty:{n}` on one line; `as=application/json` for `{head, dirty: [paths]}` |
 | `urn:repo:{repo}:hash[:{path}]` | the **content hash** (S1) — `sha256:{hex}` of a file's bytes, or the **merkle** construction over a directory's entries (ignore-filtered), so one edit re-keys exactly the path to the root |
-| `urn:repo:{repo}:explain[:{path}]` | an **LLM-derived orientation explanation** (S1), archived by `(path, content-hash, version-tag)` — derived once per content version, reused forever; `as=application/json` adds `{content_hash, version_tag, derived}`, `as=text/html` the page face with provenance, `as=text/turtle` the archive entry's graph; `version=` addresses an older tag; `annotations=include` (S3) folds the target's annotations in — the json face gains an `annotations` array, the text face appends margin notes, and a directory rollup folds its subtree's |
+| `urn:repo:{repo}:explain[:{path}]` | an **LLM-derived orientation explanation** (S1), archived by `(path, content-hash, version-tag)` — derived once per content version, reused forever; `as=application/json` adds `{content_hash, version_tag, derived}`, `as=text/html` the page face with provenance and a backlink to the explained resource, `as=text/turtle` the archive entry's graph; `version=` addresses an older tag; `annotations=include` (S3) folds the target's annotations in — the json face gains an `annotations` array, the text face appends margin notes, the html face renders the annotation cards, and a directory rollup folds its subtree's |
 | `urn:repo:{repo}:explain-versions[:{path}]` | what the archive holds for a path — one row per entry (tag, hash, model, derived-at), across content versions and tags; a pure store read (no net capability) |
 | `urn:annotation[:{id}]` | a **W3C Web Annotation** (S2) on a file — Sink creates/updates (anchoring the quoted text; the bare `urn:annotation` mints a uuid id), Source reads with drift **re-anchoring**, Delete removes; faces: `text/plain` (the body), `as=application/json`, `as=text/turtle` |
 | `urn:repo:{repo}:annotations[:{path}]` | every annotation on one file (or the whole repo, path omitted) in reading order, drift-reconciled on each read; faces: `application/json` (default), `as=text/html` (panel fragment), `as=text/turtle` |
@@ -104,10 +104,19 @@ formats degrade to escaped plain text, and extensionless well-known names
 line in `<span id="L{n}">` with a self-linking gutter number, so `#L42`
 deep-links a line — the anchor surface annotations target. With the
 annotation store mounted, the file view marks annotated lines
-(`browse-line-annotated`) and appends an annotations panel: one card per
-annotation at its `#L{n}` anchor (orphans visually flagged) plus a create
-form that `hx-post`s a Sink of `urn:annotation` through the host's `/k/`
-adapter (form fields become sink args — htmx only, no scripts).
+(`browse-line-annotated`), renders an inline marker per anchored annotation
+between the gutter number and the code (`browse-annotation-marker` — an
+anchor down to the annotation's card whose native `title` tooltip reveals
+the note; hosts may style it as a margin dot), and appends an annotations
+panel: one card per annotation at its `#L{n}` anchor (orphans visually
+flagged, listed without a marker) plus a create form that `hx-post`s a Sink
+of `urn:annotation` through the host's `/k/` adapter (form fields become
+sink args — htmx only, no scripts). With the explanation family mounted,
+the tree and file faces carry explain links (`browse-explain-link` — the
+tree face one per entry plus the directory's own under a
+`browse-actions` nav), and the explain face backlinks its target
+(`browse-view-link`) and folds the annotation cards in under
+`annotations=include`.
 
 ## Annotations (S2)
 

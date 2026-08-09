@@ -72,7 +72,7 @@
 //! annotate it. Declared = enforced: the kernel baseline-checks each verb's
 //! `requires` before dispatch.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -700,14 +700,36 @@ impl Included {
         }
         out
     }
+
+    /// The annotation cards as an HTML fragment — what an
+    /// `annotations=include` html face folds in, the same card markup the
+    /// file face's panel renders. Subtree rows label each card with its path;
+    /// `form_target` (a concrete file IRI) appends the create form — a
+    /// rollup passes `None` (a create needs one target).
+    pub(crate) fn panel_html(&self, form_target: Option<&str>) -> String {
+        let mut out = String::from("<div class=\"browse-annotations\">");
+        for (ann, line) in &self.rows {
+            out.push_str(&annotation_card_html(ann, *line, self.with_paths));
+        }
+        if let Some(target) = form_target {
+            out.push_str(&annotation_form_html(target));
+        }
+        out.push_str("</div>");
+        out
+    }
 }
 
 /// A quote clipped to margin width (60 chars), char-boundary safe.
 fn clip(s: &str) -> String {
-    if s.chars().count() <= 60 {
+    clip_to(s, 60)
+}
+
+/// Clip to `max` chars with an ellipsis, char-boundary safe.
+fn clip_to(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
         return s.to_string();
     }
-    let clipped: String = s.chars().take(59).collect();
+    let clipped: String = s.chars().take(max - 1).collect();
     format!("{clipped}…")
 }
 
@@ -1264,12 +1286,21 @@ fn annotation_turtle_document(anns: &[Annotation]) -> String {
 
 /// One annotation as an HTML card: the line anchor, the quote, the body, and
 /// any drift flags. Orphans keep their (approximate) anchor but are visually
-/// flagged.
-fn annotation_card_html(ann: &Annotation, line: Option<u64>) -> String {
+/// flagged. `show_path` labels the card with its file (subtree folds span
+/// many files).
+fn annotation_card_html(ann: &Annotation, line: Option<u64>, show_path: bool) -> String {
     let orphan_class = if ann.orphaned {
         " browse-annotation-orphaned"
     } else {
         ""
+    };
+    let path = if show_path {
+        format!(
+            "<span class=\"browse-annotation-path\">{}</span> ",
+            esc(&ann.rel)
+        )
+    } else {
+        String::new()
     };
     let anchor = match line {
         Some(n) => format!("<a class=\"browse-annotation-line\" href=\"#L{n}\">L{n}</a> "),
@@ -1285,7 +1316,7 @@ fn annotation_card_html(ann: &Annotation, line: Option<u64>) -> String {
         flags.push_str("<span class=\"browse-annotation-flag\">re-anchored</span>");
     }
     format!(
-        "<div class=\"browse-annotation{orphan_class}\" id=\"annotation-{id}\">{anchor}\
+        "<div class=\"browse-annotation{orphan_class}\" id=\"annotation-{id}\">{path}{anchor}\
          <blockquote class=\"browse-annotation-quote\">{exact}</blockquote>\
          <p class=\"browse-annotation-body\">{body}</p>{flags}</div>",
         id = esc(&ann.id),
@@ -1315,7 +1346,7 @@ fn annotation_form_html(target_iri: &str) -> String {
 fn annotations_panel_html(target_iri: &str, rows: &[(Annotation, Option<u64>)]) -> String {
     let mut out = String::from("<div class=\"browse-annotations\">");
     for (ann, line) in rows {
-        out.push_str(&annotation_card_html(ann, *line));
+        out.push_str(&annotation_card_html(ann, *line, false));
     }
     out.push_str(&annotation_form_html(target_iri));
     out.push_str("</div>");
@@ -1330,7 +1361,7 @@ fn annotations_listing_html(repo: &str, rel: &str, rows: &[(Annotation, Option<u
         // create needs a concrete target).
         out.push_str("<div class=\"browse-annotations\">");
         for (ann, line) in rows {
-            out.push_str(&annotation_card_html(ann, *line));
+            out.push_str(&annotation_card_html(ann, *line, false));
         }
         out.push_str("</div>");
     } else {
@@ -1340,22 +1371,38 @@ fn annotations_listing_html(repo: &str, rel: &str, rows: &[(Annotation, Option<u
     out
 }
 
+/// One anchored line's inline marker in the file view: the annotation id
+/// (`#annotation-{id}` — its card's anchor in the panel below) and a clipped,
+/// one-line note for the marker's native tooltip.
+pub(crate) struct Marker {
+    pub(crate) id: String,
+    pub(crate) note: String,
+}
+
 /// The file face's overlay (called from the S0 HTML view when a store is
-/// mounted): the set of 1-based lines carrying a live (non-orphaned) anchor —
-/// the view marks them — plus the rendered panel. Runs the same drift pass as
-/// Source, against the content the view already read.
+/// mounted): per 1-based line, the markers of its live (non-orphaned)
+/// anchors — the view marks the line and renders them inline — plus the
+/// rendered panel. Orphans keep their card in the panel but get no marker
+/// (their quote is at no current line). Runs the same drift pass as Source,
+/// against the content the view already read.
 pub(crate) fn file_overlay(
     store: &Store,
     repo: &str,
     rel: &str,
     text: &str,
-) -> Result<(BTreeSet<u64>, String)> {
+) -> Result<(BTreeMap<u64, Vec<Marker>>, String)> {
     let rows = reconcile_against_text(store, repo, rel, text)?;
-    let marked: BTreeSet<u64> = rows
-        .iter()
-        .filter(|(ann, _)| !ann.orphaned)
-        .filter_map(|(_, line)| *line)
-        .collect();
+    let mut marked: BTreeMap<u64, Vec<Marker>> = BTreeMap::new();
+    for (ann, line) in &rows {
+        if ann.orphaned {
+            continue;
+        }
+        let Some(line) = line else { continue };
+        marked.entry(*line).or_default().push(Marker {
+            id: ann.id.clone(),
+            note: clip_to(&collapse(&ann.body), 160),
+        });
+    }
     let panel = annotations_panel_html(&file_iri(repo, rel), &rows);
     Ok((marked, panel))
 }
@@ -1658,6 +1705,65 @@ mod tests {
     }
 
     // --- the re-anchoring suite ---------------------------------------------
+
+    #[test]
+    fn anchored_markers_appear_at_their_lines_and_orphans_keep_their_card() {
+        let root = temp_dir();
+        std::fs::write(
+            root.join("a.rs"),
+            "fn one() {}\nfn two() {}\nfn three() {}\n",
+        )
+        .unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        annotate(&k, "mid", "a.rs", "fn two()", "the middle function");
+        let html = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:file:a.rs",
+                &[("as", "text/html")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        // The marker renders INSIDE the anchored line: its card anchor sits
+        // between L2's opening and L3's, and the line carries the mark class.
+        let l2 = html.find("id=\"L2\"").expect("L2 anchor");
+        let l3 = html.find("id=\"L3\"").expect("L3 anchor");
+        let marker = html.find("href=\"#annotation-mid\"").expect("marker");
+        assert!(l2 < marker && marker < l3, "{html}");
+        assert!(
+            html.contains("browse-line browse-line-annotated\" id=\"L2\""),
+            "{html}"
+        );
+        assert!(
+            html.contains("class=\"browse-annotation-marker\""),
+            "{html}"
+        );
+        assert!(html.contains("title=\"the middle function\""), "{html}");
+        // The bottom panel still lists the card.
+        assert!(html.contains("id=\"annotation-mid\""), "{html}");
+
+        // Edit the quote away: the card stays (orphan-flagged, the overview
+        // is where orphans live), the marker goes.
+        std::fs::write(root.join("a.rs"), "fn one() {}\nfn three() {}\n").unwrap();
+        let html = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:file:a.rs",
+                &[("as", "text/html")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert!(!html.contains("browse-annotation-marker"), "{html}");
+        assert!(!html.contains("browse-line-annotated"), "{html}");
+        assert!(html.contains("browse-annotation-orphaned"), "{html}");
+        assert!(html.contains("id=\"annotation-mid\""), "{html}");
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     #[test]
     fn a_moved_quote_reanchors_and_the_reanchor_persists() {
