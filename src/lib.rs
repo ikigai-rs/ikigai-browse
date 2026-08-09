@@ -49,6 +49,12 @@
 //!   surface — annotations target the PR IRI and drift like file ones — and
 //!   the derived layers archive by the HEAD COMMIT (`headRefOid`), so new
 //!   commits re-derive and prior entries stay addressable.
+//! - `urn:repo:{repo}:prs:{path}` — the **contextual** listing: the PRs that
+//!   touched anything at or under a path, newest first — open PRs by
+//!   intersecting their changed files (`urn:repo:pr:files`), merged PRs mined
+//!   from the path-scoped commit log (`urn:repo:log path=`) by the
+//!   squash-merge `(#N)` subject convention. Subdirectory tree pages lazy-load
+//!   THEIR listing; the root keeps the repo-wide block.
 //!
 //! ## Resolution is the access model
 //!
@@ -363,11 +369,11 @@ pub(crate) fn path_binding(inv: &Invocation<'_>) -> Result<String> {
     }
 }
 
-/// Resolve a root-relative path to a canonical path within the root — **the
-/// jail**. `..` and absolute segments are rejected lexically; the target is
-/// then canonicalized (it must exist — browsing is a read) and required to sit
-/// within the canonical root, so a symlink component cannot escape.
-pub(crate) fn resolve(root: &Path, rel: &str) -> Result<PathBuf> {
+/// The lexical half of the jail, shared by [`resolve`] and the path-scoped PR
+/// listing (which scopes HISTORY — a deleted directory's past is still real,
+/// so the path is never canonicalized there): `..` and absolute segments are
+/// rejected outright.
+pub(crate) fn lexical_jail(rel: &str) -> Result<()> {
     for component in Path::new(rel).components() {
         match component {
             Component::Normal(_) | Component::CurDir => {}
@@ -379,6 +385,15 @@ pub(crate) fn resolve(root: &Path, rel: &str) -> Result<PathBuf> {
             }
         }
     }
+    Ok(())
+}
+
+/// Resolve a root-relative path to a canonical path within the root — **the
+/// jail**. `..` and absolute segments are rejected lexically; the target is
+/// then canonicalized (it must exist — browsing is a read) and required to sit
+/// within the canonical root, so a symlink component cannot escape.
+pub(crate) fn resolve(root: &Path, rel: &str) -> Result<PathBuf> {
+    lexical_jail(rel)?;
     let canonical_root = root
         .canonicalize()
         .map_err(|e| Error::Endpoint(format!("browse: root `{}`: {e}", root.display())))?;
@@ -793,23 +808,34 @@ fn tree_html(repo: &str, rel: &str, entries: &[Entry], explain: bool) -> String 
         ));
     }
     out.push_str("</ul>");
-    // The repo front page's recent-PRs section, LAZY by design: the tree
-    // renders instantly and htmx fetches the listing after insertion
+    // Every tree page's recent-PRs section, LAZY by design: the tree renders
+    // instantly and htmx fetches the listing after insertion
     // (hx-trigger="load", swapping into the block itself). When the pr
     // facades are absent the fetch answers the typed 404-with-guidance and
     // the host renders it per its error handling — the tree never blocks on
     // it. `chrome=embed` keeps the loaded fragment crumb-free (this page
-    // already has the trail); `state=all limit=10` is the recency window
-    // (ikigai-repo >= 0.1.4 facade args, forwarded by the prs endpoint).
-    if rel.is_empty() {
-        out.push_str(&format!(
-            "<section class=\"browse-recent-prs\"><h4>recent pull requests</h4>\
-             <div hx-get=\"/k/source {iri} state=all limit=10 chrome=embed as=text/html\" \
-             hx-trigger=\"load\" hx-swap=\"innerHTML\">\
-             <p class=\"browse-recent-prs-loading\">loading&#8230;</p></div></section>",
-            iri = pr::prs_iri(repo),
-        ));
-    }
+    // already has the trail). The ROOT loads the repo-wide listing
+    // (`state=all limit=10`, ikigai-repo >= 0.1.4 facade args forwarded by
+    // the prs endpoint); a SUBDIRECTORY loads its own path-scoped listing
+    // (`urn:repo:{repo}:prs:{path}`, default state=all), so every directory
+    // page shows the PRs that touched IT.
+    let (iri_with_args, label) = if rel.is_empty() {
+        (
+            format!("{} state=all limit=10", pr::prs_iri(repo)),
+            "recent pull requests".to_string(),
+        )
+    } else {
+        (
+            format!("{} limit=10", pr::prs_scoped_iri(repo, rel)),
+            "pull requests touching this directory".to_string(),
+        )
+    };
+    out.push_str(&format!(
+        "<section class=\"browse-recent-prs\"><h4>{label}</h4>\
+         <div hx-get=\"/k/source {iri_with_args} chrome=embed as=text/html\" \
+         hx-trigger=\"load\" hx-swap=\"innerHTML\">\
+         <p class=\"browse-recent-prs-loading\">loading&#8230;</p></div></section>",
+    ));
     out.push_str("</div>");
     out
 }

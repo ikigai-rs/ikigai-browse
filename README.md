@@ -17,6 +17,7 @@ pairs), and each root answers three resource families:
 | `urn:repo:{repo}:annotations[:{path}]` | every annotation on one file (or the whole repo, path omitted) in reading order, drift-reconciled on each read; faces: `application/json` (default), `as=text/html` (panel fragment), `as=text/turtle` |
 | `urn:repo:{repo}:review:{path}` | the **machine review pass** (S4) — region-grain LLM commentary minted as real annotations (provenance-distinguished), the pass archived by `(path, content-hash, review-tag)` so re-sourcing unchanged content mints nothing; faces: `text/plain` (the margin digest), `as=application/json` (`{minted, orphaned_items, reviewed_bytes, total_bytes, annotations, …}`), `as=text/html` (the card page), `as=text/turtle` (the pass's provenance graph); `debug=raw` derives and returns the model's **unparsed answer** (nothing minted or archived) — the parse-failure diagnosis face |
 | `urn:repo:{repo}:prs` | the root's **pull requests** — ikigai-repo's `urn:repo:pr:list` facade resolved through the kernel with `dir=` the root's directory; `state=` (`open`/`closed`/`merged`/`all`) and `limit=` forward to the facade (ikigai-repo ≥ 0.1.4 — omitted, the facade's defaults apply); `text/plain` (default) is `number`⇥`title`⇥`branch`⇥`updated`⇥`state` per line (empty = no matching PRs), `as=application/json` the facade's structured rows, `as=text/html` the listing with each PR linking its page (`chrome=embed` for the rows-only fragment other faces fold in) |
+| `urn:repo:{repo}:prs:{path}` | the **contextual listing** — the PRs that touched anything at or under a path, newest first: open PRs from `urn:repo:pr:list` intersected per-PR with `urn:repo:pr:files` (ikigai-repo ≥ 0.1.5; bounded to the 20 most recently updated open PRs), merged PRs mined from the path-scoped log (`urn:repo:log path=`, last 100 path-touching commits) by the squash-merge **convention** that a subject ends `(#N)` — a merge-commit repo yields fewer rows, never wrong ones; the path is a *history* scope (a deleted directory still lists; no history = empty listing); open rows first, then merged, deduped by number; `state=` (`open`/`merged`/`all`, default `all`) and `limit=` cap the synthesized listing; faces mirror `prs` (`as=application/json` is the synthesized `{number, title, state, branch, updated}` rows; the html face labels its scope) |
 | `urn:repo:{repo}:pr:{n}` | the **PR page** — metadata (`urn:repo:pr:view` json: author object, `headRefOid`) + the unified diff (`urn:repo:pr:diff`); the DIFF TEXT is an annotation surface (annotations target the PR IRI and quote diff lines, drifting like file annotations); `as=text/html` renders the highlighted, line-anchored diff with markers and the annotations panel; `annotations=include` folds the margin into the plain/json faces |
 | `urn:repo:{repo}:pr:{n}:explain` | a **review-shaped PR explanation** — what the change does and what a reviewer would look at — archived by `(repo, pr, headRefOid, version-tag)`: new commits derive fresh, prior entries stay addressable (`version=`) |
 | `urn:repo:{repo}:pr:{n}:review` | the **machine review pass over the diff** — findings minted as machine annotations targeting the PR IRI, the pass archived by `(repo, pr, headRefOid, review-tag)` so an unchanged head mints nothing; `reviewed_bytes`/`total_bytes` on the json face say how much of a big diff the model actually saw, and `debug=raw` returns the unparsed answer |
@@ -116,10 +117,12 @@ is the index so it works untouched; any other host either styles/rebinds
 `.browse-home-link` (its page, its rules — e.g. `hx-boost`, or rewriting the
 `href`) or ships it harmlessly unstyled. The PR pages carry a real ancestor
 trail (repo → `prs` → `#n` → `explain`/`review`), every ancestor a live crumb.
-The **root tree** additionally renders a lazy *recent pull requests* block
-(`browse-recent-prs`): a `div` with `hx-get="/k/source urn:repo:{repo}:prs
-state=all limit=10 chrome=embed as=text/html"` and `hx-trigger="load"`,
-swapping into itself. The tree face itself never consults the pr facades — it
+Every **tree page** additionally renders a lazy pull-requests block
+(`browse-recent-prs`), swapping into itself with `hx-trigger="load"`: the
+root loads the repo-wide listing (`hx-get="/k/source urn:repo:{repo}:prs
+state=all limit=10 chrome=embed as=text/html"`), and each subdirectory loads
+its own **contextual** listing (`urn:repo:{repo}:prs:{path} limit=10`) — every
+directory page shows the PRs that touched *it*. The tree face itself never consults the pr facades — it
 renders instantly, and when the facades are not mounted the lazy fetch answers
 the typed 404-with-guidance, which the host renders per its own error
 handling (a host that shows kernel errors inline needs nothing extra). Highlighting uses

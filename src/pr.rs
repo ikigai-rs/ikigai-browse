@@ -39,7 +39,7 @@
 //! (`urn:cap:exec:gh` in ikigai-repo) when the sub-request dispatches — the
 //! composition's concern, surfaced honestly by attenuation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -63,7 +63,7 @@ use crate::{
     CAP_WILDCARD,
 };
 
-// --- the facade contract (ikigai-repo ≥ 0.1.3) --------------------------------
+// --- the facade contract (ikigai-repo ≥ 0.1.3; the scoped listing ≥ 0.1.5) ----
 
 /// `number⇥title⇥branch⇥updated` per line; empty body + success = no open PRs.
 const FACADE_LIST: &str = "urn:repo:pr:list";
@@ -72,6 +72,21 @@ const FACADE_LIST: &str = "urn:repo:pr:list";
 const FACADE_VIEW: &str = "urn:repo:pr:view";
 /// The byte-pure unified diff.
 const FACADE_DIFF: &str = "urn:repo:pr:diff";
+/// The commit log; `path=` scopes it to path-touching commits (0.1.5) and
+/// `as=application/json` yields `[{hash, author, date, subject}]`.
+const FACADE_LOG: &str = "urn:repo:log";
+/// One PR's changed paths, one per line (0.1.5).
+const FACADE_FILES: &str = "urn:repo:pr:files";
+
+// --- fan-out bounds (the scoped listing's cost ceiling) -----------------------
+
+/// At most this many open PRs (the facade's recency order — the most recently
+/// updated ones) are probed for their changed files by the path-scoped
+/// listing: one `pr:files` sub-request each is the fan-out being bounded.
+const OPEN_PROBE: u32 = 20;
+/// At most this many path-touching commits are scanned for squash-merge
+/// `(#N)` subjects — one `log` call regardless, this only caps its depth.
+const LOG_WINDOW: u32 = 100;
 
 // --- prompts (each constant is versioned; edit ⇒ bump its version) ------------
 
@@ -130,6 +145,11 @@ const PR_REVIEW_REMINDER: &str =
 
 pub(crate) fn prs_iri(repo: &str) -> String {
     format!("urn:repo:{repo}:prs")
+}
+
+/// The path-scoped listing's IRI for a root-relative path.
+pub(crate) fn prs_scoped_iri(repo: &str, rel: &str) -> String {
+    format!("urn:repo:{repo}:prs:{}", crate::iri_encode(rel))
 }
 
 pub(crate) fn pr_iri(repo: &str, n: u64) -> String {
@@ -403,7 +423,15 @@ pub(crate) fn bind_pages(
     let prs: Arc<dyn Endpoint> = Arc::new(PrsEndpoint {
         roots: Arc::clone(roots),
     });
-    let mut space = bind_family(space, roots, prs, Some("prs"), None);
+    let space = bind_family(space, roots, prs, Some("prs"), None);
+    // The contextual listing is its own row AND endpoint: its argument
+    // surface (state has no `closed`, limit caps a synthesized merge) and its
+    // description differ from the repo-wide passthrough above, and one
+    // describe() cannot honestly cover both.
+    let scoped: Arc<dyn Endpoint> = Arc::new(PrsScopedEndpoint {
+        roots: Arc::clone(roots),
+    });
+    let mut space = bind_family(space, roots, scoped, None, Some("prs:{path}"));
     let page: Arc<dyn Endpoint> = Arc::new(PrEndpoint {
         roots: Arc::clone(roots),
         store: store.map(Arc::clone),
@@ -522,7 +550,8 @@ fn prs_description() -> Description {
              facade's structured rows through; as=text/html renders the listing with \
              each PR linking its page (urn:repo:{repo}:pr:{n}) — chrome=embed serves \
              the rows-only fragment for embedding (the root tree's lazy recent-PRs \
-             block). Live and uncacheable.",
+             block). urn:repo:{repo}:prs:{path} scopes the listing to the PRs that \
+             touched that path. Live and uncacheable.",
         )
         .verb(Verb::Source)
         .verb(Verb::Meta)
@@ -559,6 +588,36 @@ fn prs_description() -> Description {
         .output("text/html;charset=utf-8")
 }
 
+/// One listing `<li>`: the PR page link, the state badge (uppercase keyword,
+/// empty = none), branch, updated. Shared by the repo-wide and path-scoped
+/// listings so the two render identically.
+fn pr_row_li(repo: &str, n: u64, title: &str, state: &str, branch: &str, updated: &str) -> String {
+    let state_span = if state.is_empty() {
+        String::new()
+    } else {
+        format!(" <span class=\"browse-pr-state\">{}</span>", esc(state))
+    };
+    format!(
+        "<li><button class=\"browse-pr\" hx-get=\"/k/source {iri} as=text/html\" \
+         hx-target=\"#browse\" hx-swap=\"innerHTML\">#{n} {title}</button>{state_span} \
+         <span class=\"browse-pr-branch\">{branch}</span> \
+         <span class=\"browse-pr-updated\">{updated}</span></li>",
+        iri = pr_iri(repo, n),
+        title = esc(title),
+        branch = esc(branch),
+        updated = esc(updated),
+    )
+}
+
+/// Wrap rendered rows in the listing `<ul>` (or the friendly empty state).
+fn prs_list_body(rows: String) -> String {
+    if rows.is_empty() {
+        "<p class=\"browse-prs-empty\">no pull requests</p>".to_string()
+    } else {
+        format!("<ul class=\"browse-prs\">{rows}</ul>")
+    }
+}
+
 fn prs_html(repo: &str, listing: &str, embed: bool) -> String {
     let mut rows = String::new();
     for line in listing.lines() {
@@ -580,27 +639,9 @@ fn prs_html(repo: &str, listing: &str, embed: bool) -> String {
             ("", third)
         };
         let updated = cols.next().unwrap_or("");
-        let state_span = if state.is_empty() {
-            String::new()
-        } else {
-            format!(" <span class=\"browse-pr-state\">{}</span>", esc(state))
-        };
-        rows.push_str(&format!(
-            "<li><button class=\"browse-pr\" hx-get=\"/k/source {iri} as=text/html\" \
-             hx-target=\"#browse\" hx-swap=\"innerHTML\">#{n} {title}</button>{state_span} \
-             <span class=\"browse-pr-branch\">{branch}</span> \
-             <span class=\"browse-pr-updated\">{updated}</span></li>",
-            iri = pr_iri(repo, n),
-            title = esc(title),
-            branch = esc(branch),
-            updated = esc(updated),
-        ));
+        rows.push_str(&pr_row_li(repo, n, title, state, branch, updated));
     }
-    let body = if rows.is_empty() {
-        "<p class=\"browse-prs-empty\">no pull requests</p>".to_string()
-    } else {
-        format!("<ul class=\"browse-prs\">{rows}</ul>")
-    };
+    let body = prs_list_body(rows);
     if embed {
         return body;
     }
@@ -609,6 +650,326 @@ fn prs_html(repo: &str, listing: &str, embed: bool) -> String {
     out.push_str(&body);
     out.push_str("</div>");
     out
+}
+
+// --- the path-scoped listing --------------------------------------------------
+
+/// One synthesized row of the contextual listing — the shape both text and
+/// json faces serve. `branch` is empty for merged-from-log rows (the log
+/// knows the subject and date, not the branch — and a per-row `pr:view`
+/// round-trip is exactly the fan-out this listing refuses).
+struct ScopedRow {
+    number: u64,
+    title: String,
+    state: String,
+    branch: String,
+    updated: String,
+}
+
+/// Extract the squash-merge convention from a commit subject: a trailing
+/// `(#N)` names the PR the commit merged. Returns the number and the subject
+/// with the suffix stripped (the row's title). A subject without the suffix
+/// (a merge-commit repo, a hand-written message) is simply not a PR row —
+/// fewer rows, never wrong ones.
+fn merged_pr_subject(subject: &str) -> Option<(u64, String)> {
+    let open = subject.rfind("(#")?;
+    let digits = subject[open + 2..].strip_suffix(')')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n = digits.parse().ok()?;
+    Some((n, subject[..open].trim_end().to_string()))
+}
+
+/// Does `file` sit at or under the scope path?
+fn under_scope(file: &str, scope: &str) -> bool {
+    file == scope
+        || file
+            .strip_prefix(scope)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+struct PrsScopedEndpoint {
+    roots: Roots,
+}
+
+#[async_trait]
+impl Endpoint for PrsScopedEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        if inv.request.verb != Verb::Source {
+            return Err(Error::Endpoint(format!(
+                "browse-prs-scoped does not support the {:?} verb",
+                inv.request.verb
+            )));
+        }
+        let (repo, root) = repo_root(inv, &self.roots)?;
+        granted(inv, repo)?;
+        // The scope is a HISTORY filter, never a filesystem lookup: `..` and
+        // absolute segments are rejected lexically, but the path is not
+        // required to exist — a deleted directory's PR history is still real.
+        let rel = crate::path_binding(inv)?;
+        if rel.is_empty() {
+            return Err(Error::MissingArgument("path".to_string()));
+        }
+        crate::lexical_jail(&rel)?;
+        let scope = rel.trim_end_matches('/').to_string();
+
+        let state = match inv.inline_str("state").unwrap_or("all") {
+            s @ ("open" | "merged" | "all") => s.to_string(),
+            other => {
+                return Err(Error::InvalidArgument {
+                    name: "state".to_string(),
+                    detail: format!(
+                        "`{other}` is not open, merged, or all (a closed-unmerged PR leaves \
+                         no merge commit to find, so `closed` is not offered here)"
+                    ),
+                })
+            }
+        };
+        let limit: Option<usize> = match inv.inline_str("limit") {
+            Ok(value) => Some(value.parse().map_err(|_| Error::InvalidArgument {
+                name: "limit".to_string(),
+                detail: format!("`{value}` is not a number"),
+            })?),
+            Err(_) => None,
+        };
+
+        let mut rows: Vec<ScopedRow> = Vec::new();
+        let mut seen: BTreeSet<u64> = BTreeSet::new();
+
+        // Open PRs: list (recency order), then intersect each PR's changed
+        // files with the scope. The fan-out is bounded at OPEN_PROBE probes —
+        // the facade's limit= keeps the listing itself that short.
+        if state != "merged" {
+            let listing = facade(
+                inv,
+                FACADE_LIST,
+                &[
+                    ("state", "open".to_string()),
+                    ("limit", OPEN_PROBE.to_string()),
+                    ("as", "application/json".to_string()),
+                    dir_arg(root),
+                ],
+            )
+            .await?;
+            let parsed: serde_json::Value =
+                serde_json::from_slice(&listing.bytes).map_err(|e| {
+                    Error::Endpoint(format!("browse: `{FACADE_LIST}` did not return JSON: {e}"))
+                })?;
+            for pr in parsed.as_array().map(Vec::as_slice).unwrap_or_default() {
+                let Some(n) = pr.get("number").and_then(|v| v.as_u64()) else {
+                    continue;
+                };
+                let files =
+                    facade(inv, FACADE_FILES, &[("pr", n.to_string()), dir_arg(root)]).await?;
+                let files = String::from_utf8_lossy(&files.bytes).into_owned();
+                if !files.lines().any(|f| under_scope(f.trim(), &scope)) {
+                    continue;
+                }
+                let text = |key: &str| {
+                    pr.get(key)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                };
+                seen.insert(n);
+                rows.push(ScopedRow {
+                    number: n,
+                    title: text("title"),
+                    state: {
+                        let s = text("state");
+                        if s.is_empty() {
+                            "OPEN".to_string()
+                        } else {
+                            s
+                        }
+                    },
+                    branch: text("headRefName"),
+                    updated: text("updatedAt"),
+                });
+            }
+        }
+
+        // Merged PRs: one path-scoped log call, subjects mined for the
+        // squash-merge `(#N)` convention, deduped in log order (= recency).
+        if state != "open" {
+            let log = facade(
+                inv,
+                FACADE_LOG,
+                &[
+                    ("path", scope.clone()),
+                    ("limit", LOG_WINDOW.to_string()),
+                    ("as", "application/json".to_string()),
+                    dir_arg(root),
+                ],
+            )
+            .await?;
+            let parsed: serde_json::Value = serde_json::from_slice(&log.bytes).map_err(|e| {
+                Error::Endpoint(format!("browse: `{FACADE_LOG}` did not return JSON: {e}"))
+            })?;
+            for entry in parsed.as_array().map(Vec::as_slice).unwrap_or_default() {
+                let subject = entry.get("subject").and_then(|v| v.as_str()).unwrap_or("");
+                let Some((n, title)) = merged_pr_subject(subject) else {
+                    continue;
+                };
+                if !seen.insert(n) {
+                    continue;
+                }
+                rows.push(ScopedRow {
+                    number: n,
+                    title,
+                    state: "MERGED".to_string(),
+                    branch: String::new(),
+                    updated: entry
+                        .get("date")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                });
+            }
+        }
+
+        if let Some(limit) = limit {
+            rows.truncate(limit);
+        }
+
+        match inv.inline_str("as").unwrap_or("text/plain") {
+            t if t.starts_with("application/json") => {
+                let rows: Vec<serde_json::Value> = rows
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "number": r.number,
+                            "title": r.title,
+                            "state": r.state,
+                            "branch": r.branch,
+                            "updated": r.updated,
+                        })
+                    })
+                    .collect();
+                Ok(repr(
+                    "application/json",
+                    serde_json::Value::Array(rows).to_string(),
+                ))
+            }
+            t if t.starts_with("text/html") => {
+                let lis: String = rows
+                    .iter()
+                    .map(|r| pr_row_li(repo, r.number, &r.title, &r.state, &r.branch, &r.updated))
+                    .collect();
+                let body = prs_list_body(lis);
+                if inv.inline_str("chrome").is_ok_and(|c| c == "embed") {
+                    // The rows-only fragment: the embedding page (a tree
+                    // page's lazy block) already carries crumbs and a
+                    // scope-naming heading.
+                    return Ok(repr_utf8("text/html", body));
+                }
+                let mut out = String::from("<div class=\"browse\">");
+                out.push_str(&crate::crumb_trail(&[
+                    (repo.to_string(), Some(crate::tree_iri(repo, ""))),
+                    ("prs".to_string(), Some(prs_iri(repo))),
+                    (scope.clone(), None),
+                ]));
+                out.push_str(&format!(
+                    "<p class=\"browse-prs-scope\">pull requests touching {}/&#8230;</p>",
+                    esc(&scope)
+                ));
+                out.push_str(&body);
+                out.push_str("</div>");
+                Ok(repr_utf8("text/html", out))
+            }
+            _ => {
+                let text: String = rows
+                    .iter()
+                    .map(|r| {
+                        format!(
+                            "{}\t{}\t{}\t{}\t{}\n",
+                            r.number, r.title, r.state, r.branch, r.updated
+                        )
+                    })
+                    .collect();
+                Ok(repr_utf8("text/plain", text))
+            }
+        }
+    }
+
+    fn name(&self) -> &str {
+        "browse-prs-scoped"
+    }
+
+    fn describe(&self) -> Description {
+        prs_scoped_description()
+    }
+}
+
+/// `repo` is not an ArgSpec — see [`prs_description`]'s note.
+fn prs_scoped_description() -> Description {
+    Description::new("browse-prs-scoped")
+        .title("Pull requests touching a path")
+        .summary(
+            "The pull requests of a configured browse root that touched anything at or \
+             under a path — urn:repo:{repo}:prs:{path}, newest first. Open PRs come from \
+             ikigai-repo's urn:repo:pr:list facade intersected per-PR with \
+             urn:repo:pr:files (the changed paths; ikigai-repo >= 0.1.5), bounded to the \
+             20 most recently updated open PRs; merged PRs are mined from the \
+             path-scoped commit log (urn:repo:log path=, the last 100 path-touching \
+             commits) by the squash-merge CONVENTION that a subject ends `(#N)` — a repo \
+             that merges without squashing simply yields fewer merged rows, never wrong \
+             ones. Closed-unmerged PRs leave no commit and are not probed (state= offers \
+             open, merged, all; default all). The path is a history scope, not a \
+             filesystem lookup — a deleted directory's PR history still lists, and a \
+             path with no PR history is an empty listing, not an error. Open rows first \
+             (list recency), then merged rows (log order), deduped by number; limit= \
+             caps the combined listing. text/plain (default) is one \
+             number<TAB>title<TAB>state<TAB>branch<TAB>updated line per PR (branch empty \
+             on merged-from-log rows); as=application/json the synthesized rows \
+             ({number, title, state, branch, updated}); as=text/html the listing labeled \
+             with its scope, each PR linking its page — chrome=embed serves the \
+             rows-only fragment (subdirectory tree pages' lazy recent-PRs block). The \
+             facades must be mounted in the composition and enforce their own exec \
+             capability; unmounted, this answers a typed NotFound naming the gap. Live \
+             and uncacheable.",
+        )
+        .verb(Verb::Source)
+        .verb(Verb::Meta)
+        .requires(CAP_WILDCARD)
+        .input(ArgSpec::new("path").binding().summary(
+            "the scope: a directory or file path within the root, percent-encoded \
+                     — filters history, need not exist on disk",
+        ))
+        .input(
+            ArgSpec::new("state")
+                .optional()
+                .summary(
+                    "open (probed via changed files), merged (mined from the path-scoped \
+                     log), or all",
+                )
+                .one_of(["open", "merged", "all"])
+                .default_value("all"),
+        )
+        .input(
+            ArgSpec::new("limit")
+                .optional()
+                .class("http://www.w3.org/2001/XMLSchema#integer")
+                .summary("at most this many rows after the open+merged merge"),
+        )
+        .input(
+            ArgSpec::new("chrome")
+                .optional()
+                .summary("embed renders the html rows only (no crumbs/scope label)")
+                .one_of(["full", "embed"])
+                .default_value("full"),
+        )
+        .input(
+            ArgSpec::new("as")
+                .optional()
+                .summary("the face to render")
+                .one_of(["text/plain", "application/json", "text/html"])
+                .default_value("text/plain"),
+        )
+        .output("text/plain;charset=utf-8")
+        .output("application/json")
+        .output("text/html;charset=utf-8")
 }
 
 // --- the PR page --------------------------------------------------------------
@@ -1327,13 +1688,24 @@ mod tests {
     const LIST: &str =
         "3\tAdd beta\tfeature/beta\t2026-08-09T12:00:00Z\n7\tFix <gamma>\tfix/g\t2026-08-08T09:30:00Z\n";
 
+    /// The json face of the fake `pr:list` — the fields the scoped listing
+    /// reads (number, title, state, headRefName, updatedAt).
+    const LIST_JSON: &str = r#"[
+        {"number":3,"title":"Add beta","state":"OPEN","headRefName":"feature/beta","updatedAt":"2026-08-09T12:00:00Z"},
+        {"number":7,"title":"Fix <gamma>","state":"OPEN","headRefName":"fix/g","updatedAt":"2026-08-08T09:30:00Z"}]"#;
+
     /// The mutable state behind the fake ikigai-repo facades, plus a log of
     /// every call's args — the kernel-resolution seam the tests stub, exactly
-    /// as the explain tests stub the LLM.
+    /// as the explain tests stub the LLM. `log_json` and `files` stub the
+    /// 0.1.5 contract (`urn:repo:log path=` / `urn:repo:pr:files`) the
+    /// scoped listing codes to; the hub live-verifies after both publishes.
     struct FakeRepo {
         list: Mutex<String>,
+        list_json: Mutex<String>,
         view: Mutex<serde_json::Value>,
         diff: Mutex<String>,
+        log_json: Mutex<String>,
+        files: Mutex<BTreeMap<u64, String>>,
         calls: Mutex<Vec<(String, BTreeMap<String, String>)>>,
     }
 
@@ -1341,6 +1713,7 @@ mod tests {
         fn new() -> Arc<Self> {
             Arc::new(FakeRepo {
                 list: Mutex::new(LIST.to_string()),
+                list_json: Mutex::new(LIST_JSON.to_string()),
                 view: Mutex::new(serde_json::json!({
                     "number": 3,
                     "title": "Add beta",
@@ -1355,8 +1728,18 @@ mod tests {
                     "body": "Adds beta between alpha and gamma.",
                 })),
                 diff: Mutex::new(DIFF.to_string()),
+                log_json: Mutex::new("[]".to_string()),
+                files: Mutex::new(BTreeMap::new()),
                 calls: Mutex::new(Vec::new()),
             })
+        }
+
+        fn set_log_json(&self, json: &str) {
+            *self.log_json.lock().unwrap() = json.to_string();
+        }
+
+        fn set_files(&self, pr: u64, files: &str) {
+            self.files.lock().unwrap().insert(pr, files.to_string());
         }
 
         fn set_diff(&self, diff: &str) {
@@ -1378,18 +1761,24 @@ mod tests {
         }
     }
 
-    /// Bind the three pr facades as deterministic fakes. Each declares
+    /// Bind the pr + log facades as deterministic fakes. Each declares
     /// `urn:cap:exec:gh` like the real ikigai-repo module, so attenuation is
     /// exercised for real.
     fn fake_repo_space(state: &Arc<FakeRepo>) -> EndpointSpace {
         let mut space = EndpointSpace::new();
-        for iri in [FACADE_LIST, FACADE_VIEW, FACADE_DIFF] {
+        for iri in [
+            FACADE_LIST,
+            FACADE_VIEW,
+            FACADE_DIFF,
+            FACADE_LOG,
+            FACADE_FILES,
+        ] {
             let state = Arc::clone(state);
             space = space.bind(
                 Exact::new(iri),
                 FnEndpoint::new("fake-repo", move |inv: &Invocation<'_>| {
                     let mut args = BTreeMap::new();
-                    for name in ["pr", "dir", "as", "repo", "state", "limit"] {
+                    for name in ["pr", "dir", "as", "repo", "state", "limit", "path"] {
                         if let Ok(value) = inv.inline_str(name) {
                             args.insert(name.to_string(), value.to_string());
                         }
@@ -1397,11 +1786,12 @@ mod tests {
                     let want_json = args
                         .get("as")
                         .is_some_and(|a| a.starts_with("application/json"));
+                    let pr_arg = args.get("pr").and_then(|v| v.parse::<u64>().ok());
                     state.calls.lock().unwrap().push((iri.to_string(), args));
                     match iri {
                         FACADE_LIST if want_json => Ok(repr(
                             "application/json",
-                            "[{\"number\":3,\"title\":\"Add beta\"}]".to_string(),
+                            state.list_json.lock().unwrap().clone(),
                         )),
                         FACADE_LIST => {
                             Ok(repr_utf8("text/plain", state.list.lock().unwrap().clone()))
@@ -1410,6 +1800,17 @@ mod tests {
                             "application/json",
                             state.view.lock().unwrap().to_string(),
                         )),
+                        FACADE_LOG => Ok(repr(
+                            "application/json",
+                            state.log_json.lock().unwrap().clone(),
+                        )),
+                        FACADE_FILES => {
+                            let files = state.files.lock().unwrap();
+                            let body = pr_arg
+                                .and_then(|n| files.get(&n).cloned())
+                                .unwrap_or_default();
+                            Ok(repr_utf8("text/plain", body))
+                        }
                         _ => Ok(repr_utf8("text/plain", state.diff.lock().unwrap().clone())),
                     }
                 })
@@ -1622,6 +2023,222 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// The scoped fixture: PRs 3 (touches src/) and 7 (touches docs/) open,
+    /// and a src-scoped log whose subjects carry the squash-merge convention
+    /// — plus one commit without it and one duplicate `(#10)`.
+    fn scoped_fixture(state: &Arc<FakeRepo>) {
+        state.set_files(3, "src/lib.rs\nsrc/pr.rs\n");
+        state.set_files(7, "docs/guide.md\n");
+        state.set_log_json(
+            r#"[
+            {"hash":"a1","author":"Alice","date":"2026-08-07T10:00:00Z","subject":"Navigation UX + anchoring (#10)"},
+            {"hash":"b2","author":"Alice","date":"2026-08-06T10:00:00Z","subject":"tidy comments without a pr"},
+            {"hash":"c3","author":"Alice","date":"2026-08-05T10:00:00Z","subject":"Follow-up polish (#10)"},
+            {"hash":"d4","author":"Alice","date":"2026-08-04T09:00:00Z","subject":"The PR family (#9)"}]"#,
+        );
+    }
+
+    #[test]
+    fn the_scoped_listing_filters_open_by_files_and_mines_merged_from_the_log() {
+        let root = temp_dir();
+        let store = Arc::new(Store::new().unwrap());
+        let state = FakeRepo::new();
+        scoped_fixture(&state);
+        let k = pages_kernel(&root, &store, &state);
+
+        // Open rows first (list recency), then merged in log order; PR 7
+        // (docs-only) is filtered out, the duplicate (#10) deduped, and the
+        // convention-free commit contributes nothing.
+        let text = body(&source(&k, "urn:repo:demo:prs:src", &[]).unwrap());
+        assert_eq!(
+            text,
+            "3\tAdd beta\tOPEN\tfeature/beta\t2026-08-09T12:00:00Z\n\
+             10\tNavigation UX + anchoring\tMERGED\t\t2026-08-07T10:00:00Z\n\
+             9\tThe PR family\tMERGED\t\t2026-08-04T09:00:00Z\n"
+        );
+
+        // The fan-out bounds and the facade args: one bounded open list, one
+        // files probe per open PR, one path-scoped log window.
+        let list_call = state.calls_to(FACADE_LIST).pop().unwrap();
+        assert_eq!(list_call.get("state"), Some(&"open".to_string()));
+        assert_eq!(list_call.get("limit"), Some(&OPEN_PROBE.to_string()));
+        assert_eq!(
+            list_call.get("dir"),
+            Some(&root.to_string_lossy().into_owned())
+        );
+        let file_probes: Vec<String> = state
+            .calls_to(FACADE_FILES)
+            .iter()
+            .filter_map(|args| args.get("pr").cloned())
+            .collect();
+        assert_eq!(file_probes, ["3", "7"]);
+        let log_call = state.calls_to(FACADE_LOG).pop().unwrap();
+        assert_eq!(log_call.get("path"), Some(&"src".to_string()));
+        assert_eq!(log_call.get("limit"), Some(&LOG_WINDOW.to_string()));
+
+        // A trailing slash scopes identically (the scope is normalized).
+        let slashed = body(&source(&k, "urn:repo:demo:prs:src/", &[]).unwrap());
+        assert_eq!(slashed, text);
+
+        // The json face is the synthesized rows.
+        let rows = json(&k, "urn:repo:demo:prs:src", &[]);
+        assert_eq!(rows.as_array().unwrap().len(), 3);
+        assert_eq!(rows[0]["number"], 3);
+        assert_eq!(rows[0]["branch"], "feature/beta");
+        assert_eq!(rows[1]["number"], 10);
+        assert_eq!(rows[1]["state"], "MERGED");
+        assert_eq!(rows[1]["branch"], "");
+        assert_eq!(rows[1]["updated"], "2026-08-07T10:00:00Z");
+
+        // state= narrows to one source; limit= caps the combined listing.
+        let open = body(&source(&k, "urn:repo:demo:prs:src", &[("state", "open")]).unwrap());
+        assert_eq!(open.lines().count(), 1, "{open}");
+        assert!(open.starts_with("3\t"), "{open}");
+        let logs_before = state.calls_to(FACADE_LOG).len();
+        let lists_before = state.calls_to(FACADE_LIST).len();
+        let merged = body(&source(&k, "urn:repo:demo:prs:src", &[("state", "merged")]).unwrap());
+        assert_eq!(merged.lines().count(), 2, "{merged}");
+        assert!(merged.starts_with("10\t"), "{merged}");
+        // state=open never called the log; state=merged never probed a PR.
+        assert_eq!(state.calls_to(FACADE_LOG).len(), logs_before + 1);
+        assert_eq!(state.calls_to(FACADE_LIST).len(), lists_before);
+        let capped = body(&source(&k, "urn:repo:demo:prs:src", &[("limit", "2")]).unwrap());
+        assert_eq!(capped.lines().count(), 2, "{capped}");
+
+        // An open PR whose number ALSO appears in a log subject (a
+        // hand-written reference) stays one row — the open one.
+        state.set_log_json(
+            r#"[{"hash":"e5","author":"A","date":"2026-08-03T00:00:00Z","subject":"Add beta (#3)"}]"#,
+        );
+        let text = body(&source(&k, "urn:repo:demo:prs:src", &[]).unwrap());
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(text.contains("OPEN"), "{text}");
+
+        // A scope with no PR history is an EMPTY listing, not an error — and
+        // the path is never resolved against the filesystem (nothing named
+        // `ghost` exists under the root; a deleted directory's history would
+        // list the same way).
+        state.set_log_json("[]");
+        assert_eq!(
+            body(&source(&k, "urn:repo:demo:prs:ghost", &[]).unwrap()),
+            ""
+        );
+
+        // Typed argument errors: an escape attempt, a bad state, a bad limit.
+        let err = source(&k, "urn:repo:demo:prs:../etc", &[]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument { .. }), "{err:?}");
+        let err = source(&k, "urn:repo:demo:prs:src", &[("state", "closed")]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument { .. }), "{err:?}");
+        let err = source(&k, "urn:repo:demo:prs:src", &[("limit", "many")]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument { .. }), "{err:?}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_scoped_html_labels_its_scope_and_embed_stays_rows_only() {
+        let root = temp_dir();
+        let store = Arc::new(Store::new().unwrap());
+        let state = FakeRepo::new();
+        scoped_fixture(&state);
+        let k = pages_kernel(&root, &store, &state);
+
+        let html = body(&source(&k, "urn:repo:demo:prs:src", &[("as", "text/html")]).unwrap());
+        assert!(
+            html.contains("pull requests touching src/&#8230;"),
+            "{html}"
+        );
+        // Crumbs: repo and prs live, the scope inert; rows link the pages.
+        assert!(
+            html.contains("<span class=\"browse-here\">src</span>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("hx-get=\"/k/source urn:repo:demo:pr:10 as=text/html\""),
+            "{html}"
+        );
+        assert!(
+            html.contains("<span class=\"browse-pr-state\">MERGED</span>"),
+            "{html}"
+        );
+
+        // chrome=embed: rows only — no crumbs, no scope label (the embedding
+        // tree page carries both).
+        let embedded = body(
+            &source(
+                &k,
+                "urn:repo:demo:prs:src",
+                &[("as", "text/html"), ("chrome", "embed")],
+            )
+            .unwrap(),
+        );
+        assert!(
+            embedded.starts_with("<ul class=\"browse-prs\">"),
+            "{embedded}"
+        );
+        assert!(!embedded.contains("browse-crumbs"), "{embedded}");
+        assert!(!embedded.contains("browse-prs-scope"), "{embedded}");
+
+        // Empty scope, html face: the friendly empty state.
+        state.set_log_json("[]");
+        let html = body(&source(&k, "urn:repo:demo:prs:ghost", &[("as", "text/html")]).unwrap());
+        assert!(html.contains("no pull requests"), "{html}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn subdirectory_trees_lazy_load_their_own_scoped_listing() {
+        let root = temp_dir();
+        let store = Arc::new(Store::new().unwrap());
+        let state = FakeRepo::new();
+        let k = pages_kernel(&root, &store, &state);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "fn a() {}\n").unwrap();
+
+        // A subdirectory page's lazy block loads ITS path-scoped listing
+        // (default state=all — the scoped row's own default).
+        let html = body(&source(&k, "urn:repo:demo:tree:src", &[("as", "text/html")]).unwrap());
+        assert!(
+            html.contains(
+                "hx-get=\"/k/source urn:repo:demo:prs:src limit=10 chrome=embed \
+                 as=text/html\" hx-trigger=\"load\""
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains("pull requests touching this directory"),
+            "{html}"
+        );
+        // The root keeps the repo-wide block (asserted fully in the listing
+        // test) — no scoped IRI there.
+        let html = body(&source(&k, "urn:repo:demo:tree", &[("as", "text/html")]).unwrap());
+        assert!(!html.contains("urn:repo:demo:prs:"), "{html}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn merged_pr_subjects_follow_the_squash_convention() {
+        // The convention: a TRAILING `(#N)`. Anything else is not a PR row.
+        assert_eq!(
+            merged_pr_subject("Navigation UX (#10)"),
+            Some((10, "Navigation UX".to_string()))
+        );
+        assert_eq!(
+            merged_pr_subject("Revert \"Add beta (#3)\" (#12)"),
+            Some((12, "Revert \"Add beta (#3)\"".to_string()))
+        );
+        assert_eq!(merged_pr_subject("(#7)"), Some((7, String::new())));
+        for subject in [
+            "no convention here",
+            "mid (#4) sentence",
+            "empty parens (#)",
+            "not digits (#x1)",
+            "unterminated (#5",
+            "",
+        ] {
+            assert_eq!(merged_pr_subject(subject), None, "{subject}");
+        }
+    }
+
     #[test]
     fn absent_facades_are_a_typed_not_found_naming_the_gap() {
         let root = temp_dir();
@@ -1631,7 +2248,11 @@ mod tests {
             vec![("demo".to_string(), root.to_path_buf())],
             Arc::clone(&store),
         )));
-        for iri in ["urn:repo:demo:prs", "urn:repo:demo:pr:3"] {
+        for iri in [
+            "urn:repo:demo:prs",
+            "urn:repo:demo:pr:3",
+            "urn:repo:demo:prs:src",
+        ] {
             let err = source(&k, iri, &[]).unwrap_err();
             assert!(matches!(err, Error::NotFound(_)), "{iri}: {err:?}");
             assert!(format!("{err:?}").contains("ikigai-repo"), "{err:?}");
@@ -2090,6 +2711,14 @@ index 3f9c2d1..8a41b77 100644
         }
         let names: Vec<&str> = review_desc.inputs.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, ["n", "as", "debug"]);
+        // The scoped listing: pages-tier caps only, path the sole binding.
+        let scoped_desc = prs_scoped_description();
+        assert_eq!(scoped_desc.requires, vec![CAP_WILDCARD.to_string()]);
+        let names: Vec<&str> = scoped_desc.inputs.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["path", "state", "limit", "chrome", "as"]);
+        // And the per-root grant is enforced on it like every browse row.
+        let err = issue(&k, Verb::Source, "urn:repo:demo:prs:src", &[], &wrong_root).unwrap_err();
+        assert!(matches!(err, Error::Denied(_)), "{err:?}");
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -2190,6 +2819,7 @@ index 3f9c2d1..8a41b77 100644
             .collect();
         for row in [
             "urn:repo:demo:prs",
+            "urn:repo:demo:prs:{path}",
             "urn:repo:demo:pr:{n}",
             "urn:repo:demo:pr:{n}:explain",
             "urn:repo:demo:pr:{n}:review",
