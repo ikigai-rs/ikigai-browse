@@ -66,10 +66,12 @@ use ikigai_core::{
 use oxigraph::model::{GraphName, Literal, NamedNode, Quad, Term};
 use oxigraph::store::Store;
 
+use crate::annotate::{self, Included, TargetFilter};
 use crate::hash::hash_iri;
 use crate::{
-    crumbs_html, esc, file_iri, granted, human_size, iri_encode, media_type_for, path_binding,
-    repo_root, repr, repr_utf8, resolve, tree_iri, ttl_str, KnownRepo, Roots, CAP_WILDCARD,
+    crumbs_html, esc, file_iri, granted, human_size, include_annotations, iri_encode,
+    media_type_for, path_binding, repo_root, repr, repr_utf8, resolve, tree_iri, ttl_str,
+    KnownRepo, Roots, CAP_WILDCARD,
 };
 
 /// The network capability the explain action declares (wildcard offering
@@ -705,6 +707,9 @@ impl Endpoint for ExplainEndpoint {
 
         let iri = entry_iri(repo, &rel, &hash, &tag);
         if let Some(entry) = load_entry(&config.store, &iri)? {
+            let included = self
+                .included(inv, repo, &rel, grain == Grain::Directory)
+                .await?;
             return face(
                 inv,
                 repo,
@@ -713,6 +718,7 @@ impl Endpoint for ExplainEndpoint {
                     entry,
                     derived: false,
                 },
+                included.as_ref(),
             );
         }
         if let Some(tag) = requested {
@@ -754,6 +760,9 @@ impl Endpoint for ExplainEndpoint {
             derived_at: inv.now().map(|t| iso8601(t.as_millis())),
         };
         store_entry(&config.store, &entry)?;
+        let included = self
+            .included(inv, repo, &rel, grain == Grain::Directory)
+            .await?;
         face(
             inv,
             repo,
@@ -762,6 +771,7 @@ impl Endpoint for ExplainEndpoint {
                 entry,
                 derived: true,
             },
+            included.as_ref(),
         )
     }
 
@@ -783,6 +793,30 @@ enum Tier {
 }
 
 impl ExplainEndpoint {
+    /// The `annotations=include` payload for this explain, when asked for — a
+    /// file target folds its own annotations, a directory rollup its
+    /// subtree's (the whole repo at the root). Same drift-reconciliation as
+    /// the listing endpoint.
+    async fn included(
+        &self,
+        inv: &Invocation<'_>,
+        repo: &str,
+        rel: &str,
+        dir: bool,
+    ) -> Result<Option<Included>> {
+        if !include_annotations(inv)? {
+            return Ok(None);
+        }
+        let filter = if dir {
+            TargetFilter::Subtree(rel)
+        } else {
+            TargetFilter::File(rel)
+        };
+        annotate::included_for(inv, &self.config.store, repo, filter)
+            .await
+            .map(Some)
+    }
+
     /// The model identity folded into this request's version tag, in
     /// precedence order: the explicit config label (the operator's override)
     /// → the provider's `urn:llm:…:model` resolved through the kernel
@@ -917,11 +951,17 @@ pub(crate) fn parse_iri(iri: &str) -> Result<Iri> {
 
 // --- faces ------------------------------------------------------------------
 
-fn face(inv: &Invocation<'_>, repo: &str, rel: &str, served: Served) -> Result<Representation> {
+fn face(
+    inv: &Invocation<'_>,
+    repo: &str,
+    rel: &str,
+    served: Served,
+    included: Option<&Included>,
+) -> Result<Representation> {
     let entry = &served.entry;
     match inv.inline_str("as").unwrap_or("text/plain") {
         t if t.starts_with("application/json") => {
-            let json = serde_json::json!({
+            let mut json = serde_json::json!({
                 "text": entry.text,
                 "content_hash": entry.hash,
                 "version_tag": entry.tag,
@@ -930,6 +970,9 @@ fn face(inv: &Invocation<'_>, repo: &str, rel: &str, served: Served) -> Result<R
                 "prompt_kind": entry.kind,
                 "target": entry.target_iri,
             });
+            if let Some(included) = included {
+                json["annotations"] = included.json();
+            }
             Ok(repr("application/json", json.to_string()))
         }
         t if t.starts_with("text/html") => Ok(repr_utf8(
@@ -937,7 +980,14 @@ fn face(inv: &Invocation<'_>, repo: &str, rel: &str, served: Served) -> Result<R
             explain_html(repo, rel, entry, served.derived),
         )),
         t if t.starts_with("text/turtle") => Ok(repr("text/turtle", explain_turtle(entry))),
-        _ => Ok(repr_utf8("text/plain", entry.text.clone())),
+        _ => {
+            let mut text = entry.text.clone();
+            if let Some(included) = included {
+                text.push_str("\n\n");
+                text.push_str(&included.margin_text());
+            }
+            Ok(repr_utf8("text/plain", text))
+        }
     }
 }
 
@@ -1005,7 +1055,10 @@ fn explain_description(roots: &Roots) -> Description {
              identity; version= addresses an older tag. text/plain (default) is the text; \
              as=application/json adds {content_hash, version_tag, derived}; as=text/html \
              renders the page face with provenance; as=text/turtle emits the archive \
-             entry's graph.",
+             entry's graph. annotations=include folds the target's annotations in \
+             (drift-reconciled like the listing): the json face gains an annotations \
+             array, the text face appends a margin-notes section; a directory rollup \
+             folds its subtree's.",
         )
         .verb(Verb::Source)
         .verb(Verb::Meta)
@@ -1026,6 +1079,16 @@ fn explain_description(roots: &Roots) -> Description {
         .input(ArgSpec::new("version").optional().summary(
             "an archived version tag (e.g. code-v1@qwen3-coder:30b) instead of the current one",
         ))
+        .input(
+            ArgSpec::new("annotations")
+                .optional()
+                .summary(
+                    "include folds the target's annotations into the json and text faces \
+                     (a directory rollup folds its subtree's)",
+                )
+                .one_of(["include", "true", "false"])
+                .default_value("false"),
+        )
         .input(
             ArgSpec::new("as")
                 .optional()
@@ -1732,13 +1795,82 @@ mod tests {
         assert!(description.requires.contains(&CAP_WILDCARD.to_string()));
         assert!(description.requires.contains(&CAP_NET.to_string()));
         let names: Vec<&str> = description.inputs.iter().map(|i| i.name.as_str()).collect();
-        assert_eq!(names, ["repo", "path", "version", "as"]);
+        assert_eq!(names, ["repo", "path", "version", "annotations", "as"]);
 
         // The versions listing never derives — it must NOT demand net.
         use ikigai_core::Endpoint as _;
         let versions = versions_endpoint(&roots, &config).describe();
         assert!(versions.requires.contains(&CAP_WILDCARD.to_string()));
         assert!(!versions.requires.contains(&CAP_NET.to_string()));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn explain_annotations_include_folds_the_targets_annotations() {
+        let root = temp_dir();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "fn main() {}\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, |c| c);
+
+        // Annotate through the kernel — space_with_explain carries S2 too.
+        let annotate_cap = Capability::scoped(["urn:cap:browse:read:demo", crate::CAP_ANNOTATE]);
+        let request = Request::new(Verb::Sink, Iri::parse("urn:annotation:n1").unwrap())
+            .with_arg(
+                "target",
+                ArgRef::Inline(b"urn:repo:demo:file:src/lib.rs".to_vec()),
+            )
+            .with_arg("exact", ArgRef::Inline(b"fn main()".to_vec()))
+            .with_arg("body", ArgRef::Inline(b"the entry point".to_vec()));
+        block_on(k.issue(request, &annotate_cap)).unwrap();
+
+        // The json face gains an annotations array — the same row shape the
+        // listing endpoint serves.
+        let row = json(
+            &k,
+            "urn:repo:demo:explain:src/lib.rs",
+            &[("annotations", "include")],
+        );
+        assert_eq!(row["annotations"][0]["exact"], "fn main()");
+        assert_eq!(row["annotations"][0]["body"], "the entry point");
+        assert_eq!(row["annotations"][0]["line"], 1);
+        assert_eq!(row["annotations"][0]["orphaned"], false);
+
+        // Without the arg the json shape is unchanged.
+        let bare = json(&k, "urn:repo:demo:explain:src/lib.rs", &[]);
+        assert!(bare.get("annotations").is_none(), "{bare}");
+
+        // The text face appends the margin-notes section.
+        let text = body(
+            &source(
+                &k,
+                "urn:repo:demo:explain:src/lib.rs",
+                &[("annotations", "include")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert!(text.contains("--- annotations (1) ---"), "{text}");
+        assert!(
+            text.contains("L1 \"fn main()\" -- the entry point"),
+            "{text}"
+        );
+
+        // A directory rollup folds its subtree's annotations, path-prefixed.
+        let rollup = body(
+            &source(
+                &k,
+                "urn:repo:demo:explain",
+                &[("annotations", "include")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert!(
+            rollup.contains("src/lib.rs L1 \"fn main()\" -- the entry point"),
+            "{rollup}"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

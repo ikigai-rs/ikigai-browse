@@ -1,0 +1,52 @@
+%YAML 1.2
+---
+# A minimal house syntax for Turtle / TriG — two-face's extended set (bat's)
+# carries no RDF definitions, and the graph faces of this very module deserve
+# highlighting. Deliberately small: comments, directives, IRIs, literals,
+# prefixed names, blank nodes. Every regex compiles under fancy-regex (the
+# pure-Rust engine this crate pins).
+name: Turtle
+file_extensions:
+  - ttl
+  - trig
+scope: source.turtle
+contexts:
+  main:
+    - match: '#.*'
+      scope: comment.line.number-sign.turtle
+    - match: '"""'
+      push: triple_string
+    - match: '"'
+      push: string
+    - match: '@(?:prefix|base)\b'
+      scope: keyword.other.directive.turtle
+    - match: '\b(?:PREFIX|BASE|GRAPH)\b'
+      scope: keyword.other.directive.turtle
+    - match: '<[^<>"{}|^`\\ ]*>'
+      scope: entity.name.type.iri.turtle
+    - match: '\^\^'
+      scope: keyword.operator.datatype.turtle
+    - match: '@[A-Za-z]+(?:-[A-Za-z0-9]+)*'
+      scope: constant.other.language-tag.turtle
+    - match: '\b(?:true|false)\b'
+      scope: constant.language.boolean.turtle
+    - match: '(?<=\s)a(?=\s)'
+      scope: keyword.other.type.turtle
+    - match: '[-+]?[0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?\b'
+      scope: constant.numeric.turtle
+    - match: '_:[A-Za-z0-9._-]+'
+      scope: variable.other.blank-node.turtle
+    - match: '[A-Za-z][A-Za-z0-9._-]*:[A-Za-z0-9._%-]*'
+      scope: storage.type.prefixed-name.turtle
+  string:
+    - meta_scope: string.quoted.double.turtle
+    - match: '\\.'
+      scope: constant.character.escape.turtle
+    - match: '"'
+      pop: true
+  triple_string:
+    - meta_scope: string.quoted.triple.turtle
+    - match: '\\.'
+      scope: constant.character.escape.turtle
+    - match: '"""'
+      pop: true

@@ -1,7 +1,7 @@
 [package]
 name = "ikigai-browse"
 description = "Repository browsing as ikigai resources: per-root tree / file / git-state / hash endpoints, an archived LLM explanation layer, and W3C Web Annotations that re-anchor under drift - capability-gated, with text, htmx-HTML, and Turtle faces."
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -18,8 +18,14 @@ categories = ["development-tools", "filesystem"]
 # — the platform seam, like ikigai-repo. No wasm face by design.
 ikigai-core = "0.1.49"
 # Syntax highlighting for the file HTML face. The pure-Rust regex engine
-# (default-fancy) so CI never needs a C toolchain for oniguruma.
-syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
+# (default-fancy) so CI never needs a C toolchain for oniguruma; yaml-load
+# compiles the embedded Turtle .sublime-syntax (assets/) at first use.
+syntect = { version = "5.3", default-features = false, features = ["default-fancy", "yaml-load"] }
+# The extended syntax + theme sets (S3): ~100 formats the stock syntect set
+# misses (TOML, TypeScript, Dockerfile, …). syntect-fancy keeps the pure-Rust
+# posture — it drops the handful of definitions fancy-regex cannot compile
+# rather than pulling in oniguruma.
+two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
 # The `as=application/json` face of urn:repo:{repo}:state (correct escaping of
 # arbitrary dirty-file paths).
 serde_json = "1"
