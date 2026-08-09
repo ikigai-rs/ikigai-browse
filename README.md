@@ -3,7 +3,7 @@
 Repository browsing as [ikigai](https://github.com/ikigai-rs) resources — the
 foundation of the repository-browsing family. A host mounts
 [`space`](src/lib.rs) over a set of named **roots** (`(name, directory)`
-pairs), and each root answers three resource families:
+pairs), and each root answers these resource families:
 
 | resource | what it is |
 |----------|------------|
@@ -16,6 +16,7 @@ pairs), and each root answers three resource families:
 | `urn:annotation[:{id}]` | a **W3C Web Annotation** (S2) on a file — Sink creates/updates (anchoring the quoted text; the bare `urn:annotation` mints a uuid id), Source reads with drift **re-anchoring**, Delete removes; faces: `text/plain` (the body), `as=application/json`, `as=text/turtle` |
 | `urn:repo:{repo}:annotations[:{path}]` | every annotation on one file (or the whole repo, path omitted) in reading order, drift-reconciled on each read; faces: `application/json` (default), `as=text/html` (panel fragment), `as=text/turtle` |
 | `urn:repo:{repo}:review:{path}` | the **machine review pass** (S4) — region-grain LLM commentary minted as real annotations (provenance-distinguished), the pass archived by `(path, content-hash, review-tag)` so re-sourcing unchanged content mints nothing; faces: `text/plain` (the margin digest), `as=application/json` (`{minted, orphaned_items, reviewed_bytes, total_bytes, annotations, …}`), `as=text/html` (the card page), `as=text/turtle` (the pass's provenance graph); `debug=raw` derives and returns the model's **unparsed answer** (nothing minted or archived) — the parse-failure diagnosis face |
+| `urn:repo:style` | the **theme stylesheet** the classed highlight faces bind to — `text/css`, root-independent, cacheable: the light theme's rules at top level plus the dark theme's under `@media (prefers-color-scheme: dark)`, all targeting the `hl-` classes the HTML faces emit (see the host contract below) |
 | `urn:repo:{repo}:prs` | the root's **pull requests** — ikigai-repo's `urn:repo:pr:list` facade resolved through the kernel with `dir=` the root's directory; `state=` (`open`/`closed`/`merged`/`all`) and `limit=` forward to the facade (ikigai-repo ≥ 0.1.4 — omitted, the facade's defaults apply); `text/plain` (default) is `number`⇥`title`⇥`branch`⇥`updated`⇥`state` per line (empty = no matching PRs), `as=application/json` the facade's structured rows, `as=text/html` the listing with each PR linking its page (`chrome=embed` for the rows-only fragment other faces fold in) |
 | `urn:repo:{repo}:prs:{path}` | the **contextual listing** — the PRs that touched anything at or under a path, newest first: open PRs from `urn:repo:pr:list` intersected per-PR with `urn:repo:pr:files` (ikigai-repo ≥ 0.1.5; bounded to the 20 most recently updated open PRs), merged PRs mined from the path-scoped log (`urn:repo:log path=`, last 100 path-touching commits) by the squash-merge **convention** that a subject ends `(#N)` — a merge-commit repo yields fewer rows, never wrong ones; the path is a *history* scope (a deleted directory still lists; no history = empty listing); open rows first, then merged, deduped by number; `state=` (`open`/`merged`/`all`, default `all`) and `limit=` cap the synthesized listing; faces mirror `prs` (`as=application/json` is the synthesized `{number, title, state, branch, updated}` rows; the html face labels its scope) |
 | `urn:repo:{repo}:pr:{n}` | the **PR page** — metadata (`urn:repo:pr:view` json: author object, `headRefOid`) + the unified diff (`urn:repo:pr:diff`); the DIFF TEXT is an annotation surface (annotations target the PR IRI and quote diff lines, drifting like file annotations); `as=text/html` renders the highlighted, line-anchored diff with markers and the annotations panel; `annotations=include` folds the margin into the plain/json faces |
@@ -125,13 +126,27 @@ its own **contextual** listing (`urn:repo:{repo}:prs:{path} limit=10`) — every
 directory page shows the PRs that touched *it*. The tree face itself never consults the pr facades — it
 renders instantly, and when the facades are not mounted the lazy fetch answers
 the typed 404-with-guidance, which the host renders per its own error
-handling (a host that shows kernel errors inline needs nothing extra). Highlighting uses
-[two-face](https://crates.io/crates/two-face)'s extended syntax set (~100
-formats the stock syntect set misses — TOML, TypeScript, Dockerfile, …) under
-the pure-Rust fancy-regex engine, plus an embedded house Turtle/TriG
-definition ([assets/](assets/)) so the graph faces highlight too; unknown
-formats degrade to escaped plain text, and extensionless well-known names
-(`Dockerfile`) match by file name. File views wrap each
+handling (a host that shows kernel errors inline needs nothing extra).
+
+**Highlighting is class-based; the host includes the stylesheet.** The file
+and PR-diff faces emit syntect *classed* spans — `hl-`-prefixed scope-atom
+classes (`class="hl-comment hl-line hl-rust"`), never inline styles — and the
+`<pre>` carries `browse-code hl-code` (`hl-code` is the base
+foreground/background rule). The colors live in **`urn:repo:style`**
+(`text/css`, cacheable): InspiredGitHub's rules at top level plus
+base16-ocean.dark's inside `@media (prefers-color-scheme: dark)` — one
+stylesheet, both schemes, so pages read correctly on light and dark hosts
+with no light islands. A host either links it through its `/k/` adapter
+(`<link rel="stylesheet" href="/k/source urn:repo:style">`, however its
+adapter spells that) or resolves `urn:repo:style` once server-side and
+inlines the CSS into its page shell; a host that ships neither gets
+readable-but-monochrome code in the page's own colors, never wrong ones.
+Syntax coverage is [two-face](https://crates.io/crates/two-face)'s extended
+set (~100 formats the stock syntect set misses — TOML, TypeScript,
+Dockerfile, …) under the pure-Rust fancy-regex engine, plus an embedded house
+Turtle/TriG definition ([assets/](assets/)) so the graph faces highlight too;
+unknown formats degrade to escaped plain text, and extensionless well-known
+names (`Dockerfile`) match by file name. File views wrap each
 line in `<span id="L{n}">` with a self-linking gutter number, so `#L42`
 deep-links a line — the anchor surface annotations target. With the
 annotation store mounted, the file view marks annotated lines

@@ -49,6 +49,10 @@
 //!   surface — annotations target the PR IRI and drift like file ones — and
 //!   the derived layers archive by the HEAD COMMIT (`headRefOid`), so new
 //!   commits re-derive and prior entries stay addressable.
+//! - `urn:repo:style` — the **theme stylesheet** the classed highlight faces
+//!   bind to (`text/css`, root-independent, cacheable): the light theme's
+//!   rules plus the dark theme's under `@media (prefers-color-scheme: dark)`,
+//!   all targeting the `hl-` classes the HTML faces emit.
 //! - `urn:repo:{repo}:prs:{path}` — the **contextual** listing: the PRs that
 //!   touched anything at or under a path, newest first — open PRs by
 //!   intersecting their changed files (`urn:repo:pr:files`), merged PRs mined
@@ -101,10 +105,8 @@ use ikigai_core::{
     Invocation, Iri, ReprType, Representation, Result, UriTemplate, Verb,
 };
 use oxigraph::store::Store;
-use syntect::easy::HighlightLines;
-use syntect::highlighting::Theme;
-use syntect::html::{styled_line_to_highlighted_html, IncludeBackground};
-use syntect::parsing::{SyntaxDefinition, SyntaxSet};
+use syntect::html::{css_for_theme_with_class_style, line_tokens_to_classed_spans, ClassStyle};
+use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxDefinition, SyntaxSet};
 use syntect::util::LinesWithEndings;
 
 mod annotate;
@@ -228,6 +230,8 @@ fn base_space(
     let space = bind_family(space, roots, file, None, Some("file:{path}"));
     let space = bind_family(space, roots, state, Some("state"), None);
     let space = bind_family(space, roots, hash, Some("hash"), Some("hash:{path}"));
+    // The theme stylesheet: one concrete row shared by all roots.
+    let space = space.bind(StyleRow, style_endpoint());
     // The pull-request pages ride with every variant: they need no store and
     // no LLM — only ikigai-repo's pr facades resolved through the kernel at
     // runtime (unmounted facades answer a typed NotFound, not a panic).
@@ -1088,12 +1092,47 @@ fn syntaxes() -> &'static SyntaxSet {
     })
 }
 
-fn theme() -> &'static Theme {
-    static THEME: OnceLock<Theme> = OnceLock::new();
-    THEME.get_or_init(|| {
-        // The same InspiredGitHub look S0 shipped, now from two-face's
-        // embedded theme set (syntect's default ThemeSet is no longer loaded).
-        two_face::theme::extra()[two_face::theme::EmbeddedThemeName::InspiredGithub].clone()
+/// The class prefix every highlight span and the theme stylesheet share.
+/// Under [`CLASS_STYLE`] a scope like `comment.line.rust` renders as
+/// `class="hl-comment hl-line hl-rust"`, and [`STYLE_IRI`]'s rules target
+/// exactly those classes — markup and stylesheet cannot drift apart.
+const CLASS_PREFIX: &str = "hl-";
+
+/// syntect's class-based output mode: classes in the markup, colors in the
+/// stylesheet — the host's color scheme decides, not the representation.
+/// (S0-S5 baked InspiredGitHub's colors inline, forcing light islands on
+/// dark hosts.)
+const CLASS_STYLE: ClassStyle = ClassStyle::SpacedPrefixed {
+    prefix: CLASS_PREFIX,
+};
+
+/// The theme stylesheet resource — one concrete, root-independent row (the
+/// classed markup it styles renders on every mount). It cannot collide with
+/// a root named `style`: root rows always carry a family segment
+/// (`urn:repo:style:tree`), never the bare IRI.
+pub const STYLE_IRI: &str = "urn:repo:style";
+
+/// The generated theme stylesheet: InspiredGitHub's rules (the light look S0
+/// shipped) at top level plus base16-ocean.dark's inside a
+/// `@media (prefers-color-scheme: dark)` block — ONE stylesheet serving both
+/// schemes, generated once from two-face's embedded theme set via
+/// `css_for_theme_with_class_style`. The `.hl-code` base rule carries each
+/// theme's foreground/background, which the `<pre>` opts into.
+fn style_css() -> &'static str {
+    static CSS: OnceLock<String> = OnceLock::new();
+    CSS.get_or_init(|| {
+        let themes = two_face::theme::extra();
+        let light = css_for_theme_with_class_style(
+            &themes[two_face::theme::EmbeddedThemeName::InspiredGithub],
+            CLASS_STYLE,
+        )
+        .expect("the embedded light theme generates CSS");
+        let dark = css_for_theme_with_class_style(
+            &themes[two_face::theme::EmbeddedThemeName::Base16OceanDark],
+            CLASS_STYLE,
+        )
+        .expect("the embedded dark theme generates CSS");
+        format!("{light}\n@media (prefers-color-scheme: dark) {{\n{dark}}}\n")
     })
 }
 
@@ -1162,17 +1201,34 @@ fn highlight_html(
                 .and_then(|l| syntaxes.find_syntax_by_first_line(l))
         })
         .unwrap_or_else(|| syntaxes.find_syntax_plain_text());
-    let mut highlighter = HighlightLines::new(syntax, theme());
-    let mut out = String::from("<pre class=\"browse-code\"><code>");
+    let mut parse = ParseState::new(syntax);
+    let mut scopes = ScopeStack::new();
+    let mut out = format!("<pre class=\"browse-code {CLASS_PREFIX}code\"><code>");
     for (i, line) in LinesWithEndings::from(text).enumerate() {
         let n = i + 1;
-        // A highlighter hiccup on one line degrades that line to escaped
-        // plain text rather than failing the whole face.
-        let html = highlighter
-            .highlight_line(line, syntaxes)
+        // Classed spans with PER-LINE balance: spans syntect leaves open
+        // across lines (a block comment, a multi-line string) are closed at
+        // the line's end and re-opened with the same classes at the next
+        // line's start, so every line wrapper stays a well-formed unit and
+        // the `#L{n}` anchor contract survives. A parser hiccup on one line
+        // degrades that line to escaped plain text rather than failing the
+        // whole face.
+        let html = parse
+            .parse_line(line, syntaxes)
             .ok()
-            .and_then(|regions| {
-                styled_line_to_highlighted_html(&regions, IncludeBackground::No).ok()
+            .and_then(|ops| {
+                let reopened = reopen_spans(scopes.as_slice());
+                line_tokens_to_classed_spans(line, &ops, CLASS_STYLE, &mut scopes)
+                    .ok()
+                    .map(|(spans, _)| {
+                        let mut html = reopened;
+                        html.push_str(&spans);
+                        // The stack now reflects the line's END: everything
+                        // still on it is a span this line opened (or
+                        // re-opened) and must close.
+                        html.push_str(&"</span>".repeat(scopes.len()));
+                        html
+                    })
             })
             .unwrap_or_else(|| esc(line));
         let markers = annotated.get(&(n as u64));
@@ -1210,6 +1266,73 @@ fn highlight_html(
     }
     out.push_str("</code></pre>");
     out
+}
+
+/// Re-open the spans a previous line left dangling: one `<span>` per scope
+/// still on the stack, classed exactly as `line_tokens_to_classed_spans`
+/// classes its own (each scope atom, prefixed — syntect keeps that mapping
+/// private, but it is tiny, and the multi-line test pins ours against real
+/// output: the re-opened comment span must carry the same `hl-comment` its
+/// opener did).
+fn reopen_spans(scopes: &[Scope]) -> String {
+    let mut out = String::new();
+    for scope in scopes {
+        out.push_str("<span class=\"");
+        for (i, atom) in scope.build_string().split('.').enumerate() {
+            if i > 0 {
+                out.push(' ');
+            }
+            out.push_str(CLASS_PREFIX);
+            out.push_str(atom);
+        }
+        out.push_str("\">");
+    }
+    out
+}
+
+// --- style endpoint ---------------------------------------------------------
+
+/// The stylesheet's one concrete grammar row: the bare [`STYLE_IRI`], no
+/// bindings — it is the same stylesheet whatever the roots are.
+struct StyleRow;
+
+impl Grammar for StyleRow {
+    fn match_iri(&self, iri: &Iri) -> Option<Bindings> {
+        (iri.as_str() == STYLE_IRI).then(Bindings::new)
+    }
+
+    fn pattern(&self) -> String {
+        STYLE_IRI.to_string()
+    }
+}
+
+/// `urn:repo:style` — the theme stylesheet every classed highlight face binds
+/// to. A pure function of the build (the embedded themes and the class style),
+/// so the representation is cacheable; there is no per-root residual to
+/// enforce, so the declared wildcard IS the whole check (the kernel baseline
+/// runs it before dispatch).
+fn style_endpoint() -> FnEndpoint {
+    FnEndpoint::new("browse-style", move |_inv: &Invocation<'_>| {
+        Ok(repr_utf8("text/css", style_css().to_string()).cacheable())
+    })
+    .with_description(style_description())
+}
+
+fn style_description() -> Description {
+    Description::new("browse-style")
+        .title("Highlight stylesheet")
+        .summary(
+            "The theme stylesheet the classed highlight faces bind to — urn:repo:style, \
+             text/css. InspiredGitHub's rules (light) at top level plus base16-ocean.dark's \
+             inside @media (prefers-color-scheme: dark): one stylesheet, both schemes. \
+             Every rule targets the hl- classes the html faces emit, plus the .hl-code \
+             base (foreground/background) their <pre> carries. A pure function of the \
+             build — cacheable.",
+        )
+        .verb(Verb::Source)
+        .verb(Verb::Meta)
+        .requires(CAP_WILDCARD)
+        .output("text/css;charset=utf-8")
 }
 
 // --- state endpoint ---------------------------------------------------------
@@ -1610,8 +1733,15 @@ mod tests {
         assert!(html.contains("id=\"L1\""), "{html}");
         assert!(html.contains("id=\"L3\""), "{html}");
         assert!(html.contains("href=\"#L2\""), "{html}");
-        // Highlighted (spans with inline styles), inside a <pre>.
-        assert!(html.contains("<pre class=\"browse-code\">"), "{html}");
+        // Highlighted via CLASSES (the rules live in urn:repo:style), never
+        // inline styles — the host's color scheme decides, not the markup.
+        assert!(
+            html.contains("<pre class=\"browse-code hl-code\">"),
+            "{html}"
+        );
+        assert!(html.contains("class=\"hl-"), "{html}");
+        assert!(!html.contains("style=\""), "{html}");
+        assert!(!html.contains("color:#"), "{html}");
         // The binary sibling renders a stub, not garbage.
         let out = source(
             &k,
@@ -1665,19 +1795,104 @@ mod tests {
             )
             .unwrap();
             let html = body(&out);
-            // A real syntax matched: the view carries more than one token
-            // color (plain-text degradation renders a single color).
-            let colors: BTreeSet<&str> = html
-                .split("color:#")
+            // A real syntax matched: the view carries more than one distinct
+            // token class (plain-text degradation carries at most one).
+            let classes: BTreeSet<&str> = html
+                .split("<span class=\"hl-")
                 .skip(1)
-                .filter_map(|s| s.get(..6))
+                .filter_map(|s| s.split('"').next())
                 .collect();
-            assert!(colors.len() >= 2, "{path} fell back to plain text: {html}");
+            assert!(classes.len() >= 2, "{path} fell back to plain text: {html}");
             // The per-line anchor contract survives the two-face swap.
             assert!(html.contains("id=\"L1\""), "{path}: {html}");
             assert!(html.contains("id=\"L2\""), "{path}: {html}");
             assert!(html.contains("href=\"#L2\""), "{path}: {html}");
         }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The per-line rebalance: a construct syntect keeps a span open across
+    /// lines (here a Rust block comment) must (a) leave every line's span
+    /// structure balanced — the line wrappers ARE the `#L{n}` anchor surface,
+    /// an unclosed highlight span would swallow them — and (b) carry its
+    /// classes onto the continuation lines via the re-opened spans, pinning
+    /// our reimplementation of syntect's scope→class mapping against real
+    /// output.
+    #[test]
+    fn multi_line_constructs_stay_balanced_and_keep_their_classes() {
+        let root = temp_dir();
+        std::fs::write(root.join("lib.rs"), "/* one\n   two\n*/\nfn x() {}\n").unwrap();
+        let k = kernel(vec![("demo".to_string(), root.clone())]);
+        let html = body(
+            &source(
+                &k,
+                "urn:repo:demo:file:lib.rs",
+                &[("as", "text/html")],
+                &demo_cap(),
+            )
+            .unwrap(),
+        );
+        // Balanced overall…
+        assert_eq!(
+            html.matches("<span").count(),
+            html.matches("</span>").count(),
+            "{html}"
+        );
+        // …and per line: each browse-line chunk closes what it opens.
+        for chunk in html.split("<span class=\"browse-line\"").skip(1) {
+            let line = chunk.split("<span class=\"browse-line\"").next().unwrap();
+            // +1 for the browse-line wrapper itself, closed within the chunk
+            // (the next line's wrapper starts a new chunk).
+            assert_eq!(
+                line.matches("<span").count() + 1,
+                line.matches("</span>").count(),
+                "unbalanced line: {line}"
+            );
+        }
+        // The comment's classes reach line 2 (only via the re-opened span —
+        // no token starts there).
+        let line2 = html
+            .split("id=\"L2\"")
+            .nth(1)
+            .and_then(|s| s.split("id=\"L3\"").next())
+            .unwrap();
+        assert!(line2.contains("hl-comment"), "{line2}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The stylesheet face: both scheme blocks in one text/css representation,
+    /// classed to match the markup, and cacheable (a pure function of the
+    /// build).
+    #[test]
+    fn the_style_face_serves_both_scheme_blocks_and_is_cacheable() {
+        let root = demo_root();
+        let k = kernel(vec![("demo".to_string(), root.clone())]);
+        let cap = demo_cap();
+        let out = source(&k, STYLE_IRI, &[], &cap).unwrap();
+        assert_eq!(out.repr_type.media_type, "text/css");
+        let css = body(&out);
+        // The base rule the <pre class="… hl-code"> opts into, light theme
+        // (InspiredGitHub's white page) at top level…
+        assert!(css.contains(".hl-code {"), "{css}");
+        assert!(css.contains("background-color: #ffffff"), "{css}");
+        // …and the dark theme (base16-ocean.dark's slate) inside the media
+        // block.
+        let dark = css
+            .split("@media (prefers-color-scheme: dark) {")
+            .nth(1)
+            .expect("the dark block exists");
+        assert!(dark.contains(".hl-code {"), "{css}");
+        assert!(dark.contains("background-color: #2b303b"), "{css}");
+        // Scope rules target the same prefix the markup emits.
+        assert!(css.contains(".hl-comment"), "{css}");
+        // Cacheable: the second resolution is a cache hit.
+        let request = Request::new(Verb::Source, Iri::parse(STYLE_IRI).unwrap());
+        assert!(k.is_cached(&request, &cap), "the stylesheet should cache");
+        // No browse grant at all ⇒ denied by the kernel baseline, like every
+        // other browse action.
+        let unrelated = Capability::scoped(["urn:cap:unrelated"]);
+        let err = source(&k, STYLE_IRI, &[], &unrelated).unwrap_err();
+        assert!(matches!(err, Error::Denied(_)), "{err:?}");
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1887,6 +2102,7 @@ mod tests {
             "urn:repo:demo:annotations",
             "urn:repo:demo:annotations:{path}",
             "urn:annotation:{id}",
+            "urn:repo:style",
         ] {
             assert!(
                 offered.contains(row),
