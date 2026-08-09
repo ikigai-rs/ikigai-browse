@@ -584,6 +584,175 @@ fn refresh(store: &Store, ann: &mut Annotation, current: &CurrentContent) -> Res
     }
 }
 
+/// Run the drift pass over a set of loaded annotations, fetching each distinct
+/// target's current content through the kernel once, and return the rows in
+/// reading order (path, position, id) — the shared middle of the listing
+/// endpoint and the `annotations=include` fetch.
+async fn reconcile(
+    inv: &Invocation<'_>,
+    store: &Store,
+    repo: &str,
+    mut anns: Vec<Annotation>,
+) -> Result<Vec<(Annotation, Option<u64>)>> {
+    let mut contents: BTreeMap<String, CurrentContent> = BTreeMap::new();
+    for ann in &anns {
+        if !contents.contains_key(&ann.rel) {
+            let current = current_content(inv, repo, &ann.rel).await?;
+            contents.insert(ann.rel.clone(), current);
+        }
+    }
+    let mut rows: Vec<(Annotation, Option<u64>)> = Vec::with_capacity(anns.len());
+    for mut ann in anns.drain(..) {
+        let current = contents.get(&ann.rel).expect("fetched above");
+        let line = refresh(store, &mut ann, current)?;
+        rows.push((ann, line));
+    }
+    // Re-anchoring may have moved positions — restore reading order.
+    rows.sort_by(|(a, _), (b, _)| (&a.rel, a.start, &a.id).cmp(&(&b.rel, b.start, &b.id)));
+    Ok(rows)
+}
+
+/// The drift pass against content already in hand (the file face's path — no
+/// kernel fetch), rows in reading order.
+fn reconcile_against_text(
+    store: &Store,
+    repo: &str,
+    rel: &str,
+    text: &str,
+) -> Result<Vec<(Annotation, Option<u64>)>> {
+    let mut anns = list_annotations(store, repo, Some(rel))?;
+    let current = CurrentContent::Text(text.to_string(), hash_bytes(text.as_bytes()));
+    let mut rows: Vec<(Annotation, Option<u64>)> = Vec::with_capacity(anns.len());
+    for mut ann in anns.drain(..) {
+        let line = refresh(store, &mut ann, &current)?;
+        rows.push((ann, line));
+    }
+    rows.sort_by(|(a, _), (b, _)| (a.start, &a.id).cmp(&(b.start, &b.id)));
+    Ok(rows)
+}
+
+// --- annotations=include (S3) ------------------------------------------------
+
+/// Which annotations an `annotations=include` resolution folds in: exactly one
+/// file's, or (a directory explain) everything under a subtree — `""` is the
+/// whole repo.
+#[derive(Clone, Copy)]
+pub(crate) enum TargetFilter<'a> {
+    File(&'a str),
+    Subtree(&'a str),
+}
+
+/// Drift-reconciled annotation rows ready to fold into another resource's
+/// response — the `annotations=include` payload for the file and explain
+/// faces.
+pub(crate) struct Included {
+    rows: Vec<(Annotation, Option<u64>)>,
+    /// Rows may span multiple files (a subtree filter) — margin notes then
+    /// carry the path.
+    with_paths: bool,
+}
+
+impl Included {
+    /// The JSON face's `annotations` array — the same row shape the listing
+    /// endpoint serves (quote, body, line, drift flags, and the rest).
+    pub(crate) fn json(&self) -> serde_json::Value {
+        serde_json::Value::Array(
+            self.rows
+                .iter()
+                .map(|(ann, line)| annotation_json(ann, *line))
+                .collect(),
+        )
+    }
+
+    /// The compact margin-notes section a text face appends: a counted header,
+    /// then one line per annotation — anchor line, drift flag, clipped quote,
+    /// whitespace-collapsed body.
+    pub(crate) fn margin_text(&self) -> String {
+        let mut out = format!("--- annotations ({}) ---", self.rows.len());
+        for (ann, line) in &self.rows {
+            out.push('\n');
+            if self.with_paths {
+                out.push_str(&ann.rel);
+                out.push(' ');
+            }
+            if let Some(n) = line {
+                out.push_str(&format!("L{n} "));
+            }
+            if ann.orphaned {
+                out.push_str("[orphaned] ");
+            } else if ann.reanchored {
+                out.push_str("[re-anchored] ");
+            }
+            out.push_str(&format!(
+                "\"{}\" -- {}",
+                clip(&ann.exact),
+                collapse(&ann.body)
+            ));
+        }
+        out
+    }
+}
+
+/// A quote clipped to margin width (60 chars), char-boundary safe.
+fn clip(s: &str) -> String {
+    if s.chars().count() <= 60 {
+        return s.to_string();
+    }
+    let clipped: String = s.chars().take(59).collect();
+    format!("{clipped}…")
+}
+
+/// A body collapsed to one line for the margin (all whitespace runs → one
+/// space).
+fn collapse(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The `annotations=include` fetch through the kernel — same
+/// drift-reconciliation as the listing endpoint. A [`TargetFilter::Subtree`]
+/// keeps only annotations under the directory (all of them when it names the
+/// root).
+pub(crate) async fn included_for(
+    inv: &Invocation<'_>,
+    store: &Store,
+    repo: &str,
+    filter: TargetFilter<'_>,
+) -> Result<Included> {
+    let anns = match filter {
+        TargetFilter::File(rel) => list_annotations(store, repo, Some(rel))?,
+        TargetFilter::Subtree(rel) => {
+            let all = list_annotations(store, repo, None)?;
+            if rel.is_empty() {
+                all
+            } else {
+                let prefix = format!("{rel}/");
+                all.into_iter()
+                    .filter(|ann| ann.rel.starts_with(&prefix))
+                    .collect()
+            }
+        }
+    };
+    let rows = reconcile(inv, store, repo, anns).await?;
+    Ok(Included {
+        rows,
+        with_paths: matches!(filter, TargetFilter::Subtree(_)),
+    })
+}
+
+/// The `annotations=include` payload for a file face whose content is already
+/// in hand — the drift pass runs against the very text being served.
+pub(crate) fn included_for_text(
+    store: &Store,
+    repo: &str,
+    rel: &str,
+    text: &str,
+) -> Result<Included> {
+    Ok(Included {
+        rows: reconcile_against_text(store, repo, rel, text)?,
+        with_paths: false,
+    })
+}
+
 /// Source the target's current content through the kernel. A NotFound (the
 /// file was deleted) or non-UTF-8 answer is `Unavailable` — drift, not an
 /// error; anything else propagates.
@@ -924,24 +1093,9 @@ impl Endpoint for AnnotationsEndpoint {
         granted(inv, repo)?;
         let rel = path_binding(inv)?;
         let filter = (!rel.is_empty()).then_some(rel.as_str());
-        let mut anns = list_annotations(&self.store, repo, filter)?;
-
+        let anns = list_annotations(&self.store, repo, filter)?;
         // One content fetch per distinct target, then the drift pass each.
-        let mut contents: BTreeMap<String, CurrentContent> = BTreeMap::new();
-        for ann in &anns {
-            if !contents.contains_key(&ann.rel) {
-                let current = current_content(inv, repo, &ann.rel).await?;
-                contents.insert(ann.rel.clone(), current);
-            }
-        }
-        let mut lines: Vec<Option<u64>> = Vec::with_capacity(anns.len());
-        for ann in &mut anns {
-            let current = contents.get(&ann.rel).expect("fetched above");
-            lines.push(refresh(&self.store, ann, current)?);
-        }
-        // Re-anchoring may have moved positions — restore reading order.
-        let mut rows: Vec<(Annotation, Option<u64>)> = anns.into_iter().zip(lines).collect();
-        rows.sort_by(|(a, _), (b, _)| (&a.rel, a.start, &a.id).cmp(&(&b.rel, b.start, &b.id)));
+        let rows = reconcile(inv, &self.store, repo, anns).await?;
 
         match inv.inline_str("as").unwrap_or("application/json") {
             t if t.starts_with("text/html") => Ok(repr_utf8(
@@ -1188,14 +1342,7 @@ pub(crate) fn file_overlay(
     rel: &str,
     text: &str,
 ) -> Result<(BTreeSet<u64>, String)> {
-    let mut anns = list_annotations(store, repo, Some(rel))?;
-    let current = CurrentContent::Text(text.to_string(), hash_bytes(text.as_bytes()));
-    let mut rows: Vec<(Annotation, Option<u64>)> = Vec::with_capacity(anns.len());
-    for mut ann in anns.drain(..) {
-        let line = refresh(store, &mut ann, &current)?;
-        rows.push((ann, line));
-    }
-    rows.sort_by(|(a, _), (b, _)| (a.start, &a.id).cmp(&(b.start, &b.id)));
+    let rows = reconcile_against_text(store, repo, rel, text)?;
     let marked: BTreeSet<u64> = rows
         .iter()
         .filter(|(ann, _)| !ann.orphaned)
@@ -1961,6 +2108,145 @@ mod tests {
         let listing = annotations_description(&roots);
         assert!(listing.requires.contains(&CAP_WILDCARD.to_string()));
         assert!(!listing.requires.contains(&CAP_ANNOTATE.to_string()));
+    }
+
+    #[test]
+    fn annotations_include_folds_margin_notes_into_the_file_text_face() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "fn one() {}\nfn two() {}\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        annotate(&k, "note-1", "a.rs", "fn two()", "the second\nfunction");
+
+        let out = issue(
+            &k,
+            Verb::Source,
+            "urn:repo:demo:file:a.rs",
+            &[("annotations", "include")],
+            &cap(),
+        )
+        .unwrap();
+        // The composite face is text/plain — it is no longer just the file.
+        assert_eq!(out.repr_type.media_type, "text/plain");
+        let text = body(&out);
+        assert!(text.starts_with("fn one() {}\nfn two() {}\n"), "{text}");
+        assert!(text.contains("--- annotations (1) ---"), "{text}");
+        // Compact margin line: anchor, quote, whitespace-collapsed body.
+        assert!(
+            text.contains("L2 \"fn two()\" -- the second function"),
+            "{text}"
+        );
+
+        // annotations=true is the declared boolean spelling of the same.
+        let same = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:file:a.rs",
+                &[("annotations", "true")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(same, text);
+
+        // The default (annotations=false) raw face is untouched.
+        let raw = issue(&k, Verb::Source, "urn:repo:demo:file:a.rs", &[], &cap()).unwrap();
+        assert_eq!(raw.repr_type.media_type, "text/x-rust");
+        assert_eq!(body(&raw), "fn one() {}\nfn two() {}\n");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn included_margin_notes_carry_drift_flags() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "fn one() {}\nfn two() {}\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        annotate(&k, "note-1", "a.rs", "fn two()", "watch this");
+
+        // Content shifts: the include pass re-anchors and says so.
+        std::fs::write(root.join("a.rs"), "// moved\nfn one() {}\nfn two() {}\n").unwrap();
+        let text = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:file:a.rs",
+                &[("annotations", "include")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert!(
+            text.contains("L3 [re-anchored] \"fn two()\" -- watch this"),
+            "{text}"
+        );
+
+        // The quote disappears: flagged orphaned, never dropped.
+        std::fs::write(root.join("a.rs"), "// moved\nfn one() {}\n").unwrap();
+        let text = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:file:a.rs",
+                &[("annotations", "include")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert!(
+            text.contains("[orphaned] \"fn two()\" -- watch this"),
+            "{text}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn annotations_include_fails_loud_when_it_cannot_be_honored() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "fn one() {}\n").unwrap();
+        std::fs::write(root.join("img.png"), [0x89, 0x50, 0x4E, 0x47, 0x00, 0xFF]).unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+
+        // Binary content has no text face to fold notes into.
+        let err = issue(
+            &k,
+            Verb::Source,
+            "urn:repo:demo:file:img.png",
+            &[("annotations", "include")],
+            &cap(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument { .. }), "{err:?}");
+
+        // A value outside the declared enum is a typed argument error.
+        let err = issue(
+            &k,
+            Verb::Source,
+            "urn:repo:demo:file:a.rs",
+            &[("annotations", "maybe")],
+            &cap(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument { .. }), "{err:?}");
+
+        // A plain space() mounts no store: asking is an error, not a silent
+        // no-op (and the arg is not declared there — see the describe test).
+        let bare = ikigai_core::Kernel::new(Arc::new(crate::space(vec![(
+            "demo".to_string(),
+            root.clone(),
+        )])));
+        let err = issue(
+            &bare,
+            Verb::Source,
+            "urn:repo:demo:file:a.rs",
+            &[("annotations", "include")],
+            &Capability::scoped(["urn:cap:browse:read:demo"]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument { .. }), "{err:?}");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

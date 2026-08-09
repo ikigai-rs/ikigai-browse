@@ -69,9 +69,9 @@ use ikigai_core::{
 };
 use oxigraph::store::Store;
 use syntect::easy::HighlightLines;
-use syntect::highlighting::{Theme, ThemeSet};
+use syntect::highlighting::Theme;
 use syntect::html::{styled_line_to_highlighted_html, IncludeBackground};
-use syntect::parsing::SyntaxSet;
+use syntect::parsing::{SyntaxDefinition, SyntaxSet};
 use syntect::util::LinesWithEndings;
 
 mod annotate;
@@ -333,6 +333,21 @@ pub(crate) fn repr_utf8(media: &str, body: String) -> Representation {
         ReprType::new(media).with_param("charset", "utf-8"),
         body.into_bytes(),
     )
+}
+
+/// The `annotations` arg shared by the file and explain faces: `include` (the
+/// S2-recommended spelling) or `true` folds the target's annotations into the
+/// response; `false` (the default) leaves it untouched. Anything else is a
+/// typed argument error — the manifold declares exactly these values.
+pub(crate) fn include_annotations(inv: &Invocation<'_>) -> Result<bool> {
+    match inv.inline_str("annotations").unwrap_or("false") {
+        "include" | "true" => Ok(true),
+        "" | "false" => Ok(false),
+        other => Err(Error::InvalidArgument {
+            name: "annotations".to_string(),
+            detail: format!("`{other}` is not a recognized value (include, true, or false)"),
+        }),
+    }
 }
 
 /// Minimal HTML escaping for names and paths embedded in attributes and text.
@@ -687,6 +702,7 @@ fn tree_turtle(repo: &str, rel: &str, entries: &[Entry]) -> String {
 fn file_endpoint(roots: &Roots, store: Option<&Arc<Store>>) -> FnEndpoint {
     let held = Arc::clone(roots);
     let store = store.map(Arc::clone);
+    let has_store = store.is_some();
     FnEndpoint::new("browse-file", move |inv: &Invocation<'_>| {
         let (repo, root) = repo_root(inv, &held)?;
         granted(inv, repo)?;
@@ -703,19 +719,51 @@ fn file_endpoint(roots: &Roots, store: Option<&Arc<Store>>) -> FnEndpoint {
         }
         let bytes = std::fs::read(&target)
             .map_err(|e| Error::Endpoint(format!("browse: read `{rel}`: {e}")))?;
+        let include = include_annotations(inv)?;
         match inv.inline_str("as").unwrap_or("") {
+            // The HTML face already renders the annotations panel when the
+            // store is mounted — `annotations=include` changes nothing there.
             t if t.starts_with("text/html") => Ok(repr_utf8(
                 "text/html",
                 file_html(repo, &rel, &bytes, store.as_deref())?,
             )),
+            _ if include => {
+                // One resolution = content + human margin notes (the
+                // agent-grounding face). Only a mounted store and textual
+                // content can honor it — anything else fails loud.
+                let Some(store) = store.as_deref() else {
+                    return Err(Error::InvalidArgument {
+                        name: "annotations".to_string(),
+                        detail: "no annotation store is mounted (space_with_annotations / \
+                                 space_with_explain)"
+                            .to_string(),
+                    });
+                };
+                let Ok(text) = std::str::from_utf8(&bytes) else {
+                    return Err(Error::InvalidArgument {
+                        name: "annotations".to_string(),
+                        detail: format!(
+                            "`{rel}` is binary — there is no text face to fold annotations into"
+                        ),
+                    });
+                };
+                let included = annotate::included_for_text(store, repo, &rel, text)?;
+                let mut out = text.to_string();
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push('\n');
+                out.push_str(&included.margin_text());
+                Ok(repr_utf8("text/plain", out))
+            }
             _ => Ok(Representation::new(media_type_for(&target, &bytes), bytes)),
         }
     })
-    .with_description(file_description(roots))
+    .with_description(file_description(roots, has_store))
 }
 
-fn file_description(roots: &Roots) -> Description {
-    Description::new("browse-file")
+fn file_description(roots: &Roots, has_store: bool) -> Description {
+    let mut description = Description::new("browse-file")
         .title("Repository file")
         .summary(
             "The content of one file within a configured browse root — \
@@ -724,7 +772,9 @@ fn file_description(roots: &Roots) -> Description {
              as=text/html renders a syntax-highlighted, line-numbered view whose lines \
              carry id=\"L{n}\" anchors — and, when the annotation store is mounted, marks \
              annotated lines and appends the annotations panel with its create form. \
-             Live and uncacheable.",
+             annotations=include (store mounted, textual content) serves the text plus a \
+             compact margin-notes section — content and human annotations in one \
+             resolution. Live and uncacheable.",
         )
         .verb(Verb::Source)
         .verb(Verb::Meta)
@@ -739,7 +789,23 @@ fn file_description(roots: &Roots) -> Description {
             ArgSpec::new("path")
                 .binding()
                 .summary("file path within the root, percent-encoded"),
-        )
+        );
+    // Declared only when a store is mounted — offering the arg on a plain
+    // `space()` mount would make the manifold over-offer.
+    if has_store {
+        description = description.input(
+            ArgSpec::new("annotations")
+                .optional()
+                .summary(
+                    "include folds the file's annotations in: the text face appends a \
+                     margin-notes section, drift-reconciled against the very content served \
+                     (the html face already renders them)",
+                )
+                .one_of(["include", "true", "false"])
+                .default_value("false"),
+        );
+    }
+    description
         .input(
             ArgSpec::new("as")
                 .optional()
@@ -748,6 +814,7 @@ fn file_description(roots: &Roots) -> Description {
         )
         .output("application/octet-stream")
         .output("text/html;charset=utf-8")
+        .output("text/plain;charset=utf-8")
 }
 
 /// The extension→media-type map for the raw face; unknown extensions fall back
@@ -788,18 +855,32 @@ pub(crate) fn media_type_for(path: &Path, bytes: &[u8]) -> ReprType {
     }
 }
 
+/// The house Turtle/TriG definition (assets/): two-face's extended set (bat's
+/// assets) still carries no RDF syntaxes, and the graph faces of this very
+/// module deserve highlighting.
+const TURTLE_SYNTAX: &str = include_str!("../assets/Turtle.sublime-syntax");
+
+/// two-face's extended syntax set (~100 formats the stock syntect set misses —
+/// TOML, TypeScript, Dockerfile, …) plus the embedded Turtle definition.
+/// Unknown formats still degrade to escaped plain text.
 fn syntaxes() -> &'static SyntaxSet {
     static SYNTAXES: OnceLock<SyntaxSet> = OnceLock::new();
-    SYNTAXES.get_or_init(SyntaxSet::load_defaults_newlines)
+    SYNTAXES.get_or_init(|| {
+        let mut builder = two_face::syntax::extra_newlines().into_builder();
+        builder.add(
+            SyntaxDefinition::load_from_str(TURTLE_SYNTAX, true, None)
+                .expect("the embedded Turtle syntax is valid"),
+        );
+        builder.build()
+    })
 }
 
 fn theme() -> &'static Theme {
     static THEME: OnceLock<Theme> = OnceLock::new();
     THEME.get_or_init(|| {
-        ThemeSet::load_defaults()
-            .themes
-            .remove("InspiredGitHub")
-            .expect("syntect ships InspiredGitHub")
+        // The same InspiredGitHub look S0 shipped, now from two-face's
+        // embedded theme set (syntect's default ThemeSet is no longer loaded).
+        two_face::theme::extra()[two_face::theme::EmbeddedThemeName::InspiredGithub].clone()
     })
 }
 
@@ -835,10 +916,18 @@ fn file_html(repo: &str, rel: &str, bytes: &[u8], store: Option<&Store>) -> Resu
 /// `browse-line-annotated` mark.
 fn highlight_html(rel: &str, text: &str, annotated: &BTreeSet<u64>) -> String {
     let syntaxes = syntaxes();
-    let syntax = Path::new(rel)
+    let path = Path::new(rel);
+    let syntax = path
         .extension()
         .and_then(|e| e.to_str())
         .and_then(|e| syntaxes.find_syntax_by_extension(e))
+        // Extensionless well-known names (Dockerfile, Makefile, …): sublime
+        // syntaxes list full file names among their "extensions".
+        .or_else(|| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| syntaxes.find_syntax_by_extension(n))
+        })
         .or_else(|| {
             text.lines()
                 .next()
@@ -1235,6 +1324,63 @@ mod tests {
     }
 
     #[test]
+    fn the_extended_syntax_set_covers_wide_formats_and_turtle() {
+        let syntaxes = syntaxes();
+        // Formats the stock syntect set misses, now covered by two-face…
+        for ext in ["toml", "ts", "tsx", "dockerfile"] {
+            assert!(
+                syntaxes.find_syntax_by_extension(ext).is_some(),
+                "two-face should cover `{ext}`"
+            );
+        }
+        // …the extensionless well-known name…
+        assert!(syntaxes.find_syntax_by_extension("Dockerfile").is_some());
+        // …and the embedded house Turtle/TriG definition.
+        for ext in ["ttl", "trig"] {
+            assert!(
+                syntaxes.find_syntax_by_extension(ext).is_some(),
+                "the embedded Turtle syntax should cover `{ext}`"
+            );
+        }
+    }
+
+    #[test]
+    fn wide_formats_highlight_and_line_anchors_survive() {
+        let root = temp_dir();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        std::fs::write(root.join("Dockerfile"), "FROM rust:1\nRUN cargo build\n").unwrap();
+        std::fs::write(
+            root.join("graph.ttl"),
+            "@prefix ik: <https://ikigai-rs.dev/ns#> .\n<urn:x> a ik:File .\n",
+        )
+        .unwrap();
+        let k = kernel(vec![("demo".to_string(), root.clone())]);
+        for path in ["Cargo.toml", "Dockerfile", "graph.ttl"] {
+            let out = source(
+                &k,
+                &format!("urn:repo:demo:file:{path}"),
+                &[("as", "text/html")],
+                &demo_cap(),
+            )
+            .unwrap();
+            let html = body(&out);
+            // A real syntax matched: the view carries more than one token
+            // color (plain-text degradation renders a single color).
+            let colors: BTreeSet<&str> = html
+                .split("color:#")
+                .skip(1)
+                .filter_map(|s| s.get(..6))
+                .collect();
+            assert!(colors.len() >= 2, "{path} fell back to plain text: {html}");
+            // The per-line anchor contract survives the two-face swap.
+            assert!(html.contains("id=\"L1\""), "{path}: {html}");
+            assert!(html.contains("id=\"L2\""), "{path}: {html}");
+            assert!(html.contains("href=\"#L2\""), "{path}: {html}");
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn a_percent_encoded_path_resolves() {
         let root = demo_root();
         let k = kernel(vec![("demo".to_string(), root.clone())]);
@@ -1383,6 +1529,21 @@ mod tests {
                 .find(|i| i.name == "repo")
                 .unwrap();
             assert_eq!(repo.one_of, vec!["demo".to_string()], "{}", description.id);
+        }
+        // The annotations arg is offered only when a store is mounted —
+        // declaring it on a plain space() would make the manifold over-offer.
+        {
+            use ikigai_core::Endpoint;
+            let bare = file_endpoint(&roots, None).describe();
+            assert!(!bare.inputs.iter().any(|i| i.name == "annotations"));
+            let store = Arc::new(oxigraph::store::Store::new().unwrap());
+            let with_store = file_endpoint(&roots, Some(&store)).describe();
+            let ann = with_store
+                .inputs
+                .iter()
+                .find(|i| i.name == "annotations")
+                .expect("declared when the store is mounted");
+            assert_eq!(ann.one_of, vec!["include", "true", "false"]);
         }
         std::fs::remove_dir_all(&root).ok();
     }

@@ -8,10 +8,10 @@ pairs), and each root answers three resource families:
 | resource | what it is |
 |----------|------------|
 | `urn:repo:{repo}:tree` / `urn:repo:{repo}:tree:{path}` | a directory listing — `text/plain` (default; `name`⇥`kind`⇥`size` per line), `as=text/html` (htmx-navigable), `as=text/turtle` (the skolemized graph) |
-| `urn:repo:{repo}:file:{path}` | file content — raw bytes under an extension-mapped media type; `as=text/html` for a syntax-highlighted, line-numbered view with `#L{n}` anchors |
+| `urn:repo:{repo}:file:{path}` | file content — raw bytes under an extension-mapped media type; `as=text/html` for a syntax-highlighted, line-numbered view with `#L{n}` anchors; `annotations=include` (S3, store mounted) serves the text plus a compact, drift-reconciled margin-notes section — content and human annotations in one resolution |
 | `urn:repo:{repo}:state` | the **freshness oracle** — HEAD sha + `clean`/`dirty:{n}` on one line; `as=application/json` for `{head, dirty: [paths]}` |
 | `urn:repo:{repo}:hash[:{path}]` | the **content hash** (S1) — `sha256:{hex}` of a file's bytes, or the **merkle** construction over a directory's entries (ignore-filtered), so one edit re-keys exactly the path to the root |
-| `urn:repo:{repo}:explain[:{path}]` | an **LLM-derived orientation explanation** (S1), archived by `(path, content-hash, version-tag)` — derived once per content version, reused forever; `as=application/json` adds `{content_hash, version_tag, derived}`, `as=text/html` the page face with provenance, `as=text/turtle` the archive entry's graph; `version=` addresses an older tag |
+| `urn:repo:{repo}:explain[:{path}]` | an **LLM-derived orientation explanation** (S1), archived by `(path, content-hash, version-tag)` — derived once per content version, reused forever; `as=application/json` adds `{content_hash, version_tag, derived}`, `as=text/html` the page face with provenance, `as=text/turtle` the archive entry's graph; `version=` addresses an older tag; `annotations=include` (S3) folds the target's annotations in — the json face gains an `annotations` array, the text face appends margin notes, and a directory rollup folds its subtree's |
 | `urn:repo:{repo}:explain-versions[:{path}]` | what the archive holds for a path — one row per entry (tag, hash, model, derived-at), across content versions and tags; a pure store read (no net capability) |
 | `urn:annotation[:{id}]` | a **W3C Web Annotation** (S2) on a file — Sink creates/updates (anchoring the quoted text; the bare `urn:annotation` mints a uuid id), Source reads with drift **re-anchoring**, Delete removes; faces: `text/plain` (the body), `as=application/json`, `as=text/turtle` |
 | `urn:repo:{repo}:annotations[:{path}]` | every annotation on one file (or the whole repo, path omitted) in reading order, drift-reconciled on each read; faces: `application/json` (default), `as=text/html` (panel fragment), `as=text/turtle` |
@@ -84,7 +84,13 @@ milliseconds.
 The `text/html` faces are htmx **fragments**, not pages — ikigai-runbook's
 server-driven house style. Entries and breadcrumbs `hx-get`
 `/k/source <iri> as=text/html` into a `#browse` container the host provides;
-the host's adapter maps `/k/<command>` onto its engine. File views wrap each
+the host's adapter maps `/k/<command>` onto its engine. Highlighting uses
+[two-face](https://crates.io/crates/two-face)'s extended syntax set (~100
+formats the stock syntect set misses — TOML, TypeScript, Dockerfile, …) under
+the pure-Rust fancy-regex engine, plus an embedded house Turtle/TriG
+definition ([assets/](assets/)) so the graph faces highlight too; unknown
+formats degrade to escaped plain text, and extensionless well-known names
+(`Dockerfile`) match by file name. File views wrap each
 line in `<span id="L{n}">` with a self-linking gutter number, so `#L42`
 deep-links a line — the anchor surface annotations target. With the
 annotation store mounted, the file view marks annotated lines
