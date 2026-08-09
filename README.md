@@ -15,6 +15,7 @@ pairs), and each root answers three resource families:
 | `urn:repo:{repo}:explain-versions[:{path}]` | what the archive holds for a path — one row per entry (tag, hash, model, derived-at), across content versions and tags; a pure store read (no net capability) |
 | `urn:annotation[:{id}]` | a **W3C Web Annotation** (S2) on a file — Sink creates/updates (anchoring the quoted text; the bare `urn:annotation` mints a uuid id), Source reads with drift **re-anchoring**, Delete removes; faces: `text/plain` (the body), `as=application/json`, `as=text/turtle` |
 | `urn:repo:{repo}:annotations[:{path}]` | every annotation on one file (or the whole repo, path omitted) in reading order, drift-reconciled on each read; faces: `application/json` (default), `as=text/html` (panel fragment), `as=text/turtle` |
+| `urn:repo:{repo}:review:{path}` | the **machine review pass** (S4) — region-grain LLM commentary minted as real annotations (provenance-distinguished), the pass archived by `(path, content-hash, review-tag)` so re-sourcing unchanged content mints nothing; faces: `text/plain` (the margin digest), `as=application/json` (`{minted, orphaned_items, annotations, …}`), `as=text/html` (the card page), `as=text/turtle` (the pass's provenance graph) |
 
 **Resolution is the access model.** A `{repo}` that is not a configured root is
 a clean resolution *miss* (the grammar refuses to match; other mounted spaces
@@ -144,6 +145,61 @@ browse read); Sink and Delete require `urn:cap:annotate`; Sink also declares
 the browse wildcard because anchoring sources the target through the kernel —
 a capability that cannot read a file cannot annotate it.
 
+## The machine review pass (S4)
+
+`urn:repo:{repo}:review:{path}` (mounted by `space_with_explain`) is the
+review layer: Source asks the review model for findings — each an **exact
+quote** from the file plus a reviewer's note — anchors every quote, and mints
+each anchored finding as a real `urn:annotation:` through the same machinery
+human notes use. Machine and human annotations live on ONE queryable axis,
+distinguished only by provenance (all standard terms — no vocab publish):
+
+- `dcterms:creator` — the model identity (its presence IS the machine
+  discriminator; the JSON rows also carry a `machine` boolean).
+- `oa:motivatedBy` — `oa:assessing` on review findings; the human Sink stamps
+  `oa:commenting` (absent on pre-S4 stores — read compatibility).
+- `prov:wasGeneratedBy` — the pass entry that minted the finding; the pass
+  records the inverse as `prov:generated` and the reviewed file as
+  `prov:used`.
+
+The pass is archived like an explanation — keyed
+`(path, content-hash, review-v{N}@model)`, the minted IRIs recorded in the
+entry — so **re-sourcing unchanged content is an archive hit that mints
+nothing**. Changed content is a fresh pass, and the earlier pass's annotations
+re-anchor or orphan exactly like human ones: the drift is the review-history
+story, kept visible. A finding whose quote does not anchor (the model
+misquoted) mints nothing and is counted (`orphaned_items`), never fatal; a
+pass in which nothing parses or nothing anchors is an error and is NOT
+archived (an empty pass must not poison a key that would never re-derive).
+Faces render the kinds distinguishably: hollow line markers (`○`,
+`browse-annotation-marker-machine`) against the solid human dot, a
+`review by {model}` identity line on machine cards
+(`browse-annotation-machine`), and a `[review:{model}]` label in margin text.
+
+The review action `requires` all three of `urn:cap:browse:read:*`,
+`urn:cap:net:*`, and `urn:cap:annotate` — it reads, asks a model, and writes.
+Knobs on `ExplainConfig`: `review_provider` (default `urn:llm:coder:ask`),
+`review_max_tokens` (default 800), `review_model_label` (the tag override,
+same precedence as the explain labels).
+
+Because findings are ordinary annotations in the shared graph, one SPARQL axis
+answers review questions directly, e.g. every machine finding still anchored
+in the current content:
+
+```sparql
+PREFIX oa: <http://www.w3.org/ns/oa#>
+PREFIX dcterms: <http://purl.org/dc/terms/>
+PREFIX ik: <https://ikigai-rs.dev/ns#>
+SELECT ?file ?quote ?note ?model WHERE {
+  ?a a oa:Annotation ; dcterms:creator ?model ;
+     ik:annotates ?file ; oa:bodyValue ?note ;
+     oa:hasSelector [ oa:exact ?quote ] .
+  FILTER NOT EXISTS { ?a ik:orphaned true }
+}
+```
+
+— or only the human notes: `FILTER NOT EXISTS { ?a dcterms:creator ?m }`.
+
 ## Vocabulary (Turtle face)
 
 The graph face skolemizes everything under the same `urn:repo:…` IRIs that
@@ -164,7 +220,12 @@ new writes (and any annotation rewrite) use the new terms, and lingering
 use the external `oa:` (`http://www.w3.org/ns/oa#`) terms `oa:Annotation`,
 `oa:TextQuoteSelector`, `oa:TextPositionSelector`, `oa:bodyValue`,
 `oa:hasSelector`, `oa:prefix`, `oa:exact`, `oa:suffix`, `oa:start`, `oa:end`,
-and `dcterms:created`.
+and `dcterms:created`. The S4 review layer adds the standard provenance terms
+`dcterms:creator`, `oa:motivatedBy` (`oa:assessing` / `oa:commenting`), and
+`prov:` (`http://www.w3.org/ns/prov#`) `prov:wasGeneratedBy` /
+`prov:generated` / `prov:used`, plus two `ik:` terms pending addition to the
+published vocabulary: `ik:Review` (the pass-entry class) and
+`ik:orphanedItems` (the count of findings whose quotes did not anchor).
 
 ## License
 

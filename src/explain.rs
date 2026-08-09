@@ -148,29 +148,36 @@ pub struct ExplainConfig {
     pub(crate) store: Arc<Store>,
     file_provider: String,
     dir_provider: String,
+    pub(crate) review_provider: String,
     file_model_label: Option<String>,
     dir_model_label: Option<String>,
+    pub(crate) review_model_label: Option<String>,
     file_max_tokens: u32,
     dir_max_tokens: u32,
-    temperature: String,
+    pub(crate) review_max_tokens: u32,
+    pub(crate) temperature: String,
     pub(crate) ignore: BTreeSet<String>,
-    max_prompt_bytes: usize,
+    pub(crate) max_prompt_bytes: usize,
 }
 
 impl ExplainConfig {
     /// A config over the host's shared Oxigraph store, with the design-of-record
     /// defaults: file grain → `urn:llm:coder:ask` at 400 tokens, directory
-    /// rollup → `urn:llm:ask` at 600, `temperature=0.2`, the standard ignore
-    /// set, prompts fed at most 16 KiB of content.
+    /// rollup → `urn:llm:ask` at 600, the review pass → `urn:llm:coder:ask` at
+    /// 800 (findings carry quotes — they need headroom), `temperature=0.2`,
+    /// the standard ignore set, prompts fed at most 16 KiB of content.
     pub fn new(store: Arc<Store>) -> Self {
         ExplainConfig {
             store,
             file_provider: "urn:llm:coder:ask".to_string(),
             dir_provider: "urn:llm:ask".to_string(),
+            review_provider: "urn:llm:coder:ask".to_string(),
             file_model_label: None,
             dir_model_label: None,
+            review_model_label: None,
             file_max_tokens: 400,
             dir_max_tokens: 600,
+            review_max_tokens: 800,
             temperature: "0.2".to_string(),
             ignore: crate::hash::default_ignore(),
             max_prompt_bytes: 16 * 1024,
@@ -186,6 +193,13 @@ impl ExplainConfig {
     /// The provider IRI the directory rollup asks (default `urn:llm:ask`).
     pub fn dir_provider(mut self, iri: impl Into<String>) -> Self {
         self.dir_provider = iri.into();
+        self
+    }
+
+    /// The provider IRI the review pass asks (default `urn:llm:coder:ask` —
+    /// the same coder tier as the file grain).
+    pub fn review_provider(mut self, iri: impl Into<String>) -> Self {
+        self.review_provider = iri.into();
         self
     }
 
@@ -223,6 +237,20 @@ impl ExplainConfig {
         self
     }
 
+    /// The model identity folded into review version tags — the operator's
+    /// override, with the same precedence as [`Self::file_model_label`].
+    pub fn review_model_label(mut self, label: impl Into<String>) -> Self {
+        self.review_model_label = Some(label.into());
+        self
+    }
+
+    /// The review pass's `max_tokens` ceiling (default 800 — each finding
+    /// carries a verbatim quote plus commentary).
+    pub fn review_max_tokens(mut self, tokens: u32) -> Self {
+        self.review_max_tokens = tokens;
+        self
+    }
+
     /// Sampling temperature passed to every ask (default `0.2`).
     pub fn temperature(mut self, temperature: impl Into<String>) -> Self {
         self.temperature = temperature.into();
@@ -249,7 +277,7 @@ impl ExplainConfig {
 /// The last-resort model label when nothing resolves: the provider IRI's
 /// middle segment (`urn:llm:coder:ask` ⇒ `coder`, `urn:llm:ask` ⇒ `ask`),
 /// else the whole IRI.
-fn provider_label(provider: &str) -> String {
+pub(crate) fn provider_label(provider: &str) -> String {
     let tail = provider.strip_prefix("urn:llm:").unwrap_or(provider);
     tail.strip_suffix(":ask").unwrap_or(tail).to_string()
 }
@@ -264,7 +292,7 @@ fn provider_label(provider: &str) -> String {
 /// provider segment and 0.10 binds no `urn:llm:model` — for it the default
 /// provider name is read from `urn:llm:config` (also cacheable) and THAT
 /// provider's `:model` resolved: two cheap hops instead of one.
-async fn resolve_model(inv: &Invocation<'_>, provider: &str) -> Option<String> {
+pub(crate) async fn resolve_model(inv: &Invocation<'_>, provider: &str) -> Option<String> {
     if let Some(p) = provider
         .strip_prefix("urn:llm:")
         .and_then(|tail| tail.strip_suffix(":ask"))
@@ -373,7 +401,7 @@ fn grain_prompt(grain: Grain) -> &'static str {
 
 /// Truncate at a char boundary with an explicit marker — silently feeding a
 /// model half a file invites confident nonsense about the missing half.
-fn truncate(text: &str, max_bytes: usize) -> String {
+pub(crate) fn truncate(text: &str, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
         return text.to_string();
     }

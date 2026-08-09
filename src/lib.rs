@@ -35,6 +35,12 @@
 //!   that RE-ANCHOR when the target drifts and are orphan-flagged (never
 //!   dropped) when the quote is gone. The file HTML face gains an annotations
 //!   panel and marks annotated lines.
+//! - `urn:repo:{repo}:review:{path}` — the S4 **machine review pass**
+//!   ([`space_with_explain`]): region-grain LLM commentary minted as real
+//!   annotations (provenance-distinguished — `dcterms:creator`,
+//!   `oa:motivatedBy oa:assessing`, `prov:wasGeneratedBy`), the pass archived
+//!   by `(path, content-hash, review-tag)` so re-sourcing unchanged content
+//!   mints nothing.
 //!
 //! ## Resolution is the access model
 //!
@@ -90,6 +96,7 @@ use syntect::util::LinesWithEndings;
 mod annotate;
 mod explain;
 mod hash;
+mod review;
 
 pub use annotate::CAP_ANNOTATE;
 pub use explain::ExplainConfig;
@@ -157,8 +164,12 @@ pub fn space_with_explain(
     let roots = build_roots(roots);
     let ignore = Arc::new(config.ignore.clone());
     let store = Arc::clone(&config.store);
+    let shared = Arc::new(config.clone());
     let space = base_space(&roots, &ignore, Some(&store), true);
     let space = explain::bind(space, &roots, config);
+    // The S4 review pass (machine-minted annotations) rides with the
+    // explanation family: it needs the same LLM seam and the same store.
+    let space = review::bind(space, &roots, &shared);
     annotate::bind(space, &roots, &store)
 }
 
@@ -1073,9 +1084,18 @@ fn highlight_html(
             markers
                 .iter()
                 .map(|m| {
+                    // Hollow for machine (review) annotations, solid for
+                    // human — the two kinds are distinguishable at the line.
+                    let (class, dot) = if m.machine {
+                        (
+                            "browse-annotation-marker browse-annotation-marker-machine",
+                            "○",
+                        )
+                    } else {
+                        ("browse-annotation-marker", "●")
+                    };
                     format!(
-                        "<a class=\"browse-annotation-marker\" href=\"#annotation-{}\" \
-                         title=\"{}\">●</a>",
+                        "<a class=\"{class}\" href=\"#annotation-{}\" title=\"{}\">{dot}</a>",
                         esc(&m.id),
                         esc(&m.note)
                     )
