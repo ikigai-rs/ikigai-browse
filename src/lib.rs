@@ -652,37 +652,63 @@ fn tree_text(entries: &[Entry]) -> String {
         .join("\n")
 }
 
-/// The breadcrumb strip: the repo name and every ancestor directory `hx-get`
-/// their tree face; the final segment (the current dir or file) is inert text.
-pub(crate) fn crumbs_html(repo: &str, rel: &str) -> String {
+/// The home affordance every crumb strip starts with: a plain anchor to the
+/// HOST's index. `href="/"` is deliberate — in ikigai-web `/` is the host
+/// index, so it works untouched; any other host either styles/rebinds
+/// `.browse-home-link` (its adapter owns the page) or ships it harmlessly
+/// unstyled. Documented in the README's host-contract section.
+fn home_link_html() -> &'static str {
+    "<a class=\"browse-home-link\" href=\"/\" aria-label=\"home\">&#8962;</a>\
+     <span class=\"browse-sep\">/</span>"
+}
+
+/// The generalized breadcrumb strip: the home affordance, then one crumb per
+/// item. `Some(iri)` crumbs `hx-get` that resource's html face into
+/// `#browse`; `None` is the inert current segment. Labels are escaped here.
+pub(crate) fn crumb_trail(items: &[(String, Option<String>)]) -> String {
     let mut out = String::from("<nav class=\"browse-crumbs\">");
+    out.push_str(home_link_html());
+    for (label, target) in items {
+        match target {
+            Some(iri) => out.push_str(&format!(
+                "<button class=\"browse-crumb\" hx-get=\"/k/source {iri} as=text/html\" \
+                 hx-target=\"#browse\" hx-swap=\"innerHTML\">{}</button>\
+                 <span class=\"browse-sep\">/</span>",
+                esc(label)
+            )),
+            None => out.push_str(&format!(
+                "<span class=\"browse-here\">{}</span>",
+                esc(label)
+            )),
+        }
+    }
+    out.push_str("</nav>");
+    out
+}
+
+/// The path-shaped breadcrumb strip: the repo name and every ancestor
+/// directory `hx-get` their tree face; the final segment (the current dir or
+/// file) is inert text.
+pub(crate) fn crumbs_html(repo: &str, rel: &str) -> String {
     let segments: Vec<&str> = if rel.is_empty() {
         Vec::new()
     } else {
         rel.split('/').collect()
     };
-    let mut push_crumb = |target: &str, label: &str, last: bool| {
-        if last {
-            out.push_str(&format!(
-                "<span class=\"browse-here\">{}</span>",
-                esc(label)
-            ));
-        } else {
-            out.push_str(&format!(
-                "<button class=\"browse-crumb\" hx-get=\"/k/source {target} as=text/html\" \
-                 hx-target=\"#browse\" hx-swap=\"innerHTML\">{}</button>\
-                 <span class=\"browse-sep\">/</span>",
-                esc(label)
-            ));
-        }
-    };
-    push_crumb(&tree_iri(repo, ""), repo, segments.is_empty());
+    let mut items = Vec::with_capacity(segments.len() + 1);
+    items.push((
+        repo.to_string(),
+        (!segments.is_empty()).then(|| tree_iri(repo, "")),
+    ));
     for (i, segment) in segments.iter().enumerate() {
+        let last = i + 1 == segments.len();
         let prefix = segments[..=i].join("/");
-        push_crumb(&tree_iri(repo, &prefix), segment, i + 1 == segments.len());
+        items.push((
+            segment.to_string(),
+            (!last).then(|| tree_iri(repo, &prefix)),
+        ));
     }
-    out.push_str("</nav>");
-    out
+    crumb_trail(&items)
 }
 
 /// The explain affordance (rendered only when the explanation family is
@@ -766,7 +792,25 @@ fn tree_html(repo: &str, rel: &str, entries: &[Entry], explain: bool) -> String 
             kind = e.kind.label(),
         ));
     }
-    out.push_str("</ul></div>");
+    out.push_str("</ul>");
+    // The repo front page's recent-PRs section, LAZY by design: the tree
+    // renders instantly and htmx fetches the listing after insertion
+    // (hx-trigger="load", swapping into the block itself). When the pr
+    // facades are absent the fetch answers the typed 404-with-guidance and
+    // the host renders it per its error handling — the tree never blocks on
+    // it. `chrome=embed` keeps the loaded fragment crumb-free (this page
+    // already has the trail); `state=all limit=10` is the recency window
+    // (ikigai-repo >= 0.1.4 facade args, forwarded by the prs endpoint).
+    if rel.is_empty() {
+        out.push_str(&format!(
+            "<section class=\"browse-recent-prs\"><h4>recent pull requests</h4>\
+             <div hx-get=\"/k/source {iri} state=all limit=10 chrome=embed as=text/html\" \
+             hx-trigger=\"load\" hx-swap=\"innerHTML\">\
+             <p class=\"browse-recent-prs-loading\">loading&#8230;</p></div></section>",
+            iri = pr::prs_iri(repo),
+        ));
+    }
+    out.push_str("</div>");
     out
 }
 
@@ -1412,6 +1456,11 @@ mod tests {
         // A space in a filename is percent-encoded in the IRI it links.
         assert!(
             html.contains("urn:repo:demo:file:hello%20world.txt"),
+            "{html}"
+        );
+        // Every crumb strip opens with the host-wireable home affordance.
+        assert!(
+            html.contains("<a class=\"browse-home-link\" href=\"/\""),
             "{html}"
         );
         std::fs::remove_dir_all(&root).ok();

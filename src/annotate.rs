@@ -633,6 +633,126 @@ fn find_anchor(content: &str, exact: &str, prefix: &str, suffix: &str) -> Option
     })
 }
 
+/// A unified-diff line with its one-column marker (`+`/`-`/context space)
+/// removed — what a model that quoted the CODE line effectively saw.
+fn strip_marker(line: &str) -> &str {
+    line.strip_prefix(['+', '-', ' ']).unwrap_or(line)
+}
+
+/// A diff-surface anchoring result: where the quote landed, and — when it
+/// only landed after marker-stripping — the ORIGINAL diff line to store as
+/// the exact quote (drift must keep comparing real diff content, never the
+/// stripped fiction the match was found through).
+struct DiffAnchor {
+    anchor: Anchor,
+    stored_exact: Option<String>,
+}
+
+/// Anchoring against a unified diff — the PR targets' surface. Models (and
+/// humans) quote the CODE they read, not the diff's leading `+`/`-`/space
+/// column — and the QUOTE parser trims, so a context line's leading space is
+/// gone before anchoring ever runs. Precedence, first hit wins:
+///
+/// 1. the quote, exactly as given, anywhere in the raw diff (context-scored,
+///    [`find_anchor`]'s rule) — a marker-faithful quote anchors precisely,
+///    to its own span;
+/// 2. the quote, as given, in the marker-stripped shadow of the diff (every
+///    line's leading `+`/`-`/space removed) — a quote of consecutive CODE
+///    lines matches across the markers that interleave them;
+/// 3. the quote with ITS OWN single leading `+`/`-`/space removed, in the
+///    shadow (the model carried a marker, but a stale or wrong one);
+/// 4. that marker-stripped quote whitespace-trimmed, in the shadow (models
+///    that pad the marker — `+ code` for `+code` — or drop indentation).
+///
+/// Stages 2-4 search first-occurrence (the shadow has no honest context to
+/// score) and anchor the WHOLE original diff line(s) the hit spans,
+/// reporting that original text as the exact to store — drift must keep
+/// comparing real diff content, never the stripped fiction the match was
+/// found through.
+fn find_anchor_in_diff(
+    content: &str,
+    exact: &str,
+    prefix: &str,
+    suffix: &str,
+) -> Option<DiffAnchor> {
+    if let Some(anchor) = find_anchor(content, exact, prefix, suffix) {
+        return Some(DiffAnchor {
+            anchor,
+            stored_exact: None,
+        });
+    }
+    // The marker-stripped shadow, plus per shadow line: the original line's
+    // byte span and its own starting offset in the shadow.
+    let mut shadow = String::with_capacity(content.len());
+    let mut lines: Vec<(usize, usize, usize)> = Vec::new();
+    let mut pos = 0usize;
+    for line in content.split_inclusive('\n') {
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        lines.push((pos, pos + body.len(), shadow.len()));
+        shadow.push_str(strip_marker(body));
+        if body.len() != line.len() {
+            shadow.push('\n');
+        }
+        pos += line.len();
+    }
+    let marker_stripped = strip_marker(exact);
+    let mut needles = vec![exact, marker_stripped, marker_stripped.trim()];
+    needles.dedup();
+    for needle in needles {
+        if needle.is_empty() {
+            continue;
+        }
+        let Some(hit) = shadow.find(needle) else {
+            continue;
+        };
+        let end = hit + needle.len();
+        // The whole original lines the shadow hit spans.
+        let first = lines.partition_point(|&(_, _, s)| s <= hit) - 1;
+        let last = lines.partition_point(|&(_, _, s)| s < end).max(1) - 1;
+        let (byte_start, byte_end) = (lines[first].0, lines[last].1);
+        let char_start = content[..byte_start].chars().count() as u64;
+        let original = &content[byte_start..byte_end];
+        return Some(DiffAnchor {
+            anchor: Anchor {
+                byte_start,
+                byte_end,
+                char_start,
+                char_end: char_start + original.chars().count() as u64,
+                line: 1 + content[..byte_start].matches('\n').count() as u64,
+            },
+            stored_exact: Some(original.to_string()),
+        });
+    }
+    None
+}
+
+/// Which anchoring discipline a target's text demands: plain quote search
+/// for file content, the marker-tolerant [`find_anchor_in_diff`] for a pull
+/// request's unified diff.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Surface {
+    File,
+    Diff,
+}
+
+/// Anchor on the right surface, normalizing both disciplines to a
+/// [`DiffAnchor`] (file hits never carry a stored-exact override).
+fn find_anchor_on(
+    surface: Surface,
+    content: &str,
+    exact: &str,
+    prefix: &str,
+    suffix: &str,
+) -> Option<DiffAnchor> {
+    match surface {
+        Surface::Diff => find_anchor_in_diff(content, exact, prefix, suffix),
+        Surface::File => find_anchor(content, exact, prefix, suffix).map(|anchor| DiffAnchor {
+            anchor,
+            stored_exact: None,
+        }),
+    }
+}
+
 /// The stored context around an anchored quote: up to [`CONTEXT_CHARS`]
 /// characters each side. Always derived from the anchored occurrence (never
 /// the caller's raw arguments) so re-anchoring matches real neighbors.
@@ -714,9 +834,22 @@ fn refresh(store: &Store, ann: &mut Annotation, current: &CurrentContent) -> Res
                 }
                 return Ok(Some(line_of(text, ann.start)));
             }
-            match find_anchor(text, &ann.exact, &ann.prefix, &ann.suffix) {
-                Some(anchor) => {
+            // PR annotations re-anchor with the diff discipline: a new head's
+            // diff may flip a line's marker (`+` settling into context), and
+            // the marker-stripped retry follows the line across that.
+            let surface = match ann.target_ref() {
+                TargetRef::Pr(_) => Surface::Diff,
+                TargetRef::File(_) => Surface::File,
+            };
+            match find_anchor_on(surface, text, &ann.exact, &ann.prefix, &ann.suffix) {
+                Some(DiffAnchor {
+                    anchor,
+                    stored_exact,
+                }) => {
                     let (prefix, suffix) = context_around(text, &anchor);
+                    if let Some(exact) = stored_exact {
+                        ann.exact = exact;
+                    }
                     ann.prefix = prefix;
                     ann.suffix = suffix;
                     ann.start = anchor.char_start;
@@ -1167,12 +1300,23 @@ impl AnnotationEndpoint {
                 ),
             });
         };
-        let anchor = find_anchor(&text, &exact, hint_prefix, hint_suffix).ok_or_else(|| {
+        // A PR target's surface is its unified diff — anchor with the
+        // marker-tolerant discipline (a quote of the code line still lands;
+        // the stored exact becomes the original diff line).
+        let surface = match &parsed {
+            SinkTarget::Pr { .. } => Surface::Diff,
+            SinkTarget::File { .. } => Surface::File,
+        };
+        let DiffAnchor {
+            anchor,
+            stored_exact,
+        } = find_anchor_on(surface, &text, &exact, hint_prefix, hint_suffix).ok_or_else(|| {
             Error::InvalidArgument {
                 name: "exact".to_string(),
                 detail: format!("the quote was not found in `{target}`"),
             }
         })?;
+        let exact = stored_exact.unwrap_or(exact);
         let (prefix, suffix) = context_around(&text, &anchor);
 
         // An update keeps its original creation instant.
@@ -1664,10 +1808,13 @@ pub(crate) fn file_overlay(
 /// `prov:wasGeneratedBy` (the pass entry). Anchors `exact` in `text` (already
 /// in hand — the pass sourced it) with no context hints: the model was told to
 /// pick distinctive quotes, and the deterministic first-occurrence rule covers
-/// the rest. Returns the minted IRI, or `None` when the quote does not anchor
-/// — the caller counts it and moves on (one bad item must not kill the pass).
-/// `target_iri` names the annotated surface (a file, or a PR page whose diff
-/// is `text`); `rel` is its path, empty for a PR.
+/// the rest. `surface` selects the anchoring discipline — [`Surface::Diff`]
+/// for a PR pass tolerates dropped/wrong leading diff markers and stores the
+/// original diff line as the exact. Returns the minted IRI, or `None` when
+/// the quote does not anchor — the caller counts it and moves on (one bad
+/// item must not kill the pass). `target_iri` names the annotated surface (a
+/// file, or a PR page whose diff is `text`); `rel` is its path, empty for a
+/// PR.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn mint_review_annotation(
     store: &Store,
@@ -1681,10 +1828,16 @@ pub(crate) fn mint_review_annotation(
     model: &str,
     pass_iri: &str,
     created: Option<String>,
+    surface: Surface,
 ) -> Result<Option<String>> {
-    let Some(anchor) = find_anchor(text, exact, "", "") else {
+    let Some(DiffAnchor {
+        anchor,
+        stored_exact,
+    }) = find_anchor_on(surface, text, exact, "", "")
+    else {
         return Ok(None);
     };
+    let exact = stored_exact.as_deref().unwrap_or(exact);
     let (prefix, suffix) = context_around(text, &anchor);
     let ann = Annotation {
         id: uuid::Uuid::new_v4().to_string(),
@@ -2362,6 +2515,42 @@ mod tests {
         let first = annotate(&k, "first", "a.rs", "= 1;", "first wins");
         assert_eq!(first["line"], 1);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn diff_anchoring_precedence_exact_then_shadow_then_stripped_quote() {
+        let diff = "--- a/f\n+++ b/f\n@@ -1,2 +1,3 @@\n context()\n-removed()\n+added()\n";
+
+        // 1. A marker-faithful quote anchors exactly — its own span, no
+        //    stored-exact override.
+        let hit = find_anchor_in_diff(diff, "+added()", "", "").unwrap();
+        assert_eq!(hit.stored_exact, None);
+        assert_eq!(hit.anchor.line, 6);
+
+        // A markerless quote that is a plain substring of its line also
+        // anchors at stage 1 (substring search never needed the marker).
+        let hit = find_anchor_in_diff(diff, "removed()", "", "").unwrap();
+        assert_eq!(hit.stored_exact, None);
+        assert_eq!(hit.anchor.line, 5);
+
+        // 3. A WRONG marker misses raw and the marker-stripped retry lands
+        //    it — the stored exact is the ORIGINAL diff line.
+        let hit = find_anchor_in_diff(diff, "-added()", "", "").unwrap();
+        assert_eq!(hit.stored_exact.as_deref(), Some("+added()"));
+        assert_eq!(hit.anchor.line, 6);
+
+        // 4. A padded marker (`+ code` for `+code`) trims down and lands.
+        let hit = find_anchor_in_diff(diff, "+ added()", "", "").unwrap();
+        assert_eq!(hit.stored_exact.as_deref(), Some("+added()"));
+
+        // 2. A quote spanning CODE lines crosses the interleaved markers in
+        //    the shadow; the stored exact is the original diff lines.
+        let hit = find_anchor_in_diff(diff, "removed()\nadded()", "", "").unwrap();
+        assert_eq!(hit.stored_exact.as_deref(), Some("-removed()\n+added()"));
+        assert_eq!(hit.anchor.line, 5);
+
+        // Still a miss when the code is simply not there.
+        assert!(find_anchor_in_diff(diff, "vanished()", "", "").is_none());
     }
 
     #[test]

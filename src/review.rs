@@ -448,6 +448,7 @@ impl Endpoint for ReviewEndpoint {
                 &model,
                 &iri,
                 created.clone(),
+                annotate::Surface::File,
             )? {
                 Some(annotation_iri) => minted.push(annotation_iri),
                 // The model misquoted: mint nothing for this item, count it.
