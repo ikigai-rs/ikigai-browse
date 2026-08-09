@@ -37,11 +37,23 @@
 //!
 //! ## Resolution is the access model
 //!
-//! A `{repo}` that is not a configured root is a **clean miss** — the grammar
-//! itself refuses to match, so resolution falls through to whatever else is
+//! A `{repo}` that is not a configured root is a **clean miss** — no bound
+//! grammar mentions it, so resolution falls through to whatever else is
 //! mounted rather than erroring here. Paths are **jailed** to their root:
 //! `..` and absolute segments are rejected lexically, and the canonicalized
 //! target must stay inside the canonicalized root, so a symlink cannot escape.
+//!
+//! ## Manifold citizenship
+//!
+//! Roots are known at bind time, so the space enumerates **per-configured-root
+//! rows**: for each root, the concrete resources (`urn:repo:{name}:tree`,
+//! `:state`, `:hash`, …) and the `{path}`-templated ones
+//! (`urn:repo:{name}:file:{path}`, …) are separate entries — the catalog and
+//! the capability-scoped action manifold (`urn:kernel:actions`) advertise
+//! exactly the repos an agent can actually browse, and every templated row
+//! survives the kernel's probe-expansion (a `{repo}` template cannot: no
+//! placeholder names a configured root). The bare `urn:annotation` (Sink mints
+//! an id) stays resolvable but unlisted; `urn:annotation:{id}` is its row.
 //!
 //! ## Capabilities
 //!
@@ -64,8 +76,8 @@ use std::process::Command;
 use std::sync::{Arc, OnceLock};
 
 use ikigai_core::{
-    ArgSpec, Bindings, Description, EndpointSpace, Error, FnEndpoint, Grammar, Invocation, Iri,
-    ReprType, Representation, Result, UriTemplate, Verb,
+    ArgSpec, Bindings, Description, Endpoint, EndpointSpace, Error, FnEndpoint, Grammar,
+    Invocation, Iri, ReprType, Representation, Result, UriTemplate, Verb,
 };
 use oxigraph::store::Store;
 use syntect::easy::HighlightLines;
@@ -147,9 +159,11 @@ pub fn space_with_explain(
 fn build_roots(roots: impl IntoIterator<Item = (String, PathBuf)>) -> Roots {
     let mut map = BTreeMap::new();
     for (name, dir) in roots {
+        // No `:`/`/` (the name must embed cleanly in the URN grammar) and no
+        // `{`/`}` (it is spliced literally into per-root URI templates).
         assert!(
-            !name.is_empty() && !name.contains([':', '/']),
-            "browse: root name `{name}` must be non-empty and contain no `:` or `/`"
+            !name.is_empty() && !name.contains([':', '/', '{', '}']),
+            "browse: root name `{name}` must be non-empty and contain no `:`, `/`, `{{`, or `}}`"
         );
         assert!(
             map.insert(name.clone(), dir).is_none(),
@@ -167,79 +181,106 @@ fn base_space(
     ignore: &Arc<std::collections::BTreeSet<String>>,
     store: Option<&Arc<Store>>,
 ) -> EndpointSpace {
-    EndpointSpace::new()
-        .bind(
-            KnownRepo::new(
-                &["urn:repo:{repo}:tree:{path}", "urn:repo:{repo}:tree"],
-                "urn:repo:{repo}:tree[:{path}]",
-                roots,
-            ),
-            tree_endpoint(roots),
-        )
-        .bind(
-            KnownRepo::new(
-                &["urn:repo:{repo}:file:{path}"],
-                "urn:repo:{repo}:file:{path}",
-                roots,
-            ),
-            file_endpoint(roots, store),
-        )
-        .bind(
-            KnownRepo::new(&["urn:repo:{repo}:state"], "urn:repo:{repo}:state", roots),
-            state_endpoint(roots),
-        )
-        .bind(
-            KnownRepo::new(
-                &["urn:repo:{repo}:hash:{path}", "urn:repo:{repo}:hash"],
-                "urn:repo:{repo}:hash[:{path}]",
-                roots,
-            ),
-            hash::hash_endpoint(roots, ignore),
-        )
+    let tree: Arc<dyn Endpoint> = Arc::new(tree_endpoint(roots));
+    let file: Arc<dyn Endpoint> = Arc::new(file_endpoint(roots, store));
+    let state: Arc<dyn Endpoint> = Arc::new(state_endpoint(roots));
+    let hash: Arc<dyn Endpoint> = Arc::new(hash::hash_endpoint(roots, ignore));
+    let space = EndpointSpace::new();
+    let space = bind_family(space, roots, tree, Some("tree"), Some("tree:{path}"));
+    let space = bind_family(space, roots, file, None, Some("file:{path}"));
+    let space = bind_family(space, roots, state, Some("state"), None);
+    bind_family(space, roots, hash, Some("hash"), Some("hash:{path}"))
 }
 
 // --- grammar ----------------------------------------------------------------
 
-/// A URI-template grammar that additionally requires the captured `{repo}` to
-/// name a configured root — so an unconfigured repo is a clean resolution
-/// MISS (falling through to other mounted spaces), never an error from here.
-pub(crate) struct KnownRepo {
-    templates: Vec<UriTemplate>,
-    pattern: String,
-    roots: Roots,
+/// One manifold row for one configured root: a concrete IRI
+/// (`urn:repo:{name}:tree`) or a URI template whose `{repo}` is already fixed
+/// (`urn:repo:{name}:tree:{path}`). `pattern()` IS the row the manifold
+/// advertises, so a concrete row resolves directly and a templated row
+/// survives the catalog's **probe-expansion** (core expands each `{var}` with
+/// a placeholder and the expansion must match the grammar that owns the row —
+/// see `ikigai-core`'s `describe_entry`). The earlier `{repo}`-templated
+/// grammar could not: no placeholder names a configured root, so every browse
+/// row was invisible to every manifold. The root name is injected as the
+/// `repo` binding either way, so endpoints keep reading `bindings["repo"]`,
+/// and an unconfigured repo stays a clean resolution MISS — no bound grammar
+/// mentions it at all.
+pub(crate) struct RootRow {
+    repo: String,
+    matcher: RowMatcher,
 }
 
-impl KnownRepo {
-    pub(crate) fn new(templates: &[&str], pattern: &str, roots: &Roots) -> Self {
-        KnownRepo {
-            templates: templates
-                .iter()
-                .map(|t| UriTemplate::parse(*t).expect("browse templates are valid"))
-                .collect(),
-            pattern: pattern.to_string(),
-            roots: Arc::clone(roots),
+enum RowMatcher {
+    Exact(String),
+    Template(UriTemplate),
+}
+
+impl RootRow {
+    fn exact(repo: &str, iri: String) -> Self {
+        RootRow {
+            repo: repo.to_string(),
+            matcher: RowMatcher::Exact(iri),
+        }
+    }
+
+    fn template(repo: &str, template: &str) -> Self {
+        RootRow {
+            repo: repo.to_string(),
+            matcher: RowMatcher::Template(
+                UriTemplate::parse(template).expect("browse templates are valid"),
+            ),
         }
     }
 }
 
-impl Grammar for KnownRepo {
+impl Grammar for RootRow {
     fn match_iri(&self, iri: &Iri) -> Option<Bindings> {
-        for template in &self.templates {
-            if let Some(bindings) = template.match_iri(iri) {
-                if bindings
-                    .get("repo")
-                    .is_some_and(|r| self.roots.contains_key(r))
-                {
-                    return Some(bindings);
-                }
-            }
-        }
-        None
+        let mut bindings = match &self.matcher {
+            RowMatcher::Exact(exact) => (iri.as_str() == exact).then(Bindings::new)?,
+            RowMatcher::Template(template) => template.match_iri(iri)?,
+        };
+        bindings.insert("repo", self.repo.as_str());
+        Some(bindings)
     }
 
     fn pattern(&self) -> String {
-        self.pattern.clone()
+        match &self.matcher {
+            RowMatcher::Exact(exact) => exact.clone(),
+            RowMatcher::Template(template) => template.source().to_string(),
+        }
     }
+}
+
+/// Bind one resource family for every configured root, all rows sharing one
+/// endpoint: per root, the concrete row (`urn:repo:{name}:{concrete}`) and/or
+/// the templated row (`urn:repo:{name}:{templated}`). Roots are known at bind
+/// time, so the space's `entries()` enumerates exactly the repos an agent can
+/// browse — the manifold advertises per-root rows instead of a `{repo}`
+/// template no probe can satisfy, and the old `[:...]` display sugar becomes
+/// its real concrete + templated pair.
+pub(crate) fn bind_family(
+    mut space: EndpointSpace,
+    roots: &Roots,
+    endpoint: Arc<dyn Endpoint>,
+    concrete: Option<&str>,
+    templated: Option<&str>,
+) -> EndpointSpace {
+    for name in roots.keys() {
+        if let Some(suffix) = concrete {
+            space = space.bind_arc(
+                RootRow::exact(name, format!("urn:repo:{name}:{suffix}")),
+                Arc::clone(&endpoint),
+            );
+        }
+        if let Some(suffix) = templated {
+            space = space.bind_arc(
+                RootRow::template(name, &format!("urn:repo:{name}:{suffix}")),
+                Arc::clone(&endpoint),
+            );
+        }
+    }
+    space
 }
 
 // --- shared helpers ---------------------------------------------------------
@@ -516,10 +557,15 @@ fn tree_endpoint(roots: &Roots) -> FnEndpoint {
             _ => Ok(repr_utf8("text/plain", tree_text(&entries))),
         }
     })
-    .with_description(tree_description(roots))
+    .with_description(tree_description())
 }
 
-fn tree_description(roots: &Roots) -> Description {
+/// NOTE (the manifold contract): `repo` is deliberately NOT an ArgSpec. Every
+/// advertised row fixes the root in its pattern (`urn:repo:{name}:tree…`), so
+/// there is no `{repo}` variable left to declare — declaring one would make
+/// MCP/validate demand an argument no row can substitute. The `repo` binding
+/// the endpoint reads is injected by [`RootRow`], not supplied by callers.
+fn tree_description() -> Description {
     Description::new("browse-tree")
         .title("Repository tree")
         .summary(
@@ -533,12 +579,6 @@ fn tree_description(roots: &Roots) -> Description {
         .verb(Verb::Source)
         .verb(Verb::Meta)
         .requires(CAP_WILDCARD)
-        .input(
-            ArgSpec::new("repo")
-                .binding()
-                .summary("a configured root name")
-                .one_of(roots.keys().cloned()),
-        )
         .input(
             ArgSpec::new("path")
                 .binding()
@@ -759,10 +799,11 @@ fn file_endpoint(roots: &Roots, store: Option<&Arc<Store>>) -> FnEndpoint {
             _ => Ok(Representation::new(media_type_for(&target, &bytes), bytes)),
         }
     })
-    .with_description(file_description(roots, has_store))
+    .with_description(file_description(has_store))
 }
 
-fn file_description(roots: &Roots, has_store: bool) -> Description {
+/// `repo` is not an ArgSpec — see [`tree_description`]'s note.
+fn file_description(has_store: bool) -> Description {
     let mut description = Description::new("browse-file")
         .title("Repository file")
         .summary(
@@ -779,12 +820,6 @@ fn file_description(roots: &Roots, has_store: bool) -> Description {
         .verb(Verb::Source)
         .verb(Verb::Meta)
         .requires(CAP_WILDCARD)
-        .input(
-            ArgSpec::new("repo")
-                .binding()
-                .summary("a configured root name")
-                .one_of(roots.keys().cloned()),
-        )
         .input(
             ArgSpec::new("path")
                 .binding()
@@ -1041,10 +1076,11 @@ fn state_endpoint(roots: &Roots) -> FnEndpoint {
             }
         }
     })
-    .with_description(state_description(roots))
+    .with_description(state_description())
 }
 
-fn state_description(roots: &Roots) -> Description {
+/// `repo` is not an ArgSpec — see [`tree_description`]'s note.
+fn state_description() -> Description {
     Description::new("browse-state")
         .title("Repository state (freshness oracle)")
         .summary(
@@ -1057,12 +1093,6 @@ fn state_description(roots: &Roots) -> Description {
         .verb(Verb::Source)
         .verb(Verb::Meta)
         .requires(CAP_WILDCARD)
-        .input(
-            ArgSpec::new("repo")
-                .binding()
-                .summary("a configured root name")
-                .one_of(roots.keys().cloned()),
-        )
         .input(
             ArgSpec::new("as")
                 .optional()
@@ -1519,16 +1549,12 @@ mod tests {
                 description.requires
             );
             let names: Vec<&str> = description.inputs.iter().map(|i| i.name.as_str()).collect();
-            assert!(names.contains(&"repo"), "{}: {names:?}", description.id);
             assert!(names.contains(&"as"), "{}: {names:?}", description.id);
             assert_eq!(names.contains(&"path"), wants_path, "{}", description.id);
-            // The repo arg enumerates the configured roots for selection.
-            let repo = description
-                .inputs
-                .iter()
-                .find(|i| i.name == "repo")
-                .unwrap();
-            assert_eq!(repo.one_of, vec!["demo".to_string()], "{}", description.id);
+            // `repo` is NOT an ArgSpec: every advertised row fixes the root in
+            // its pattern, so declaring a repo argument would demand something
+            // no row can substitute. The binding is grammar-injected.
+            assert!(!names.contains(&"repo"), "{}: {names:?}", description.id);
         }
         // The annotations arg is offered only when a store is mounted —
         // declaring it on a plain space() would make the manifold over-offer.
@@ -1636,7 +1662,9 @@ mod tests {
         // No browse grant ⇒ no browse rows at all.
         let unrelated = Capability::scoped(["urn:cap:unrelated"]);
         assert!(
-            offered(&unrelated).iter().all(|r| !r.starts_with("urn:repo:")),
+            offered(&unrelated)
+                .iter()
+                .all(|r| !r.starts_with("urn:repo:")),
             "{:#?}",
             offered(&unrelated)
         );
