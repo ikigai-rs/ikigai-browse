@@ -15,11 +15,11 @@ pairs), and each root answers three resource families:
 | `urn:repo:{repo}:explain-versions[:{path}]` | what the archive holds for a path — one row per entry (tag, hash, model, derived-at), across content versions and tags; a pure store read (no net capability) |
 | `urn:annotation[:{id}]` | a **W3C Web Annotation** (S2) on a file — Sink creates/updates (anchoring the quoted text; the bare `urn:annotation` mints a uuid id), Source reads with drift **re-anchoring**, Delete removes; faces: `text/plain` (the body), `as=application/json`, `as=text/turtle` |
 | `urn:repo:{repo}:annotations[:{path}]` | every annotation on one file (or the whole repo, path omitted) in reading order, drift-reconciled on each read; faces: `application/json` (default), `as=text/html` (panel fragment), `as=text/turtle` |
-| `urn:repo:{repo}:review:{path}` | the **machine review pass** (S4) — region-grain LLM commentary minted as real annotations (provenance-distinguished), the pass archived by `(path, content-hash, review-tag)` so re-sourcing unchanged content mints nothing; faces: `text/plain` (the margin digest), `as=application/json` (`{minted, orphaned_items, annotations, …}`), `as=text/html` (the card page), `as=text/turtle` (the pass's provenance graph) |
+| `urn:repo:{repo}:review:{path}` | the **machine review pass** (S4) — region-grain LLM commentary minted as real annotations (provenance-distinguished), the pass archived by `(path, content-hash, review-tag)` so re-sourcing unchanged content mints nothing; faces: `text/plain` (the margin digest), `as=application/json` (`{minted, orphaned_items, reviewed_bytes, total_bytes, annotations, …}`), `as=text/html` (the card page), `as=text/turtle` (the pass's provenance graph); `debug=raw` derives and returns the model's **unparsed answer** (nothing minted or archived) — the parse-failure diagnosis face |
 | `urn:repo:{repo}:prs` | the root's **pull requests** — ikigai-repo's `urn:repo:pr:list` facade resolved through the kernel with `dir=` the root's directory; `state=` (`open`/`closed`/`merged`/`all`) and `limit=` forward to the facade (ikigai-repo ≥ 0.1.4 — omitted, the facade's defaults apply); `text/plain` (default) is `number`⇥`title`⇥`branch`⇥`updated`⇥`state` per line (empty = no matching PRs), `as=application/json` the facade's structured rows, `as=text/html` the listing with each PR linking its page (`chrome=embed` for the rows-only fragment other faces fold in) |
 | `urn:repo:{repo}:pr:{n}` | the **PR page** — metadata (`urn:repo:pr:view` json: author object, `headRefOid`) + the unified diff (`urn:repo:pr:diff`); the DIFF TEXT is an annotation surface (annotations target the PR IRI and quote diff lines, drifting like file annotations); `as=text/html` renders the highlighted, line-anchored diff with markers and the annotations panel; `annotations=include` folds the margin into the plain/json faces |
 | `urn:repo:{repo}:pr:{n}:explain` | a **review-shaped PR explanation** — what the change does and what a reviewer would look at — archived by `(repo, pr, headRefOid, version-tag)`: new commits derive fresh, prior entries stay addressable (`version=`) |
-| `urn:repo:{repo}:pr:{n}:review` | the **machine review pass over the diff** — findings minted as machine annotations targeting the PR IRI, the pass archived by `(repo, pr, headRefOid, review-tag)` so an unchanged head mints nothing |
+| `urn:repo:{repo}:pr:{n}:review` | the **machine review pass over the diff** — findings minted as machine annotations targeting the PR IRI, the pass archived by `(repo, pr, headRefOid, review-tag)` so an unchanged head mints nothing; `reviewed_bytes`/`total_bytes` on the json face say how much of a big diff the model actually saw, and `debug=raw` returns the unparsed answer |
 
 **Resolution is the access model.** A `{repo}` that is not a configured root is
 a clean resolution *miss* (the grammar refuses to match; other mounted spaces
@@ -214,12 +214,22 @@ re-anchor or orphan exactly like human ones: the drift is the review-history
 story, kept visible. A finding whose quote does not anchor (the model
 misquoted) mints nothing and is counted (`orphaned_items`), never fatal; a
 pass in which nothing parses or nothing anchors is an error and is NOT
-archived (an empty pass must not poison a key that would never re-derive).
-The PR pass (`pr:{n}:review`, prompt `pr-review-v2`) tells the model to quote
+archived (an empty pass must not poison a key that would never re-derive) —
+the parse-failure error carries the raw answer's opening, and `debug=raw`
+re-sources the resource into the model's full **unparsed** answer (nothing
+minted, nothing archived) so a collapsed answer is inspectable live.
+The PR pass (`pr:{n}:review`, prompt `pr-review-v3`) tells the model to quote
 diff lines *including* their leading `+`/`-`/space marker AND anchors with
 the marker-tolerant diff discipline (see S2) — belt and suspenders: a model
 that ignores the instruction still anchors, and a marker-faithful quote
-anchors precisely.
+anchors precisely. Both review prompts (v2 file / v3 PR) restate the format
+contract *after* the content: on a big input, a contract stated only up top
+loses to the content and the model answers label-free (measured — the last
+words the model reads must be the format).
+Inputs larger than `max_prompt_bytes` (default 16 KiB) are truncated on the
+prompt side only — quotes anchor against the whole surface — and the pass
+says so honestly: `reviewed_bytes`/`total_bytes` on the json face and the
+archive entry, a `(input truncated)` notice on the text and html faces.
 Faces render the kinds distinguishably: hollow line markers (`○`,
 `browse-annotation-marker-machine`) against the solid human dot, a
 `review by {model}` identity line on machine cards

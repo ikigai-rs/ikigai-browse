@@ -54,7 +54,7 @@ use oxigraph::store::Store;
 
 use crate::annotate::{self, Included, CAP_ANNOTATE, PROV};
 use crate::explain::{
-    ik, iso8601, parse_iri, provider_label, resolve_model, truncate, CAP_NET, IK,
+    ik, iso8601, parse_iri, provider_label, resolve_model, truncate, truncated_len, CAP_NET, IK,
 };
 use crate::hash::hash_iri;
 use crate::{
@@ -66,7 +66,11 @@ use crate::{
 
 /// Version of the review prompt pair, folded into the archive key. A prompt
 /// edit bumps this; earlier passes stay recorded under their old tag.
-const REVIEW_PROMPT_VERSION: &str = "review-v1";
+/// v2: the format contract is RESTATED after the content — with a large
+/// input, a contract stated only up top loses to the content and the model
+/// answers label-free (the pr-review-v2 live failure: quote-and-commentary
+/// prose, zero `QUOTE:`/`NOTE:` lines, nothing parseable).
+const REVIEW_PROMPT_VERSION: &str = "review-v2";
 
 /// The reviewer persona. The centerpiece constraint: commentary a thoughtful
 /// colleague would leave — intent, tradeoffs, risks, and earned praise — not
@@ -90,6 +94,17 @@ const REVIEW_PROMPT: &str =
      Do not number the findings. Do not add headings, preamble, or closing \
      remarks. The QUOTE must appear verbatim in the file or the finding is \
      discarded.";
+
+/// The format contract again, appended AFTER the content: the last words the
+/// model reads must be the format, or a long file crowds the contract out of
+/// its answer (measured on qwen3-coder:30b — a 16 KiB prompt with the
+/// contract only up top yielded label-free findings; restated, 6/6 labeled).
+const REVIEW_REMINDER: &str =
+    "Now give the findings. Remember the format contract: each finding is \
+     exactly two lines - the first starts `QUOTE: ` followed by a short \
+     snippet copied character-for-character from one line of the file above, \
+     the second starts `NOTE: ` with your commentary. No headings, no \
+     numbering, nothing else.";
 
 // --- the archive entry (RDF in the shared store) ------------------------------
 
@@ -119,7 +134,42 @@ pub(crate) struct PassEntry {
     pub(crate) model: String,
     pub(crate) minted: Vec<String>,
     pub(crate) orphaned_items: u64,
+    /// How much of the input the model actually saw vs. its full size —
+    /// honest reporting for big inputs (`max_prompt_bytes` truncates what is
+    /// fed; quotes still anchor against everything). `None` on entries
+    /// archived before these fields existed.
+    pub(crate) reviewed_bytes: Option<u64>,
+    pub(crate) total_bytes: Option<u64>,
     pub(crate) derived_at: Option<String>,
+}
+
+impl PassEntry {
+    /// The truncation notice the plain and html faces append when the model
+    /// saw less than the whole input — silence would misrepresent the pass.
+    pub(crate) fn truncation_note(&self) -> Option<String> {
+        match (self.reviewed_bytes, self.total_bytes) {
+            (Some(reviewed), Some(total)) if reviewed < total => Some(format!(
+                " · reviewed {reviewed} of {total} bytes (input truncated)"
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// A one-line, length-capped excerpt of a raw model answer — carried by the
+/// parse-failure errors so a collapsed answer is diagnosable from the error
+/// itself (the full answer is one `debug=raw` re-source away).
+pub(crate) fn answer_excerpt(answer: &str) -> String {
+    const MAX_BYTES: usize = 240;
+    let flat = answer.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.len() <= MAX_BYTES {
+        return flat;
+    }
+    let mut end = MAX_BYTES;
+    while end > 0 && !flat.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &flat[..end])
 }
 
 pub(crate) fn pass_iri(repo: &str, rel: &str, hash: &str, tag: &str) -> String {
@@ -186,6 +236,19 @@ pub(crate) fn store_pass(store: &Store, entry: &PassEntry) -> Result<()> {
             g.clone(),
         ),
     ];
+    for (term, value) in [
+        ("reviewedBytes", entry.reviewed_bytes),
+        ("totalBytes", entry.total_bytes),
+    ] {
+        if let Some(value) = value {
+            quads.push(Quad::new(
+                subject.clone(),
+                ik(term),
+                Literal::new_typed_literal(value.to_string(), xsd::NON_NEGATIVE_INTEGER),
+                g.clone(),
+            ));
+        }
+    }
     for iri in &entry.minted {
         quads.push(Quad::new(
             subject.clone(),
@@ -225,6 +288,8 @@ pub(crate) fn load_pass(store: &Store, iri: &str) -> Result<Option<PassEntry>> {
         model: String::new(),
         minted: Vec::new(),
         orphaned_items: 0,
+        reviewed_bytes: None,
+        total_bytes: None,
         derived_at: None,
     };
     let mut found = false;
@@ -246,6 +311,12 @@ pub(crate) fn load_pass(store: &Store, iri: &str) -> Result<Option<PassEntry>> {
             Some("model") => entry.model = literal(&quad.object),
             Some("orphanedItems") => {
                 entry.orphaned_items = literal(&quad.object).parse().unwrap_or(0);
+            }
+            Some("reviewedBytes") => {
+                entry.reviewed_bytes = literal(&quad.object).parse().ok();
+            }
+            Some("totalBytes") => {
+                entry.total_bytes = literal(&quad.object).parse().ok();
             }
             Some("derivedAt") => entry.derived_at = Some(literal(&quad.object)),
             _ => match predicate {
@@ -391,17 +462,34 @@ impl Endpoint for ReviewEndpoint {
         };
         let tag = format!("{REVIEW_PROMPT_VERSION}@{model}");
 
+        // `debug=raw` is the diagnosis face: derive one fresh answer and
+        // return it UNPARSED — nothing minted, nothing archived, the archive
+        // neither consulted nor written (a probe must never poison a key).
+        let debug_raw = match inv.inline_str("debug") {
+            Ok("raw") => true,
+            Ok(other) => {
+                return Err(Error::InvalidArgument {
+                    name: "debug".to_string(),
+                    detail: format!("unknown debug face `{other}` (the one face is `raw`)"),
+                })
+            }
+            Err(_) => false,
+        };
+
         let iri = pass_iri(repo, &rel, &hash, &tag);
-        if let Some(entry) = load_pass(&config.store, &iri)? {
-            // The hit path: mints NOTHING. The recorded annotations are
-            // drift-reconciled against the very content in hand.
-            let included = annotate::included_for_ids(&config.store, &entry.minted, &text)?;
-            return face(inv, repo, &rel, &entry, false, &included);
+        if !debug_raw {
+            if let Some(entry) = load_pass(&config.store, &iri)? {
+                // The hit path: mints NOTHING. The recorded annotations are
+                // drift-reconciled against the very content in hand.
+                let included = annotate::included_for_ids(&config.store, &entry.minted, &text)?;
+                return face(inv, repo, &rel, &entry, false, &included);
+            }
         }
 
         // Miss: derive one pass. Ask, parse, anchor, mint, archive.
         let prompt = format!(
-            "{REVIEW_PROMPT}\n\nRepository: {repo}\nPath: {rel}\n\n```\n{}\n```",
+            "{REVIEW_PROMPT}\n\nRepository: {repo}\nPath: {rel}\n\n```\n{}\n```\n\n\
+             {REVIEW_REMINDER}",
             truncate(&text, config.max_prompt_bytes),
         );
         let request = Request::new(Verb::Source, parse_iri(&config.review_provider)?)
@@ -420,15 +508,23 @@ impl Endpoint for ReviewEndpoint {
             );
         let answer = inv.issue(request).await?;
         let answer = String::from_utf8_lossy(&answer.bytes).to_string();
+        if debug_raw {
+            return Ok(repr_utf8("text/plain", answer));
+        }
         let (findings, malformed) = parse_findings(&answer);
         if findings.is_empty() {
             // Nothing parseable at all IS a failure — erroring (and archiving
             // nothing) keeps the key re-derivable instead of poisoning it
-            // with an empty pass.
+            // with an empty pass. The error carries the answer's opening so
+            // the collapse is diagnosable (a label-free format, a refusal, an
+            // empty ceiling-starved reply all read differently).
             return Err(Error::Endpoint(format!(
                 "browse: `{}` returned no parseable QUOTE:/NOTE: findings for `{rel}` \
-                 (max_tokens {} — thinking models may need a higher ceiling); nothing archived",
-                config.review_provider, config.review_max_tokens
+                 (max_tokens {}); nothing archived. The answer began: \"{}\" — re-source \
+                 with debug=raw for the full unparsed answer",
+                config.review_provider,
+                config.review_max_tokens,
+                answer_excerpt(&answer)
             )));
         }
 
@@ -475,6 +571,8 @@ impl Endpoint for ReviewEndpoint {
             model,
             minted,
             orphaned_items,
+            reviewed_bytes: Some(truncated_len(&text, config.max_prompt_bytes) as u64),
+            total_bytes: Some(text.len() as u64),
             derived_at: created,
         };
         store_pass(&config.store, &entry)?;
@@ -511,6 +609,8 @@ fn face(
                 "derived": derived,
                 "minted": entry.minted,
                 "orphaned_items": entry.orphaned_items,
+                "reviewed_bytes": entry.reviewed_bytes,
+                "total_bytes": entry.total_bytes,
                 "derived_at": entry.derived_at,
                 "annotations": included.json(),
             });
@@ -533,6 +633,9 @@ fn face(
                     " · {} item(s) did not anchor",
                     entry.orphaned_items
                 ));
+            }
+            if let Some(note) = entry.truncation_note() {
+                out.push_str(&note);
             }
             out.push('\n');
             out.push_str(&included.margin_text());
@@ -579,6 +682,9 @@ fn review_html(
             entry.orphaned_items
         ));
     }
+    if let Some(note) = entry.truncation_note() {
+        provenance.push_str(&esc(&note));
+    }
     out.push_str(&format!(
         "<p class=\"browse-provenance\">{provenance}</p></div>"
     ));
@@ -602,6 +708,14 @@ pub(crate) fn pass_turtle(entry: &PassEntry) -> String {
             entry.orphaned_items
         ),
     ];
+    for (term, value) in [
+        ("reviewedBytes", entry.reviewed_bytes),
+        ("totalBytes", entry.total_bytes),
+    ] {
+        if let Some(value) = value {
+            props.push(format!("ik:{term} \"{value}\"^^xsd:nonNegativeInteger"));
+        }
+    }
     if !entry.minted.is_empty() {
         let refs: Vec<String> = entry.minted.iter().map(|iri| format!("<{iri}>")).collect();
         props.push(format!("prov:generated {}", refs.join(", ")));
@@ -652,6 +766,15 @@ fn review_description() -> Description {
                 .summary("the face to render")
                 .one_of(["text/plain", "application/json", "text/html", "text/turtle"])
                 .default_value("text/plain"),
+        )
+        .input(
+            ArgSpec::new("debug")
+                .optional()
+                .summary(
+                    "raw: derive and return the model's unparsed answer (text/plain) — \
+                     nothing parsed, minted, or archived; the parse-failure diagnosis face",
+                )
+                .one_of(["raw"]),
         )
         .output("text/plain;charset=utf-8")
         .output("application/json")
@@ -790,9 +913,12 @@ mod tests {
 
         let first = json(&k, "urn:repo:demo:review:a.rs", &[]);
         assert_eq!(first["derived"], true);
-        assert_eq!(first["version_tag"], "review-v1@r1");
+        assert_eq!(first["version_tag"], "review-v2@r1");
         assert_eq!(first["model"], "r1");
         assert_eq!(first["orphaned_items"], 0);
+        // Nothing was truncated, and the face says exactly what was seen.
+        assert_eq!(first["reviewed_bytes"], CONTENT.len());
+        assert_eq!(first["total_bytes"], CONTENT.len());
         assert_eq!(first["minted"].as_array().unwrap().len(), 2);
         assert_eq!(first["annotations"].as_array().unwrap().len(), 2);
         assert_eq!(log.count(), 1);
@@ -815,10 +941,16 @@ mod tests {
         let listing = json(&k, "urn:repo:demo:annotations:a.rs", &[]);
         assert_eq!(listing.as_array().unwrap().len(), 2, "mint-once");
 
-        // The prompt fed the model the file and the format contract.
+        // The prompt fed the model the file and the format contract — and the
+        // contract is RESTATED after the content (long inputs crowd a
+        // top-only contract out of the answer).
         let (prompt, system, max_tokens) = log.last();
         assert!(prompt.contains("QUOTE:"), "{prompt}");
         assert!(prompt.contains("fn beta()"), "{prompt}");
+        assert!(
+            prompt.rfind("format contract").unwrap() > prompt.rfind("fn gamma()").unwrap(),
+            "the reminder must follow the content: {prompt}"
+        );
         assert!(system.contains("reviewing a colleague's file"), "{system}");
         assert_eq!(max_tokens, "800");
         std::fs::remove_dir_all(&root).ok();
@@ -927,10 +1059,17 @@ mod tests {
         let store = Arc::new(Store::new().unwrap());
         let log = Arc::new(Log::default());
 
-        // Nothing parseable at all: error, nothing archived, retry re-asks.
+        // Nothing parseable at all: error, nothing archived, retry re-asks —
+        // and the error CARRIES the answer's opening plus the debug=raw
+        // affordance (the collapse must be diagnosable from the error).
         let k = kernel_with(&root, &store, &log, "I think this file is nice overall.");
         let err = issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).unwrap_err();
         assert!(format!("{err:?}").contains("no parseable"), "{err:?}");
+        assert!(
+            format!("{err:?}").contains("I think this file is nice overall."),
+            "{err:?}"
+        );
+        assert!(format!("{err:?}").contains("debug=raw"), "{err:?}");
         let err = issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).unwrap_err();
         assert!(format!("{err:?}").contains("no parseable"), "{err:?}");
         assert_eq!(log.count(), 2, "an unarchived pass re-derives");
@@ -1050,9 +1189,16 @@ mod tests {
         assert!(ttl.contains("a ik:Review"), "{ttl}");
         assert!(ttl.contains("prov:used <urn:repo:demo:file:a.rs>"), "{ttl}");
         assert!(ttl.contains("prov:generated <urn:annotation:"), "{ttl}");
-        assert!(ttl.contains("ik:versionTag \"review-v1@r1\""), "{ttl}");
+        assert!(ttl.contains("ik:versionTag \"review-v2@r1\""), "{ttl}");
         assert!(
             ttl.contains("ik:orphanedItems \"0\"^^xsd:nonNegativeInteger"),
+            "{ttl}"
+        );
+        assert!(
+            ttl.contains(&format!(
+                "ik:totalBytes \"{}\"^^xsd:nonNegativeInteger",
+                CONTENT.len()
+            )),
             "{ttl}"
         );
 
@@ -1123,7 +1269,106 @@ mod tests {
         // No `repo` ArgSpec: rows fix the root; the binding is
         // grammar-injected.
         let names: Vec<&str> = description.inputs.iter().map(|i| i.name.as_str()).collect();
-        assert_eq!(names, ["path", "as"]);
+        assert_eq!(names, ["path", "as", "debug"]);
+    }
+
+    #[test]
+    fn debug_raw_returns_the_unparsed_answer_and_touches_nothing() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, TWO_FINDINGS);
+
+        // An archived pass first — the probe must bypass it, not serve it.
+        issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).unwrap();
+        assert_eq!(log.count(), 1);
+
+        let raw = issue(
+            &k,
+            Verb::Source,
+            "urn:repo:demo:review:a.rs",
+            &[("debug", "raw")],
+            &cap(),
+        )
+        .unwrap();
+        assert_eq!(raw.repr_type.media_type, "text/plain");
+        assert_eq!(body(&raw), TWO_FINDINGS, "the answer verbatim, unparsed");
+        assert_eq!(log.count(), 2, "a fresh ask, not the archive hit");
+        // Nothing new minted by the probe.
+        let listing = json(&k, "urn:repo:demo:annotations:a.rs", &[]);
+        assert_eq!(listing.as_array().unwrap().len(), 2);
+
+        // The probe works where the normal pass FAILS — the whole point.
+        let store2 = Arc::new(Store::new().unwrap());
+        let log2 = Arc::new(Log::default());
+        let k2 = kernel_with(&root, &store2, &log2, "label-free musings about the file");
+        let raw = issue(
+            &k2,
+            Verb::Source,
+            "urn:repo:demo:review:a.rs",
+            &[("debug", "raw")],
+            &cap(),
+        )
+        .unwrap();
+        assert_eq!(body(&raw), "label-free musings about the file");
+        let listing = json(&k2, "urn:repo:demo:annotations:a.rs", &[]);
+        assert_eq!(listing.as_array().unwrap().len(), 0, "nothing minted");
+
+        // An unknown debug face is a typed argument error, no ask spent.
+        let err = issue(
+            &k2,
+            Verb::Source,
+            "urn:repo:demo:review:a.rs",
+            &[("debug", "verbose")],
+            &cap(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument { .. }), "{err:?}");
+        assert_eq!(log2.count(), 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_truncated_input_is_reported_honestly() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        // A ceiling below the file size: the model sees a prefix, the quotes
+        // still anchor against the WHOLE file, and every face says how much
+        // was actually reviewed.
+        let cfg = ExplainConfig::new(Arc::clone(&store))
+            .review_model_label("r1")
+            .max_prompt_bytes(20);
+        let browse = crate::space_with_explain(vec![("demo".to_string(), root.clone())], cfg);
+        let k = Kernel::new(Arc::new(Fallback::new(vec![
+            Arc::new(browse),
+            Arc::new(llm_space(&log, TWO_FINDINGS)),
+        ])));
+
+        let pass = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(pass["reviewed_bytes"], 20);
+        assert_eq!(pass["total_bytes"], CONTENT.len());
+        // `fn beta() {}` lies past the 20-byte window yet anchors: the anchor
+        // surface is the full text, only the prompt is truncated.
+        assert_eq!(pass["minted"].as_array().unwrap().len(), 2);
+        let (prompt, _, _) = log.last();
+        assert!(prompt.contains("… (content truncated)"), "{prompt}");
+
+        // The archive hit serves the same honest numbers, and the plain face
+        // names the truncation.
+        let hit = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(hit["derived"], false);
+        assert_eq!(hit["reviewed_bytes"], 20);
+        let text =
+            body(&issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).unwrap());
+        assert!(
+            text.contains(&format!(
+                "reviewed 20 of {} bytes (input truncated)",
+                CONTENT.len()
+            )),
+            "{text}"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
