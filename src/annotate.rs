@@ -96,6 +96,19 @@ pub const CAP_ANNOTATE: &str = "urn:cap:annotate";
 
 const OA: &str = "http://www.w3.org/ns/oa#";
 const DCTERMS_CREATED: &str = "http://purl.org/dc/terms/created";
+/// Machine provenance (S4, the review layer) — all STANDARD terms, no vocab
+/// publish needed: `dcterms:creator` carries the model identity on
+/// machine-minted annotations, `oa:motivatedBy` distinguishes the review's
+/// `oa:assessing` from the human `oa:commenting`, and `prov:wasGeneratedBy`
+/// links a machine annotation back to the review pass that minted it.
+const DCTERMS_CREATOR: &str = "http://purl.org/dc/terms/creator";
+pub(crate) const PROV: &str = "http://www.w3.org/ns/prov#";
+const PROV_WAS_GENERATED_BY: &str = "http://www.w3.org/ns/prov#wasGeneratedBy";
+
+/// The `oa:motivatedBy` value the human Sink stamps.
+const MOTIVATION_HUMAN: &str = "commenting";
+/// The `oa:motivatedBy` value the review pass stamps.
+const MOTIVATION_REVIEW: &str = "assessing";
 
 /// How much context the stored quote selector carries on each side of the
 /// exact quote (characters). Part of the re-anchoring contract.
@@ -187,11 +200,26 @@ struct Annotation {
     created: Option<String>,
     reanchored: bool,
     orphaned: bool,
+    /// `dcterms:creator` — the model identity on machine-minted annotations.
+    /// `Some` IS the machine/human discriminator: human annotations never
+    /// carry a creator (v1 is single-user; the passkey→workspace arc will add
+    /// human authorship on a different axis).
+    creator: Option<String>,
+    /// `oa:motivatedBy` (the short term: `commenting` / `assessing`). Absent
+    /// on pre-S4 stores — read compatibility, never a discriminator.
+    motivation: Option<String>,
+    /// `prov:wasGeneratedBy` — the review pass entry that minted this
+    /// annotation (machine annotations only).
+    generated_by: Option<String>,
 }
 
 impl Annotation {
     fn iri(&self) -> String {
         annotation_iri(&self.id)
+    }
+
+    fn machine(&self) -> bool {
+        self.creator.is_some()
     }
 }
 
@@ -302,9 +330,33 @@ fn store_annotation(store: &Store, ann: &Annotation) -> Result<()> {
     }
     if ann.orphaned {
         quads.push(Quad::new(
-            subject,
+            subject.clone(),
             ik("orphaned"),
             Literal::new_typed_literal("true", xsd::BOOLEAN),
+            g.clone(),
+        ));
+    }
+    if let Some(motivation) = &ann.motivation {
+        quads.push(Quad::new(
+            subject.clone(),
+            oa("motivatedBy"),
+            oa(motivation),
+            g.clone(),
+        ));
+    }
+    if let Some(creator) = &ann.creator {
+        quads.push(Quad::new(
+            subject.clone(),
+            NamedNode::new(DCTERMS_CREATOR).map_err(store_err)?,
+            Literal::new_simple_literal(creator),
+            g.clone(),
+        ));
+    }
+    if let Some(pass) = &ann.generated_by {
+        quads.push(Quad::new(
+            subject,
+            NamedNode::new(PROV_WAS_GENERATED_BY).map_err(store_err)?,
+            NamedNode::new(pass).map_err(store_err)?,
             g,
         ));
     }
@@ -354,6 +406,9 @@ fn load_annotation(store: &Store, id: &str) -> Result<Option<Annotation>> {
         created: None,
         reanchored: false,
         orphaned: false,
+        creator: None,
+        motivation: None,
+        generated_by: None,
     };
     let literal = |term: &Term| match term {
         Term::Literal(l) => l.value().to_string(),
@@ -368,9 +423,19 @@ fn load_annotation(store: &Store, id: &str) -> Result<Option<Annotation>> {
         let quad = quad.map_err(store_err)?;
         let predicate = quad.predicate.as_str();
         if let Some(term) = predicate.strip_prefix(OA) {
-            if term == "bodyValue" {
-                ann.body = literal(&quad.object);
-                found = true;
+            match term {
+                "bodyValue" => {
+                    ann.body = literal(&quad.object);
+                    found = true;
+                }
+                "motivatedBy" => {
+                    if let Term::NamedNode(node) = &quad.object {
+                        if let Some(short) = node.as_str().strip_prefix(OA) {
+                            ann.motivation = Some(short.to_string());
+                        }
+                    }
+                }
+                _ => {}
             }
         } else if let Some(term) = predicate.strip_prefix(IK) {
             match term {
@@ -397,6 +462,12 @@ fn load_annotation(store: &Store, id: &str) -> Result<Option<Annotation>> {
             }
         } else if predicate == DCTERMS_CREATED {
             ann.created = Some(literal(&quad.object));
+        } else if predicate == DCTERMS_CREATOR {
+            ann.creator = Some(literal(&quad.object));
+        } else if predicate == PROV_WAS_GENERATED_BY {
+            if let Term::NamedNode(node) = &quad.object {
+                ann.generated_by = Some(node.as_str().to_string());
+            }
         }
     }
     if !found {
@@ -691,6 +762,9 @@ impl Included {
                 out.push_str("[orphaned] ");
             } else if ann.reanchored {
                 out.push_str("[re-anchored] ");
+            }
+            if let Some(creator) = &ann.creator {
+                out.push_str(&format!("[review:{creator}] "));
             }
             out.push_str(&format!(
                 "\"{}\" -- {}",
@@ -989,6 +1063,13 @@ impl AnnotationEndpoint {
             created,
             reanchored: false,
             orphaned: false,
+            // The human Sink: oa:commenting, no creator (the machine
+            // discriminator), no generating pass. An update of a
+            // machine-minted id rewrites it as human commentary — the words
+            // are no longer the model's.
+            creator: None,
+            motivation: Some(MOTIVATION_HUMAN.to_string()),
+            generated_by: None,
         };
         rewrite_annotation(&self.store, &ann)?;
         match inv.inline_str("as").unwrap_or("text/plain") {
@@ -1217,6 +1298,10 @@ fn annotation_json(ann: &Annotation, line: Option<u64>) -> serde_json::Value {
         "created": ann.created,
         "reanchored": ann.reanchored,
         "orphaned": ann.orphaned,
+        "machine": ann.machine(),
+        "creator": ann.creator,
+        "motivation": ann.motivation,
+        "generated_by": ann.generated_by,
     })
 }
 
@@ -1244,6 +1329,15 @@ fn annotation_turtle(ann: &Annotation) -> String {
     }
     if ann.orphaned {
         props.push("ik:orphaned true".to_string());
+    }
+    if let Some(motivation) = &ann.motivation {
+        props.push(format!("oa:motivatedBy oa:{motivation}"));
+    }
+    if let Some(creator) = &ann.creator {
+        props.push(format!("dcterms:creator {}", ttl_str(creator)));
+    }
+    if let Some(pass) = &ann.generated_by {
+        props.push(format!("prov:wasGeneratedBy <{pass}>"));
     }
     let mut out = format!("<{}> {} .\n", ann.iri(), props.join(" ;\n    "));
 
@@ -1275,7 +1369,7 @@ fn annotation_turtle(ann: &Annotation) -> String {
 fn annotation_turtle_document(anns: &[Annotation]) -> String {
     let mut out = format!(
         "@prefix oa: <{OA}> .\n@prefix ik: <{IK}> .\n@prefix dcterms: <http://purl.org/dc/terms/> \
-         .\n@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n"
+         .\n@prefix prov: <{PROV}> .\n@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n"
     );
     for ann in anns {
         out.push('\n');
@@ -1294,6 +1388,23 @@ fn annotation_card_html(ann: &Annotation, line: Option<u64>, show_path: bool) ->
     } else {
         ""
     };
+    // Machine cards are visibly machine: the class hook plus the model
+    // identity, so review commentary is never mistaken for a human note.
+    let machine_class = if ann.machine() {
+        " browse-annotation-machine"
+    } else {
+        ""
+    };
+    let model = ann
+        .creator
+        .as_deref()
+        .map(|creator| {
+            format!(
+                "<span class=\"browse-annotation-model\">review by {}</span> ",
+                esc(creator)
+            )
+        })
+        .unwrap_or_default();
     let path = if show_path {
         format!(
             "<span class=\"browse-annotation-path\">{}</span> ",
@@ -1316,7 +1427,8 @@ fn annotation_card_html(ann: &Annotation, line: Option<u64>, show_path: bool) ->
         flags.push_str("<span class=\"browse-annotation-flag\">re-anchored</span>");
     }
     format!(
-        "<div class=\"browse-annotation{orphan_class}\" id=\"annotation-{id}\">{path}{anchor}\
+        "<div class=\"browse-annotation{orphan_class}{machine_class}\" \
+         id=\"annotation-{id}\">{path}{anchor}{model}\
          <blockquote class=\"browse-annotation-quote\">{exact}</blockquote>\
          <p class=\"browse-annotation-body\">{body}</p>{flags}</div>",
         id = esc(&ann.id),
@@ -1377,6 +1489,9 @@ fn annotations_listing_html(repo: &str, rel: &str, rows: &[(Annotation, Option<u
 pub(crate) struct Marker {
     pub(crate) id: String,
     pub(crate) note: String,
+    /// Machine-minted (review) markers render hollow (`○`) against the solid
+    /// human dot (`●`) — the two kinds are distinguishable at the line.
+    pub(crate) machine: bool,
 }
 
 /// The file face's overlay (called from the S0 HTML view when a store is
@@ -1401,10 +1516,86 @@ pub(crate) fn file_overlay(
         marked.entry(*line).or_default().push(Marker {
             id: ann.id.clone(),
             note: clip_to(&collapse(&ann.body), 160),
+            machine: ann.machine(),
         });
     }
     let panel = annotations_panel_html(&file_iri(repo, rel), &rows);
     Ok((marked, panel))
+}
+
+// --- the review layer's mint (S4) -------------------------------------------
+
+/// Mint one MACHINE annotation — the review pass's finding, stored through the
+/// same machinery as a human note and distinguished only by provenance:
+/// `dcterms:creator` (the model identity), `oa:motivatedBy oa:assessing`, and
+/// `prov:wasGeneratedBy` (the pass entry). Anchors `exact` in `text` (already
+/// in hand — the pass sourced it) with no context hints: the model was told to
+/// pick distinctive quotes, and the deterministic first-occurrence rule covers
+/// the rest. Returns the minted IRI, or `None` when the quote does not anchor
+/// — the caller counts it and moves on (one bad item must not kill the pass).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mint_review_annotation(
+    store: &Store,
+    repo: &str,
+    rel: &str,
+    text: &str,
+    hash: &str,
+    exact: &str,
+    note: &str,
+    model: &str,
+    pass_iri: &str,
+    created: Option<String>,
+) -> Result<Option<String>> {
+    let Some(anchor) = find_anchor(text, exact, "", "") else {
+        return Ok(None);
+    };
+    let (prefix, suffix) = context_around(text, &anchor);
+    let ann = Annotation {
+        id: uuid::Uuid::new_v4().to_string(),
+        body: note.to_string(),
+        target_iri: file_iri(repo, rel),
+        repo: repo.to_string(),
+        rel: rel.to_string(),
+        hash: hash.to_string(),
+        prefix,
+        exact: exact.to_string(),
+        suffix,
+        start: anchor.char_start,
+        end: anchor.char_end,
+        created,
+        reanchored: false,
+        orphaned: false,
+        creator: Some(model.to_string()),
+        motivation: Some(MOTIVATION_REVIEW.to_string()),
+        generated_by: Some(pass_iri.to_string()),
+    };
+    store_annotation(store, &ann)?;
+    Ok(Some(ann.iri()))
+}
+
+/// The named annotations (a review pass's minted set), drift-reconciled
+/// against content already in hand — the review faces' rows. Ids that no
+/// longer load (someone deleted the annotation) are skipped: the pass entry
+/// records history, the store records the present. Same [`Included`] the
+/// `annotations=include` folds serve, so the faces are shared.
+pub(crate) fn included_for_ids(store: &Store, iris: &[String], text: &str) -> Result<Included> {
+    let current = CurrentContent::Text(text.to_string(), hash_bytes(text.as_bytes()));
+    let mut rows: Vec<(Annotation, Option<u64>)> = Vec::with_capacity(iris.len());
+    for iri in iris {
+        let Some(id) = iri.strip_prefix("urn:annotation:") else {
+            continue;
+        };
+        let Some(mut ann) = load_annotation(store, id)? else {
+            continue;
+        };
+        let line = refresh(store, &mut ann, &current)?;
+        rows.push((ann, line));
+    }
+    rows.sort_by(|(a, _), (b, _)| (a.start, &a.id).cmp(&(b.start, &b.id)));
+    Ok(Included {
+        rows,
+        with_paths: false,
+    })
 }
 
 // --- tests ------------------------------------------------------------------
