@@ -1548,6 +1548,102 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// The acceptance IS the manifold: every browse family must reach
+    /// `select_actions` under an authorizing capability, as per-configured-root
+    /// rows, and every templated row must survive the catalog's
+    /// probe-expansion (core expands each `{var}` with a placeholder and the
+    /// expansion must match the very grammar that owns the row). This is what
+    /// 0.2.2 failed: `{repo}`-templated grammars probe-expanded to
+    /// `urn:repo:probe:…`, which no configured-root grammar matches, so browse
+    /// rows never reached ANY manifold.
+    #[test]
+    fn the_manifold_offers_per_root_rows_that_survive_probe_expansion() {
+        use ikigai_core::ActionQuery;
+        let root = demo_root();
+        let store = Arc::new(oxigraph::store::Store::new().unwrap());
+        let k = Kernel::new(Arc::new(crate::space_with_explain(
+            vec![("demo".to_string(), root.clone())],
+            crate::ExplainConfig::new(store),
+        )));
+        // browse grant + a net grant (explain declares urn:cap:net:* too).
+        let cap = Capability::scoped(["urn:cap:browse:read:demo", "urn:cap:net:localhost"]);
+        let query = ActionQuery {
+            capability: Some(&cap),
+            ..Default::default()
+        };
+        let offered: BTreeSet<String> = k
+            .select_actions(&query)
+            .into_iter()
+            .map(|m| m.endpoint)
+            .collect();
+        for row in [
+            "urn:repo:demo:tree",
+            "urn:repo:demo:tree:{path}",
+            "urn:repo:demo:file:{path}",
+            "urn:repo:demo:state",
+            "urn:repo:demo:hash",
+            "urn:repo:demo:hash:{path}",
+            "urn:repo:demo:explain",
+            "urn:repo:demo:explain:{path}",
+            "urn:repo:demo:explain-versions",
+            "urn:repo:demo:explain-versions:{path}",
+            "urn:repo:demo:annotations",
+            "urn:repo:demo:annotations:{path}",
+            "urn:annotation:{id}",
+        ] {
+            assert!(
+                offered.contains(row),
+                "manifold is missing `{row}`; offered: {offered:#?}"
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// What the capability grammar supports at SELECTION time: the browse
+    /// actions declare the wildcard offering (`urn:cap:browse:read:*` = "holds
+    /// some grant under this prefix"), and the description is per-endpoint —
+    /// shared by every root's rows — so a single-root grant is offered ALL
+    /// roots' rows. Root scoping is enforced at invoke time (`granted`), not
+    /// narrowed per row at selection; a capability with no browse grant at all
+    /// sees nothing. Pinned here so the residual over-offer is a documented
+    /// fact, not an accident.
+    #[test]
+    fn selection_offers_wildcard_wide_and_enforcement_scopes_per_root() {
+        use ikigai_core::ActionQuery;
+        let a = demo_root();
+        let b = demo_root();
+        let k = Kernel::new(Arc::new(space(vec![
+            ("alpha".to_string(), a.clone()),
+            ("beta".to_string(), b.clone()),
+        ])));
+        let offered = |cap: &Capability| -> BTreeSet<String> {
+            let query = ActionQuery {
+                capability: Some(cap),
+                ..Default::default()
+            };
+            k.select_actions(&query)
+                .into_iter()
+                .map(|m| m.endpoint)
+                .collect()
+        };
+        // A single-root grant satisfies the wildcard offering, so BOTH roots'
+        // rows are offered (invoking beta is still Denied — enforcement is the
+        // authority, selection its pre-flight).
+        let alpha_only = Capability::scoped(["urn:cap:browse:read:alpha"]);
+        let rows = offered(&alpha_only);
+        assert!(rows.contains("urn:repo:alpha:tree"), "{rows:#?}");
+        assert!(rows.contains("urn:repo:beta:tree"), "{rows:#?}");
+        // No browse grant ⇒ no browse rows at all.
+        let unrelated = Capability::scoped(["urn:cap:unrelated"]);
+        assert!(
+            offered(&unrelated).iter().all(|r| !r.starts_with("urn:repo:")),
+            "{:#?}",
+            offered(&unrelated)
+        );
+        std::fs::remove_dir_all(&a).ok();
+        std::fs::remove_dir_all(&b).ok();
+    }
+
     #[test]
     fn reads_are_uncacheable_live_facts() {
         let root = demo_root();
