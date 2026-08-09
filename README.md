@@ -16,7 +16,7 @@ pairs), and each root answers three resource families:
 | `urn:annotation[:{id}]` | a **W3C Web Annotation** (S2) on a file — Sink creates/updates (anchoring the quoted text; the bare `urn:annotation` mints a uuid id), Source reads with drift **re-anchoring**, Delete removes; faces: `text/plain` (the body), `as=application/json`, `as=text/turtle` |
 | `urn:repo:{repo}:annotations[:{path}]` | every annotation on one file (or the whole repo, path omitted) in reading order, drift-reconciled on each read; faces: `application/json` (default), `as=text/html` (panel fragment), `as=text/turtle` |
 | `urn:repo:{repo}:review:{path}` | the **machine review pass** (S4) — region-grain LLM commentary minted as real annotations (provenance-distinguished), the pass archived by `(path, content-hash, review-tag)` so re-sourcing unchanged content mints nothing; faces: `text/plain` (the margin digest), `as=application/json` (`{minted, orphaned_items, annotations, …}`), `as=text/html` (the card page), `as=text/turtle` (the pass's provenance graph) |
-| `urn:repo:{repo}:prs` | the root's **open pull requests** — ikigai-repo's `urn:repo:pr:list` facade resolved through the kernel with `dir=` the root's directory; `text/plain` (default) is `number`⇥`title`⇥`branch`⇥`updated` per line (empty = no open PRs), `as=application/json` the facade's structured rows, `as=text/html` the listing with each PR linking its page |
+| `urn:repo:{repo}:prs` | the root's **pull requests** — ikigai-repo's `urn:repo:pr:list` facade resolved through the kernel with `dir=` the root's directory; `state=` (`open`/`closed`/`merged`/`all`) and `limit=` forward to the facade (ikigai-repo ≥ 0.1.4 — omitted, the facade's defaults apply); `text/plain` (default) is `number`⇥`title`⇥`branch`⇥`updated`⇥`state` per line (empty = no matching PRs), `as=application/json` the facade's structured rows, `as=text/html` the listing with each PR linking its page (`chrome=embed` for the rows-only fragment other faces fold in) |
 | `urn:repo:{repo}:pr:{n}` | the **PR page** — metadata (`urn:repo:pr:view` json: author object, `headRefOid`) + the unified diff (`urn:repo:pr:diff`); the DIFF TEXT is an annotation surface (annotations target the PR IRI and quote diff lines, drifting like file annotations); `as=text/html` renders the highlighted, line-anchored diff with markers and the annotations panel; `annotations=include` folds the margin into the plain/json faces |
 | `urn:repo:{repo}:pr:{n}:explain` | a **review-shaped PR explanation** — what the change does and what a reviewer would look at — archived by `(repo, pr, headRefOid, version-tag)`: new commits derive fresh, prior entries stay addressable (`version=`) |
 | `urn:repo:{repo}:pr:{n}:review` | the **machine review pass over the diff** — findings minted as machine annotations targeting the PR IRI, the pass archived by `(repo, pr, headRefOid, review-tag)` so an unchanged head mints nothing |
@@ -107,7 +107,22 @@ milliseconds.
 The `text/html` faces are htmx **fragments**, not pages — ikigai-runbook's
 server-driven house style. Entries and breadcrumbs `hx-get`
 `/k/source <iri> as=text/html` into a `#browse` container the host provides;
-the host's adapter maps `/k/<command>` onto its engine. Highlighting uses
+the host's adapter maps `/k/<command>` onto its engine.
+
+**The host contract, in full.** Beyond `#browse` and the `/k/` adapter, every
+crumb strip opens with a **home affordance**: `<a class="browse-home-link"
+href="/">⌂</a>`. It is a plain anchor to the host's index — in ikigai-web `/`
+is the index so it works untouched; any other host either styles/rebinds
+`.browse-home-link` (its page, its rules — e.g. `hx-boost`, or rewriting the
+`href`) or ships it harmlessly unstyled. The PR pages carry a real ancestor
+trail (repo → `prs` → `#n` → `explain`/`review`), every ancestor a live crumb.
+The **root tree** additionally renders a lazy *recent pull requests* block
+(`browse-recent-prs`): a `div` with `hx-get="/k/source urn:repo:{repo}:prs
+state=all limit=10 chrome=embed as=text/html"` and `hx-trigger="load"`,
+swapping into itself. The tree face itself never consults the pr facades — it
+renders instantly, and when the facades are not mounted the lazy fetch answers
+the typed 404-with-guidance, which the host renders per its own error
+handling (a host that shows kernel errors inline needs nothing extra). Highlighting uses
 [two-face](https://crates.io/crates/two-face)'s extended syntax set (~100
 formats the stock syntect set misses — TOML, TypeScript, Dockerfile, …) under
 the pure-Rust fancy-regex engine, plus an embedded house Turtle/TriG
@@ -151,6 +166,23 @@ true`); quote gone → `ik:orphaned true`, still rendered and flagged, never
 silently dropped — and a later read that finds the quote again (an edit
 reverted) heals it. The store is only written when something changed.
 
+**Diff targets anchor marker-tolerantly.** A PR target's surface is its
+unified diff, and quotes — model or human — name the CODE, not the diff's
+leading `+`/`-`/space column. Anchoring against a diff therefore tries, in
+order, first hit wins: **(1)** the quote exactly as given, anywhere in the
+raw diff (context-scored — a marker-faithful quote anchors to its precise
+span); **(2)** the quote in the **marker-stripped shadow** of the diff (every
+line's leading marker removed — a quote of consecutive code lines matches
+across the interleaved markers); **(3)** the quote with its own single
+leading marker removed (a wrong or stale marker); **(4)** that stripped quote
+whitespace-trimmed (padded markers, dropped indentation). A stage-2/3/4 hit
+anchors the whole original diff line(s) and stores THAT original text as
+`oa:exact` — drift keeps comparing real diff content, never the stripped
+fiction the match was found through. The same discipline runs at Sink time,
+at review-mint time, and on every drift pass (so a `+` line that settles into
+context on a later head is followed, its stored exact rewritten to the new
+line).
+
 **Capabilities.** Per-verb `ActionSpec`s: Source requires
 `urn:cap:browse:read:*` (checked against the annotation's root, like every
 browse read); Sink and Delete require `urn:cap:annotate`; Sink also declares
@@ -183,6 +215,11 @@ story, kept visible. A finding whose quote does not anchor (the model
 misquoted) mints nothing and is counted (`orphaned_items`), never fatal; a
 pass in which nothing parses or nothing anchors is an error and is NOT
 archived (an empty pass must not poison a key that would never re-derive).
+The PR pass (`pr:{n}:review`, prompt `pr-review-v2`) tells the model to quote
+diff lines *including* their leading `+`/`-`/space marker AND anchors with
+the marker-tolerant diff discipline (see S2) — belt and suspenders: a model
+that ignores the instruction still anchors, and a marker-faithful quote
+anchors precisely.
 Faces render the kinds distinguishably: hollow line markers (`○`,
 `browse-annotation-marker-machine`) against the solid human dot, a
 `review by {model}` identity line on machine cards

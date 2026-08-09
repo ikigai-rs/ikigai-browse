@@ -57,8 +57,8 @@ use crate::explain::{
 };
 use crate::review::{load_pass, parse_findings, pass_iri, pass_turtle, store_pass, PassEntry};
 use crate::{
-    bind_family, crumbs_html, esc, granted, highlight_html, repo_root, repr, repr_utf8,
-    ExplainConfig, Roots, CAP_WILDCARD,
+    bind_family, esc, granted, highlight_html, repo_root, repr, repr_utf8, ExplainConfig, Roots,
+    CAP_WILDCARD,
 };
 
 // --- the facade contract (ikigai-repo ≥ 0.1.3) --------------------------------
@@ -83,7 +83,10 @@ const PR_PROMPT: &str = "Explain this pull request from its diff: what does this
      and what deserves the closest review attention.";
 
 /// Version of the PR review prompt pair, folded into the pass archive key.
-const PR_REVIEW_PROMPT_VERSION: &str = "pr-review-v1";
+/// v2: the QUOTE must include the line's leading diff marker (+/-/space) —
+/// v1 quotes routinely dropped it and nothing anchored (the diff-aware
+/// anchoring in [`crate::annotate`] is the other half of that fix).
+const PR_REVIEW_PROMPT_VERSION: &str = "pr-review-v2";
 /// The PR reviewer persona (the file pass's, retargeted at a diff).
 const PR_REVIEW_SYSTEM_PROMPT: &str =
     "You are an experienced engineer reviewing a colleague's pull request. \
@@ -98,12 +101,13 @@ const PR_REVIEW_SYSTEM_PROMPT: &str =
 /// finding anchors by its verbatim quote from the DIFF).
 const PR_REVIEW_PROMPT: &str = "Review this pull request's diff and give your 3 to 6 most useful \
      findings. Format each finding as exactly two lines and nothing else:\n\
-     QUOTE: <a short snippet copied character-for-character from one line of \
-     the diff - under 80 characters, distinctive enough to occur only once>\n\
+     QUOTE: <one line copied character-for-character from the diff, INCLUDING \
+     its leading '+', '-', or space column - under 80 characters, distinctive \
+     enough to occur only once>\n\
      NOTE: <one or two sentences of review commentary on that region>\n\
      Do not number the findings. Do not add headings, preamble, or closing \
-     remarks. The QUOTE must appear verbatim in the diff or the finding is \
-     discarded.";
+     remarks. The QUOTE must appear verbatim in the diff, leading diff marker \
+     and all, or the finding is discarded.";
 
 // --- IRIs ---------------------------------------------------------------------
 
@@ -124,6 +128,29 @@ fn pr_explain_iri(repo: &str, n: u64) -> String {
 /// entry's `ik:about` names the PR IRI either way).
 fn pr_rel(n: u64) -> String {
     format!("pr:{n}")
+}
+
+/// The PR family's breadcrumb trail — repo → prs → #n [→ layer] — built
+/// explicitly because a PR is not a directory path: every ancestor is a live
+/// crumb (the repo to its root tree, `prs` to the listing, `#n` to the PR
+/// page when a deeper layer is current), and the current segment is inert.
+fn pr_crumbs(repo: &str, n: Option<u64>, layer: Option<&str>) -> String {
+    let mut items = vec![
+        (repo.to_string(), Some(crate::tree_iri(repo, ""))),
+        ("prs".to_string(), Some(prs_iri(repo))),
+    ];
+    if let Some(n) = n {
+        items.push((format!("#{n}"), layer.is_some().then(|| pr_iri(repo, n))));
+    }
+    if let Some(layer) = layer {
+        items.push((layer.to_string(), None));
+    }
+    // The trail's last entry must be inert: with no PR number, `prs` itself
+    // is current.
+    if n.is_none() {
+        items.last_mut().expect("non-empty").1 = None;
+    }
+    crate::crumb_trail(&items)
 }
 
 // --- through the kernel -------------------------------------------------------
@@ -419,25 +446,35 @@ impl Endpoint for PrsEndpoint {
         }
         let (repo, root) = repo_root(inv, &self.roots)?;
         granted(inv, repo)?;
+        // The 0.1.4 facade args, forwarded ONLY when the caller supplied them
+        // — an older mounted facade never sees an argument it cannot answer,
+        // and the defaults stay the facade's own (state=open, no limit).
+        let mut args = vec![dir_arg(root)];
+        for name in ["state", "limit"] {
+            if let Ok(value) = inv.inline_str(name) {
+                args.push((name, value.to_string()));
+            }
+        }
         match inv.inline_str("as").unwrap_or("text/plain") {
             // The structured face is the facade's own `--json` export, passed
-            // through verbatim (number/title/headRefName/updatedAt rows).
+            // through verbatim (number/title/headRefName/updatedAt/state rows).
             t if t.starts_with("application/json") => {
-                facade(
-                    inv,
-                    FACADE_LIST,
-                    &[("as", "application/json".to_string()), dir_arg(root)],
-                )
-                .await
+                let mut args = args;
+                args.push(("as", "application/json".to_string()));
+                facade(inv, FACADE_LIST, &args).await
             }
             t if t.starts_with("text/html") => {
-                let listing = facade(inv, FACADE_LIST, &[dir_arg(root)]).await?;
+                let listing = facade(inv, FACADE_LIST, &args).await?;
                 let text = String::from_utf8_lossy(&listing.bytes).to_string();
-                Ok(repr_utf8("text/html", prs_html(repo, &text)))
+                // chrome=embed: the rows-only fragment another face folds in
+                // (the root tree's lazy recent-PRs block) — no crumbs, no
+                // wrapper, the embedding page already carries both.
+                let embed = inv.inline_str("chrome").is_ok_and(|c| c == "embed");
+                Ok(repr_utf8("text/html", prs_html(repo, &text, embed)))
             }
             // The default face is the facade's text contract, untouched:
-            // number⇥title⇥branch⇥updated per line, empty = no open PRs.
-            _ => facade(inv, FACADE_LIST, &[dir_arg(root)]).await,
+            // number⇥title⇥branch⇥updated[⇥state] per line, empty = no PRs.
+            _ => facade(inv, FACADE_LIST, &args).await,
         }
     }
 
@@ -454,21 +491,45 @@ impl Endpoint for PrsEndpoint {
 /// pattern (see `crate::bind_family`); the binding is grammar-injected.
 fn prs_description() -> Description {
     Description::new("browse-prs")
-        .title("Open pull requests of a browse root")
+        .title("Pull requests of a browse root")
         .summary(
-            "The open pull requests of a configured browse root — urn:repo:{repo}:prs, \
+            "The pull requests of a configured browse root — urn:repo:{repo}:prs, \
              resolved through the kernel from ikigai-repo's urn:repo:pr:list facade run \
              in the root's directory (the facades must be mounted in the composition and \
              enforce their own exec capability; unmounted, this answers a typed NotFound \
-             naming the gap). text/plain (default) is one number<TAB>title<TAB>branch\
-             <TAB>updated line per PR — an empty body means no open PRs, not an error; \
-             as=application/json passes the facade's structured rows through; \
-             as=text/html renders the listing with each PR linking its page \
-             (urn:repo:{repo}:pr:{n}). Live and uncacheable.",
+             naming the gap). state= and limit= forward to the facade (ikigai-repo >= \
+             0.1.4: state filtering plus recency sort; omitted, the facade's own \
+             defaults apply — open PRs, unlimited). text/plain (default) is one \
+             number<TAB>title<TAB>branch<TAB>updated<TAB>state line per PR — an empty \
+             body means no matching PRs, not an error; as=application/json passes the \
+             facade's structured rows through; as=text/html renders the listing with \
+             each PR linking its page (urn:repo:{repo}:pr:{n}) — chrome=embed serves \
+             the rows-only fragment for embedding (the root tree's lazy recent-PRs \
+             block). Live and uncacheable.",
         )
         .verb(Verb::Source)
         .verb(Verb::Meta)
         .requires(CAP_WILDCARD)
+        .input(
+            ArgSpec::new("state")
+                .optional()
+                .summary("filter by state, forwarded to the facade")
+                .one_of(["open", "closed", "merged", "all"])
+                .default_value("open"),
+        )
+        .input(
+            ArgSpec::new("limit")
+                .optional()
+                .class("http://www.w3.org/2001/XMLSchema#integer")
+                .summary("at most this many PRs, most recently updated first"),
+        )
+        .input(
+            ArgSpec::new("chrome")
+                .optional()
+                .summary("embed renders the html rows only (no crumbs/wrapper)")
+                .one_of(["full", "embed"])
+                .default_value("full"),
+        )
         .input(
             ArgSpec::new("as")
                 .optional()
@@ -481,9 +542,7 @@ fn prs_description() -> Description {
         .output("text/html;charset=utf-8")
 }
 
-fn prs_html(repo: &str, listing: &str) -> String {
-    let mut out = String::from("<div class=\"browse\">");
-    out.push_str(&crumbs_html(repo, "prs"));
+fn prs_html(repo: &str, listing: &str, embed: bool) -> String {
     let mut rows = String::new();
     for line in listing.lines() {
         let mut cols = line.split('\t');
@@ -495,9 +554,17 @@ fn prs_html(repo: &str, listing: &str) -> String {
         };
         let branch = cols.next().unwrap_or("");
         let updated = cols.next().unwrap_or("");
+        // The 0.1.4 text contract's fifth column; absent on an older facade,
+        // and an empty state simply renders no badge.
+        let state = cols.next().unwrap_or("");
+        let state_span = if state.is_empty() {
+            String::new()
+        } else {
+            format!(" <span class=\"browse-pr-state\">{}</span>", esc(state))
+        };
         rows.push_str(&format!(
             "<li><button class=\"browse-pr\" hx-get=\"/k/source {iri} as=text/html\" \
-             hx-target=\"#browse\" hx-swap=\"innerHTML\">#{n} {title}</button> \
+             hx-target=\"#browse\" hx-swap=\"innerHTML\">#{n} {title}</button>{state_span} \
              <span class=\"browse-pr-branch\">{branch}</span> \
              <span class=\"browse-pr-updated\">{updated}</span></li>",
             iri = pr_iri(repo, n),
@@ -506,11 +573,17 @@ fn prs_html(repo: &str, listing: &str) -> String {
             updated = esc(updated),
         ));
     }
-    if rows.is_empty() {
-        out.push_str("<p class=\"browse-prs-empty\">no open pull requests</p>");
+    let body = if rows.is_empty() {
+        "<p class=\"browse-prs-empty\">no pull requests</p>".to_string()
     } else {
-        out.push_str(&format!("<ul class=\"browse-prs\">{rows}</ul>"));
+        format!("<ul class=\"browse-prs\">{rows}</ul>")
+    };
+    if embed {
+        return body;
     }
+    let mut out = String::from("<div class=\"browse\">");
+    out.push_str(&pr_crumbs(repo, None, None));
+    out.push_str(&body);
     out.push_str("</div>");
     out
 }
@@ -695,7 +768,7 @@ fn pr_html(
     explain: bool,
 ) -> String {
     let mut out = String::from("<div class=\"browse\">");
-    out.push_str(&crumbs_html(repo, &format!("pr#{n}")));
+    out.push_str(&pr_crumbs(repo, Some(n), None));
     let mut actions = format!(
         "<button class=\"browse-view-link\" hx-get=\"/k/source {} as=text/html\" \
          hx-target=\"#browse\" hx-swap=\"innerHTML\">pull requests</button>",
@@ -834,7 +907,7 @@ fn pr_explain_face(
         )),
         t if t.starts_with("text/html") => {
             let mut out = String::from("<div class=\"browse\">");
-            out.push_str(&crumbs_html(repo, &format!("pr#{n}")));
+            out.push_str(&pr_crumbs(repo, Some(n), Some("explain")));
             out.push_str(&format!(
                 "<nav class=\"browse-actions\"><button class=\"browse-view-link\" \
                  hx-get=\"/k/source {} as=text/html\" hx-target=\"#browse\" \
@@ -989,6 +1062,7 @@ impl Endpoint for PrReviewEndpoint {
                 &model,
                 &iri,
                 created.clone(),
+                annotate::Surface::Diff,
             )? {
                 Some(annotation_iri) => minted.push(annotation_iri),
                 None => orphaned_items += 1,
@@ -1054,7 +1128,7 @@ fn pr_review_face(
         )),
         t if t.starts_with("text/html") => {
             let mut out = String::from("<div class=\"browse\">");
-            out.push_str(&crumbs_html(repo, &format!("pr#{n}")));
+            out.push_str(&pr_crumbs(repo, Some(n), Some("review")));
             out.push_str(&format!(
                 "<nav class=\"browse-actions\"><button class=\"browse-view-link\" \
                  hx-get=\"/k/source {} as=text/html\" hx-target=\"#browse\" \
@@ -1247,7 +1321,7 @@ mod tests {
                 Exact::new(iri),
                 FnEndpoint::new("fake-repo", move |inv: &Invocation<'_>| {
                     let mut args = BTreeMap::new();
-                    for name in ["pr", "dir", "as", "repo"] {
+                    for name in ["pr", "dir", "as", "repo", "state", "limit"] {
                         if let Ok(value) = inv.inline_str(name) {
                             args.insert(name.to_string(), value.to_string());
                         }
@@ -1417,16 +1491,63 @@ mod tests {
         assert!(html.contains("#7 Fix &lt;gamma&gt;"), "{html}");
         assert!(html.contains("feature/beta"), "{html}");
 
-        // No open PRs: empty text passthrough, a friendly html empty state.
+        // The 0.1.4 facade args are forwarded ONLY when supplied: the calls
+        // above carried neither, this one carries both — and the fifth
+        // (state) column renders as a badge.
+        assert!(!calls[0].contains_key("state"), "{:?}", calls[0]);
+        assert!(!calls[0].contains_key("limit"), "{:?}", calls[0]);
+        *state.list.lock().unwrap() =
+            "3\tAdd beta\tfeature/beta\t2026-08-09T12:00:00Z\tmerged\n".to_string();
+        let html = body(
+            &source(
+                &k,
+                "urn:repo:demo:prs",
+                &[("as", "text/html"), ("state", "all"), ("limit", "10")],
+            )
+            .unwrap(),
+        );
+        assert!(
+            html.contains("<span class=\"browse-pr-state\">merged</span>"),
+            "{html}"
+        );
+        let forwarded = state.calls_to(FACADE_LIST).pop().unwrap();
+        assert_eq!(forwarded.get("state"), Some(&"all".to_string()));
+        assert_eq!(forwarded.get("limit"), Some(&"10".to_string()));
+
+        // chrome=embed is the rows-only fragment — no crumbs, no wrapper.
+        let embedded = body(
+            &source(
+                &k,
+                "urn:repo:demo:prs",
+                &[("as", "text/html"), ("chrome", "embed")],
+            )
+            .unwrap(),
+        );
+        assert!(
+            embedded.starts_with("<ul class=\"browse-prs\">"),
+            "{embedded}"
+        );
+        assert!(!embedded.contains("browse-crumbs"), "{embedded}");
+
+        // No PRs: empty text passthrough, a friendly html empty state.
         state.list.lock().unwrap().clear();
         assert_eq!(body(&source(&k, "urn:repo:demo:prs", &[]).unwrap()), "");
         let html = body(&source(&k, "urn:repo:demo:prs", &[("as", "text/html")]).unwrap());
-        assert!(html.contains("no open pull requests"), "{html}");
+        assert!(html.contains("no pull requests"), "{html}");
 
-        // The root tree's html face links the listing.
+        // The root tree's html face links the listing AND lazy-loads the
+        // recent-PRs block (hx-trigger=load, embed chrome, the 0.1.4 args) —
+        // the tree itself renders without ever consulting the facades.
         let html = body(&source(&k, "urn:repo:demo:tree", &[("as", "text/html")]).unwrap());
         assert!(
             html.contains("hx-get=\"/k/source urn:repo:demo:prs as=text/html\""),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                "hx-get=\"/k/source urn:repo:demo:prs state=all limit=10 chrome=embed \
+                 as=text/html\" hx-trigger=\"load\""
+            ),
             "{html}"
         );
         std::fs::remove_dir_all(&root).ok();
@@ -1486,6 +1607,16 @@ mod tests {
         let html = body(&source(&k, "urn:repo:demo:pr:3", &[("as", "text/html")]).unwrap());
         assert!(html.contains("#3 Add beta"), "{html}");
         assert!(html.contains("browse-code"), "{html}");
+        // The crumb trail: home affordance, repo and prs as live crumbs,
+        // the PR number inert.
+        assert!(
+            html.contains("<a class=\"browse-home-link\" href=\"/\""),
+            "{html}"
+        );
+        assert!(
+            html.contains("<span class=\"browse-here\">#3</span>"),
+            "{html}"
+        );
         assert!(html.contains("id=\"L6\""), "{html}");
         assert!(
             html.contains("name=\"target\" value=\"urn:repo:demo:pr:3\""),
@@ -1564,6 +1695,15 @@ mod tests {
         let rows = json(&k, "urn:repo:demo:annotations", &[]);
         assert_eq!(rows[0]["reanchored"], true);
         assert_eq!(rows[0]["line"], 7);
+
+        // A later head flips the line's marker (the addition settles into
+        // context): the marker-stripped retry follows it, and the stored
+        // exact becomes the NEW original diff line — drift stays honest.
+        state.set_diff(&DIFF.replace("+fn beta() {}", " fn beta() {}"));
+        let rows = json(&k, "urn:repo:demo:annotations", &[]);
+        assert_eq!(rows[0]["exact"], " fn beta() {}");
+        assert_eq!(rows[0]["reanchored"], true);
+        assert_eq!(rows[0]["orphaned"], false);
 
         // The quote vanishes entirely: orphaned, never dropped.
         state.set_diff("diff --git a/x b/x\n+++ b/x\n+nothing left\n");
@@ -1659,7 +1799,7 @@ mod tests {
 
         let pass = json(&k, "urn:repo:demo:pr:3:review", &[]);
         assert_eq!(pass["derived"], true);
-        assert_eq!(pass["version_tag"], "pr-review-v1@r1");
+        assert_eq!(pass["version_tag"], "pr-review-v2@r1");
         assert_eq!(
             pass["content_hash"], OID,
             "the pass keys on the head commit"
@@ -1708,6 +1848,109 @@ mod tests {
         assert!(ttl.contains("a ik:Review"), "{ttl}");
         assert!(ttl.contains("prov:used <urn:repo:demo:pr:3>"), "{ttl}");
         assert!(ttl.contains("prov:generated <urn:annotation:"), "{ttl}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A realistic diff for the anchoring fix: change lines carry `+`/`-`
+    /// markers over indented code, context lines a leading space — the
+    /// surface every one of the live pass's six quotes misquoted against.
+    // Leading whitespace is load-bearing (context lines start with a space,
+    // code carries indentation) — embedded newlines, no `\` continuations.
+    const REAL_DIFF: &str = "diff --git a/src/config.rs b/src/config.rs
+index 3f9c2d1..8a41b77 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -10,7 +10,9 @@ impl Config {
+     pub fn load(path: &Path) -> Result<Config> {
+-        let text = std::fs::read_to_string(path)?;
++        let text = std::fs::read_to_string(path)
++            .with_context(|| format!(\"reading {}\", path.display()))?;
+         toml::from_str(&text).map_err(Into::into)
+     }
+ }
+";
+
+    #[test]
+    fn model_style_quotes_anchor_in_the_marker_stripped_diff() {
+        let root = temp_dir();
+        let store = Arc::new(Store::new().unwrap());
+        let state = FakeRepo::new();
+        let log = Arc::new(Log::default());
+        // Three model-style findings against REAL_DIFF:
+        //   1. marker-faithful (the v2 prompt obeyed) — anchors exactly;
+        //   2. a WRONG marker (`+` on what is a context line) — anchors via
+        //      the marker-stripped retry, storing the original context line;
+        //   3. no marker at all (the v1 live failure's shape) — a plain
+        //      substring of its diff line, anchoring exactly.
+        let findings = "QUOTE: -        let text = std::fs::read_to_string(path)?;\n\
+             NOTE: The bare ? lost the path - good riddance.\n\
+             QUOTE: +toml::from_str(&text).map_err(Into::into)\n\
+             NOTE: Parse errors still lack the path context the read now carries.\n\
+             QUOTE: pub fn load(path: &Path) -> Result<Config> {\n\
+             NOTE: Loading stays sync - fine at config scale.\n";
+        let k = explain_kernel(&root, &store, &state, &log, findings);
+        state.set_diff(REAL_DIFF);
+
+        let pass = json(&k, "urn:repo:demo:pr:3:review", &[]);
+        assert_eq!(pass["derived"], true);
+        assert_eq!(
+            pass["minted"].as_array().unwrap().len(),
+            3,
+            "every model-style quote anchors: {pass}"
+        );
+        assert_eq!(pass["orphaned_items"], 0);
+
+        // The stored exacts stay honest: a stripped match records the
+        // ORIGINAL diff line (marker and indentation intact); exact matches
+        // keep the model's own quote.
+        let rows = json(&k, "urn:repo:demo:annotations", &[]);
+        let exacts: Vec<&str> = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["exact"].as_str().unwrap())
+            .collect();
+        assert!(
+            exacts.contains(&"pub fn load(path: &Path) -> Result<Config> {"),
+            "{exacts:?}"
+        );
+        assert!(
+            exacts.contains(&"-        let text = std::fs::read_to_string(path)?;"),
+            "{exacts:?}"
+        );
+        assert!(
+            exacts.contains(&"         toml::from_str(&text).map_err(Into::into)"),
+            "{exacts:?}"
+        );
+
+        // A human Sink quoting consecutive CODE lines (no markers, the way
+        // anyone reads a diff): the marker-stripped shadow carries the match
+        // across the interleaved `+` columns, and the stored exact is the
+        // original two diff lines.
+        let ack = issue(
+            &k,
+            Verb::Sink,
+            "urn:annotation:pr-multiline",
+            &[
+                ("target", "urn:repo:demo:pr:3"),
+                (
+                    "exact",
+                    "        let text = std::fs::read_to_string(path)\n            \
+                     .with_context(|| format!(\"reading {}\", path.display()))?;",
+                ),
+                ("body", "the two-line read"),
+                ("as", "application/json"),
+            ],
+            &cap(),
+        )
+        .unwrap();
+        let created: serde_json::Value = serde_json::from_str(&body(&ack)).unwrap();
+        assert_eq!(created["line"], 8, "anchored at the first spanned line");
+        assert_eq!(
+            created["exact"],
+            "+        let text = std::fs::read_to_string(path)\n\
+             +            .with_context(|| format!(\"reading {}\", path.display()))?;"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
