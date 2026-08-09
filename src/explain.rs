@@ -398,7 +398,7 @@ pub(crate) fn ik(term: &str) -> NamedNode {
 /// ```turtle
 /// <urn:ikigai:browse:explain:{repo}:{hash}:{tag}:{path}> a ik:Explanation ;
 ///     ik:repo "demo" ; ik:path "src/lib.rs" ;
-///     ik:target <urn:repo:demo:file:src/lib.rs> ;
+///     ik:about <urn:repo:demo:file:src/lib.rs> ;
 ///     ik:contentHash "sha256:…" ; ik:versionTag "code-v1@qwen3-coder:30b" ;
 ///     ik:model "qwen3-coder:30b" ; ik:promptKind "code" ;
 ///     ik:explanation "…the text…" ;
@@ -456,7 +456,7 @@ fn store_entry(store: &Store, entry: &ArchiveEntry) -> Result<()> {
         ),
         Quad::new(
             subject.clone(),
-            ik("target"),
+            ik("about"),
             target,
             GraphName::DefaultGraph,
         ),
@@ -543,7 +543,15 @@ fn load_entry(store: &Store, iri: &str) -> Result<Option<ArchiveEntry>> {
             Some("model") => entry.model = literal(&quad.object),
             Some("promptKind") => entry.kind = literal(&quad.object),
             Some("derivedAt") => entry.derived_at = Some(literal(&quad.object)),
-            Some("target") => {
+            Some("about") => {
+                if let Term::NamedNode(node) = &quad.object {
+                    entry.target_iri = node.as_str().to_string();
+                }
+            }
+            // Legacy term (pre-0.2.2 archives wrote ik:target; the routing
+            // family owns that term now). Read-only compatibility: never
+            // written, and ik:about wins if both are somehow present.
+            Some("target") if entry.target_iri.is_empty() => {
                 if let Term::NamedNode(node) = &quad.object {
                     entry.target_iri = node.as_str().to_string();
                 }
@@ -554,23 +562,30 @@ fn load_entry(store: &Store, iri: &str) -> Result<Option<ArchiveEntry>> {
     Ok(found.then_some(entry))
 }
 
-/// Every archived entry whose `ik:target` is the given resource — the
-/// `explain-versions` listing. Sorted newest-first by `ik:derivedAt` (entries
-/// without a timestamp sort last), then by tag for determinism.
+/// Every archived entry whose `ik:about` is the given resource — the
+/// `explain-versions` listing. Also matches the legacy `ik:target` predicate
+/// (pre-0.2.2 archives), so old entries stay listed without a migration.
+/// Sorted newest-first by `ik:derivedAt` (entries without a timestamp sort
+/// last), then by tag for determinism.
 fn list_versions(store: &Store, target_iri: &str) -> Result<Vec<ArchiveEntry>> {
     let target = match NamedNode::new(target_iri) {
         Ok(node) => node,
         Err(_) => return Ok(Vec::new()),
     };
+    let mut subjects = std::collections::BTreeSet::new();
+    for predicate in [ik("about"), ik("target")] {
+        for quad in store.quads_for_pattern(
+            None,
+            Some(predicate.as_ref()),
+            Some(target.as_ref().into()),
+            None,
+        ) {
+            let quad = quad.map_err(store_err)?;
+            subjects.insert(quad.subject.to_string());
+        }
+    }
     let mut entries = Vec::new();
-    for quad in store.quads_for_pattern(
-        None,
-        Some(ik("target").as_ref()),
-        Some(target.as_ref().into()),
-        None,
-    ) {
-        let quad = quad.map_err(store_err)?;
-        let subject = quad.subject.to_string();
+    for subject in &subjects {
         let iri = subject.trim_start_matches('<').trim_end_matches('>');
         if let Some(entry) = load_entry(store, iri)? {
             entries.push(entry);
@@ -968,7 +983,7 @@ fn face(
                 "derived": served.derived,
                 "model": entry.model,
                 "prompt_kind": entry.kind,
-                "target": entry.target_iri,
+                "about": entry.target_iri,
             });
             if let Some(included) = included {
                 json["annotations"] = included.json();
@@ -1024,7 +1039,7 @@ fn explain_turtle(entry: &ArchiveEntry) -> String {
         "a ik:Explanation".to_string(),
         format!("ik:repo {}", ttl_str(&entry.repo)),
         format!("ik:path {}", ttl_str(&entry.rel)),
-        format!("ik:target <{}>", entry.target_iri),
+        format!("ik:about <{}>", entry.target_iri),
         format!("ik:contentHash {}", ttl_str(&entry.hash)),
         format!("ik:versionTag {}", ttl_str(&entry.tag)),
         format!("ik:model {}", ttl_str(&entry.model)),
@@ -1595,6 +1610,50 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// Pre-0.2.2 archives wrote `ik:target` where the code now writes
+    /// `ik:about` (the term was ceded to the routing family). Read
+    /// compatibility, no migration: the entry-IRI lookup never keyed on the
+    /// predicate, the loader accepts the legacy term, and the versions
+    /// listing matches both.
+    #[test]
+    fn a_legacy_ik_target_archive_stays_addressable_and_listed() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "// v1\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, |c| c);
+
+        // Archive an entry, then rewrite it to the legacy shape in place.
+        source(&k, "urn:repo:demo:explain:a.rs", &[], &cap()).unwrap();
+        let legacy: Vec<Quad> = store
+            .quads_for_pattern(None, Some(ik("about").as_ref()), None, None)
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(legacy.len(), 1);
+        for quad in &legacy {
+            store.remove(quad).unwrap();
+            store
+                .insert(&Quad::new(
+                    quad.subject.clone(),
+                    ik("target"),
+                    quad.object.clone(),
+                    quad.graph_name.clone(),
+                ))
+                .unwrap();
+        }
+
+        // The archive hit does not re-derive (the key is the entry IRI)...
+        let asks = log.count(FILE_PROVIDER);
+        let row = json(&k, "urn:repo:demo:explain:a.rs", &[]);
+        assert_eq!(log.count(FILE_PROVIDER), asks, "served from the archive");
+        // ...the loader fills the subject from the legacy predicate...
+        assert_eq!(row["about"], "urn:repo:demo:file:a.rs", "{row}");
+        // ...and the versions listing still finds the legacy entry.
+        let rows = json(&k, "urn:repo:demo:explain-versions:a.rs", &[]);
+        assert_eq!(rows.as_array().unwrap().len(), 1, "{rows}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// A canned OpenAI-shaped completion transport for tests that mount the
     /// REAL ikigai-llm space (the `:model` identity resolution goes through
     /// genuine 0.10 endpoints; only the network hop is faked).
@@ -1775,6 +1834,8 @@ mod tests {
         let ttl = body(&out);
         assert!(ttl.contains("ik:versionTag \"code-v1@m1\""), "{ttl}");
         assert!(ttl.contains("ik:contentHash \"sha256:"), "{ttl}");
+        assert!(ttl.contains("ik:about <urn:repo:demo:file:a.rs>"), "{ttl}");
+        assert!(!ttl.contains("ik:target"), "the retired term: {ttl}");
         std::fs::remove_dir_all(&root).ok();
     }
 

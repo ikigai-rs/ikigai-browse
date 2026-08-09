@@ -105,7 +105,7 @@ adapter (form fields become sink args — htmx only, no scripts).
 same host-injected Oxigraph store the explanation archive uses
 (`space_with_explain` includes both families — ONE shared graph, queryable
 together). The shape is skolemized `oa:` — stable IRIs, no blank nodes, and
-the W3C target node flattened to `ik:target` — with BOTH selector kinds
+the W3C target node flattened to `ik:annotates` — with BOTH selector kinds
 stored per annotation: `oa:TextQuoteSelector` (`oa:prefix`/`oa:exact`/
 `oa:suffix`, context derived from the anchored occurrence) and
 `oa:TextPositionSelector` (`oa:start`/`oa:end`, character offsets), keyed to
@@ -132,10 +132,16 @@ resolve — directory children as `tree:` IRIs, files as `file:` IRIs — so the
 graph is diffable, SPARQL-able, *and navigable*. It uses these `ik:`
 (`https://ikigai-rs.dev/ns#`) terms: `ik:Directory`, `ik:File`, `ik:Symlink`,
 `ik:Explanation` (classes), `ik:entry`, `ik:fileName`, `ik:path`, `ik:repo`,
-`ik:byteSize`, `ik:target`, `ik:contentHash`, `ik:versionTag`, `ik:model`,
+`ik:byteSize`, `ik:about` (an explanation's subject), `ik:annotates` (an
+annotation's target), `ik:contentHash`, `ik:versionTag`, `ik:model`,
 `ik:promptKind`, `ik:explanation`, `ik:derivedAt`, and (S2) `ik:reanchored`,
 `ik:orphaned` (properties). These are pending addition to the published
-vocabulary (`ik:model` already exists). The annotation graphs additionally
+vocabulary (`ik:model` already exists). Before 0.2.2 both families wrote
+`ik:target` for the subject/target link; that term belongs to the inbound-HTTP
+routing family, so browse retired it. Stores written by older versions read
+fine — both loaders and the versions listing accept the legacy predicate, all
+new writes (and any annotation rewrite) use the new terms, and lingering
+`ik:target` triples in an old archive are harmless. The annotation graphs additionally
 use the external `oa:` (`http://www.w3.org/ns/oa#`) terms `oa:Annotation`,
 `oa:TextQuoteSelector`, `oa:TextPositionSelector`, `oa:bodyValue`,
 `oa:hasSelector`, `oa:prefix`, `oa:exact`, `oa:suffix`, `oa:start`, `oa:end`,
