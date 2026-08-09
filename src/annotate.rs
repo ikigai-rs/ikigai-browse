@@ -148,36 +148,59 @@ fn validate_id(id: &str) -> Result<String> {
     Ok(id.to_string())
 }
 
-/// The annotated browse resource: `urn:repo:{repo}:file:{path}` where `{repo}`
-/// is a configured root. Only file targets are annotatable in v1 (the line
-/// anchors and quote selectors are text-content concepts).
-fn parse_target(
-    target: &str,
-    roots: &BTreeMap<String, std::path::PathBuf>,
-) -> Result<(String, String)> {
+/// A Sink's parsed target: one file, or one pull request (its diff text is
+/// the anchor surface).
+enum SinkTarget {
+    File { repo: String, rel: String },
+    Pr { repo: String, number: u64 },
+}
+
+/// The annotated browse resource: `urn:repo:{repo}:file:{path}` or
+/// `urn:repo:{repo}:pr:{n}`, where `{repo}` is a configured root. Both are
+/// text surfaces — a file's content, a PR's unified diff; the line anchors
+/// and quote selectors are text-content concepts either way.
+fn parse_target(target: &str, roots: &BTreeMap<String, std::path::PathBuf>) -> Result<SinkTarget> {
     let bad = |detail: String| Error::InvalidArgument {
         name: "target".to_string(),
         detail,
     };
     let rest = target.strip_prefix("urn:repo:").ok_or_else(|| {
         bad(format!(
-            "`{target}` is not a urn:repo:{{repo}}:file:{{path}} IRI"
+            "`{target}` is not a urn:repo:{{repo}}:file:{{path}} or urn:repo:{{repo}}:pr:{{n}} IRI"
         ))
     })?;
     let (repo, rest) = rest
         .split_once(':')
         .ok_or_else(|| bad(format!("`{target}` carries no path")))?;
-    let rel_encoded = rest.strip_prefix("file:").ok_or_else(|| {
-        bad("only file resources are annotatable (urn:repo:{repo}:file:{path})".to_string())
-    })?;
     if !roots.contains_key(repo) {
         return Err(bad(format!("`{repo}` is not a configured root")));
     }
+    if let Some(number) = rest.strip_prefix("pr:") {
+        // The PR page itself, digits only — `pr:{n}:explain` and friends are
+        // derived layers, not annotation surfaces.
+        let number: u64 = number.parse().map_err(|_| {
+            bad(format!(
+                "`{target}` is not an annotatable pull-request page (urn:repo:{{repo}}:pr:{{n}})"
+            ))
+        })?;
+        return Ok(SinkTarget::Pr {
+            repo: repo.to_string(),
+            number,
+        });
+    }
+    let rel_encoded = rest.strip_prefix("file:").ok_or_else(|| {
+        bad("only file and pull-request resources are annotatable \
+             (urn:repo:{repo}:file:{path} or urn:repo:{repo}:pr:{n})"
+            .to_string())
+    })?;
     let rel = iri_decode(rel_encoded)?;
     if rel.is_empty() {
         return Err(bad(format!("`{target}` carries no path")));
     }
-    Ok((repo.to_string(), rel))
+    Ok(SinkTarget::File {
+        repo: repo.to_string(),
+        rel,
+    })
 }
 
 // --- the annotation record --------------------------------------------------
@@ -213,6 +236,14 @@ struct Annotation {
     generated_by: Option<String>,
 }
 
+/// What an annotation's recorded target IS — derived from the stored
+/// `ik:annotates` IRI, never a separate triple: a file's content, or a pull
+/// request's diff.
+enum TargetRef<'a> {
+    File(&'a str),
+    Pr(u64),
+}
+
 impl Annotation {
     fn iri(&self) -> String {
         annotation_iri(&self.id)
@@ -220,6 +251,38 @@ impl Annotation {
 
     fn machine(&self) -> bool {
         self.creator.is_some()
+    }
+
+    /// Parse the recorded target IRI. Anything that is not this repo's
+    /// `pr:{n}` page reads as a file target at the recorded path — including
+    /// legacy records, whose `ik:annotates` always named a file.
+    fn target_ref(&self) -> TargetRef<'_> {
+        if let Some(number) = self
+            .target_iri
+            .strip_prefix("urn:repo:")
+            .and_then(|rest| rest.strip_prefix(&self.repo))
+            .and_then(|rest| rest.strip_prefix(":pr:"))
+            .and_then(|n| n.parse::<u64>().ok())
+        {
+            return TargetRef::Pr(number);
+        }
+        TargetRef::File(&self.rel)
+    }
+
+    /// The PR number, for targets that are PR pages.
+    fn pr_number(&self) -> Option<u64> {
+        match self.target_ref() {
+            TargetRef::Pr(n) => Some(n),
+            TargetRef::File(_) => None,
+        }
+    }
+
+    /// Where this annotation lives, for display: the file path, or `pr#{n}`.
+    fn place(&self) -> String {
+        match self.target_ref() {
+            TargetRef::Pr(n) => format!("pr#{n}"),
+            TargetRef::File(rel) => rel.to_string(),
+        }
     }
 }
 
@@ -249,12 +312,6 @@ fn store_annotation(store: &Store, ann: &Annotation) -> Result<()> {
             subject.clone(),
             ik("repo"),
             Literal::new_simple_literal(&ann.repo),
-            g.clone(),
-        ),
-        Quad::new(
-            subject.clone(),
-            ik("path"),
-            Literal::new_simple_literal(&ann.rel),
             g.clone(),
         ),
         Quad::new(
@@ -296,6 +353,16 @@ fn store_annotation(store: &Store, ann: &Annotation) -> Result<()> {
             g.clone(),
         ),
     ];
+    // A PR annotation carries no path (its target IRI is the record) — the
+    // triple is written only when there is one.
+    if !ann.rel.is_empty() {
+        quads.push(Quad::new(
+            subject.clone(),
+            ik("path"),
+            Literal::new_simple_literal(&ann.rel),
+            g.clone(),
+        ));
+    }
     if !ann.prefix.is_empty() {
         quads.push(Quad::new(
             quote.clone(),
@@ -604,11 +671,18 @@ fn line_of(content: &str, char_offset: u64) -> u64 {
 enum CurrentContent {
     /// UTF-8 text plus its `sha256:{hex}` content hash.
     Text(String, String),
-    /// The file is gone or binary — nothing to anchor against.
+    /// The target is gone or binary — nothing to anchor against.
     Unavailable,
+    /// The target could not be consulted at all (a PR whose data facades are
+    /// not mounted, or whose fetch failed). Distinct from [`Unavailable`]:
+    /// "could not look" must not orphan what "looked and it is gone" would.
+    Unknown,
 }
 
-fn hash_bytes(bytes: &[u8]) -> String {
+/// `sha256:{hex}` of raw bytes — the annotation layer's content key (also
+/// what the review layers stamp on annotations they mint against text they
+/// already hold).
+pub(crate) fn content_hash(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
@@ -619,6 +693,9 @@ fn hash_bytes(bytes: &[u8]) -> String {
 /// an unchanged (or already-orphaned) annotation touch nothing.
 fn refresh(store: &Store, ann: &mut Annotation, current: &CurrentContent) -> Result<Option<u64>> {
     match current {
+        // Served exactly as recorded, flags untouched: no content was in
+        // hand, so nothing can honestly be said about drift.
+        CurrentContent::Unknown => Ok(None),
         CurrentContent::Unavailable => {
             if !ann.orphaned {
                 ann.orphaned = true;
@@ -671,19 +748,20 @@ fn refresh(store: &Store, ann: &mut Annotation, current: &CurrentContent) -> Res
 async fn reconcile(
     inv: &Invocation<'_>,
     store: &Store,
+    roots: &BTreeMap<String, std::path::PathBuf>,
     repo: &str,
     mut anns: Vec<Annotation>,
 ) -> Result<Vec<(Annotation, Option<u64>)>> {
     let mut contents: BTreeMap<String, CurrentContent> = BTreeMap::new();
     for ann in &anns {
-        if !contents.contains_key(&ann.rel) {
-            let current = current_content(inv, repo, &ann.rel).await?;
-            contents.insert(ann.rel.clone(), current);
+        if !contents.contains_key(&ann.target_iri) {
+            let current = current_content_for(inv, roots, repo, &ann.target_ref()).await?;
+            contents.insert(ann.target_iri.clone(), current);
         }
     }
     let mut rows: Vec<(Annotation, Option<u64>)> = Vec::with_capacity(anns.len());
     for mut ann in anns.drain(..) {
-        let current = contents.get(&ann.rel).expect("fetched above");
+        let current = contents.get(&ann.target_iri).expect("fetched above");
         let line = refresh(store, &mut ann, current)?;
         rows.push((ann, line));
     }
@@ -701,7 +779,7 @@ fn reconcile_against_text(
     text: &str,
 ) -> Result<Vec<(Annotation, Option<u64>)>> {
     let mut anns = list_annotations(store, repo, Some(rel))?;
-    let current = CurrentContent::Text(text.to_string(), hash_bytes(text.as_bytes()));
+    let current = CurrentContent::Text(text.to_string(), content_hash(text.as_bytes()));
     let mut rows: Vec<(Annotation, Option<u64>)> = Vec::with_capacity(anns.len());
     for mut ann in anns.drain(..) {
         let line = refresh(store, &mut ann, &current)?;
@@ -752,7 +830,7 @@ impl Included {
         for (ann, line) in &self.rows {
             out.push('\n');
             if self.with_paths {
-                out.push_str(&ann.rel);
+                out.push_str(&ann.place());
                 out.push(' ');
             }
             if let Some(n) = line {
@@ -820,24 +898,28 @@ fn collapse(s: &str) -> String {
 pub(crate) async fn included_for(
     inv: &Invocation<'_>,
     store: &Store,
+    roots: &BTreeMap<String, std::path::PathBuf>,
     repo: &str,
     filter: TargetFilter<'_>,
 ) -> Result<Included> {
     let anns = match filter {
         TargetFilter::File(rel) => list_annotations(store, repo, Some(rel))?,
         TargetFilter::Subtree(rel) => {
+            // File annotations only: a subtree is a directory concept, and a
+            // PR annotation lives under no directory (its own page folds it).
             let all = list_annotations(store, repo, None)?;
+            let files = all
+                .into_iter()
+                .filter(|ann| matches!(ann.target_ref(), TargetRef::File(_)));
             if rel.is_empty() {
-                all
+                files.collect()
             } else {
                 let prefix = format!("{rel}/");
-                all.into_iter()
-                    .filter(|ann| ann.rel.starts_with(&prefix))
-                    .collect()
+                files.filter(|ann| ann.rel.starts_with(&prefix)).collect()
             }
         }
     };
-    let rows = reconcile(inv, store, repo, anns).await?;
+    let rows = reconcile(inv, store, roots, repo, anns).await?;
     Ok(Included {
         rows,
         with_paths: matches!(filter, TargetFilter::Subtree(_)),
@@ -865,13 +947,41 @@ async fn current_content(inv: &Invocation<'_>, repo: &str, rel: &str) -> Result<
     match inv.source(&parse_iri(&file_iri(repo, rel))?).await {
         Ok(repr) => Ok(match String::from_utf8(repr.bytes.clone()) {
             Ok(text) => {
-                let hash = hash_bytes(&repr.bytes);
+                let hash = content_hash(&repr.bytes);
                 CurrentContent::Text(text, hash)
             }
             Err(_) => CurrentContent::Unavailable,
         }),
         Err(Error::NotFound(_)) => Ok(CurrentContent::Unavailable),
         Err(e) => Err(e),
+    }
+}
+
+/// [`current_content`], dispatched on the target's kind. A PR target's
+/// surface is its unified diff, fetched through ikigai-repo's facade — ANY
+/// failure there (facades unmounted, gh error) is `Unknown`, never an error
+/// and never an orphaning: one broken PR fetch must not kill (or rewrite) a
+/// listing.
+async fn current_content_for(
+    inv: &Invocation<'_>,
+    roots: &BTreeMap<String, std::path::PathBuf>,
+    repo: &str,
+    target: &TargetRef<'_>,
+) -> Result<CurrentContent> {
+    match target {
+        TargetRef::File(rel) => current_content(inv, repo, rel).await,
+        TargetRef::Pr(n) => {
+            let Some(dir) = roots.get(repo) else {
+                return Ok(CurrentContent::Unknown);
+            };
+            match crate::pr::diff_text(inv, dir, *n).await {
+                Ok(text) => {
+                    let hash = content_hash(text.as_bytes());
+                    Ok(CurrentContent::Text(text, hash))
+                }
+                Err(_) => Ok(CurrentContent::Unknown),
+            }
+        }
     }
 }
 
@@ -983,7 +1093,7 @@ impl AnnotationEndpoint {
         let id = Self::id_binding(inv)?;
         let mut ann = self.load_required(&id)?;
         granted(inv, &ann.repo)?;
-        let current = current_content(inv, &ann.repo, &ann.rel).await?;
+        let current = current_content_for(inv, &self.roots, &ann.repo, &ann.target_ref()).await?;
         let line = refresh(&self.store, &mut ann, &current)?;
         match inv.inline_str("as").unwrap_or("text/plain") {
             t if t.starts_with("application/json") => Ok(repr(
@@ -1008,7 +1118,20 @@ impl AnnotationEndpoint {
             None => (uuid::Uuid::new_v4().to_string(), true),
         };
         let target = inv.inline_str("target")?.trim().to_string();
-        let (repo, rel) = parse_target(&target, &self.roots)?;
+        let parsed = parse_target(&target, &self.roots)?;
+        // The per-root grant, enforced uniformly: for a file target the
+        // anchoring read below enforces it structurally anyway; for a PR
+        // target the diff facade knows nothing of browse roots, so the check
+        // here is the declared wildcard's enforcement.
+        let (repo, rel, target_iri) = match &parsed {
+            SinkTarget::File { repo, rel } => (repo.clone(), rel.clone(), file_iri(repo, rel)),
+            SinkTarget::Pr { repo, number } => (
+                repo.clone(),
+                String::new(),
+                crate::pr::pr_iri(repo, *number),
+            ),
+        };
+        granted(inv, &repo)?;
         // Pipeline citizenship: the note text is the `body` arg, with the
         // piped `content` as fallback.
         let body = inv
@@ -1029,10 +1152,19 @@ impl AnnotationEndpoint {
         let hint_prefix = inv.inline_str("prefix").unwrap_or("");
         let hint_suffix = inv.inline_str("suffix").unwrap_or("");
 
-        let CurrentContent::Text(text, hash) = current_content(inv, &repo, &rel).await? else {
+        let tref = match &parsed {
+            SinkTarget::File { rel, .. } => TargetRef::File(rel),
+            SinkTarget::Pr { number, .. } => TargetRef::Pr(*number),
+        };
+        let CurrentContent::Text(text, hash) =
+            current_content_for(inv, &self.roots, &repo, &tref).await?
+        else {
             return Err(Error::InvalidArgument {
                 name: "target".to_string(),
-                detail: format!("`{target}` is not annotatable text (missing or binary)"),
+                detail: format!(
+                    "`{target}` is not annotatable text (missing, binary, or — for a pull \
+                     request — its urn:repo:pr:* facades are not mounted)"
+                ),
             });
         };
         let anchor = find_anchor(&text, &exact, hint_prefix, hint_suffix).ok_or_else(|| {
@@ -1051,7 +1183,7 @@ impl AnnotationEndpoint {
         let ann = Annotation {
             id: id.clone(),
             body,
-            target_iri: file_iri(&repo, &rel),
+            target_iri,
             repo,
             rel,
             hash,
@@ -1210,7 +1342,7 @@ impl Endpoint for AnnotationsEndpoint {
         let filter = (!rel.is_empty()).then_some(rel.as_str());
         let anns = list_annotations(&self.store, repo, filter)?;
         // One content fetch per distinct target, then the drift pass each.
-        let rows = reconcile(inv, &self.store, repo, anns).await?;
+        let rows = reconcile(inv, &self.store, &self.roots, repo, anns).await?;
 
         match inv.inline_str("as").unwrap_or("application/json") {
             t if t.starts_with("text/html") => Ok(repr_utf8(
@@ -1287,6 +1419,7 @@ fn annotation_json(ann: &Annotation, line: Option<u64>) -> serde_json::Value {
         "annotates": ann.target_iri,
         "repo": ann.repo,
         "path": ann.rel,
+        "pr": ann.pr_number(),
         "body": ann.body,
         "prefix": ann.prefix,
         "exact": ann.exact,
@@ -1408,7 +1541,7 @@ fn annotation_card_html(ann: &Annotation, line: Option<u64>, show_path: bool) ->
     let path = if show_path {
         format!(
             "<span class=\"browse-annotation-path\">{}</span> ",
-            esc(&ann.rel)
+            esc(&ann.place())
         )
     } else {
         String::new()
@@ -1533,9 +1666,12 @@ pub(crate) fn file_overlay(
 /// pick distinctive quotes, and the deterministic first-occurrence rule covers
 /// the rest. Returns the minted IRI, or `None` when the quote does not anchor
 /// — the caller counts it and moves on (one bad item must not kill the pass).
+/// `target_iri` names the annotated surface (a file, or a PR page whose diff
+/// is `text`); `rel` is its path, empty for a PR.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn mint_review_annotation(
     store: &Store,
+    target_iri: &str,
     repo: &str,
     rel: &str,
     text: &str,
@@ -1553,7 +1689,7 @@ pub(crate) fn mint_review_annotation(
     let ann = Annotation {
         id: uuid::Uuid::new_v4().to_string(),
         body: note.to_string(),
-        target_iri: file_iri(repo, rel),
+        target_iri: target_iri.to_string(),
         repo: repo.to_string(),
         rel: rel.to_string(),
         hash: hash.to_string(),
@@ -1579,7 +1715,7 @@ pub(crate) fn mint_review_annotation(
 /// records history, the store records the present. Same [`Included`] the
 /// `annotations=include` folds serve, so the faces are shared.
 pub(crate) fn included_for_ids(store: &Store, iris: &[String], text: &str) -> Result<Included> {
-    let current = CurrentContent::Text(text.to_string(), hash_bytes(text.as_bytes()));
+    let current = CurrentContent::Text(text.to_string(), content_hash(text.as_bytes()));
     let mut rows: Vec<(Annotation, Option<u64>)> = Vec::with_capacity(iris.len());
     for iri in iris {
         let Some(id) = iri.strip_prefix("urn:annotation:") else {
@@ -1594,6 +1730,97 @@ pub(crate) fn included_for_ids(store: &Store, iris: &[String], text: &str) -> Re
     rows.sort_by(|(a, _), (b, _)| (a.start, &a.id).cmp(&(b.start, &b.id)));
     Ok(Included {
         rows,
+        with_paths: false,
+    })
+}
+
+// --- target-scoped reads (the PR page's surface) ------------------------------
+
+/// Every annotation whose recorded target is `target_iri` (matching the
+/// legacy `ik:target` predicate too), in (position, id) order.
+fn list_annotations_for_target(store: &Store, target_iri: &str) -> Result<Vec<Annotation>> {
+    let target = match NamedNode::new(target_iri) {
+        Ok(node) => node,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mut ids = std::collections::BTreeSet::new();
+    for predicate in [ik("annotates"), ik("target")] {
+        for quad in store.quads_for_pattern(
+            None,
+            Some(predicate.as_ref()),
+            Some(target.as_ref().into()),
+            None,
+        ) {
+            let quad = quad.map_err(store_err)?;
+            let subject = quad.subject.to_string();
+            let iri = subject.trim_start_matches('<').trim_end_matches('>');
+            if let Some(id) = iri.strip_prefix("urn:annotation:") {
+                ids.insert(id.to_string());
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for id in &ids {
+        if let Some(ann) = load_annotation(store, id)? {
+            out.push(ann);
+        }
+    }
+    out.sort_by(|a, b| (a.start, &a.id).cmp(&(b.start, &b.id)));
+    Ok(out)
+}
+
+/// The drift pass for one target against content already in hand — the PR
+/// page's path (its diff is the anchor surface), rows in reading order.
+fn reconcile_target_against_text(
+    store: &Store,
+    target_iri: &str,
+    text: &str,
+) -> Result<Vec<(Annotation, Option<u64>)>> {
+    let mut anns = list_annotations_for_target(store, target_iri)?;
+    let current = CurrentContent::Text(text.to_string(), content_hash(text.as_bytes()));
+    let mut rows: Vec<(Annotation, Option<u64>)> = Vec::with_capacity(anns.len());
+    for mut ann in anns.drain(..) {
+        let line = refresh(store, &mut ann, &current)?;
+        rows.push((ann, line));
+    }
+    rows.sort_by(|(a, _), (b, _)| (a.start, &a.id).cmp(&(b.start, &b.id)));
+    Ok(rows)
+}
+
+/// The overlay for a rendered text surface whose annotations target one IRI
+/// (the PR page's diff view): markers per annotated line plus the panel with
+/// its create form targeting that IRI. The [`file_overlay`] of the PR world.
+pub(crate) fn target_overlay(
+    store: &Store,
+    target_iri: &str,
+    text: &str,
+) -> Result<(BTreeMap<u64, Vec<Marker>>, String)> {
+    let rows = reconcile_target_against_text(store, target_iri, text)?;
+    let mut marked: BTreeMap<u64, Vec<Marker>> = BTreeMap::new();
+    for (ann, line) in &rows {
+        if ann.orphaned {
+            continue;
+        }
+        let Some(line) = line else { continue };
+        marked.entry(*line).or_default().push(Marker {
+            id: ann.id.clone(),
+            note: clip_to(&collapse(&ann.body), 160),
+            machine: ann.machine(),
+        });
+    }
+    let panel = annotations_panel_html(target_iri, &rows);
+    Ok((marked, panel))
+}
+
+/// The `annotations=include` payload for a target whose text is already in
+/// hand — the PR page's fold.
+pub(crate) fn included_for_target_text(
+    store: &Store,
+    target_iri: &str,
+    text: &str,
+) -> Result<Included> {
+    Ok(Included {
+        rows: reconcile_target_against_text(store, target_iri, text)?,
         with_paths: false,
     })
 }

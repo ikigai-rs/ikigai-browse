@@ -84,7 +84,7 @@ pub const CAP_NET: &str = "urn:cap:net:*";
 
 /// The shared system prompt for every grain. Editing it changes every
 /// explanation, so bump ALL the per-kind versions below when it changes.
-const SYSTEM_PROMPT: &str =
+pub(crate) const SYSTEM_PROMPT: &str =
     "You are the explanation layer of a repository browser. Write a concise \
      orientation for a developer seeing this item for the first time: what it \
      is, what it is for, and what stands out. Plain prose, no headings, no \
@@ -149,12 +149,15 @@ pub struct ExplainConfig {
     file_provider: String,
     dir_provider: String,
     pub(crate) review_provider: String,
+    pub(crate) pr_provider: String,
     file_model_label: Option<String>,
     dir_model_label: Option<String>,
     pub(crate) review_model_label: Option<String>,
+    pub(crate) pr_model_label: Option<String>,
     file_max_tokens: u32,
     dir_max_tokens: u32,
     pub(crate) review_max_tokens: u32,
+    pub(crate) pr_max_tokens: u32,
     pub(crate) temperature: String,
     pub(crate) ignore: BTreeSet<String>,
     pub(crate) max_prompt_bytes: usize,
@@ -163,21 +166,26 @@ pub struct ExplainConfig {
 impl ExplainConfig {
     /// A config over the host's shared Oxigraph store, with the design-of-record
     /// defaults: file grain → `urn:llm:coder:ask` at 400 tokens, directory
-    /// rollup → `urn:llm:ask` at 600, the review pass → `urn:llm:coder:ask` at
-    /// 800 (findings carry quotes — they need headroom), `temperature=0.2`,
-    /// the standard ignore set, prompts fed at most 16 KiB of content.
+    /// rollup → `urn:llm:ask` at 600, the review passes → `urn:llm:coder:ask` at
+    /// 800 (findings carry quotes — they need headroom), the pull-request
+    /// explain → `urn:llm:coder:ask` at 600 (a diff walk reads like code but
+    /// summarizes like a rollup), `temperature=0.2`, the standard ignore set,
+    /// prompts fed at most 16 KiB of content.
     pub fn new(store: Arc<Store>) -> Self {
         ExplainConfig {
             store,
             file_provider: "urn:llm:coder:ask".to_string(),
             dir_provider: "urn:llm:ask".to_string(),
             review_provider: "urn:llm:coder:ask".to_string(),
+            pr_provider: "urn:llm:coder:ask".to_string(),
             file_model_label: None,
             dir_model_label: None,
             review_model_label: None,
+            pr_model_label: None,
             file_max_tokens: 400,
             dir_max_tokens: 600,
             review_max_tokens: 800,
+            pr_max_tokens: 600,
             temperature: "0.2".to_string(),
             ignore: crate::hash::default_ignore(),
             max_prompt_bytes: 16 * 1024,
@@ -248,6 +256,27 @@ impl ExplainConfig {
     /// carries a verbatim quote plus commentary).
     pub fn review_max_tokens(mut self, tokens: u32) -> Self {
         self.review_max_tokens = tokens;
+        self
+    }
+
+    /// The provider IRI the pull-request explain asks (default
+    /// `urn:llm:coder:ask` — a diff reads like code).
+    pub fn pr_provider(mut self, iri: impl Into<String>) -> Self {
+        self.pr_provider = iri.into();
+        self
+    }
+
+    /// The model identity folded into pull-request explain version tags — the
+    /// operator's override, with the same precedence as
+    /// [`Self::file_model_label`].
+    pub fn pr_model_label(mut self, label: impl Into<String>) -> Self {
+        self.pr_model_label = Some(label.into());
+        self
+    }
+
+    /// The pull-request explain's `max_tokens` ceiling (default 600).
+    pub fn pr_max_tokens(mut self, tokens: u32) -> Self {
+        self.pr_max_tokens = tokens;
         self
     }
 
@@ -432,23 +461,23 @@ pub(crate) fn ik(term: &str) -> NamedNode {
 ///     ik:explanation "…the text…" ;
 ///     ik:derivedAt "2026-08-08T17:00:00.000Z"^^xsd:dateTime .
 /// ```
-struct ArchiveEntry {
-    iri: String,
-    repo: String,
-    rel: String,
-    target_iri: String,
-    hash: String,
-    tag: String,
-    model: String,
-    kind: String,
-    text: String,
-    derived_at: Option<String>,
+pub(crate) struct ArchiveEntry {
+    pub(crate) iri: String,
+    pub(crate) repo: String,
+    pub(crate) rel: String,
+    pub(crate) target_iri: String,
+    pub(crate) hash: String,
+    pub(crate) tag: String,
+    pub(crate) model: String,
+    pub(crate) kind: String,
+    pub(crate) text: String,
+    pub(crate) derived_at: Option<String>,
 }
 
 /// The stable, addressable archive key. Tag and path are percent-encoded
 /// (they may carry spaces or non-URN characters); the hash and repo embed
 /// cleanly by construction.
-fn entry_iri(repo: &str, rel: &str, hash: &str, tag: &str) -> String {
+pub(crate) fn entry_iri(repo: &str, rel: &str, hash: &str, tag: &str) -> String {
     format!(
         "urn:ikigai:browse:explain:{repo}:{hash}:{}:{}",
         iri_encode(tag),
@@ -460,7 +489,7 @@ fn store_err(e: impl std::fmt::Display) -> Error {
     Error::Endpoint(format!("browse: explanation archive: {e}"))
 }
 
-fn store_entry(store: &Store, entry: &ArchiveEntry) -> Result<()> {
+pub(crate) fn store_entry(store: &Store, entry: &ArchiveEntry) -> Result<()> {
     let subject = NamedNode::new(&entry.iri).map_err(store_err)?;
     let target = NamedNode::new(&entry.target_iri).map_err(store_err)?;
     let mut quads: Vec<Quad> = vec![
@@ -535,7 +564,7 @@ fn store_entry(store: &Store, entry: &ArchiveEntry) -> Result<()> {
 
 /// Load one archived entry by its key IRI — `None` on a miss (no
 /// `ik:explanation` triple under that subject).
-fn load_entry(store: &Store, iri: &str) -> Result<Option<ArchiveEntry>> {
+pub(crate) fn load_entry(store: &Store, iri: &str) -> Result<Option<ArchiveEntry>> {
     let subject = match NamedNode::new(iri) {
         Ok(node) => node,
         Err(_) => return Ok(None),
@@ -851,7 +880,7 @@ impl ExplainEndpoint {
         } else {
             TargetFilter::File(rel)
         };
-        annotate::included_for(inv, &self.config.store, repo, filter)
+        annotate::included_for(inv, &self.config.store, &self.roots, repo, filter)
             .await
             .map(Some)
     }
@@ -1083,7 +1112,7 @@ fn explain_html(
 }
 
 /// The archive entry as Turtle — the same skolemized shape the store holds.
-fn explain_turtle(entry: &ArchiveEntry) -> String {
+pub(crate) fn explain_turtle(entry: &ArchiveEntry) -> String {
     let mut props = vec![
         "a ik:Explanation".to_string(),
         format!("ik:repo {}", ttl_str(&entry.repo)),
