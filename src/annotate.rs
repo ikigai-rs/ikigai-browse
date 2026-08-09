@@ -8,13 +8,13 @@
 //! Vanilla `oa:` loves blank nodes (the target and selector nodes of the W3C
 //! model are conventionally anonymous). The house deviation: every node is a
 //! stable IRI, and the intermediate `oa:hasTarget` node is flattened away —
-//! `ik:target` points straight at the annotated browse resource. The `oa:`
+//! `ik:annotates` points straight at the annotated browse resource. The `oa:`
 //! *property* names are kept.
 //!
 //! ```turtle
 //! <urn:annotation:{id}> a oa:Annotation ;
 //!     oa:bodyValue "the note text" ;
-//!     ik:target <urn:repo:demo:file:src/lib.rs> ;
+//!     ik:annotates <urn:repo:demo:file:src/lib.rs> ;
 //!     ik:repo "demo" ; ik:path "src/lib.rs" ;
 //!     ik:contentHash "sha256:…" ;              # the file version annotated
 //!     oa:hasSelector <urn:annotation:{id}:selector:quote> ,
@@ -216,7 +216,7 @@ fn store_annotation(store: &Store, ann: &Annotation) -> Result<()> {
             Literal::new_simple_literal(&ann.body),
             g.clone(),
         ),
-        Quad::new(subject.clone(), ik("target"), target, g.clone()),
+        Quad::new(subject.clone(), ik("annotates"), target, g.clone()),
         Quad::new(
             subject.clone(),
             ik("repo"),
@@ -379,7 +379,16 @@ fn load_annotation(store: &Store, id: &str) -> Result<Option<Annotation>> {
                 "contentHash" => ann.hash = literal(&quad.object),
                 "reanchored" => ann.reanchored = literal(&quad.object) == "true",
                 "orphaned" => ann.orphaned = literal(&quad.object) == "true",
-                "target" => {
+                "annotates" => {
+                    if let Term::NamedNode(node) = &quad.object {
+                        ann.target_iri = node.as_str().to_string();
+                    }
+                }
+                // Legacy term (pre-0.2.2 stores wrote ik:target; the routing
+                // family owns that term now). Read-only compatibility: any
+                // rewrite (update, re-anchor, orphan) re-stores the graph
+                // with ik:annotates; ik:annotates wins if both are present.
+                "target" if ann.target_iri.is_empty() => {
                     if let Term::NamedNode(node) = &quad.object {
                         ann.target_iri = node.as_str().to_string();
                     }
@@ -412,7 +421,7 @@ fn load_annotation(store: &Store, id: &str) -> Result<Option<Annotation>> {
 
 /// Every annotation in the store for one repo — optionally narrowed to one
 /// path. Filters by `rdf:type oa:Annotation` (the shared store also holds
-/// `ik:Explanation` entries with `ik:repo`/`ik:target` triples — type is the
+/// `ik:Explanation` entries with `ik:repo`/`ik:about` triples — type is the
 /// discriminator). Sorted by (path, start, id) for a stable reading order.
 fn list_annotations(store: &Store, repo: &str, rel: Option<&str>) -> Result<Vec<Annotation>> {
     use oxigraph::model::vocab::rdf;
@@ -1173,7 +1182,7 @@ fn annotation_json(ann: &Annotation, line: Option<u64>) -> serde_json::Value {
     serde_json::json!({
         "id": ann.id,
         "iri": ann.iri(),
-        "target": ann.target_iri,
+        "annotates": ann.target_iri,
         "repo": ann.repo,
         "path": ann.rel,
         "body": ann.body,
@@ -1196,7 +1205,7 @@ fn annotation_turtle(ann: &Annotation) -> String {
     let mut props = vec![
         "a oa:Annotation".to_string(),
         format!("oa:bodyValue {}", ttl_str(&ann.body)),
-        format!("ik:target <{}>", ann.target_iri),
+        format!("ik:annotates <{}>", ann.target_iri),
         format!("ik:repo {}", ttl_str(&ann.repo)),
         format!("ik:path {}", ttl_str(&ann.rel)),
         format!("ik:contentHash {}", ttl_str(&ann.hash)),
@@ -1439,7 +1448,7 @@ mod tests {
 
         let created = annotate(&k, "note-1", "a.rs", "fn two()", "the middle function");
         assert_eq!(created["iri"], "urn:annotation:note-1");
-        assert_eq!(created["target"], "urn:repo:demo:file:a.rs");
+        assert_eq!(created["annotates"], "urn:repo:demo:file:a.rs");
         assert_eq!(created["line"], 2);
         assert_eq!(created["start"], 12);
         assert_eq!(created["end"], 20);
@@ -1881,6 +1890,11 @@ mod tests {
                 assert!(!t.object.to_string().starts_with("_:"), "{ttl}");
             }
             assert!(ttl.contains("a oa:Annotation"), "{ttl}");
+            assert!(
+                ttl.contains("ik:annotates <urn:repo:demo:file:a.rs>"),
+                "{ttl}"
+            );
+            assert!(!ttl.contains("ik:target"), "the retired term: {ttl}");
             assert!(ttl.contains("oa:exact \"fn one()\""), "{ttl}");
             assert!(
                 ttl.contains("<urn:annotation:n1:selector:position> a oa:TextPositionSelector"),
@@ -1888,6 +1902,64 @@ mod tests {
             );
             assert!(ttl.contains("ik:contentHash \"sha256:"), "{ttl}");
         }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Pre-0.2.2 stores wrote `ik:target` where the code now writes
+    /// `ik:annotates` (the term was ceded to the routing family). Legacy
+    /// annotations still load (never-drop extends to renames), and the first
+    /// rewrite — an update, re-anchor, or orphan pass — re-stores the graph
+    /// under the new term.
+    #[test]
+    fn a_legacy_ik_target_annotation_reads_and_migrates_on_rewrite() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "fn one() {}\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        annotate(&k, "old", "a.rs", "fn one()", "kept");
+
+        // Rewrite the stored graph to the legacy shape in place.
+        let minted: Vec<Quad> = store
+            .quads_for_pattern(None, Some(ik("annotates").as_ref()), None, None)
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(minted.len(), 1);
+        for quad in &minted {
+            store.remove(quad).unwrap();
+            store
+                .insert(&Quad::new(
+                    quad.subject.clone(),
+                    ik("target"),
+                    quad.object.clone(),
+                    quad.graph_name.clone(),
+                ))
+                .unwrap();
+        }
+
+        // The legacy annotation still reads, subject IRI intact.
+        let row = json_of(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:annotation:old",
+                &[("as", "application/json")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(row["annotates"], "urn:repo:demo:file:a.rs", "{row}");
+        assert_eq!(row["body"], "kept", "{row}");
+
+        // An update rewrites the whole graph — the legacy term is gone.
+        annotate(&k, "old", "a.rs", "fn one()", "updated");
+        let target_quads = store
+            .quads_for_pattern(None, Some(ik("target").as_ref()), None, None)
+            .count();
+        let annotates_quads = store
+            .quads_for_pattern(None, Some(ik("annotates").as_ref()), None, None)
+            .count();
+        assert_eq!(target_quads, 0, "the rewrite retires the legacy term");
+        assert_eq!(annotates_quads, 1);
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -2033,7 +2105,8 @@ mod tests {
         .unwrap();
 
         // ONE store now holds both shapes, queryable together: the
-        // explanation and the annotation share the ik:target IRI.
+        // explanation's ik:about and the annotation's ik:annotates name the
+        // same resource IRI.
         let typed = |class: NamedNode| -> Vec<String> {
             store
                 .quads_for_pattern(None, Some(rdf::TYPE), Some(class.as_ref().into()), None)
@@ -2044,20 +2117,30 @@ mod tests {
         let annotations = typed(oa("Annotation"));
         assert_eq!(explanations.len(), 1, "the explanation is archived");
         assert_eq!(annotations.len(), 1, "the annotation is stored");
-        let targets: Vec<String> = store
-            .quads_for_pattern(None, Some(ik("target").as_ref()), None, None)
-            .map(|q| match q.unwrap().object {
-                Term::NamedNode(n) => n.as_str().to_string(),
-                other => other.to_string(),
-            })
-            .collect();
+        let objects_of = |predicate: NamedNode| -> Vec<String> {
+            store
+                .quads_for_pattern(None, Some(predicate.as_ref()), None, None)
+                .map(|q| match q.unwrap().object {
+                    Term::NamedNode(n) => n.as_str().to_string(),
+                    other => other.to_string(),
+                })
+                .collect()
+        };
+        let abouts = objects_of(ik("about"));
+        let annotated = objects_of(ik("annotates"));
         assert_eq!(
-            targets
-                .iter()
-                .filter(|t| *t == "urn:repo:demo:file:a.rs")
-                .count(),
-            2,
-            "both graphs point at the same target: {targets:?}"
+            abouts,
+            ["urn:repo:demo:file:a.rs"],
+            "the explanation's subject"
+        );
+        assert_eq!(
+            annotated,
+            ["urn:repo:demo:file:a.rs"],
+            "the annotation's target"
+        );
+        assert!(
+            objects_of(ik("target")).is_empty(),
+            "nothing writes the retired ik:target term"
         );
 
         // And both resource families still answer off that one store.
