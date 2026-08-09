@@ -53,9 +53,11 @@ use oxigraph::store::Store;
 use crate::annotate::{self, Included, CAP_ANNOTATE};
 use crate::explain::{
     entry_iri, explain_turtle, iso8601, load_entry, parse_iri, provider_label, resolve_model,
-    store_entry, truncate, ArchiveEntry, CAP_NET, SYSTEM_PROMPT,
+    store_entry, truncate, truncated_len, ArchiveEntry, CAP_NET, SYSTEM_PROMPT,
 };
-use crate::review::{load_pass, parse_findings, pass_iri, pass_turtle, store_pass, PassEntry};
+use crate::review::{
+    answer_excerpt, load_pass, parse_findings, pass_iri, pass_turtle, store_pass, PassEntry,
+};
 use crate::{
     bind_family, esc, granted, highlight_html, repo_root, repr, repr_utf8, ExplainConfig, Roots,
     CAP_WILDCARD,
@@ -86,7 +88,12 @@ const PR_PROMPT: &str = "Explain this pull request from its diff: what does this
 /// v2: the QUOTE must include the line's leading diff marker (+/-/space) —
 /// v1 quotes routinely dropped it and nothing anchored (the diff-aware
 /// anchoring in [`crate::annotate`] is the other half of that fix).
-const PR_REVIEW_PROMPT_VERSION: &str = "pr-review-v2";
+/// v3: the format contract is RESTATED after the diff — on a big diff
+/// (16 KiB fed), qwen3-coder answered the v2 prompt with label-free
+/// quote-and-commentary prose: zero `QUOTE:`/`NOTE:` lines, nothing
+/// parseable, deterministically at temperature 0.2. The contract stated only
+/// above the diff loses to the diff; restated below it, 6/6 findings parse.
+const PR_REVIEW_PROMPT_VERSION: &str = "pr-review-v3";
 /// The PR reviewer persona (the file pass's, retargeted at a diff).
 const PR_REVIEW_SYSTEM_PROMPT: &str =
     "You are an experienced engineer reviewing a colleague's pull request. \
@@ -108,6 +115,16 @@ const PR_REVIEW_PROMPT: &str = "Review this pull request's diff and give your 3 
      Do not number the findings. Do not add headings, preamble, or closing \
      remarks. The QUOTE must appear verbatim in the diff, leading diff marker \
      and all, or the finding is discarded.";
+
+/// The format contract again, appended AFTER the diff — the last words the
+/// model reads must be the format (see the v3 note on
+/// [`PR_REVIEW_PROMPT_VERSION`]).
+const PR_REVIEW_REMINDER: &str =
+    "Now give the findings. Remember the format contract: each finding is \
+     exactly two lines - the first starts `QUOTE: ` followed by one line \
+     copied character-for-character from the diff above (leading '+', '-', \
+     or space column included, under 80 characters), the second starts \
+     `NOTE: ` with your commentary. No headings, no numbering, nothing else.";
 
 // --- IRIs ---------------------------------------------------------------------
 
@@ -1015,17 +1032,34 @@ impl Endpoint for PrReviewEndpoint {
         let model = model_label(inv, &config.review_provider, &config.review_model_label).await;
         let tag = format!("{PR_REVIEW_PROMPT_VERSION}@{model}");
 
+        // `debug=raw` is the diagnosis face: derive one fresh answer and
+        // return it UNPARSED — nothing minted, nothing archived, the archive
+        // neither consulted nor written (a probe must never poison a key).
+        let debug_raw = match inv.inline_str("debug") {
+            Ok("raw") => true,
+            Ok(other) => {
+                return Err(Error::InvalidArgument {
+                    name: "debug".to_string(),
+                    detail: format!("unknown debug face `{other}` (the one face is `raw`)"),
+                })
+            }
+            Err(_) => false,
+        };
+
         let iri = pass_iri(repo, &pr_rel(n), &view.head_oid, &tag);
-        if let Some(entry) = load_pass(&config.store, &iri)? {
-            // The hit path mints NOTHING; the recorded set is reconciled
-            // against the diff in hand.
-            let included = annotate::included_for_ids(&config.store, &entry.minted, &diff)?;
-            return pr_review_face(inv, repo, n, &entry, false, &included);
+        if !debug_raw {
+            if let Some(entry) = load_pass(&config.store, &iri)? {
+                // The hit path mints NOTHING; the recorded set is reconciled
+                // against the diff in hand.
+                let included = annotate::included_for_ids(&config.store, &entry.minted, &diff)?;
+                return pr_review_face(inv, repo, n, &entry, false, &included);
+            }
         }
 
         // Miss: derive one pass. Ask, parse, anchor in the diff, mint, archive.
         let prompt = format!(
-            "{PR_REVIEW_PROMPT}\n\nRepository: {repo}\nPull request: #{} {}\n\n```diff\n{}\n```",
+            "{PR_REVIEW_PROMPT}\n\nRepository: {repo}\nPull request: #{} {}\n\n```diff\n{}\n```\
+             \n\n{PR_REVIEW_REMINDER}",
             view.number,
             view.title,
             truncate(&diff, config.max_prompt_bytes),
@@ -1039,12 +1073,21 @@ impl Endpoint for PrReviewEndpoint {
             config.review_max_tokens,
         )
         .await?;
+        if debug_raw {
+            return Ok(repr_utf8("text/plain", answer));
+        }
         let (findings, malformed) = parse_findings(&answer);
         if findings.is_empty() {
+            // The error carries the answer's opening so the collapse is
+            // diagnosable from the error itself (a label-free format, a
+            // refusal, a ceiling-starved reply all read differently).
             return Err(Error::Endpoint(format!(
                 "browse: `{}` returned no parseable QUOTE:/NOTE: findings for pr {n} \
-                 (max_tokens {} — thinking models may need a higher ceiling); nothing archived",
-                config.review_provider, config.review_max_tokens
+                 (max_tokens {}); nothing archived. The answer began: \"{}\" — re-source \
+                 with debug=raw for the full unparsed answer",
+                config.review_provider,
+                config.review_max_tokens,
+                answer_excerpt(&answer)
             )));
         }
 
@@ -1092,6 +1135,8 @@ impl Endpoint for PrReviewEndpoint {
             model,
             minted,
             orphaned_items,
+            reviewed_bytes: Some(truncated_len(&diff, config.max_prompt_bytes) as u64),
+            total_bytes: Some(diff.len() as u64),
             derived_at: created,
         };
         store_pass(&config.store, &entry)?;
@@ -1127,6 +1172,8 @@ fn pr_review_face(
                 "derived": derived,
                 "minted": entry.minted,
                 "orphaned_items": entry.orphaned_items,
+                "reviewed_bytes": entry.reviewed_bytes,
+                "total_bytes": entry.total_bytes,
                 "derived_at": entry.derived_at,
                 "annotations": included.json(),
             })
@@ -1160,6 +1207,9 @@ fn pr_review_face(
                     entry.orphaned_items
                 ));
             }
+            if let Some(note) = entry.truncation_note() {
+                provenance.push_str(&esc(&note));
+            }
             out.push_str(&format!(
                 "<p class=\"browse-provenance\">{provenance}</p></div>"
             ));
@@ -1178,6 +1228,9 @@ fn pr_review_face(
                     " · {} item(s) did not anchor",
                     entry.orphaned_items
                 ));
+            }
+            if let Some(note) = entry.truncation_note() {
+                out.push_str(&note);
             }
             out.push('\n');
             out.push_str(&included.margin_text());
@@ -1224,6 +1277,15 @@ fn pr_review_description() -> Description {
                 .summary("the face to render")
                 .one_of(["text/plain", "application/json", "text/html", "text/turtle"])
                 .default_value("text/plain"),
+        )
+        .input(
+            ArgSpec::new("debug")
+                .optional()
+                .summary(
+                    "raw: derive and return the model's unparsed answer (text/plain) — \
+                     nothing parsed, minted, or archived; the parse-failure diagnosis face",
+                )
+                .one_of(["raw"]),
         )
         .output("text/plain;charset=utf-8")
         .output("application/json")
@@ -1806,7 +1868,7 @@ mod tests {
 
         let pass = json(&k, "urn:repo:demo:pr:3:review", &[]);
         assert_eq!(pass["derived"], true);
-        assert_eq!(pass["version_tag"], "pr-review-v2@r1");
+        assert_eq!(pass["version_tag"], "pr-review-v3@r1");
         assert_eq!(
             pass["content_hash"], OID,
             "the pass keys on the head commit"
@@ -1814,9 +1876,18 @@ mod tests {
         assert_eq!(pass["about"], "urn:repo:demo:pr:3");
         assert_eq!(pass["minted"].as_array().unwrap().len(), 2);
         assert_eq!(pass["orphaned_items"], 0);
+        // The whole diff fit — the honesty fields say so.
+        assert_eq!(pass["reviewed_bytes"], DIFF.len());
+        assert_eq!(pass["total_bytes"], DIFF.len());
         assert_eq!(log.count(), 1);
         let (prompt, system, _) = log.last();
         assert!(prompt.contains("pull request's diff"), "{prompt}");
+        // The format contract is restated AFTER the diff (big diffs crowd a
+        // top-only contract out of the answer — the v3 fix).
+        assert!(
+            prompt.rfind("format contract").unwrap() > prompt.rfind("fn gamma()").unwrap(),
+            "the reminder must follow the diff: {prompt}"
+        );
         assert!(system.contains("colleague's pull request"), "{system}");
 
         // The findings ARE annotations targeting the PR IRI — machine-marked,
@@ -2017,6 +2088,84 @@ index 3f9c2d1..8a41b77 100644
         for cap in [CAP_WILDCARD, CAP_NET, CAP_ANNOTATE] {
             assert!(review_desc.requires.contains(&cap.to_string()), "{cap}");
         }
+        let names: Vec<&str> = review_desc.inputs.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["n", "as", "debug"]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_collapsed_answer_errors_with_its_opening_and_debug_raw_captures_it() {
+        let root = temp_dir();
+        let store = Arc::new(Store::new().unwrap());
+        let state = FakeRepo::new();
+        let log = Arc::new(Log::default());
+        // The live pr:9 failure's shape: findings, but label-free.
+        let musings = "+fn beta() {}\nThe new function lands without a caller.";
+        let k = explain_kernel(&root, &store, &state, &log, musings);
+
+        let err = source(&k, "urn:repo:demo:pr:3:review", &[]).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("no parseable"), "{msg}");
+        assert!(
+            msg.contains("The new function lands without a caller."),
+            "the raw opening must ride the error: {msg}"
+        );
+        assert!(msg.contains("debug=raw"), "{msg}");
+
+        // The capture face: the answer verbatim, nothing minted or archived.
+        let raw = source(&k, "urn:repo:demo:pr:3:review", &[("debug", "raw")]).unwrap();
+        assert_eq!(raw.repr_type.media_type, "text/plain");
+        assert_eq!(body(&raw), musings);
+        let rows = json(&k, "urn:repo:demo:annotations", &[]);
+        assert_eq!(rows.as_array().unwrap().len(), 0, "the probe mints nothing");
+        // And the normal pass still derives fresh (nothing was archived).
+        let err = source(&k, "urn:repo:demo:pr:3:review", &[]).unwrap_err();
+        assert!(format!("{err:?}").contains("no parseable"), "{err:?}");
+        assert_eq!(log.count(), 3);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_truncated_diff_is_reported_honestly() {
+        let root = temp_dir();
+        let store = Arc::new(Store::new().unwrap());
+        let state = FakeRepo::new();
+        let log = Arc::new(Log::default());
+        // A prompt window smaller than the diff: the model sees a prefix,
+        // quotes anchor against the WHOLE diff, and the faces say how much
+        // was reviewed (the pr:9 shape — a 114 KiB diff behind a 16 KiB
+        // window must not present a 14% review as the review).
+        let cfg = ExplainConfig::new(Arc::clone(&store))
+            .review_model_label("r1")
+            .max_prompt_bytes(40);
+        let browse = crate::space_with_explain(vec![("demo".to_string(), root.clone())], cfg);
+        let k = Kernel::new(Arc::new(Fallback::new(vec![
+            Arc::new(browse),
+            Arc::new(fake_repo_space(&state)),
+            Arc::new(fake_llm_space(&log, TWO_FINDINGS)),
+        ])));
+
+        let pass = json(&k, "urn:repo:demo:pr:3:review", &[]);
+        assert_eq!(pass["reviewed_bytes"], 40);
+        assert_eq!(pass["total_bytes"], DIFF.len());
+        // `+fn beta() {}` lies past the 40-byte window yet anchors: only the
+        // prompt is truncated, never the anchor surface.
+        assert_eq!(pass["minted"].as_array().unwrap().len(), 2);
+        let (prompt, _, _) = log.last();
+        assert!(prompt.contains("… (content truncated)"), "{prompt}");
+
+        // The archive hit serves the same numbers; the plain face names it.
+        let hit = json(&k, "urn:repo:demo:pr:3:review", &[]);
+        assert_eq!(hit["derived"], false);
+        assert_eq!(hit["reviewed_bytes"], 40);
+        let text = body(&source(&k, "urn:repo:demo:pr:3:review", &[]).unwrap());
+        assert!(
+            text.contains(&format!(
+                "reviewed 40 of {} bytes (input truncated)",
+                DIFF.len()
+            )),
+            "{text}"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

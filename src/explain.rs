@@ -431,14 +431,25 @@ fn grain_prompt(grain: Grain) -> &'static str {
 /// Truncate at a char boundary with an explicit marker — silently feeding a
 /// model half a file invites confident nonsense about the missing half.
 pub(crate) fn truncate(text: &str, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
+    let end = truncated_len(text, max_bytes);
+    if end == text.len() {
         return text.to_string();
+    }
+    format!("{}\n… (content truncated)", &text[..end])
+}
+
+/// How many bytes of `text` [`truncate`] actually feeds the model — the
+/// honest-reporting number (`reviewed_bytes`) the review passes record next
+/// to the input's full size.
+pub(crate) fn truncated_len(text: &str, max_bytes: usize) -> usize {
+    if text.len() <= max_bytes {
+        return text.len();
     }
     let mut end = max_bytes;
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}\n… (content truncated)", &text[..end])
+    end
 }
 
 // --- the archive (RDF in the shared store) ----------------------------------
