@@ -16,6 +16,10 @@ pairs), and each root answers three resource families:
 | `urn:annotation[:{id}]` | a **W3C Web Annotation** (S2) on a file — Sink creates/updates (anchoring the quoted text; the bare `urn:annotation` mints a uuid id), Source reads with drift **re-anchoring**, Delete removes; faces: `text/plain` (the body), `as=application/json`, `as=text/turtle` |
 | `urn:repo:{repo}:annotations[:{path}]` | every annotation on one file (or the whole repo, path omitted) in reading order, drift-reconciled on each read; faces: `application/json` (default), `as=text/html` (panel fragment), `as=text/turtle` |
 | `urn:repo:{repo}:review:{path}` | the **machine review pass** (S4) — region-grain LLM commentary minted as real annotations (provenance-distinguished), the pass archived by `(path, content-hash, review-tag)` so re-sourcing unchanged content mints nothing; faces: `text/plain` (the margin digest), `as=application/json` (`{minted, orphaned_items, annotations, …}`), `as=text/html` (the card page), `as=text/turtle` (the pass's provenance graph) |
+| `urn:repo:{repo}:prs` | the root's **open pull requests** — ikigai-repo's `urn:repo:pr:list` facade resolved through the kernel with `dir=` the root's directory; `text/plain` (default) is `number`⇥`title`⇥`branch`⇥`updated` per line (empty = no open PRs), `as=application/json` the facade's structured rows, `as=text/html` the listing with each PR linking its page |
+| `urn:repo:{repo}:pr:{n}` | the **PR page** — metadata (`urn:repo:pr:view` json: author object, `headRefOid`) + the unified diff (`urn:repo:pr:diff`); the DIFF TEXT is an annotation surface (annotations target the PR IRI and quote diff lines, drifting like file annotations); `as=text/html` renders the highlighted, line-anchored diff with markers and the annotations panel; `annotations=include` folds the margin into the plain/json faces |
+| `urn:repo:{repo}:pr:{n}:explain` | a **review-shaped PR explanation** — what the change does and what a reviewer would look at — archived by `(repo, pr, headRefOid, version-tag)`: new commits derive fresh, prior entries stay addressable (`version=`) |
+| `urn:repo:{repo}:pr:{n}:review` | the **machine review pass over the diff** — findings minted as machine annotations targeting the PR IRI, the pass archived by `(repo, pr, headRefOid, review-tag)` so an unchanged head mints nothing |
 
 **Resolution is the access model.** A `{repo}` that is not a configured root is
 a clean resolution *miss* (the grammar refuses to match; other mounted spaces
@@ -70,6 +74,14 @@ roots (memory dirs, skills dirs) need not be repositories.
 **Native-only by nature** — it reads the roots' filesystem directly and spawns
 `git` for the state oracle (an argument vector, never a shell string). It is
 to source trees what `ikigai-repo` is to dev tooling. No wasm face.
+
+**The PR family needs the pr facades mounted.** Browse does NOT depend on the
+`ikigai-repo` crate — the PR resources resolve `urn:repo:pr:list` / `:view` /
+`:diff` THROUGH THE KERNEL at runtime, passing `dir=` so they run in the
+root's directory. A composition without those facades answers a typed
+`NotFound` naming the gap (the rest of browse is untouched), and the facades
+enforce their own capability (`urn:cap:exec:gh`) on dispatch — attenuation
+means a caller of the PR rows must hold it too.
 
 ```rust
 use ikigai_core::Kernel;

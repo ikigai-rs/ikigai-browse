@@ -109,20 +109,20 @@ const REVIEW_PROMPT: &str =
 /// `ik:Review` and `ik:orphanedItems` are the two terms the vocab does not
 /// hold yet (reported up, not added here); every provenance link is standard
 /// PROV / DC / OA.
-struct PassEntry {
-    iri: String,
-    repo: String,
-    rel: String,
-    target_iri: String,
-    hash: String,
-    tag: String,
-    model: String,
-    minted: Vec<String>,
-    orphaned_items: u64,
-    derived_at: Option<String>,
+pub(crate) struct PassEntry {
+    pub(crate) iri: String,
+    pub(crate) repo: String,
+    pub(crate) rel: String,
+    pub(crate) target_iri: String,
+    pub(crate) hash: String,
+    pub(crate) tag: String,
+    pub(crate) model: String,
+    pub(crate) minted: Vec<String>,
+    pub(crate) orphaned_items: u64,
+    pub(crate) derived_at: Option<String>,
 }
 
-fn pass_iri(repo: &str, rel: &str, hash: &str, tag: &str) -> String {
+pub(crate) fn pass_iri(repo: &str, rel: &str, hash: &str, tag: &str) -> String {
     format!(
         "urn:ikigai:browse:review:{repo}:{hash}:{}:{}",
         iri_encode(tag),
@@ -141,7 +141,7 @@ fn prov(term: &str) -> NamedNode {
     NamedNode::new(format!("{PROV}{term}")).expect("prov terms are valid IRIs")
 }
 
-fn store_pass(store: &Store, entry: &PassEntry) -> Result<()> {
+pub(crate) fn store_pass(store: &Store, entry: &PassEntry) -> Result<()> {
     use oxigraph::model::vocab::{rdf, xsd};
     let subject = NamedNode::new(&entry.iri).map_err(store_err)?;
     let target = NamedNode::new(&entry.target_iri).map_err(store_err)?;
@@ -210,7 +210,7 @@ fn store_pass(store: &Store, entry: &PassEntry) -> Result<()> {
 
 /// Load one archived pass by its key IRI — `None` on a miss (no
 /// `ik:versionTag` under that subject).
-fn load_pass(store: &Store, iri: &str) -> Result<Option<PassEntry>> {
+pub(crate) fn load_pass(store: &Store, iri: &str) -> Result<Option<PassEntry>> {
     let subject = match NamedNode::new(iri) {
         Ok(node) => node,
         Err(_) => return Ok(None),
@@ -271,9 +271,9 @@ fn load_pass(store: &Store, iri: &str) -> Result<Option<PassEntry>> {
 
 // --- parsing the model's findings --------------------------------------------
 
-struct Finding {
-    quote: String,
-    note: String,
+pub(crate) struct Finding {
+    pub(crate) quote: String,
+    pub(crate) note: String,
 }
 
 /// Parse `QUOTE:`/`NOTE:` pairs out of the model's answer. Returns the
@@ -282,7 +282,7 @@ struct Finding {
 /// quotes rather than killing the pass. Bare lines after a `NOTE:` continue
 /// the note (models wrap); anything before the first `QUOTE:` is preamble and
 /// is ignored.
-fn parse_findings(answer: &str) -> (Vec<Finding>, u64) {
+pub(crate) fn parse_findings(answer: &str) -> (Vec<Finding>, u64) {
     let mut findings = Vec::new();
     let mut malformed = 0u64;
     let mut quote: Option<String> = None;
@@ -438,6 +438,7 @@ impl Endpoint for ReviewEndpoint {
         for finding in &findings {
             match annotate::mint_review_annotation(
                 &config.store,
+                &file_iri(repo, &rel),
                 repo,
                 &rel,
                 &text,
@@ -586,7 +587,7 @@ fn review_html(
 /// The pass entry as Turtle — the same skolemized shape the store holds. The
 /// minted annotations are addressable at their own IRIs (and the listing's
 /// turtle face serves their full graphs); this face is the pass's record.
-fn pass_turtle(entry: &PassEntry) -> String {
+pub(crate) fn pass_turtle(entry: &PassEntry) -> String {
     let mut props = vec![
         "a ik:Review".to_string(),
         format!("ik:repo {}", ttl_str(&entry.repo)),

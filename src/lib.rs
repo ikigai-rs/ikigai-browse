@@ -41,6 +41,14 @@
 //!   `oa:motivatedBy oa:assessing`, `prov:wasGeneratedBy`), the pass archived
 //!   by `(path, content-hash, review-tag)` so re-sourcing unchanged content
 //!   mints nothing.
+//! - `urn:repo:{repo}:prs` + `urn:repo:{repo}:pr:{n}` (and, explanations
+//!   mounted, `…:pr:{n}:explain` / `…:pr:{n}:review`) — the **pull-request
+//!   family**: ikigai-repo's pr facades resolved THROUGH THE KERNEL at
+//!   runtime (`dir=` the root's directory; no crate dependency, and a typed
+//!   NotFound when they are not mounted). The PR page's DIFF is an annotation
+//!   surface — annotations target the PR IRI and drift like file ones — and
+//!   the derived layers archive by the HEAD COMMIT (`headRefOid`), so new
+//!   commits re-derive and prior entries stay addressable.
 //!
 //! ## Resolution is the access model
 //!
@@ -96,6 +104,7 @@ use syntect::util::LinesWithEndings;
 mod annotate;
 mod explain;
 mod hash;
+mod pr;
 mod review;
 
 pub use annotate::CAP_ANNOTATE;
@@ -170,6 +179,8 @@ pub fn space_with_explain(
     // The S4 review pass (machine-minted annotations) rides with the
     // explanation family: it needs the same LLM seam and the same store.
     let space = review::bind(space, &roots, &shared);
+    // So do the pull-request derived layers (pr:{n}:explain / pr:{n}:review).
+    let space = pr::bind_explain(space, &roots, &shared);
     annotate::bind(space, &roots, &store)
 }
 
@@ -210,7 +221,11 @@ fn base_space(
     let space = bind_family(space, roots, tree, Some("tree"), Some("tree:{path}"));
     let space = bind_family(space, roots, file, None, Some("file:{path}"));
     let space = bind_family(space, roots, state, Some("state"), None);
-    bind_family(space, roots, hash, Some("hash"), Some("hash:{path}"))
+    let space = bind_family(space, roots, hash, Some("hash"), Some("hash:{path}"));
+    // The pull-request pages ride with every variant: they need no store and
+    // no LLM — only ikigai-repo's pr facades resolved through the kernel at
+    // runtime (unmounted facades answer a typed NotFound, not a panic).
+    pr::bind_pages(space, roots, store, explain)
 }
 
 // --- grammar ----------------------------------------------------------------
@@ -701,7 +716,23 @@ fn actions_html(repo: &str, rel: &str, explain: bool) -> String {
 fn tree_html(repo: &str, rel: &str, entries: &[Entry], explain: bool) -> String {
     let mut out = String::from("<div class=\"browse\">");
     out.push_str(&crumbs_html(repo, rel));
-    out.push_str(&actions_html(repo, rel, explain));
+    // The header actions: the explain affordance (family mounted), and — at
+    // the top only — the repo's pull requests (a repo-grain resource, always
+    // bound; its data facades answer at resolution time).
+    let mut actions = String::new();
+    if explain {
+        actions.push_str(&explain_button(repo, rel, "explain", None));
+    }
+    if rel.is_empty() {
+        actions.push_str(&format!(
+            "<button class=\"browse-prs-link\" hx-get=\"/k/source {} as=text/html\" \
+             hx-target=\"#browse\" hx-swap=\"innerHTML\">pull requests</button>",
+            pr::prs_iri(repo),
+        ));
+    }
+    if !actions.is_empty() {
+        out.push_str(&format!("<nav class=\"browse-actions\">{actions}</nav>"));
+    }
     out.push_str("<ul class=\"browse-entries\">");
     for e in entries {
         let child = if rel.is_empty() {
