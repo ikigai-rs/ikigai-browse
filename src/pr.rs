@@ -2297,6 +2297,10 @@ mod tests {
         let html = body(&source(&k, "urn:repo:demo:pr:3", &[("as", "text/html")]).unwrap());
         assert!(html.contains("#3 Add beta"), "{html}");
         assert!(html.contains("browse-code"), "{html}");
+        // The diff highlights via classes too (the urn:repo:style contract) —
+        // no inline styles anywhere in the face.
+        assert!(html.contains("class=\"hl-"), "{html}");
+        assert!(!html.contains("style=\""), "{html}");
         // The crumb trail: home affordance, repo and prs as live crumbs,
         // the PR number inert.
         assert!(
