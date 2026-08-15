@@ -1112,12 +1112,34 @@ const CLASS_STYLE: ClassStyle = ClassStyle::SpacedPrefixed {
 /// (`urn:repo:style:tree`), never the bare IRI.
 pub const STYLE_IRI: &str = "urn:repo:style";
 
-/// The generated theme stylesheet: InspiredGitHub's rules (the light look S0
-/// shipped) at top level plus base16-ocean.dark's inside a
-/// `@media (prefers-color-scheme: dark)` block — ONE stylesheet serving both
-/// schemes, generated once from two-face's embedded theme set via
+/// The generated theme stylesheet: InspiredGitHub (light) and base16-ocean.dark
+/// (dark), generated once from two-face's embedded theme set via
 /// `css_for_theme_with_class_style`. The `.hl-code` base rule carries each
 /// theme's foreground/background, which the `<pre>` opts into.
+///
+/// **Each theme lives inside its OWN `prefers-color-scheme` block**, and that is
+/// load-bearing rather than tidy. The light rules used to sit at top level with
+/// only the dark ones in a media query — but **a media query contributes no
+/// specificity**, so the two themes shared one cascade and the more specific
+/// selector won regardless of scheme. syntect emits deeply nested scope
+/// selectors (up to 33 classes in one selector here), so no prefix or `:root`
+/// repetition could have made the dark block reliably outrank the light one;
+/// the only fix is to stop the light rules matching in dark mode at all.
+///
+/// What that cost, concretely: a Rust parameter is `hl-variable hl-parameter`,
+/// which light styles at `.hl-variable.hl-parameter` (0,2,0, `#323232`) while
+/// dark's nearest applicable rule is the bare `.hl-variable` (0,1,0). Light won
+/// in dark mode — `#323232` on `#2b303b`, a contrast ratio of about **1.03:1**,
+/// which is to say invisible. Dark's own `.hl-variable.hl-parameter.hl-function`
+/// never applied, because the markup carries no `hl-function` on a parameter.
+/// Parameters were the visible case, not the only one: every scope where
+/// InspiredGitHub is more specific than base16-ocean.dark leaked the same way.
+///
+/// [`BASE_FLOOR`] stays OUTSIDE both blocks so a user agent matching neither
+/// still gets a legible ground rather than dark-on-dark. Modern browsers always
+/// report `light` or `dark` (the `no-preference` value was dropped from the
+/// spec), so in practice one block always matches and the floor is belt and
+/// braces — a monochrome-but-readable fallback, never a wrong-colour one.
 fn style_css() -> &'static str {
     static CSS: OnceLock<String> = OnceLock::new();
     CSS.get_or_init(|| {
@@ -1132,9 +1154,39 @@ fn style_css() -> &'static str {
             CLASS_STYLE,
         )
         .expect("the embedded dark theme generates CSS");
-        format!("{light}\n@media (prefers-color-scheme: dark) {{\n{dark}}}\n")
+        format!(
+            "{BASE_FLOOR}\n\
+             @media (prefers-color-scheme: light) {{\n{light}}}\n\
+             @media (prefers-color-scheme: dark) {{\n{dark}{DARK_PARAMETER}}}\n"
+        )
     })
 }
+
+/// The unconditional ground for `<pre class="… hl-code">`: the light theme's own
+/// foreground and background, so a user agent that matches neither scheme block
+/// still renders code legibly (unhighlighted, never dark-on-dark). Kept in step
+/// with InspiredGitHub's `.hl-code` rule by
+/// `the_floor_matches_the_light_theme_base`.
+const BASE_FLOOR: &str = ".hl-code {\n color: #323232;\n background-color: #ffffff;\n}\n";
+
+/// One supplement appended INSIDE the dark block, completing the dark theme's own
+/// intent rather than overriding it.
+///
+/// base16-ocean.dark declares `variable.parameter.function` as `#c0c5ce` — its
+/// default foreground, 7.63:1 against the `#2b303b` ground. But it has no rule
+/// for `variable.parameter` WITHOUT `.function`, and that is precisely what
+/// Rust emits (`hl-variable hl-parameter`, 181 spans in one file of this crate).
+/// Such a parameter therefore falls through to the bare `.hl-variable` rule and
+/// renders in the palette's red at 3.23:1 — legible, but under the 4.5:1 bar,
+/// and not what the theme means by a parameter.
+///
+/// The colour is NOT invented: it is the same `#c0c5ce` the theme already
+/// assigns to the `.function` form, so a parameter reads the same whether or not
+/// the grammar tags it. Specificity 0,2,0 places it above the bare
+/// `.hl-variable` (0,1,0) and below the theme's own `.function` rule (0,3,0),
+/// which is the same colour anyway. Pinned by
+/// `a_parameter_reads_at_the_theme_s_own_foreground`.
+const DARK_PARAMETER: &str = "\n.hl-variable.hl-parameter {\n color: #c0c5ce;\n}\n";
 
 fn file_html(
     repo: &str,
@@ -1323,11 +1375,12 @@ fn style_description() -> Description {
         .title("Highlight stylesheet")
         .summary(
             "The theme stylesheet the classed highlight faces bind to — urn:repo:style, \
-             text/css. InspiredGitHub's rules (light) at top level plus base16-ocean.dark's \
-             inside @media (prefers-color-scheme: dark): one stylesheet, both schemes. \
-             Every rule targets the hl- classes the html faces emit, plus the .hl-code \
-             base (foreground/background) their <pre> carries. A pure function of the \
-             build — cacheable.",
+             text/css. InspiredGitHub (light) and base16-ocean.dark (dark), each inside \
+             its OWN @media (prefers-color-scheme: …) block: one stylesheet, both schemes, \
+             neither able to outrank the other by specificity. Every rule targets the hl- \
+             classes the html faces emit, plus an unconditional .hl-code floor \
+             (foreground/background) their <pre> carries, so a client matching neither \
+             scheme still reads. A pure function of the build — cacheable.",
         )
         .verb(Verb::Source)
         .verb(Verb::Meta)
@@ -1871,12 +1924,21 @@ mod tests {
         let out = source(&k, STYLE_IRI, &[], &cap).unwrap();
         assert_eq!(out.repr_type.media_type, "text/css");
         let css = body(&out);
-        // The base rule the <pre class="… hl-code"> opts into, light theme
-        // (InspiredGitHub's white page) at top level…
-        assert!(css.contains(".hl-code {"), "{css}");
-        assert!(css.contains("background-color: #ffffff"), "{css}");
-        // …and the dark theme (base16-ocean.dark's slate) inside the media
-        // block.
+        // The unconditional floor the <pre class="… hl-code"> opts into, before
+        // either scheme block — a client matching neither still reads.
+        let floor = css
+            .split("@media")
+            .next()
+            .expect("there is text before the first media block");
+        assert!(floor.contains(".hl-code {"), "{css}");
+        assert!(floor.contains("background-color: #ffffff"), "{css}");
+        // Each theme inside its OWN block: light (InspiredGitHub's white page)…
+        let light = css
+            .split("@media (prefers-color-scheme: light) {")
+            .nth(1)
+            .expect("the light block exists");
+        assert!(light.contains("background-color: #ffffff"), "{css}");
+        // …and dark (base16-ocean.dark's slate).
         let dark = css
             .split("@media (prefers-color-scheme: dark) {")
             .nth(1)
@@ -1894,6 +1956,93 @@ mod tests {
         let err = source(&k, STYLE_IRI, &[], &unrelated).unwrap_err();
         assert!(matches!(err, Error::Denied(_)), "{err:?}");
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The invariant that makes a cross-scheme leak structurally impossible: the
+    /// ONLY rule outside a scheme block is the floor. A media query adds no
+    /// specificity, so any theme rule left at top level competes with the other
+    /// theme's rules in the other scheme — and syntect's selectors run to 33
+    /// classes, so a leaked rule can be unbeatable. Confinement is the guard;
+    /// nothing about specificity needs reasoning about once this holds.
+    #[test]
+    fn no_theme_rule_sits_outside_a_scheme_block() {
+        let css = style_css();
+        let floor = css
+            .split("@media")
+            .next()
+            .expect("there is text before the first media block");
+        assert_eq!(
+            floor.trim(),
+            BASE_FLOOR.trim(),
+            "only the .hl-code floor may sit outside a scheme block — anything \
+             else can outrank the other theme in its own scheme"
+        );
+    }
+
+    /// The exact collision that made parameters unreadable, pinned so it cannot
+    /// return: a Rust parameter is `hl-variable hl-parameter`, and the light rule
+    /// for it (`#323232`) must live inside the LIGHT block only. Against dark's
+    /// `#2b303b` ground that colour is ~1.03:1 contrast — invisible.
+    #[test]
+    fn the_light_parameter_colour_cannot_reach_the_dark_ground() {
+        let css = style_css();
+        let (light, dark) = css
+            .split_once("@media (prefers-color-scheme: dark) {")
+            .expect("the dark block exists");
+        assert!(
+            light.contains(".hl-variable.hl-parameter"),
+            "the light theme still styles parameters: {light}"
+        );
+        assert!(
+            !dark.contains("#323232"),
+            "the light foreground must not appear anywhere in the dark block: {dark}"
+        );
+    }
+
+    /// A parameter must read at the dark theme's own foreground, not fall through
+    /// to the palette's red. The supplement sits inside the dark block and above
+    /// the bare `.hl-variable` rule it corrects.
+    #[test]
+    fn a_parameter_reads_at_the_theme_s_own_foreground() {
+        let css = style_css();
+        let dark = css
+            .split_once("@media (prefers-color-scheme: dark) {")
+            .expect("the dark block exists")
+            .1;
+        assert!(
+            dark.contains(".hl-variable.hl-parameter {\n color: #c0c5ce;\n}"),
+            "the parameter supplement is inside the dark block: {dark}"
+        );
+        // …and it is the theme's OWN colour, not an invented one: the same value
+        // base16-ocean.dark already gives the `.function` form of a parameter.
+        assert!(
+            dark.contains(".hl-variable.hl-parameter.hl-function {\n color: #c0c5ce;\n}"),
+            "the theme still declares the .function form at that colour: {dark}"
+        );
+    }
+
+    /// The floor mirrors InspiredGitHub's own `.hl-code` rule by hand, so it can
+    /// drift when the embedded theme changes. Catch that here rather than in a
+    /// browser.
+    #[test]
+    fn the_floor_matches_the_light_theme_base() {
+        let themes = two_face::theme::extra();
+        let light = css_for_theme_with_class_style(
+            &themes[two_face::theme::EmbeddedThemeName::InspiredGithub],
+            CLASS_STYLE,
+        )
+        .expect("the embedded light theme generates CSS");
+        let base = light
+            .split_once(".hl-code {")
+            .and_then(|(_, rest)| rest.split_once('}'))
+            .map(|(decls, _)| decls.to_string())
+            .expect("the light theme declares .hl-code");
+        for decl in base.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            assert!(
+                BASE_FLOOR.contains(decl),
+                "the floor has drifted from the light theme's .hl-code: missing {decl:?}"
+            );
+        }
     }
 
     #[test]
