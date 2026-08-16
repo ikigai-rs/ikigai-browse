@@ -1,7 +1,7 @@
 [package]
 name = "ikigai-browse"
 description = "Repository browsing as ikigai resources: per-root tree / file / git-state / hash endpoints, an archived LLM explanation layer, W3C Web Annotations that re-anchor under drift, a machine review pass that mints its findings as provenance-distinguished annotations, and a pull-request family (listing, annotatable diff pages, head-commit-keyed explains and reviews) - capability-gated, with text, htmx-HTML, and Turtle faces."
-version = "0.2.11"
+version = "0.2.12"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -18,7 +18,19 @@ categories = ["development-tools", "filesystem"]
 # 0.1.49) rides along.
 # NATIVE-ONLY: it reads the filesystem directly and spawns `git` (std::process)
 # — the platform seam, like ikigai-repo. No wasm face by design.
-ikigai-core = "0.1.54"
+#
+# 0.1.56 is the pin because `ikigai-a11y` (below) requires it for `config::
+# config_home` / `layered_paths_in`. Cargo would unify to it regardless, but a
+# pin naming a version this crate's dependency graph cannot actually satisfy
+# describes a build nobody has: state the real floor.
+ikigai-core = "0.1.56"
+# The accessibility config and the contrast-floor pass: `urn:repo:style`'s
+# themes and its contrast floor are read from the layered `a11y.toml` rather
+# than hard-coded, and each theme's own sub-floor colours are lifted to that
+# theme's own default foreground. `features = ["themes"]` is the syntect/two-face
+# bridge (name → embedded theme); the crate's default build is wasm-clean
+# without it.
+ikigai-a11y = { version = "0.1.0", features = ["themes"] }
 # Syntax highlighting for the file HTML face. The pure-Rust regex engine
 # (default-fancy) so CI never needs a C toolchain for oniguruma; yaml-load
 # compiles the embedded Turtle .sublime-syntax (assets/) at first use.

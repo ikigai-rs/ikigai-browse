@@ -50,9 +50,12 @@
 //!   the derived layers archive by the HEAD COMMIT (`headRefOid`), so new
 //!   commits re-derive and prior entries stay addressable.
 //! - `urn:repo:style` — the **theme stylesheet** the classed highlight faces
-//!   bind to (`text/css`, root-independent, cacheable): the light theme's
-//!   rules plus the dark theme's under `@media (prefers-color-scheme: dark)`,
-//!   all targeting the `hl-` classes the HTML faces emit.
+//!   bind to (`text/css`, root-independent, cacheable): each configured theme
+//!   inside its own `@media (prefers-color-scheme: …)` block, all targeting the
+//!   `hl-` classes the HTML faces emit. The themes and the contrast floor come
+//!   from the layered `a11y.toml` via `ikigai-a11y` (see [`Mount::app`]), and
+//!   every colour below that floor is lifted to its own theme's default
+//!   foreground — repaired in the theme's palette, nothing invented.
 //! - `urn:repo:{repo}:prs:{path}` — the **contextual** listing: the PRs that
 //!   touched anything at or under a path, newest first — open PRs by
 //!   intersecting their changed files (`urn:repo:pr:files`), merged PRs mined
@@ -142,8 +145,7 @@ pub(crate) type Roots = Arc<BTreeMap<String, PathBuf>>;
 /// containing `:` or `/` (it must embed cleanly in the URN grammar), or a
 /// duplicate name.
 pub fn space(roots: impl IntoIterator<Item = (String, PathBuf)>) -> EndpointSpace {
-    let roots = build_roots(roots);
-    base_space(&roots, &Arc::new(hash::default_ignore()), None, false)
+    Mount::new(roots).space()
 }
 
 /// [`space`] plus the S2 **annotation** family over a host-injected Oxigraph
@@ -156,14 +158,7 @@ pub fn space_with_annotations(
     roots: impl IntoIterator<Item = (String, PathBuf)>,
     store: Arc<Store>,
 ) -> EndpointSpace {
-    let roots = build_roots(roots);
-    let space = base_space(
-        &roots,
-        &Arc::new(hash::default_ignore()),
-        Some(&store),
-        false,
-    );
-    annotate::bind(space, &roots, &store)
+    Mount::new(roots).annotations(store).space()
 }
 
 /// [`space`] plus the S1 **explanation** family: `urn:repo:{repo}:explain[:{path}]`
@@ -178,18 +173,103 @@ pub fn space_with_explain(
     roots: impl IntoIterator<Item = (String, PathBuf)>,
     config: ExplainConfig,
 ) -> EndpointSpace {
-    let roots = build_roots(roots);
-    let ignore = Arc::new(config.ignore.clone());
-    let store = Arc::clone(&config.store);
-    let shared = Arc::new(config.clone());
-    let space = base_space(&roots, &ignore, Some(&store), true);
-    let space = explain::bind(space, &roots, config);
-    // The S4 review pass (machine-minted annotations) rides with the
-    // explanation family: it needs the same LLM seam and the same store.
-    let space = review::bind(space, &roots, &shared);
-    // So do the pull-request derived layers (pr:{n}:explain / pr:{n}:review).
-    let space = pr::bind_explain(space, &roots, &shared);
-    annotate::bind(space, &roots, &store)
+    Mount::new(roots).explain(config).space()
+}
+
+/// A browse mount under construction — the seam that carries what the module
+/// needs from the HOST rather than from a request.
+///
+/// The three `space*` functions are this builder with one knob set, kept because
+/// they are what every existing host calls. Reach for the builder when a mount
+/// needs a combination they do not spell — today that means [`Mount::app`],
+/// which no positional constructor could take without changing three
+/// signatures at once.
+///
+/// ```no_run
+/// # use std::path::PathBuf;
+/// let space = ikigai_browse::Mount::new([("core".to_string(), PathBuf::from("/src/core"))])
+///     .app("dev-server")
+///     .space();
+/// ```
+pub struct Mount {
+    roots: Roots,
+    app: Option<String>,
+    store: Option<Arc<Store>>,
+    explain: Option<ExplainConfig>,
+}
+
+impl Mount {
+    /// A mount over `roots` — `(name, directory)` pairs, validated as [`space`]
+    /// validates them.
+    pub fn new(roots: impl IntoIterator<Item = (String, PathBuf)>) -> Self {
+        Mount {
+            roots: build_roots(roots),
+            app: None,
+            store: None,
+            explain: None,
+        }
+    }
+
+    /// The **process's** name — `dev-server`, `web`, `cms-web` — which selects
+    /// the `{app}.a11y.toml` layer `urn:repo:style` reads its themes and its
+    /// contrast floor from.
+    ///
+    /// It is the host's name, not this crate's: `ikigai-browse` is a library,
+    /// and the operator writing `dev-server.a11y.toml` is configuring the front
+    /// end they are looking at, not a module linked into it. A host that says
+    /// nothing gets the shared `a11y.toml` only, which is why this is optional
+    /// rather than required — a mount that names no app is under-configured,
+    /// never wrong.
+    pub fn app(mut self, app: impl Into<String>) -> Self {
+        self.app = Some(app.into());
+        self
+    }
+
+    /// Mount the S2 **annotation** family over a host-injected Oxigraph store.
+    /// See [`space_with_annotations`].
+    pub fn annotations(mut self, store: Arc<Store>) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    /// Mount the S1 **explanation** family (and the S4 review pass, and the
+    /// derived pull-request layers) — the store rides in the config. See
+    /// [`space_with_explain`].
+    pub fn explain(mut self, config: ExplainConfig) -> Self {
+        self.store = Some(Arc::clone(&config.store));
+        self.explain = Some(config);
+        self
+    }
+
+    /// Build the space.
+    pub fn space(self) -> EndpointSpace {
+        let Mount {
+            roots,
+            app,
+            store,
+            explain,
+        } = self;
+        let app = app.as_deref();
+        let Some(config) = explain else {
+            let ignore = Arc::new(hash::default_ignore());
+            let space = base_space(&roots, &ignore, store.as_ref(), false, app);
+            return match store {
+                Some(store) => annotate::bind(space, &roots, &store),
+                None => space,
+            };
+        };
+        let ignore = Arc::new(config.ignore.clone());
+        let store = Arc::clone(&config.store);
+        let shared = Arc::new(config.clone());
+        let space = base_space(&roots, &ignore, Some(&store), true, app);
+        let space = explain::bind(space, &roots, config);
+        // The S4 review pass (machine-minted annotations) rides with the
+        // explanation family: it needs the same LLM seam and the same store.
+        let space = review::bind(space, &roots, &shared);
+        // So do the pull-request derived layers (pr:{n}:explain / pr:{n}:review).
+        let space = pr::bind_explain(space, &roots, &shared);
+        annotate::bind(space, &roots, &store)
+    }
 }
 
 fn build_roots(roots: impl IntoIterator<Item = (String, PathBuf)>) -> Roots {
@@ -220,6 +300,7 @@ fn base_space(
     ignore: &Arc<BTreeSet<String>>,
     store: Option<&Arc<Store>>,
     explain: bool,
+    app: Option<&str>,
 ) -> EndpointSpace {
     let tree: Arc<dyn Endpoint> = Arc::new(tree_endpoint(roots, explain));
     let file: Arc<dyn Endpoint> = Arc::new(file_endpoint(roots, store, explain));
@@ -231,7 +312,7 @@ fn base_space(
     let space = bind_family(space, roots, state, Some("state"), None);
     let space = bind_family(space, roots, hash, Some("hash"), Some("hash:{path}"));
     // The theme stylesheet: one concrete row shared by all roots.
-    let space = space.bind(StyleRow, style_endpoint());
+    let space = space.bind(StyleRow, style_endpoint(app));
     // The pull-request pages ride with every variant: they need no store and
     // no LLM — only ikigai-repo's pr facades resolved through the kernel at
     // runtime (unmounted facades answer a typed NotFound, not a panic).
@@ -1112,10 +1193,27 @@ const CLASS_STYLE: ClassStyle = ClassStyle::SpacedPrefixed {
 /// (`urn:repo:style:tree`), never the bare IRI.
 pub const STYLE_IRI: &str = "urn:repo:style";
 
-/// The generated theme stylesheet: InspiredGitHub (light) and base16-ocean.dark
-/// (dark), generated once from two-face's embedded theme set via
-/// `css_for_theme_with_class_style`. The `.hl-code` base rule carries each
-/// theme's foreground/background, which the `<pre>` opts into.
+/// The generated theme stylesheet: the configured light theme, the configured
+/// dark theme, each generated from two-face's embedded theme set via
+/// `css_for_theme_with_class_style` and each run through `ikigai-a11y`'s
+/// contrast-floor pass at the configured floor. The `.hl-code` base rule carries
+/// each theme's foreground/background, which the `<pre>` opts into.
+///
+/// **Which themes, and which floor, are configuration** — the layered
+/// `a11y.toml` ⊕ `{app}.a11y.toml`, read through `ikigai-a11y`. With no config
+/// files present the defaults are `InspiredGithub` / `Base16OceanDark` / 4.5,
+/// which are the constants this function used to hard-code, so a machine that
+/// has written no `a11y.toml` sees no change but the floor pass.
+///
+/// **The floor pass replaces hand-patching.** Until 0.2.12 one dark rule was
+/// corrected by a typed constant (`.hl-variable.hl-parameter { color: #c0c5ce }`,
+/// written after parameters were noticed rendering at 3.23:1). That was one
+/// instance of a general fact — some of any theme's scope colours miss the floor
+/// against that theme's own ground — so it is now derived for every rule of both
+/// themes: a sub-floor colour is lifted to **the theme's own default
+/// foreground**, the one colour a theme guarantees is legible on its own ground.
+/// Nothing is invented, and a rule whose own repainted background defeats even
+/// that is left alone rather than churned (see `ikigai_a11y::css`).
 ///
 /// **Each theme lives inside its OWN `prefers-color-scheme` block**, and that is
 /// load-bearing rather than tidy. The light rules used to sit at top level with
@@ -1135,58 +1233,95 @@ pub const STYLE_IRI: &str = "urn:repo:style";
 /// Parameters were the visible case, not the only one: every scope where
 /// InspiredGitHub is more specific than base16-ocean.dark leaked the same way.
 ///
-/// [`BASE_FLOOR`] stays OUTSIDE both blocks so a user agent matching neither
-/// still gets a legible ground rather than dark-on-dark. Modern browsers always
-/// report `light` or `dark` (the `no-preference` value was dropped from the
-/// spec), so in practice one block always matches and the floor is belt and
+/// The `.hl-code` floor stays OUTSIDE both blocks so a user agent matching
+/// neither still gets a legible ground rather than dark-on-dark. Modern browsers
+/// always report `light` or `dark` (the `no-preference` value was dropped from
+/// the spec), so in practice one block always matches and the floor is belt and
 /// braces — a monochrome-but-readable fallback, never a wrong-colour one.
-fn style_css() -> &'static str {
-    static CSS: OnceLock<String> = OnceLock::new();
-    CSS.get_or_init(|| {
-        let themes = two_face::theme::extra();
-        let light = css_for_theme_with_class_style(
-            &themes[two_face::theme::EmbeddedThemeName::InspiredGithub],
-            CLASS_STYLE,
-        )
-        .expect("the embedded light theme generates CSS");
-        let dark = css_for_theme_with_class_style(
-            &themes[two_face::theme::EmbeddedThemeName::Base16OceanDark],
-            CLASS_STYLE,
-        )
-        .expect("the embedded dark theme generates CSS");
-        format!(
-            "{BASE_FLOOR}\n\
-             @media (prefers-color-scheme: light) {{\n{light}}}\n\
-             @media (prefers-color-scheme: dark) {{\n{dark}{DARK_PARAMETER}}}\n"
-        )
+fn style_css(config: &ikigai_a11y::A11y) -> Result<String> {
+    let themes = theme_set();
+    let light = scheme_css(themes, &config.theme.light, config.contrast.min)?;
+    let dark = scheme_css(themes, &config.theme.dark, config.contrast.min)?;
+    // The floor IS the light theme's own `.hl-code` rule, read off the theme
+    // rather than copied out of it — until 0.2.12 it was a constant a test had
+    // to keep honest, and a configurable light theme has no constant to copy.
+    let floor = format!(
+        ".hl-code {{\n color: {};\n background-color: {};\n}}\n",
+        light.foreground.to_css(),
+        light.ground.to_css()
+    );
+    Ok(format!(
+        "{floor}\n\
+         @media (prefers-color-scheme: light) {{\n{}}}\n\
+         @media (prefers-color-scheme: dark) {{\n{}}}\n",
+        light.css, dark.css
+    ))
+}
+
+/// two-face's embedded theme set, loaded once: it is ~2MB of data and a pure
+/// function of the build, so memoizing it in the process is safe in the way
+/// memoizing the CONFIG would not be (a config file can change under us; the
+/// embedded themes cannot).
+fn theme_set() -> &'static two_face::theme::EmbeddedLazyThemeSet {
+    static THEMES: OnceLock<two_face::theme::EmbeddedLazyThemeSet> = OnceLock::new();
+    THEMES.get_or_init(two_face::theme::extra)
+}
+
+/// One scheme's generated CSS, floor-repaired, with the theme's own ground and
+/// default foreground — the two colours the floor rule is written from.
+struct SchemeCss {
+    css: String,
+    ground: ikigai_a11y::Rgba,
+    foreground: ikigai_a11y::Rgba,
+}
+
+/// Generate one configured theme's CSS and lift every sub-floor colour in it to
+/// that theme's own foreground.
+///
+/// This is `ikigai_a11y::themes::theme_css` spelled out, for two reasons: it
+/// shares ONE embedded theme set across both schemes rather than loading two,
+/// and it needs the ground/foreground pair for the `.hl-code` floor rule, which
+/// the turnkey call computes internally and does not return.
+fn scheme_css(
+    themes: &two_face::theme::EmbeddedLazyThemeSet,
+    name: &str,
+    min: f64,
+) -> Result<SchemeCss> {
+    // Unreachable via the config, which rejects an unknown theme name at parse
+    // — but this function is also the seam a future caller could hand a raw
+    // name, and a silent fallback to the default theme would leave an operator
+    // believing they had changed something.
+    let embedded = ikigai_a11y::themes::embedded(name).ok_or_else(|| {
+        Error::Endpoint(format!(
+            "browse: `{name}` is not an embedded theme (see ikigai_a11y::configurable_themes)"
+        ))
+    })?;
+    let theme = &themes[embedded];
+    let (ground, foreground) = ikigai_a11y::themes::ground_and_foreground(theme);
+    let css = css_for_theme_with_class_style(theme, CLASS_STYLE)
+        .map_err(|e| Error::Endpoint(format!("browse: `{name}` generates no CSS: {e}")))?;
+    Ok(SchemeCss {
+        css: ikigai_a11y::apply_floor(&css, ground, foreground, min).css,
+        ground,
+        foreground,
     })
 }
 
-/// The unconditional ground for `<pre class="… hl-code">`: the light theme's own
-/// foreground and background, so a user agent that matches neither scheme block
-/// still renders code legibly (unhighlighted, never dark-on-dark). Kept in step
-/// with InspiredGitHub's `.hl-code` rule by
-/// `the_floor_matches_the_light_theme_base`.
-const BASE_FLOOR: &str = ".hl-code {\n color: #323232;\n background-color: #ffffff;\n}\n";
-
-/// One supplement appended INSIDE the dark block, completing the dark theme's own
-/// intent rather than overriding it.
+/// The effective accessibility config for this mount's application.
 ///
-/// base16-ocean.dark declares `variable.parameter.function` as `#c0c5ce` — its
-/// default foreground, 7.63:1 against the `#2b303b` ground. But it has no rule
-/// for `variable.parameter` WITHOUT `.function`, and that is precisely what
-/// Rust emits (`hl-variable hl-parameter`, 181 spans in one file of this crate).
-/// Such a parameter therefore falls through to the bare `.hl-variable` rule and
-/// renders in the palette's red at 3.23:1 — legible, but under the 4.5:1 bar,
-/// and not what the theme means by a parameter.
-///
-/// The colour is NOT invented: it is the same `#c0c5ce` the theme already
-/// assigns to the `.function` form, so a parameter reads the same whether or not
-/// the grammar tags it. Specificity 0,2,0 places it above the bare
-/// `.hl-variable` (0,1,0) and below the theme's own `.function` rule (0,3,0),
-/// which is the same colour anyway. Pinned by
-/// `a_parameter_reads_at_the_theme_s_own_foreground`.
-const DARK_PARAMETER: &str = "\n.hl-variable.hl-parameter {\n color: #c0c5ce;\n}\n";
+/// A machine with **no config home at all** (no `HOME`, no `XDG_CONFIG_HOME`)
+/// gets the built-in defaults rather than an error: it has not misconfigured
+/// anything, it simply has nowhere to configure, and a stylesheet is the wrong
+/// place to discover that. Every other failure — an unreadable file, a
+/// misspelled theme, an out-of-range floor — is returned loud, because those are
+/// an operator having changed something and being owed the news.
+fn a11y_config(app: Option<&str>) -> Result<ikigai_a11y::A11y> {
+    match ikigai_a11y::load::load(app) {
+        Ok(config) => Ok(config),
+        Err(ikigai_a11y::ConfigError::NoConfigHome) => Ok(ikigai_a11y::A11y::default()),
+        Err(e) => Err(Error::Endpoint(format!("browse: {e}"))),
+    }
+}
 
 fn file_html(
     repo: &str,
@@ -1359,13 +1494,33 @@ impl Grammar for StyleRow {
 }
 
 /// `urn:repo:style` — the theme stylesheet every classed highlight face binds
-/// to. A pure function of the build (the embedded themes and the class style),
-/// so the representation is cacheable; there is no per-root residual to
-/// enforce, so the declared wildcard IS the whole check (the kernel baseline
-/// runs it before dispatch).
-fn style_endpoint() -> FnEndpoint {
+/// to. There is no per-root residual to enforce, so the declared wildcard IS the
+/// whole check (the kernel baseline runs it before dispatch).
+///
+/// **Still cacheable, and that is the load-bearing part.** The sheet is now a
+/// function of the build AND of the layered `a11y.toml`, and effective expiry
+/// propagates from dependencies — so had the config been treated as
+/// uncacheable-because-it-reads-a-file, every read of this stylesheet would
+/// have become a cold generation (measured at ~1.4ms against ~2µs cached:
+/// `cargo run --release --example style_cache`). Instead the representation
+/// declares a **golden thread per candidate config file**, including the ones
+/// that do not exist yet, so an operator creating `dev-server.a11y.toml`
+/// invalidates this too — on a host that watches the config home and cuts those
+/// threads. No host does yet; until one does, the threads are declared and
+/// never cut, which costs a restart to pick up an edit and costs nothing else.
+fn style_endpoint(app: Option<&str>) -> FnEndpoint {
+    let app = app.map(str::to_string);
     FnEndpoint::new("browse-style", move |_inv: &Invocation<'_>| {
-        Ok(repr_utf8("text/css", style_css().to_string()).cacheable())
+        let app = app.as_deref();
+        let config = a11y_config(app)?;
+        let mut repr = repr_utf8("text/css", style_css(&config)?).cacheable();
+        // Threads even when there is no config home: `threads` errors there, and
+        // an absent config home is exactly the case `a11y_config` already
+        // decided is not an error. Nothing to watch, nothing to declare.
+        for thread in ikigai_a11y::load::threads(app).unwrap_or_default() {
+            repr = repr.depends_on(thread);
+        }
+        Ok(repr)
     })
     .with_description(style_description())
 }
@@ -1375,12 +1530,15 @@ fn style_description() -> Description {
         .title("Highlight stylesheet")
         .summary(
             "The theme stylesheet the classed highlight faces bind to — urn:repo:style, \
-             text/css. InspiredGitHub (light) and base16-ocean.dark (dark), each inside \
-             its OWN @media (prefers-color-scheme: …) block: one stylesheet, both schemes, \
-             neither able to outrank the other by specificity. Every rule targets the hl- \
-             classes the html faces emit, plus an unconditional .hl-code floor \
+             text/css. The configured light and dark themes (a11y.toml ⊕ {app}.a11y.toml, \
+             defaulting to InspiredGithub and Base16OceanDark), each inside its OWN \
+             @media (prefers-color-scheme: …) block: one stylesheet, both schemes, neither \
+             able to outrank the other by specificity. Every colour below the configured \
+             contrast floor (default 4.5:1, WCAG AA) is lifted to its own theme's default \
+             foreground — repaired in-palette, nothing invented. Every rule targets the \
+             hl- classes the html faces emit, plus an unconditional .hl-code floor \
              (foreground/background) their <pre> carries, so a client matching neither \
-             scheme still reads. A pure function of the build — cacheable.",
+             scheme still reads. Cacheable, with a golden thread per candidate config file.",
         )
         .verb(Verb::Source)
         .verb(Verb::Meta)
@@ -1958,6 +2116,76 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// The stylesheet under the BUILT-IN defaults — never this machine's
+    /// `a11y.toml`. A developer who has configured a different theme must not
+    /// change what these tests measure, and CI (which has no config home
+    /// contents) must measure the same thing they do.
+    fn default_css() -> String {
+        style_css(&ikigai_a11y::A11y::default()).expect("the default themes generate CSS")
+    }
+
+    /// The two scheme blocks' inner text, light first.
+    fn scheme_blocks(css: &str) -> (String, String) {
+        let (light, dark) = css
+            .split_once("@media (prefers-color-scheme: dark) {")
+            .expect("the dark block exists");
+        let light = light
+            .split_once("@media (prefers-color-scheme: light) {")
+            .expect("the light block exists")
+            .1;
+        (light.to_string(), dark.to_string())
+    }
+
+    /// The colour a browser paints on an element carrying exactly `classes`,
+    /// given one scheme block: among the selectors that APPLY (every class in
+    /// the selector is on the element), the one with the most classes wins and
+    /// source order breaks ties. That is the CSS cascade minus the parts syntect
+    /// never emits — and it is what the old substring assertions only stood in
+    /// for. Asserting on the winning rule catches a regression that adds a more
+    /// specific, worse rule, which a `contains` cannot.
+    fn cascade_colour(block: &str, classes: &[&str]) -> Option<String> {
+        // syntect writes a banner comment; a brace inside it is not structure.
+        let mut stripped = String::new();
+        let mut rest = block;
+        while let Some((before, after)) = rest.split_once("/*") {
+            stripped.push_str(before);
+            rest = after.split_once("*/").map_or("", |(_, tail)| tail);
+        }
+        stripped.push_str(rest);
+
+        let mut best: Option<(usize, String)> = None;
+        for rule in stripped.split('}') {
+            let Some((selectors, body)) = rule.split_once('{') else {
+                continue;
+            };
+            let Some(colour) = body
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("color:"))
+            else {
+                continue;
+            };
+            let colour = colour.trim().trim_end_matches(';').to_string();
+            for selector in selectors.split(',') {
+                let selector = selector.trim();
+                if !selector.starts_with('.') || selector.contains(char::is_whitespace) {
+                    continue;
+                }
+                let parts: Vec<&str> = selector.trim_start_matches('.').split('.').collect();
+                if !parts.iter().all(|part| classes.contains(part)) {
+                    continue;
+                }
+                let wins = match &best {
+                    Some((count, _)) => parts.len() >= *count,
+                    None => true,
+                };
+                if wins {
+                    best = Some((parts.len(), colour.clone()));
+                }
+            }
+        }
+        best.map(|(_, colour)| colour)
+    }
+
     /// The invariant that makes a cross-scheme leak structurally impossible: the
     /// ONLY rule outside a scheme block is the floor. A media query adds no
     /// specificity, so any theme rule left at top level competes with the other
@@ -1966,14 +2194,14 @@ mod tests {
     /// nothing about specificity needs reasoning about once this holds.
     #[test]
     fn no_theme_rule_sits_outside_a_scheme_block() {
-        let css = style_css();
+        let css = default_css();
         let floor = css
             .split("@media")
             .next()
             .expect("there is text before the first media block");
         assert_eq!(
             floor.trim(),
-            BASE_FLOOR.trim(),
+            ".hl-code {\n color: #323232;\n background-color: #ffffff;\n}",
             "only the .hl-code floor may sit outside a scheme block — anything \
              else can outrank the other theme in its own scheme"
         );
@@ -1985,10 +2213,8 @@ mod tests {
     /// `#2b303b` ground that colour is ~1.03:1 contrast — invisible.
     #[test]
     fn the_light_parameter_colour_cannot_reach_the_dark_ground() {
-        let css = style_css();
-        let (light, dark) = css
-            .split_once("@media (prefers-color-scheme: dark) {")
-            .expect("the dark block exists");
+        let css = default_css();
+        let (light, dark) = scheme_blocks(&css);
         assert!(
             light.contains(".hl-variable.hl-parameter"),
             "the light theme still styles parameters: {light}"
@@ -2000,38 +2226,43 @@ mod tests {
     }
 
     /// A parameter must read at the dark theme's own foreground, not fall through
-    /// to the palette's red. The supplement sits inside the dark block and above
-    /// the bare `.hl-variable` rule it corrects.
+    /// to the palette's red — 7.63:1 rather than 3.23:1.
+    ///
+    /// Until 0.2.12 a hand-written constant supplied that colour for this one
+    /// scope. It is now the floor pass's output: the bare `.hl-variable` rule the
+    /// parameter falls through to was BELOW the floor, so the pass lifted it to
+    /// the theme's own `#c0c5ce`. Same colour, from the theme, without the
+    /// constant — and every other sub-floor scope repaired with it.
     #[test]
     fn a_parameter_reads_at_the_theme_s_own_foreground() {
-        let css = style_css();
-        let dark = css
-            .split_once("@media (prefers-color-scheme: dark) {")
-            .expect("the dark block exists")
-            .1;
-        assert!(
-            dark.contains(".hl-variable.hl-parameter {\n color: #c0c5ce;\n}"),
-            "the parameter supplement is inside the dark block: {dark}"
+        let css = default_css();
+        let (_, dark) = scheme_blocks(&css);
+        let colour = cascade_colour(&dark, &["hl-variable", "hl-parameter"])
+            .expect("some rule styles a parameter");
+        assert_eq!(colour, "#c0c5ce", "the dark theme's own foreground");
+        let ratio = ikigai_a11y::ratio(
+            ikigai_a11y::Rgba::parse(&colour).expect("a colour"),
+            ikigai_a11y::Rgba::parse("#2b303b").expect("a colour"),
         );
-        // …and it is the theme's OWN colour, not an invented one: the same value
-        // base16-ocean.dark already gives the `.function` form of a parameter.
         assert!(
-            dark.contains(".hl-variable.hl-parameter.hl-function {\n color: #c0c5ce;\n}"),
-            "the theme still declares the .function form at that colour: {dark}"
+            (ratio - 7.63).abs() < 0.01,
+            "parameters read at 7.63:1, not {ratio:.2}:1"
         );
     }
 
-    /// The floor mirrors InspiredGitHub's own `.hl-code` rule by hand, so it can
-    /// drift when the embedded theme changes. Catch that here rather than in a
-    /// browser.
+    /// The floor rule IS the light theme's own `.hl-code`, derived from the theme
+    /// rather than copied out of it — so the drift the old constant needed a test
+    /// to catch cannot happen. What is still worth pinning is that
+    /// `ground_and_foreground` and syntect's generated `.hl-code` agree about
+    /// what the theme's ground and foreground ARE.
     #[test]
-    fn the_floor_matches_the_light_theme_base() {
-        let themes = two_face::theme::extra();
-        let light = css_for_theme_with_class_style(
-            &themes[two_face::theme::EmbeddedThemeName::InspiredGithub],
-            CLASS_STYLE,
-        )
-        .expect("the embedded light theme generates CSS");
+    fn the_floor_is_the_light_theme_s_own_base_rule() {
+        let css = default_css();
+        let floor = css
+            .split("@media")
+            .next()
+            .expect("there is text before the first media block");
+        let (light, _) = scheme_blocks(&css);
         let base = light
             .split_once(".hl-code {")
             .and_then(|(_, rest)| rest.split_once('}'))
@@ -2039,10 +2270,112 @@ mod tests {
             .expect("the light theme declares .hl-code");
         for decl in base.lines().map(str::trim).filter(|l| !l.is_empty()) {
             assert!(
-                BASE_FLOOR.contains(decl),
+                floor.contains(decl),
                 "the floor has drifted from the light theme's .hl-code: missing {decl:?}"
             );
         }
+    }
+
+    /// Adopting the config changes nothing for a machine that has not written
+    /// one: `ikigai-a11y`'s defaults ARE the constants this crate hard-coded.
+    #[test]
+    fn the_defaults_are_the_themes_this_crate_used_to_hard_code() {
+        let default = ikigai_a11y::A11y::default();
+        assert_eq!(default.theme.light, "InspiredGithub");
+        assert_eq!(default.theme.dark, "Base16OceanDark");
+        assert_eq!(default.contrast.min, 4.5, "WCAG AA body text");
+    }
+
+    /// The pass ran, and ran to completion: a second pass over either block lifts
+    /// nothing more. What it leaves in `unrepaired` is not a bug — those are
+    /// rules that repaint their own background, where the theme's foreground
+    /// would not clear the floor either and inventing a colour is not the pass's
+    /// business. On base16-ocean.dark the leftovers are the two git-gutter
+    /// markers, which are chrome rather than prose.
+    #[test]
+    fn the_floor_pass_is_complete_on_both_blocks() {
+        let css = default_css();
+        let (light, dark) = scheme_blocks(&css);
+        for (block, ground, foreground) in [
+            (&light, "#ffffff", "#323232"),
+            (&dark, "#2b303b", "#c0c5ce"),
+        ] {
+            let again = ikigai_a11y::apply_floor(
+                block,
+                ikigai_a11y::Rgba::parse(ground).expect("a colour"),
+                ikigai_a11y::Rgba::parse(foreground).expect("a colour"),
+                4.5,
+            );
+            assert!(
+                again.lifted.is_empty(),
+                "a second pass found more to lift: {:?}",
+                again.lifted
+            );
+            assert!(again.repairable(4.5), "the theme can repair itself at all");
+        }
+    }
+
+    /// The themes are configuration now, not constants — asserted on a config
+    /// value rather than on a file, so the test says what it means without
+    /// depending on this machine's config home.
+    #[test]
+    fn a_configured_theme_reaches_the_stylesheet() {
+        let mut config = ikigai_a11y::A11y::default();
+        config.theme.dark = "Nord".to_string();
+        let css = style_css(&config).expect("Nord generates CSS");
+        let (_, dark) = scheme_blocks(&css);
+        assert!(
+            dark.contains("background-color: #2e3440"),
+            "the dark block is Nord's, not base16-ocean.dark's: {dark}"
+        );
+        // …and the floor still comes from the LIGHT theme, unchanged.
+        assert!(css.starts_with(".hl-code {\n color: #323232;"), "{css}");
+    }
+
+    /// A theme name no theme answers to is refused rather than silently
+    /// defaulted: an operator who misspells a theme is owed the news.
+    #[test]
+    fn an_unknown_theme_is_an_error_not_a_fallback() {
+        let mut config = ikigai_a11y::A11y::default();
+        config.theme.light = "Base16OceanDrak".to_string();
+        assert!(matches!(style_css(&config), Err(Error::Endpoint(_))));
+    }
+
+    /// The stylesheet stays CACHEABLE while depending on the config, and names
+    /// every CANDIDATE config file as a golden thread — including one that does
+    /// not exist, so an operator creating an override invalidates the sheet on a
+    /// host that watches the config home. An uncacheable config here would have
+    /// made every read a cold generation (~1.4ms against ~2µs).
+    #[test]
+    fn the_stylesheet_is_cacheable_and_declares_the_config_files() {
+        let root = demo_root();
+        let space = Mount::new(vec![("demo".to_string(), root.clone())])
+            .app("browse-test")
+            .space();
+        let k = Kernel::new(Arc::new(space));
+        let rep = block_on(k.issue(
+            Request::new(Verb::Source, Iri::parse(STYLE_IRI).unwrap()),
+            &demo_cap(),
+        ))
+        .expect("the stylesheet resolves");
+        assert_eq!(rep.expiry, ikigai_core::Expiry::Never, "cacheable");
+        let threads: Vec<String> = rep.threads().iter().map(|t| t.to_string()).collect();
+        match ikigai_core::config::config_home() {
+            // The shared layer and the app one, in that order.
+            Some(_) => {
+                assert_eq!(threads.len(), 2, "{threads:?}");
+                assert!(threads[0].ends_with("/a11y.toml"), "{threads:?}");
+                assert!(
+                    threads[1].ends_with("/browse-test.a11y.toml"),
+                    "{threads:?}"
+                );
+            }
+            // No config home on this machine: nothing to watch, nothing declared,
+            // and the sheet still renders from the built-in defaults.
+            None => assert!(threads.is_empty(), "{threads:?}"),
+        }
+        assert!(String::from_utf8_lossy(&rep.bytes).starts_with(".hl-code {"));
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
