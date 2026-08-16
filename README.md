@@ -16,7 +16,7 @@ pairs), and each root answers these resource families:
 | `urn:annotation[:{id}]` | a **W3C Web Annotation** (S2) on a file — Sink creates/updates (anchoring the quoted text; the bare `urn:annotation` mints a uuid id), Source reads with drift **re-anchoring**, Delete removes; faces: `text/plain` (the body), `as=application/json`, `as=text/turtle` |
 | `urn:repo:{repo}:annotations[:{path}]` | every annotation on one file (or the whole repo, path omitted) in reading order, drift-reconciled on each read; faces: `application/json` (default), `as=text/html` (panel fragment), `as=text/turtle` |
 | `urn:repo:{repo}:review:{path}` | the **machine review pass** (S4) — region-grain LLM commentary minted as real annotations (provenance-distinguished), the pass archived by `(path, content-hash, review-tag)` so re-sourcing unchanged content mints nothing; faces: `text/plain` (the margin digest), `as=application/json` (`{minted, orphaned_items, reviewed_bytes, total_bytes, annotations, …}`), `as=text/html` (the card page), `as=text/turtle` (the pass's provenance graph); `debug=raw` derives and returns the model's **unparsed answer** (nothing minted or archived) — the parse-failure diagnosis face |
-| `urn:repo:style` | the **theme stylesheet** the classed highlight faces bind to — `text/css`, root-independent, cacheable: each theme inside its OWN `@media (prefers-color-scheme: …)` block, above an unconditional `.hl-code` floor, all targeting the `hl-` classes the HTML faces emit (see the host contract below) |
+| `urn:repo:style` | the **theme stylesheet** the classed highlight faces bind to — `text/css`, root-independent, cacheable: each theme inside its OWN `@media (prefers-color-scheme: …)` block, above an unconditional `.hl-code` floor, all targeting the `hl-` classes the HTML faces emit, with the themes and the contrast floor read from the layered `a11y.toml` (see the host contract below) |
 | `urn:repo:{repo}:prs` | the root's **pull requests** — ikigai-repo's `urn:repo:pr:list` facade resolved through the kernel with `dir=` the root's directory; `state=` (`open`/`closed`/`merged`/`all`) and `limit=` forward to the facade (ikigai-repo ≥ 0.1.4 — omitted, the facade's defaults apply); `text/plain` (default) is `number`⇥`title`⇥`branch`⇥`updated`⇥`state` per line (empty = no matching PRs), `as=application/json` the facade's structured rows, `as=text/html` the listing with each PR linking its page (`chrome=embed` for the rows-only fragment other faces fold in) |
 | `urn:repo:{repo}:prs:{path}` | the **contextual listing** — the PRs that touched anything at or under a path, newest first: open PRs from `urn:repo:pr:list` intersected per-PR with `urn:repo:pr:files` (ikigai-repo ≥ 0.1.5; bounded to the 20 most recently updated open PRs), merged PRs mined from the path-scoped log (`urn:repo:log path=`, last 100 path-touching commits) by the squash-merge **convention** that a subject ends `(#N)` — a merge-commit repo yields fewer rows, never wrong ones; the path is a *history* scope (a deleted directory still lists; no history = empty listing); open rows first, then merged, deduped by number; `state=` (`open`/`merged`/`all`, default `all`) and `limit=` cap the synthesized listing; faces mirror `prs` (`as=application/json` is the synthesized `{number, title, state, branch, updated}` rows; the html face labels its scope) |
 | `urn:repo:{repo}:pr:{n}` | the **PR page** — metadata (`urn:repo:pr:view` json: author object, `headRefOid`) + the unified diff (`urn:repo:pr:diff`); the DIFF TEXT is an annotation surface (annotations target the PR IRI and quote diff lines, drifting like file annotations); `as=text/html` renders the highlighted, line-anchored diff with markers and the annotations panel; `annotations=include` folds the margin into the plain/json faces |
@@ -133,19 +133,48 @@ and PR-diff faces emit syntect *classed* spans — `hl-`-prefixed scope-atom
 classes (`class="hl-comment hl-line hl-rust"`), never inline styles — and the
 `<pre>` carries `browse-code hl-code` (`hl-code` is the base
 foreground/background rule). The colors live in **`urn:repo:style`**
-(`text/css`, cacheable): InspiredGitHub and base16-ocean.dark, **each inside its
-own `@media (prefers-color-scheme: …)` block** — one stylesheet, both schemes,
-so pages read correctly on light and dark hosts with no light islands. The
-confinement is load-bearing rather than tidy: a media query contributes no
-specificity, so while the light rules sat at top level the two themes shared one
-cascade and the more specific selector won whatever the active scheme — which
-rendered function parameters at 1.03:1 on the dark ground until 0.2.11. Only an
-unconditional `.hl-code` floor sits outside a block, so a client matching
-neither scheme still gets a legible ground. A host either links it through its `/k/` adapter
+(`text/css`, cacheable), **each theme inside its own `@media
+(prefers-color-scheme: …)` block** — one stylesheet, both schemes, so pages read
+correctly on light and dark hosts with no light islands. The confinement is
+load-bearing rather than tidy: a media query contributes no specificity, so
+while the light rules sat at top level the two themes shared one cascade and the
+more specific selector won whatever the active scheme — which rendered function
+parameters at 1.03:1 on the dark ground until 0.2.11. Only an unconditional
+`.hl-code` floor sits outside a block, so a client matching neither scheme still
+gets a legible ground. A host either links it through its `/k/` adapter
 (`<link rel="stylesheet" href="/k/source urn:repo:style">`, however its
 adapter spells that) or resolves `urn:repo:style` once server-side and
 inlines the CSS into its page shell; a host that ships neither gets
 readable-but-monochrome code in the page's own colors, never wrong ones.
+
+**The themes and the contrast floor are configuration, and the repair is
+derived.** Since 0.2.12 `urn:repo:style` reads
+[ikigai-a11y](https://crates.io/crates/ikigai-a11y)'s layered config —
+`$XDG_CONFIG_HOME/ikigai/a11y.toml` overridden key-wise by
+`{app}.a11y.toml` — for which light theme, which dark theme, and which
+contrast floor (defaults: `InspiredGithub`, `Base16OceanDark`, `4.5`, exactly
+what this crate used to hard-code, so a machine with no `a11y.toml` sees no
+change in the themes). Every colour in each generated sheet that misses the
+floor against that theme's own ground is then lifted to **that theme's own
+default foreground** — the one colour a theme guarantees is legible on its own
+ground, so the repair invents no hue. That replaces the hand-written
+`.hl-variable.hl-parameter` supplement 0.2.11 added after parameters were found
+at 3.23:1 on `Base16OceanDark`: the same `#c0c5ce`, now derived, along with 12
+other dark rules and 27 light ones. A rule that repaints its own background and
+still misses the floor is **left alone and reported** rather than churned —
+repairing a colour pair would mean inventing one.
+
+`{app}` is the **process's** name (`dev-server`, `web`), so it comes from the
+host at mount time: `Mount::new(roots).app("dev-server").space()`. A host that
+names none reads the shared `a11y.toml` only. The stylesheet stays
+`.cacheable()` and declares a **golden thread per candidate config file**,
+including files that do not exist yet, so creating an override invalidates it on
+a host that watches the config home. That is not decoration: effective expiry
+propagates from dependencies, so treating the config as
+uncacheable-because-it-reads-a-file would have turned a 2µs cached read into a
+~450µs generation on every page — measured by `cargo run --release --example
+style_cache`.
+
 Syntax coverage is [two-face](https://crates.io/crates/two-face)'s extended
 set (~100 formats the stock syntect set misses — TOML, TypeScript,
 Dockerfile, …) under the pure-Rust fancy-regex engine, plus an embedded house
