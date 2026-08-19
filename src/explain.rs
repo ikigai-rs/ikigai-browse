@@ -62,6 +62,18 @@
 //!   explanation only when the backends differ in model, while against the
 //!   same model it buys latency/throughput shape and costs nothing new.
 //!
+//! ## The option menu (`explain-versions … as=text/html`)
+//!
+//! The HTML faces carry a `<details>` disclosure beside their explain button.
+//! Its panel is `urn:repo:{repo}:explain-versions[:{path}]` under
+//! `as=text/html`, fetched when the disclosure opens: the archived entries the
+//! CURRENT content can reopen (free — a store read) above the models this host
+//! will derive a new one with (one model call each). **One row per MODEL**,
+//! because that is what the archive keys on — grouping by backend would offer
+//! a second entry that cannot exist. Opening a menu costs one archive read,
+//! one content hash, and ONE resolve of `urn:llm:models` — never one probe per
+//! backend, and never anything at all until a human opens it.
+//!
 //! ## Hierarchical grains, merkle keys
 //!
 //! A directory's explanation derives from its entry list plus its CHILDREN'S
@@ -84,8 +96,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ikigai_core::{
-    ArgRef, ArgSpec, Description, Endpoint, EndpointSpace, Error, FnEndpoint, Invocation, Iri,
-    Representation, Request, Result, Verb,
+    ArgRef, ArgSpec, Description, Endpoint, EndpointSpace, Error, Invocation, Iri, Representation,
+    Request, Result, Verb,
 };
 use oxigraph::model::{GraphName, Literal, NamedNode, Quad, Term};
 use oxigraph::store::Store;
@@ -759,7 +771,10 @@ pub(crate) fn iso8601(millis: u64) -> String {
 
 pub(crate) fn bind(space: EndpointSpace, roots: &Roots, config: ExplainConfig) -> EndpointSpace {
     let config = Arc::new(config);
-    let versions: Arc<dyn Endpoint> = Arc::new(versions_endpoint(roots, &config));
+    let versions: Arc<dyn Endpoint> = Arc::new(VersionsEndpoint {
+        roots: Arc::clone(roots),
+        config: Arc::clone(&config),
+    });
     let explain: Arc<dyn Endpoint> = Arc::new(ExplainEndpoint {
         roots: Arc::clone(roots),
         config,
@@ -1234,6 +1249,10 @@ fn explain_html(
             "view file"
         },
     ));
+    // The menu belongs here most of all: the provenance line below names the
+    // model that answered, and this is where a reader decides they want
+    // another one — or the one they already paid for.
+    out.push_str(&menu_html(repo, rel));
     out.push_str("<div class=\"browse-explain\">");
     for paragraph in entry.text.split("\n\n").filter(|p| !p.trim().is_empty()) {
         out.push_str(&format!("<p>{}</p>", esc(paragraph.trim())));
@@ -1364,23 +1383,392 @@ fn explain_description(config: &ExplainConfig) -> Description {
         .output("text/turtle")
 }
 
+// --- the option menu --------------------------------------------------------
+
+/// One row of the "explain with" menu: a MODEL, and every selectable provider
+/// that serves it.
+///
+/// ★ THE MENU'S AXIS IS THE MODEL, because the ARCHIVE'S axis is. The version
+/// tag folds model identity, not backend identity (see this module's header),
+/// so two providers serving one model share an archive key: choosing "the
+/// other one" returns the first one's text instantly, from the archive. A menu
+/// of BACKENDS would therefore promise a second explanation it cannot deliver,
+/// and its no-op would read as a bug. One model, one row — the serving
+/// backends are named beside it as a fact, never offered as a second choice.
+struct ModelOption {
+    /// The model identity `urn:llm:models` attributes to these providers, or
+    /// `None` when nothing reports one: no llm module bound, a selectable
+    /// provider the inventory does not list, or — since ikigai-llm 0.12, where
+    /// a provider may pin no model and discover it — a discovering provider
+    /// whose backend the inventory could not reach.
+    ///
+    /// ★ THE MENU MAY KNOW LESS THAN THE TAG WILL, and that asymmetry is
+    /// deliberate. The version tag folds `urn:llm:{p}:model`, which for a
+    /// discovering provider PROBES; the menu folds `urn:llm:models`, whose own
+    /// discovery pass is best-effort. So a discovering backend can be an
+    /// "unknown model" row here and still archive under a real discovered id.
+    /// A menu is allowed to know less than the derivation it starts; what it
+    /// may never do is claim more, which is why an unknown is shown as unknown
+    /// rather than guessed from the provider IRI without saying so.
+    ///
+    /// ★ UNKNOWN IS NOT A VALUE THAT GROUPS. Two providers of unknown model
+    /// are two rows: they may well be two models, and collapsing them would
+    /// hide a real choice behind the menu's own ignorance. Every `None` row
+    /// therefore holds exactly one provider.
+    model: Option<String>,
+    /// The selectable provider IRIs serving it, sorted; the first is the one
+    /// the row's button names. Longer than one only when `model` is `Some`.
+    providers: Vec<String>,
+    /// Which configured tier already points at this model ("files",
+    /// "directories", "files and directories") — the row a plain `explain`
+    /// click would have taken, marked so the menu does not read as a set of
+    /// alternatives to something unnamed.
+    default_for: Option<&'static str>,
+}
+
+impl ModelOption {
+    /// The row's button text: the model id when known, else the provider
+    /// heuristic ([`provider_label`]) — which is exactly the label the version
+    /// tag will carry if this row is clicked, so the menu and the archive
+    /// agree even when neither knows the model.
+    fn label(&self) -> String {
+        match &self.model {
+            Some(model) => model.clone(),
+            None => provider_label(&self.providers[0]),
+        }
+    }
+
+    /// The provider IRI the row's `provider=` names.
+    ///
+    /// Any provider in the row keys the SAME archive entry, so on a hit the
+    /// choice is invisible. On a MISS it is not: some backend actually runs
+    /// the model. `providers` is ordered so a configured tier comes first
+    /// (see [`menu_options`]) — a row that is the operator's default derives
+    /// on the operator's backend, and only a row with no configured backend
+    /// falls through to lexicographic order.
+    fn provider(&self) -> &str {
+        &self.providers[0]
+    }
+}
+
+/// Every selectable provider, grouped into menu rows by the model it serves.
+///
+/// ★ ONE SUB-REQUEST FOR THE WHOLE MENU. The identity resource the version
+/// tags fold is `urn:llm:{p}:model`, which PROBES the backend, declares
+/// `urn:cap:net:*` and is uncacheable — one network call per provider, which
+/// would make opening a menu cost as much as the derivation it is trying to
+/// let you avoid. `urn:llm:models` reports the same configured identity for
+/// every provider in one document, cacheable while no provider is discovering,
+/// and requires no capability of its own (its discovery pass consults the
+/// invocation's capability and simply skips what it may not reach). So a menu
+/// costs at most one sub-request however many backends the host has, and a
+/// browse-only session still gets the declared inventory.
+///
+/// The set of rows is drawn from [`ExplainConfig::selectable`] — the exact set
+/// `provider=` accepts — so the menu can never offer a click that would come
+/// back `Denied`.
+async fn menu_options(inv: &Invocation<'_>, config: &ExplainConfig) -> Vec<ModelOption> {
+    let inventory = model_inventory(inv).await;
+    let mut by_model: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    let mut unknown: Vec<String> = Vec::new();
+    // `selectable()` is a BTreeSet, so both loops below are already sorted.
+    for provider in config.selectable() {
+        match inventory
+            .as_ref()
+            .and_then(|inventory| inventory_model(inventory, &provider))
+        {
+            Some(model) => by_model.entry(model).or_default().push(provider),
+            None => unknown.push(provider),
+        }
+    }
+    let mut options: Vec<ModelOption> = by_model
+        .into_iter()
+        .map(|(model, mut providers)| {
+            // A configured tier first, so the row's single button derives on
+            // the backend the operator chose. Which one answers cannot change
+            // the archive KEY — that is the whole point of grouping by model —
+            // but it does decide which machine spends the time on a miss, and
+            // silently routing the default row's first derivation through some
+            // alphabetically-earlier backend would be a surprise nobody asked
+            // for.
+            providers.sort_by_key(|p| {
+                (
+                    *p != config.file_provider,
+                    *p != config.dir_provider,
+                    p.clone(),
+                )
+            });
+            ModelOption {
+                default_for: default_for(config, &providers),
+                model: Some(model),
+                providers,
+            }
+        })
+        .collect();
+    options.extend(unknown.into_iter().map(|provider| ModelOption {
+        default_for: default_for(config, std::slice::from_ref(&provider)),
+        model: None,
+        providers: vec![provider],
+    }));
+    // The tier defaults first — what a plain `explain` click already does —
+    // then alphabetically by label. Total and deterministic either way.
+    options.sort_by_key(|o| (o.default_for.is_none(), o.label()));
+    options
+}
+
+/// Which configured tier (if either) is served by one of these providers.
+fn default_for(config: &ExplainConfig, providers: &[String]) -> Option<&'static str> {
+    let file = providers.contains(&config.file_provider);
+    let dir = providers.contains(&config.dir_provider);
+    match (file, dir) {
+        (true, true) => Some("files and directories"),
+        (true, false) => Some("files"),
+        (false, true) => Some("directories"),
+        (false, false) => None,
+    }
+}
+
+/// `urn:llm:models` as JSON, or `None` — no llm module, an older one, a
+/// malformed body. Never an error: a host with no LLM bound at all still
+/// renders the menu (from provider IRIs alone), because the plain explain
+/// button it sits beside has always been offered on such a host too.
+async fn model_inventory(inv: &Invocation<'_>) -> Option<serde_json::Value> {
+    serde_json::from_str(&source_str(inv, "urn:llm:models").await?).ok()
+}
+
+/// The model an inventory attributes to a provider IRI — the same two IRI
+/// shapes [`resolve_model`] resolves, read out of one document instead of one
+/// probe each: `urn:llm:{p}:ask` names its own entry, and the bare facade
+/// `urn:llm:ask` routes to the inventory's `default` provider.
+fn inventory_model(inventory: &serde_json::Value, provider: &str) -> Option<String> {
+    let name = if provider == "urn:llm:ask" {
+        inventory.get("default")?.as_str()?.to_string()
+    } else {
+        provider
+            .strip_prefix("urn:llm:")?
+            .strip_suffix(":ask")?
+            .to_string()
+    };
+    let model = inventory.get("models")?.get(name)?.get("model")?.as_str()?;
+    let model = model.trim();
+    (!model.is_empty()).then(|| model.to_string())
+}
+
+/// The closed disclosure that sits under a face's action row: markup only, no
+/// resolution. The panel's content is a SEPARATE resolution of this path's
+/// `explain-versions … as=text/html`, fetched on the `toggle` event, so a
+/// directory listing of a thousand entries costs nothing until a human opens
+/// a menu — and opening one costs one archive read and one inventory resolve,
+/// not one per entry.
+///
+/// `<details>`/`<summary>` and not a scripted dropdown: it is focusable and
+/// operable from the keyboard with no CSS and no JavaScript of ours, it is
+/// announced as a disclosure, it is never hover-only, and being block-level it
+/// lays its panel out at any width — a phone included.
+pub(crate) fn menu_html(repo: &str, rel: &str) -> String {
+    format!(
+        "<details class=\"browse-explain-menu\"><summary>explain with…</summary>\
+         <div class=\"browse-explain-menu-body\" hx-get=\"/k/source {iri} as=text/html\" \
+         hx-trigger=\"toggle once from:closest details\" hx-target=\"this\" \
+         hx-swap=\"innerHTML\"><p>loading options…</p></div></details>",
+        iri = versions_iri(repo, rel),
+    )
+}
+
+/// A value safe to pass through the host's `/k/` adapter, which splits its
+/// command on whitespace: anything containing whitespace cannot be named as an
+/// argument there, so its row renders inert rather than emitting a request the
+/// host would mis-parse. Model ids and provider IRIs never contain whitespace
+/// in practice; a discovered one might.
+fn command_safe(value: &str) -> bool {
+    !value.is_empty() && !value.chars().any(char::is_whitespace)
+}
+
+/// The menu panel: what the archive already holds for this path (free to
+/// reopen — a pure store read) above what could still be derived for it (one
+/// model call each, then archived forever). Both lists are keyed by MODEL,
+/// which is what the archive is keyed by.
+fn menu_panel_html(
+    repo: &str,
+    rel: &str,
+    options: &[ModelOption],
+    entries: &[ArchiveEntry],
+    current_hash: Option<&str>,
+) -> String {
+    let explain = explain_iri(repo, rel);
+    let mut out = String::from("<div class=\"browse-explain-menu-panel\">");
+
+    // --- already explained, at the CURRENT content ---------------------------
+    //
+    // ONLY the current content's entries are offered. `version=` addresses
+    // `(path, current hash, tag)`, so a row archived under earlier content is
+    // not reachable through it — offering one would be a click that 404s.
+    let reopenable: Vec<&ArchiveEntry> = entries
+        .iter()
+        .filter(|e| current_hash.is_some_and(|hash| hash == e.hash))
+        .collect();
+    let earlier = entries.len() - reopenable.len();
+    out.push_str(
+        "<p class=\"browse-explain-menu-heading\">already explained \
+         <span class=\"browse-size\">from the archive — no model call</span></p>",
+    );
+    if reopenable.is_empty() {
+        let note = match (entries.is_empty(), current_hash) {
+            (true, _) => "nothing yet — no explanation of this path has been derived.".to_string(),
+            (false, None) => format!(
+                "{earlier} archived, none matchable — this path has no current content \
+                 (deleted?), so none of them can be reopened here."
+            ),
+            (false, Some(_)) => format!(
+                "nothing for the current content — {earlier} archived under earlier \
+                 versions of it, which a new derivation does not replace."
+            ),
+        };
+        out.push_str(&format!(
+            "<p class=\"browse-explain-menu-empty\">{}</p>",
+            esc(&note)
+        ));
+    } else {
+        out.push_str("<ul class=\"browse-entries browse-explain-archived\">");
+        for entry in &reopenable {
+            let detail = format!(
+                "{} · {}",
+                entry.tag,
+                entry.derived_at.as_deref().unwrap_or("no timestamp")
+            );
+            let label = if entry.model.is_empty() {
+                entry.tag.clone()
+            } else {
+                entry.model.clone()
+            };
+            if command_safe(&entry.tag) {
+                out.push_str(&format!(
+                    "<li><button class=\"browse-explain-link\" hx-get=\"/k/source {explain} \
+                     as=text/html version={tag}\" hx-target=\"#browse\" hx-swap=\"innerHTML\" \
+                     title=\"reopen this archived explanation — no model call\">{label}</button> \
+                     <span class=\"browse-size\">{detail}</span></li>",
+                    tag = esc(&entry.tag),
+                    label = esc(&label),
+                    detail = esc(&detail),
+                ));
+            } else {
+                out.push_str(&format!(
+                    "<li><span class=\"browse-explain-inert\">{}</span> \
+                     <span class=\"browse-size\">{} · not addressable from here</span></li>",
+                    esc(&label),
+                    esc(&detail),
+                ));
+            }
+        }
+        out.push_str("</ul>");
+        if earlier > 0 {
+            out.push_str(&format!(
+                "<p class=\"browse-explain-menu-empty\">{earlier} more archived under \
+                 earlier content, listed by explain-versions.</p>"
+            ));
+        }
+    }
+
+    // --- what could still be derived ----------------------------------------
+    out.push_str(
+        "<p class=\"browse-explain-menu-heading\">explain with \
+         <span class=\"browse-size\">derives — one model call, then archived</span></p>",
+    );
+    out.push_str("<ul class=\"browse-entries browse-explain-choices\">");
+    for option in options {
+        let mut notes: Vec<String> = Vec::new();
+        if let Some(tier) = option.default_for {
+            notes.push(format!("default for {tier}"));
+        }
+        if option.providers.len() > 1 {
+            // The backend named as a FACT, not offered as a second button:
+            // either of these produces the one entry this row already names.
+            notes.push(format!(
+                "served by {}",
+                option
+                    .providers
+                    .iter()
+                    .map(|p| provider_label(p))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if option.model.is_none() {
+            notes.push("backend reports no model id".to_string());
+        }
+        let detail = if notes.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " <span class=\"browse-size\">{}</span>",
+                esc(&notes.join(" · "))
+            )
+        };
+        let label = option.label();
+        if command_safe(option.provider()) {
+            out.push_str(&format!(
+                "<li><button class=\"browse-explain-link\" hx-get=\"/k/source {explain} \
+                 as=text/html provider={provider}\" hx-target=\"#browse\" \
+                 hx-swap=\"innerHTML\">{label}</button>{detail}</li>",
+                provider = esc(option.provider()),
+                label = esc(&label),
+            ));
+        } else {
+            out.push_str(&format!(
+                "<li><span class=\"browse-explain-inert\">{}</span>{detail}</li>",
+                esc(&label),
+            ));
+        }
+    }
+    out.push_str("</ul>");
+    // Secondary by construction: `browse-size` is the muted, smaller class the
+    // faces already use for detail, so the note reads as a footnote on any
+    // host that styles the family at all — without this crate inventing CSS.
+    out.push_str(
+        "<p class=\"browse-explain-menu-note\"><span class=\"browse-size\">One row per model, \
+         not per backend: an explanation is archived by the model and the prompt that made \
+         it, so two backends serving one model give one explanation — the second request is \
+         an archive hit, not a second opinion.</span></p>",
+    );
+    out.push_str("</div>");
+    out
+}
+
 // --- the versions listing ---------------------------------------------------
 
 /// `urn:repo:{repo}:explain-versions[:{path}]` — what the archive holds for a
-/// path, across content versions and tags. Pure store read: requires only the
-/// browse grant (no net — it never derives), and works for paths that no
-/// longer exist on disk (the archive outlives deletions).
-fn versions_endpoint(roots: &Roots, config: &Arc<ExplainConfig>) -> FnEndpoint {
-    let held = Arc::clone(roots);
-    let config = Arc::clone(config);
-    FnEndpoint::new("browse-explain-versions", move |inv: &Invocation<'_>| {
-        let (repo, _root) = repo_root(inv, &held)?;
+/// path, across content versions and tags, and (in the HTML face) what could
+/// still be derived for it. The text and JSON faces are a pure store read:
+/// they require only the browse grant (no net — they never derive), and work
+/// for paths that no longer exist on disk (the archive outlives deletions).
+///
+/// The HTML face is the **option menu** — see [`menu_panel_html`]. It reads
+/// two more resources, both best-effort and neither a new capability: the
+/// path's current content hash (to know which archived entries `version=` can
+/// actually reopen) and `urn:llm:models` (the inventory the menu groups by).
+/// A failure of either degrades the panel, never the resource.
+struct VersionsEndpoint {
+    roots: Roots,
+    config: Arc<ExplainConfig>,
+}
+
+#[async_trait]
+impl Endpoint for VersionsEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        if inv.request.verb != Verb::Source {
+            return Err(Error::Endpoint(format!(
+                "browse-explain-versions does not support the {:?} verb",
+                inv.request.verb
+            )));
+        }
+        let (repo, _root) = repo_root(inv, &self.roots)?;
         granted(inv, repo)?;
         let rel = path_binding(inv)?;
         // A path is a file target or a tree target; the archive knows which —
         // list both (no filesystem touch, so deleted paths still answer).
-        let mut entries = list_versions(&config.store, &file_iri(repo, &rel))?;
-        entries.extend(list_versions(&config.store, &tree_iri(repo, &rel))?);
+        let mut entries = list_versions(&self.config.store, &file_iri(repo, &rel))?;
+        entries.extend(list_versions(&self.config.store, &tree_iri(repo, &rel))?);
         match inv.inline_str("as").unwrap_or("text/plain") {
             t if t.starts_with("application/json") => {
                 let rows: Vec<serde_json::Value> = entries
@@ -1401,6 +1789,21 @@ fn versions_endpoint(roots: &Roots, config: &Arc<ExplainConfig>) -> FnEndpoint {
                     serde_json::Value::Array(rows).to_string(),
                 ))
             }
+            t if t.starts_with("text/html") => {
+                // BEST-EFFORT, both of them. The hash tells which archived
+                // entries the current content can reopen — a path that no
+                // longer exists has none, and that is a rendering difference,
+                // not an error (this resource answers for deleted paths by
+                // design). The inventory names the models; without it the menu
+                // still offers every selectable backend, labelled by the same
+                // heuristic the version tags fall back to.
+                let current = source_str(inv, &hash_iri(repo, &rel)).await;
+                let options = menu_options(inv, &self.config).await;
+                Ok(repr_utf8(
+                    "text/html",
+                    menu_panel_html(repo, &rel, &options, &entries, current.as_deref()),
+                ))
+            }
             _ => {
                 let lines: Vec<String> = entries
                     .iter()
@@ -1417,8 +1820,15 @@ fn versions_endpoint(roots: &Roots, config: &Arc<ExplainConfig>) -> FnEndpoint {
                 Ok(repr_utf8("text/plain", lines.join("\n")))
             }
         }
-    })
-    .with_description(versions_description())
+    }
+
+    fn name(&self) -> &str {
+        "browse-explain-versions"
+    }
+
+    fn describe(&self) -> Description {
+        versions_description()
+    }
 }
 
 /// `repo` is not an ArgSpec — see [`explain_description`]'s note.
@@ -1429,10 +1839,16 @@ fn versions_description() -> Description {
             "What the explanation archive holds for a path — \
              urn:repo:{repo}:explain-versions[:{path}]: one row per archived entry \
              (version tag, content hash, model, derived-at), newest first, across content \
-             versions and prompt/model tags. A pure archive read: no derivation, no \
-             network; answers even for paths that no longer exist on disk. text/plain \
+             versions and prompt/model tags. Derives nothing and never requires the network: \
+             it answers even for paths that no longer exist on disk. text/plain \
              (default) is tag<TAB>hash<TAB>model<TAB>derivedAt lines; as=application/json \
-             the structured rows.",
+             the structured rows; as=text/html is the OPTION MENU the browse faces open \
+             beside their explain button — the entries reopenable for the current content \
+             (free), above the models this host will derive a new one with (one model call \
+             each), one row per MODEL because that is what the archive keys on. The html \
+             face additionally reads the path's hash and urn:llm:models, both best-effort \
+             and neither adding a capability: without them the menu degrades rather than \
+             failing.",
         )
         .verb(Verb::Source)
         .verb(Verb::Meta)
@@ -1446,12 +1862,13 @@ fn versions_description() -> Description {
         .input(
             ArgSpec::new("as")
                 .optional()
-                .summary("application/json for the structured rows")
-                .one_of(["application/json"])
+                .summary("application/json for the structured rows, text/html for the option menu")
+                .one_of(["text/plain", "application/json", "text/html"])
                 .default_value("text/plain"),
         )
         .output("text/plain;charset=utf-8")
         .output("application/json")
+        .output("text/html;charset=utf-8")
 }
 
 // --- tests ------------------------------------------------------------------
@@ -1460,7 +1877,7 @@ fn versions_description() -> Description {
 mod tests {
     use super::*;
     use futures::executor::block_on;
-    use ikigai_core::{Capability, Exact, Fallback, Kernel};
+    use ikigai_core::{Capability, Exact, Fallback, FnEndpoint, Kernel};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Mutex;
@@ -2216,7 +2633,11 @@ mod tests {
 
         // The versions listing never derives — it must NOT demand net.
         use ikigai_core::Endpoint as _;
-        let versions = versions_endpoint(&roots, &config).describe();
+        let versions = VersionsEndpoint {
+            roots: Arc::clone(&roots),
+            config: Arc::clone(&config),
+        }
+        .describe();
         assert!(versions.requires.contains(&CAP_WILDCARD.to_string()));
         assert!(!versions.requires.contains(&CAP_NET.to_string()));
         std::fs::remove_dir_all(&root).ok();
@@ -2532,6 +2953,414 @@ mod tests {
         // A refusal is read by a human: no collapsed line-continuation runs.
         assert!(!text.contains("  "), "message reads as prose: {text}");
         assert_eq!(log.count(FILE_PROVIDER), 0);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // --- the option menu ----------------------------------------------------
+
+    /// A fake `urn:llm:models` over a literal inventory, counting resolves —
+    /// the counter is how the tests observe that a menu costs ONE inventory
+    /// read whatever the listing holds, and that a render costs none.
+    fn fake_models_space(body: &str, calls: &Arc<AtomicU32>) -> EndpointSpace {
+        let inventory: serde_json::Value = serde_json::from_str(body).unwrap();
+        let text = body.to_string();
+        let counter = Arc::clone(calls);
+        let mut space = EndpointSpace::new().bind(
+            Exact::new("urn:llm:models"),
+            FnEndpoint::new("fake-llm-models", move |_inv: &Invocation<'_>| {
+                counter.fetch_add(1, Ordering::Relaxed);
+                Ok(repr("application/json", text.clone()))
+            })
+            .with_description(Description::new("fake-llm-models").verb(Verb::Source)),
+        );
+        // The per-provider identity faces the VERSION TAGS fold, agreeing with
+        // the inventory the MENU reads — as they do on a real host, where both
+        // report the provider's configured model. (They are still two
+        // resources: a discovering provider can report null to the cheap
+        // inventory and a probed id to `:model`. The menu is allowed to know
+        // less; it may never claim more.)
+        let default = inventory["default"].as_str().unwrap().to_string();
+        for (name, entry) in inventory["models"].as_object().unwrap() {
+            let Some(model) = entry["model"].as_str().map(str::to_string) else {
+                continue;
+            };
+            let mut iris = vec![format!("urn:llm:{name}:model")];
+            if *name == default {
+                iris.push("urn:llm:model".to_string());
+            }
+            for iri in iris {
+                let model = model.clone();
+                space = space.bind(
+                    Exact::new(iri),
+                    FnEndpoint::new("fake-llm-model", move |_inv: &Invocation<'_>| {
+                        Ok(repr_utf8("text/plain", model.clone()))
+                    })
+                    .with_description(Description::new("fake-llm-model").verb(Verb::Source)),
+                );
+            }
+        }
+        let config = serde_json::json!({ "default": default }).to_string();
+        space.bind(
+            Exact::new("urn:llm:config"),
+            FnEndpoint::new("fake-llm-config", move |_inv: &Invocation<'_>| {
+                Ok(repr("application/json", config.clone()))
+            })
+            .with_description(Description::new("fake-llm-config").verb(Verb::Source)),
+        )
+    }
+
+    /// Two backends on ONE model (coder and batch both serve `same:1b`), a
+    /// third on its own (`gp`, which the bare `urn:llm:ask` facade routes to).
+    const INVENTORY: &str = r#"{
+        "default": "gp",
+        "models": {
+            "coder": {"backend": "urn:llm:coder:ask", "model": "same:1b"},
+            "batch": {"backend": "urn:llm:batch:ask", "model": "same:1b"},
+            "gp":    {"backend": "urn:llm:gp:ask",    "model": "big:70b"}
+        }
+    }"#;
+
+    fn kernel_with_inventory(
+        root: &Path,
+        store: &Arc<Store>,
+        log: &Arc<Log>,
+        inventory: &str,
+        calls: &Arc<AtomicU32>,
+        config: impl FnOnce(ExplainConfig) -> ExplainConfig,
+    ) -> Kernel {
+        let cfg = config(ExplainConfig::new(Arc::clone(store)));
+        let browse = crate::space_with_explain(vec![("demo".to_string(), root.to_path_buf())], cfg);
+        Kernel::new(Arc::new(Fallback::new(vec![
+            Arc::new(browse),
+            Arc::new(fake_models_space(inventory, calls)),
+            Arc::new(fake_llm_space(log)),
+        ])))
+    }
+
+    fn menu(kernel: &Kernel, iri: &str) -> String {
+        body(&source(kernel, iri, &[("as", "text/html")], &cap()).unwrap())
+    }
+
+    /// Every `provider=` the menu emits, in order.
+    fn offered_providers(html: &str) -> Vec<String> {
+        html.match_indices("provider=")
+            .map(|(i, _)| {
+                html[i + "provider=".len()..]
+                    .split(['"', ' '])
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Every `version=` the menu emits as a reopen button, in order.
+    fn offered_versions(html: &str) -> Vec<String> {
+        html.match_indices("version=")
+            .map(|(i, _)| {
+                html[i + "version=".len()..]
+                    .split(['"', ' '])
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_menu_offers_exactly_the_selectable_set_and_never_more() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "// a\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let calls = Arc::new(AtomicU32::new(0));
+        let k = kernel_with_inventory(&root, &store, &log, INVENTORY, &calls, |c| {
+            c.allow_provider(BATCH_PROVIDER)
+        });
+
+        let html = menu(&k, "urn:repo:demo:explain-versions:a.rs");
+        let offered = offered_providers(&html);
+        // The selectable set is {ask, coder, batch}; coder and batch serve one
+        // model, so the menu is TWO rows over THREE selectable providers.
+        assert_eq!(offered.len(), 2, "{html}");
+
+        // Every offered provider is one `provider=` accepts — the menu can
+        // never render a click that comes back Denied.
+        for provider in &offered {
+            assert!(
+                source(
+                    &k,
+                    "urn:repo:demo:explain:a.rs",
+                    &[("provider", provider)],
+                    &cap()
+                )
+                .is_ok(),
+                "menu offered `{provider}`, which explain refused"
+            );
+        }
+        // And a bound backend the operator did NOT make selectable is absent
+        // (urn:llm:gp:ask is in the inventory but not in the allowlist).
+        assert!(!html.contains("urn:llm:gp:ask"), "{html}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn two_providers_serving_one_model_are_one_row_naming_the_configured_one() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "// a\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let calls = Arc::new(AtomicU32::new(0));
+        let k = kernel_with_inventory(&root, &store, &log, INVENTORY, &calls, |c| {
+            c.allow_provider(BATCH_PROVIDER)
+        });
+
+        let html = menu(&k, "urn:repo:demo:explain-versions:a.rs");
+        // ONE row for `same:1b`, not two — the archive would key them the same,
+        // so a second row would promise an explanation it cannot produce.
+        assert_eq!(html.matches("same:1b").count(), 1, "{html}");
+        // The backends are stated as a fact beside it, never as a second button.
+        assert!(html.contains("served by coder, batch"), "{html}");
+        // And the button names the CONFIGURED tier, not the alphabetically
+        // first of the pair — a miss must derive where the operator said.
+        assert_eq!(
+            offered_providers(&html),
+            vec![DIR_PROVIDER.to_string(), FILE_PROVIDER.to_string()],
+            "{html}"
+        );
+        // The markup says why there is one row, in the panel itself.
+        assert!(
+            html.contains("One row per model, not per backend"),
+            "{html}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_unknown_model_never_collapses_two_providers() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "// a\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let calls = Arc::new(AtomicU32::new(0));
+        // Since ikigai-llm 0.12 a provider may pin no model and discover it —
+        // an unreachable backend then reports `null`. Two such providers are
+        // two rows: they may well be two models, and the menu's own ignorance
+        // must not read as a claim that they are the same.
+        let unknown = r#"{"default":"gp","models":{
+            "coder":{"backend":"urn:llm:coder:ask","model":null},
+            "batch":{"backend":"urn:llm:batch:ask","model":null},
+            "gp":{"backend":"urn:llm:gp:ask","model":"big:70b"}}}"#;
+        let k = kernel_with_inventory(&root, &store, &log, unknown, &calls, |c| {
+            c.allow_provider(BATCH_PROVIDER)
+        });
+
+        let html = menu(&k, "urn:repo:demo:explain-versions:a.rs");
+        let offered = offered_providers(&html);
+        assert_eq!(offered.len(), 3, "unknown models must not group: {html}");
+        assert!(offered.contains(&FILE_PROVIDER.to_string()), "{html}");
+        assert!(offered.contains(&BATCH_PROVIDER.to_string()), "{html}");
+        // Each unknown row says so rather than inventing an identity, and is
+        // labelled by the same heuristic its version tag will carry.
+        assert_eq!(
+            html.matches("backend reports no model id").count(),
+            2,
+            "{html}"
+        );
+        assert!(html.contains(">coder</button>"), "{html}");
+        assert!(html.contains(">batch</button>"), "{html}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_archived_explanation_reopens_from_the_menu_without_deriving() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "// a\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let calls = Arc::new(AtomicU32::new(0));
+        let k = kernel_with_inventory(&root, &store, &log, INVENTORY, &calls, |c| c);
+
+        let first = body(&source(&k, "urn:repo:demo:explain:a.rs", &[], &cap()).unwrap());
+        assert_eq!(log.count(FILE_PROVIDER), 1);
+
+        let html = menu(&k, "urn:repo:demo:explain-versions:a.rs");
+        let versions = offered_versions(&html);
+        assert_eq!(versions, vec!["code-v1@same:1b".to_string()], "{html}");
+        // The tag the menu offers reopens the archived text, and pays nothing.
+        let again = body(
+            &source(
+                &k,
+                "urn:repo:demo:explain:a.rs",
+                &[("version", &versions[0])],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(again, first);
+        assert_eq!(log.count(FILE_PROVIDER), 1, "reopening must not derive");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn entries_under_earlier_content_are_listed_but_never_offered() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "// a\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let calls = Arc::new(AtomicU32::new(0));
+        let k = kernel_with_inventory(&root, &store, &log, INVENTORY, &calls, |c| c);
+        source(&k, "urn:repo:demo:explain:a.rs", &[], &cap()).unwrap();
+
+        // Edit: the content re-keys, and the archived entry is no longer
+        // addressable by `version=` (which resolves against the CURRENT hash).
+        std::fs::write(root.join("a.rs"), "// a changed\n").unwrap();
+        let html = menu(&k, "urn:repo:demo:explain-versions:a.rs");
+        assert!(offered_versions(&html).is_empty(), "{html}");
+        assert!(html.contains("archived under earlier"), "{html}");
+        // The text face still lists it — the archive outlives the content.
+        let listing =
+            body(&source(&k, "urn:repo:demo:explain-versions:a.rs", &[], &cap()).unwrap());
+        assert!(listing.contains("code-v1@same:1b"), "{listing}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_grain_with_no_versions_still_renders_its_choices() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "// a\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let calls = Arc::new(AtomicU32::new(0));
+        let k = kernel_with_inventory(&root, &store, &log, INVENTORY, &calls, |c| c);
+
+        let html = menu(&k, "urn:repo:demo:explain-versions:a.rs");
+        assert!(html.contains("nothing yet"), "{html}");
+        assert!(offered_versions(&html).is_empty(), "{html}");
+        // The derive half is unaffected: an empty archive is the ordinary
+        // first-visit state, not a degraded one.
+        assert_eq!(offered_providers(&html).len(), 2, "{html}");
+        assert_eq!(log.count(FILE_PROVIDER), 0, "a menu never derives");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_menu_renders_with_no_llm_provider_bound_at_all() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "// a\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        // Browse alone: no urn:llm:models, no backends. The hosts that mount
+        // this crate must degrade, not fail.
+        let browse = crate::space_with_explain(
+            vec![("demo".to_string(), root.clone())],
+            ExplainConfig::new(Arc::clone(&store)),
+        );
+        let k = Kernel::new(Arc::new(browse));
+
+        let html = menu(&k, "urn:repo:demo:explain-versions:a.rs");
+        // Both configured tiers are still offered, labelled by the same
+        // provider heuristic their version tags fall back to.
+        assert_eq!(
+            offered_providers(&html),
+            vec![DIR_PROVIDER.to_string(), FILE_PROVIDER.to_string()],
+            "{html}"
+        );
+        assert!(html.contains(">coder</button>"), "{html}");
+        assert!(html.contains(">ask</button>"), "{html}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_listing_renders_one_menu_and_reads_the_inventory_only_when_opened() {
+        let root = temp_dir();
+        for n in 0..12 {
+            std::fs::write(root.join(format!("f{n}.rs")), "// x\n").unwrap();
+        }
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let calls = Arc::new(AtomicU32::new(0));
+        let k = kernel_with_inventory(&root, &store, &log, INVENTORY, &calls, |c| c);
+
+        // Rendering the directory: twelve rows, ONE menu, and not a single
+        // inventory read — the panel is a separate resolution, fetched on the
+        // disclosure's toggle.
+        let tree = body(&source(&k, "urn:repo:demo:tree", &[("as", "text/html")], &cap()).unwrap());
+        assert_eq!(tree.matches("browse-explain-menu\"").count(), 1, "{tree}");
+        assert_eq!(tree.matches("browse-explain-link").count(), 13); // header + 12 rows
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "a listing must not fan out"
+        );
+
+        // Opening it: exactly one, however many entries the directory holds.
+        menu(&k, "urn:repo:demo:explain-versions");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        menu(&k, "urn:repo:demo:explain-versions");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "one per opening, not per row"
+        );
+        assert_eq!(log.count(FILE_PROVIDER), 0, "a menu never derives");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_explain_page_carries_the_menu_and_the_versions_face_declares_it() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "// a\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let calls = Arc::new(AtomicU32::new(0));
+        let k = kernel_with_inventory(&root, &store, &log, INVENTORY, &calls, |c| c);
+
+        let page = body(
+            &source(
+                &k,
+                "urn:repo:demo:explain:a.rs",
+                &[("as", "text/html")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        // The disclosure is keyboard-operable by construction (details/summary)
+        // and lazy: it names the versions resource, it does not embed it.
+        assert!(
+            page.contains("<details class=\"browse-explain-menu\">"),
+            "{page}"
+        );
+        assert!(page.contains("<summary>explain with…</summary>"), "{page}");
+        assert!(
+            page.contains("urn:repo:demo:explain-versions:a.rs"),
+            "{page}"
+        );
+        assert!(
+            page.contains("hx-trigger=\"toggle once from:closest details\""),
+            "{page}"
+        );
+        // Only one inventory read happened, and it was NOT this page's.
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "the page itself reads no inventory"
+        );
+
+        // The html face is declared, so a client can find it without guessing.
+        let as_spec = VersionsEndpoint {
+            roots: Arc::new(std::collections::BTreeMap::from([(
+                "demo".to_string(),
+                root.clone(),
+            )])),
+            config: Arc::new(ExplainConfig::new(Arc::clone(&store))),
+        }
+        .describe();
+        let face = as_spec.inputs.iter().find(|i| i.name == "as").unwrap();
+        assert!(
+            face.one_of.contains(&"text/html".to_string()),
+            "{:?}",
+            face.one_of
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

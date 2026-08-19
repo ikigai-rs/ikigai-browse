@@ -828,14 +828,22 @@ fn explain_button(repo: &str, rel: &str, label: &str, title: Option<&str>) -> St
 }
 
 /// The header strip under the crumbs: face-level actions (today just the
-/// explain link, when that family is mounted; empty otherwise).
+/// explain link, when that family is mounted; empty otherwise), followed by
+/// the explain option menu.
+///
+/// The menu is a SIBLING of the action row, not a member of it: the row is
+/// `display:flex` in every host that styles it, and a disclosure opened inside
+/// a flex row is sized to its content — on a phone that is a column of
+/// wrapped fragments. Block-level below the row, it lays out at any width with
+/// no CSS at all.
 fn actions_html(repo: &str, rel: &str, explain: bool) -> String {
     if !explain {
         return String::new();
     }
     format!(
-        "<nav class=\"browse-actions\">{}</nav>",
-        explain_button(repo, rel, "explain", None)
+        "<nav class=\"browse-actions\">{}</nav>{}",
+        explain_button(repo, rel, "explain", None),
+        explain::menu_html(repo, rel),
     )
 }
 
@@ -858,6 +866,13 @@ fn tree_html(repo: &str, rel: &str, entries: &[Entry], explain: bool) -> String 
     }
     if !actions.is_empty() {
         out.push_str(&format!("<nav class=\"browse-actions\">{actions}</nav>"));
+    }
+    // The directory's own option menu, once — NOT one per row. The rows keep
+    // their compact `?`; a listing of a thousand entries must not carry a
+    // thousand disclosures, each of which would read the archive and the model
+    // inventory the moment it opened.
+    if explain {
+        out.push_str(&explain::menu_html(repo, rel));
     }
     out.push_str("<ul class=\"browse-entries\">");
     for e in entries {
@@ -1873,6 +1888,10 @@ mod tests {
         for iri in ["urn:repo:demo:tree", "urn:repo:demo:file:src/lib.rs"] {
             let html = body(&source(&k, iri, &[("as", "text/html")], &demo_cap()).unwrap());
             assert!(!html.contains("browse-explain-link"), "{iri}: {html}");
+            // The option menu is part of the same family: an unmounted
+            // explain-versions would answer nothing, so the disclosure that
+            // fetches it must not render either.
+            assert!(!html.contains("browse-explain-menu"), "{iri}: {html}");
         }
 
         // space_with_explain: the tree face links the directory's explain and
@@ -1895,9 +1914,13 @@ mod tests {
             "hx-get=\"/k/source urn:repo:demo:explain as=text/html\"",
             "hx-get=\"/k/source urn:repo:demo:explain:src as=text/html\"",
             "hx-get=\"/k/source urn:repo:demo:explain:README.md as=text/html\"",
+            // …and one option menu for the directory itself, pointing at its
+            // versions face. One, not one per row.
+            "hx-get=\"/k/source urn:repo:demo:explain-versions as=text/html\"",
         ] {
             assert!(html.contains(target), "missing {target}: {html}");
         }
+        assert_eq!(html.matches("browse-explain-menu\"").count(), 1, "{html}");
         let html = body(
             &source(
                 &k,

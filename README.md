@@ -12,7 +12,7 @@ pairs), and each root answers these resource families:
 | `urn:repo:{repo}:state` | the **freshness oracle** — HEAD sha + `clean`/`dirty:{n}` on one line; `as=application/json` for `{head, dirty: [paths]}` |
 | `urn:repo:{repo}:hash[:{path}]` | the **content hash** (S1) — `sha256:{hex}` of a file's bytes, or the **merkle** construction over a directory's entries (ignore-filtered), so one edit re-keys exactly the path to the root |
 | `urn:repo:{repo}:explain[:{path}]` | an **LLM-derived orientation explanation** (S1), archived by `(path, content-hash, version-tag)` — derived once per content version, reused forever; `as=application/json` adds `{content_hash, version_tag, derived}`, `as=text/html` the page face with provenance and a backlink to the explained resource, `as=text/turtle` the archive entry's graph; `version=` addresses an older tag; `provider=` derives this one against a different host-allowed backend (keyed by that backend's own model identity, so two models coexist); `annotations=include` (S3) folds the target's annotations in — the json face gains an `annotations` array, the text face appends margin notes, the html face renders the annotation cards, and a directory rollup folds its subtree's |
-| `urn:repo:{repo}:explain-versions[:{path}]` | what the archive holds for a path — one row per entry (tag, hash, model, derived-at), across content versions and tags; a pure store read (no net capability) |
+| `urn:repo:{repo}:explain-versions[:{path}]` | what the archive holds for a path — one row per entry (tag, hash, model, derived-at), across content versions and tags; derives nothing and needs no net capability; `as=text/html` is the **option menu** the faces open beside their explain button — the entries the current content can reopen (free) above the models this host will derive a new one with, one row per MODEL |
 | `urn:annotation[:{id}]` | a **W3C Web Annotation** (S2) on a file — Sink creates/updates (anchoring the quoted text; the bare `urn:annotation` mints a uuid id), Source reads with drift **re-anchoring**, Delete removes; faces: `text/plain` (the body), `as=application/json`, `as=text/turtle` |
 | `urn:repo:{repo}:annotations[:{path}]` | every annotation on one file (or the whole repo, path omitted) in reading order, drift-reconciled on each read; faces: `application/json` (default), `as=text/html` (panel fragment), `as=text/turtle` |
 | `urn:repo:{repo}:review:{path}` | the **machine review pass** (S4) — region-grain LLM commentary minted as real annotations (provenance-distinguished), the pass archived by `(path, content-hash, review-tag)` so re-sourcing unchanged content mints nothing; faces: `text/plain` (the margin digest), `as=application/json` (`{minted, orphaned_items, reviewed_bytes, total_bytes, annotations, …}`), `as=text/html` (the card page), `as=text/turtle` (the pass's provenance graph); `debug=raw` derives and returns the model's **unparsed answer** (nothing minted or archived) — the parse-failure diagnosis face |
@@ -217,6 +217,32 @@ tree face one per entry plus the directory's own under a
 `browse-actions` nav), and the explain face backlinks its target
 (`browse-view-link`) and folds the annotation cards in under
 `annotations=include`.
+
+**The option menu.** Beside each face's explain button sits a
+`<details class="browse-explain-menu">` disclosure — native, so it is
+focusable and operable from the keyboard, never hover-only, and block-level so
+its panel lays out on a phone with no CSS of ours. It renders CLOSED and
+empty: the panel is a separate resolution of this path's
+`explain-versions … as=text/html`, `hx-get`ed on the disclosure's `toggle`
+event. A listing therefore carries ONE menu (the directory's own; the per-row
+`?` stays a direct explain), and a thousand entries cost a thousand
+`<details>` tags and not one sub-request. Opening one costs an archive read,
+the path's content hash, and a single resolve of `urn:llm:models` — the
+inventory, not `urn:llm:{p}:model`, which probes its backend and would be one
+network call per provider.
+
+**One row per model, not per backend.** The menu's primary axis is the model,
+because the archive's is: two providers serving one model id share a version
+tag and therefore a key, so a second row would promise an explanation that
+cannot exist and would return the first one's text instantly. Where several
+selectable providers serve one model they are one row, which names the
+operator's configured tier as its `provider=` (any of them keys the same
+entry, but on a MISS one of them actually runs) and states the others beside
+it as a fact. A provider whose model nothing reports — no llm module, or,
+since ikigai-llm 0.12, a provider that pins no model and discovers it from an
+unreachable backend — gets its OWN row, labelled by the same provider
+heuristic its version tag will fall back to and marked as unidentified: two
+unknowns are two rows, because they may well be two models.
 
 ## Annotations (S2)
 
