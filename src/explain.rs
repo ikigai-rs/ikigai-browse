@@ -834,13 +834,16 @@ impl Endpoint for ExplainEndpoint {
             let selectable = config.selectable();
             if !selectable.contains(provider) {
                 return Err(Error::Denied(format!(
-                    "browse: `{provider}` is not a provider this host offers to explain with;                      selectable here: {}",
+                    "browse: `{provider}` is not a provider this host offers to explain \
+                     with; selectable here: {}",
                     selectable.into_iter().collect::<Vec<_>>().join(", ")
                 )));
             }
             if let Ok(version) = inv.inline_str("version") {
                 return Err(Error::Endpoint(format!(
-                    "browse: `version={version}` and `provider={provider}` both name the model                      for this explain, and they can disagree — a version tag addresses an                      archived entry outright and derives nothing. Pass one, not both."
+                    "browse: `version={version}` and `provider={provider}` both name the \
+                     model for this explain, and they can disagree — a version tag addresses \
+                     an archived entry outright and derives nothing. Pass one, not both."
                 )));
             }
         }
@@ -2420,6 +2423,8 @@ mod tests {
             text.contains(FILE_PROVIDER),
             "names what is offered: {text}"
         );
+        // A refusal is read by a human: no collapsed line-continuation runs.
+        assert!(!text.contains("  "), "message reads as prose: {text}");
         assert_eq!(log.count(BATCH_PROVIDER), 0, "refused before any ask");
         assert_eq!(log.count(FILE_PROVIDER), 0, "and never fell back");
 
@@ -2524,6 +2529,8 @@ mod tests {
             text.contains("code-v1@m1") && text.contains(FILE_PROVIDER),
             "{text}"
         );
+        // A refusal is read by a human: no collapsed line-continuation runs.
+        assert!(!text.contains("  "), "message reads as prose: {text}");
         assert_eq!(log.count(FILE_PROVIDER), 0);
         std::fs::remove_dir_all(&root).ok();
     }
