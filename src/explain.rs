@@ -2447,6 +2447,35 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// The overrides are scoped to the TIER KNOB they live on, not to the
+    /// backend: a file-grain request that picks the dir tier's provider does
+    /// not inherit `dir_model_label`. Falling through resolves that
+    /// backend's true id instead, so the worst case is losing the operator's
+    /// nickname — never gaining a wrong identity in the key.
+    #[test]
+    fn a_tiers_label_does_not_leak_across_to_the_other_grain() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "// a\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        // kernel_with sets file_model_label("m1") AND dir_model_label("d1").
+        let k = kernel_with(&root, &store, &log, |c| c);
+
+        let row = json(
+            &k,
+            "urn:repo:demo:explain:a.rs",
+            &[("provider", DIR_PROVIDER)],
+        );
+        // Neither the file tier's label (wrong backend) nor the dir tier's
+        // (right backend, wrong knob) — the resolved identity, here the
+        // heuristic because the fake space binds no :model.
+        assert_eq!(row["version_tag"], "code-v1@ask");
+        assert_eq!(row["model"], "ask");
+        assert_eq!(log.count(DIR_PROVIDER), 1, "the file grain asked it");
+        assert_eq!(log.count(FILE_PROVIDER), 0);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// A rollup applies the chosen backend to ITSELF; the children are plain
     /// sub-resolutions carrying no argument, so they keep their own tier and
     /// their own tags — the same mixing the two-tier default already does.
