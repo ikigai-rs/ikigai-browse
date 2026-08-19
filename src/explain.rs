@@ -38,6 +38,30 @@
 //! semantics — per-response truth lives in the ask's `as=application/json`
 //! envelope.
 //!
+//! ## Choosing the backend per request
+//!
+//! `provider={iri}` derives THIS explanation against a backend the caller
+//! names rather than the tier's configured one. Three things about it:
+//!
+//! - **Authority is the operator's, not the caller's.** The selectable set is
+//!   the two configured tier providers plus whatever
+//!   [`ExplainConfig::allow_provider`] added; anything else is `Denied`,
+//!   naming what was asked for and what is on offer. It never falls back
+//!   silently. The reason is that `explain`'s declared capability
+//!   (`urn:cap:net:*`) cannot vary by argument value — it means "may derive",
+//!   not "may derive against the metered vendor" — so the argument would
+//!   otherwise let anyone who may explain spend the operator's money.
+//! - **The label follows the backend that answered** (see
+//!   [`ExplainEndpoint::model_label`]): a request-selected provider does NOT
+//!   inherit an operator's `file_model_label`.
+//! - **★ The tag folds MODEL identity, not backend identity.** Two providers
+//!   serving the same model id produce the same tag and therefore the same
+//!   archive key: the second is a HIT, not a second entry. That is deliberate
+//!   — the explanation is a function of the model and the prompt, not of the
+//!   serving layer — and it means `provider=` buys a genuinely different
+//!   explanation only when the backends differ in model, while against the
+//!   same model it buys latency/throughput shape and costs nothing new.
+//!
 //! ## Hierarchical grains, merkle keys
 //!
 //! A directory's explanation derives from its entry list plus its CHILDREN'S
@@ -159,6 +183,9 @@ pub struct ExplainConfig {
     pub(crate) review_max_tokens: u32,
     pub(crate) pr_max_tokens: u32,
     pub(crate) temperature: String,
+    /// Provider IRIs a REQUEST may select beyond the two configured tiers —
+    /// the operator's opt-in half of [`ExplainConfig::selectable`].
+    selectable_providers: BTreeSet<String>,
     pub(crate) ignore: BTreeSet<String>,
     pub(crate) max_prompt_bytes: usize,
 }
@@ -187,6 +214,7 @@ impl ExplainConfig {
             review_max_tokens: 800,
             pr_max_tokens: 600,
             temperature: "0.2".to_string(),
+            selectable_providers: BTreeSet::new(),
             ignore: crate::hash::default_ignore(),
             max_prompt_bytes: 16 * 1024,
         }
@@ -284,6 +312,46 @@ impl ExplainConfig {
     pub fn temperature(mut self, temperature: impl Into<String>) -> Self {
         self.temperature = temperature.into();
         self
+    }
+
+    /// Widen the set of provider IRIs a REQUEST may name with `provider=`,
+    /// beyond the two this endpoint already asks ([`Self::file_provider`] and
+    /// [`Self::dir_provider`] are always selectable — naming one of them
+    /// points the host at a backend it already uses to explain, so it grants
+    /// no reach the caller did not already have).
+    ///
+    /// ★ THIS IS THE AUTHORITY BOUNDARY. `explain` declares one network
+    /// capability (`urn:cap:net:*`) and an `ActionSpec` cannot express a
+    /// capability that varies by ARGUMENT VALUE, so the cap says only "may
+    /// derive" — it cannot say "may derive against the metered vendor". A
+    /// caller who may explain at all could otherwise direct the host at any
+    /// backend the registry happens to hold, which the day a remote,
+    /// api-keyed provider is configured means spending the operator's money
+    /// and shipping the operator's source to a vendor. The default set is
+    /// therefore exactly what the operator already chose; widening it is the
+    /// operator's explicit act, and the widened set is published in the
+    /// action's `provider` ArgSpec (`one_of`) so the manifold states it.
+    pub fn allow_provider(mut self, iri: impl Into<String>) -> Self {
+        self.selectable_providers.insert(iri.into());
+        self
+    }
+
+    /// [`Self::allow_provider`] for several at once.
+    pub fn allow_providers(mut self, iris: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.selectable_providers
+            .extend(iris.into_iter().map(Into::into));
+        self
+    }
+
+    /// Every provider IRI a `provider=` argument may name here: the two
+    /// configured tiers plus whatever [`Self::allow_provider`] added.
+    /// Computed on demand rather than snapshotted, so builder order never
+    /// matters and a later `file_provider(…)` stays selectable.
+    pub(crate) fn selectable(&self) -> BTreeSet<String> {
+        let mut set = self.selectable_providers.clone();
+        set.insert(self.file_provider.clone());
+        set.insert(self.dir_provider.clone());
+        set
     }
 
     /// Entry names excluded from the hierarchy — from directory hashing,
@@ -755,6 +823,28 @@ impl Endpoint for ExplainEndpoint {
         let target = resolve(root, &rel)?;
         let config = &self.config;
 
+        // The caller's backend choice, validated BEFORE any work: an unknown
+        // or non-allowed provider is a refusal that names what was asked for,
+        // never a silent fall back to the configured one. A caller who asked
+        // for one model, got another, and had it archived under that other
+        // model's tag has been lied to durably — the entry is thereafter
+        // indistinguishable from a legitimate one.
+        let requested_provider = inv.inline_str("provider").ok().map(str::to_string);
+        if let Some(provider) = &requested_provider {
+            let selectable = config.selectable();
+            if !selectable.contains(provider) {
+                return Err(Error::Denied(format!(
+                    "browse: `{provider}` is not a provider this host offers to explain with;                      selectable here: {}",
+                    selectable.into_iter().collect::<Vec<_>>().join(", ")
+                )));
+            }
+            if let Ok(version) = inv.inline_str("version") {
+                return Err(Error::Endpoint(format!(
+                    "browse: `version={version}` and `provider={provider}` both name the model                      for this explain, and they can disagree — a version tag addresses an                      archived entry outright and derives nothing. Pass one, not both."
+                )));
+            }
+        }
+
         // The archive key's backbone, THROUGH the kernel (dependency-recorded).
         let hash_repr = inv.source(&parse_iri(&hash_iri(repo, &rel))?).await?;
         let hash = String::from_utf8_lossy(&hash_repr.bytes).trim().to_string();
@@ -772,13 +862,18 @@ impl Endpoint for ExplainEndpoint {
             (grain, file_iri(repo, &rel), Some((content, text)))
         };
 
-        // The model identity in the tag — resolved ONCE per request; the same
-        // value serves the archive lookup (hit path) and stamps a new entry
-        // (miss path). Binary stubs involve no model.
+        // The backend that will answer, and the model identity describing IT
+        // — resolved ONCE per request; the same value serves the archive
+        // lookup (hit path) and stamps a new entry (miss path). Binary stubs
+        // involve no model, but a bad `provider=` still failed above.
+        let tier = match grain {
+            Grain::Directory => Tier::Dir,
+            _ => Tier::File,
+        };
+        let provider = self.provider_for(tier, requested_provider.as_deref());
         let model = match grain {
             Grain::Binary => None,
-            Grain::Directory => Some(self.model_label(inv, Tier::Dir).await),
-            _ => Some(self.model_label(inv, Tier::File).await),
+            _ => Some(self.model_label(inv, tier, &provider).await),
         };
         let current_tag = version_tag(grain, model.as_deref().unwrap_or(""));
         let requested = inv.inline_str("version").ok().map(str::to_string);
@@ -810,7 +905,7 @@ impl Endpoint for ExplainEndpoint {
 
         // Miss under the current tag: derive, archive, serve.
         let text = match grain {
-            Grain::Directory => self.derive_dir(inv, repo, &rel).await?,
+            Grain::Directory => self.derive_dir(inv, repo, &rel, &provider).await?,
             Grain::Binary => {
                 let (content, _) = material.as_ref().expect("file grains carry material");
                 format!(
@@ -822,7 +917,8 @@ impl Endpoint for ExplainEndpoint {
             _ => {
                 let (_, text) = material.as_ref().expect("file grains carry material");
                 let text = text.as_deref().expect("non-binary grains are UTF-8");
-                self.derive_file(inv, repo, &rel, grain, text).await?
+                self.derive_file(inv, repo, &rel, grain, text, &provider)
+                    .await?
             }
         };
         let model = model.unwrap_or_else(|| "none".to_string());
@@ -859,7 +955,7 @@ impl Endpoint for ExplainEndpoint {
     }
 
     fn describe(&self) -> Description {
-        explain_description()
+        explain_description(&self.config)
     }
 }
 
@@ -896,20 +992,43 @@ impl ExplainEndpoint {
             .map(Some)
     }
 
+    /// The backend this request derives against for `tier`: the caller's
+    /// already-validated `provider=` when given, else the tier's configured
+    /// provider. Absent the argument this is the identity function on today's
+    /// behaviour.
+    fn provider_for(&self, tier: Tier, requested: Option<&str>) -> String {
+        match (requested, tier) {
+            (Some(provider), _) => provider.to_string(),
+            (None, Tier::File) => self.config.file_provider.clone(),
+            (None, Tier::Dir) => self.config.dir_provider.clone(),
+        }
+    }
+
     /// The model identity folded into this request's version tag, in
     /// precedence order: the explicit config label (the operator's override)
     /// → the provider's `urn:llm:…:model` resolved through the kernel
     /// ([`resolve_model`] — the true configured id) → the provider-IRI
     /// heuristic ([`provider_label`]). Infallible by design: a host without
     /// the llm module (or a pre-0.10 one) still explains, with heuristic tags.
-    async fn model_label(&self, inv: &Invocation<'_>, tier: Tier) -> String {
+    ///
+    /// ★ THE OPERATOR'S LABEL DESCRIBES THE OPERATOR'S BACKEND — it is keyed
+    /// to the provider, not to the tier, so it applies only while `provider`
+    /// IS the tier's configured one. A request that selects a different
+    /// backend resolves THAT backend's own identity instead of inheriting a
+    /// label written for another model. The alternative would stamp (say)
+    /// `file_model_label = "coder-30b"` onto a 70B model's output, writing a
+    /// wrong model identity into the archive KEY — and a wrong key is
+    /// indistinguishable from a legitimate cache entry forever after.
+    async fn model_label(&self, inv: &Invocation<'_>, tier: Tier, provider: &str) -> String {
         let config = &self.config;
-        let (provider, explicit) = match tier {
+        let (configured, explicit) = match tier {
             Tier::File => (&config.file_provider, &config.file_model_label),
             Tier::Dir => (&config.dir_provider, &config.dir_model_label),
         };
-        if let Some(label) = explicit {
-            return label.clone();
+        if provider == configured {
+            if let Some(label) = explicit {
+                return label.clone();
+            }
         }
         match resolve_model(inv, provider).await {
             Some(model) => model,
@@ -918,8 +1037,9 @@ impl ExplainEndpoint {
     }
 
     /// Derive a file-grain explanation: the grain's versioned prompt plus the
-    /// (truncated) content, asked of the configured file provider under the
-    /// mandatory token ceiling.
+    /// (truncated) content, asked of `provider` (the request's choice or the
+    /// configured file tier) under the mandatory token ceiling.
+    #[allow(clippy::too_many_arguments)]
     async fn derive_file(
         &self,
         inv: &Invocation<'_>,
@@ -927,6 +1047,7 @@ impl ExplainEndpoint {
         rel: &str,
         grain: Grain,
         content: &str,
+        provider: &str,
     ) -> Result<String> {
         let config = &self.config;
         let prompt = format!(
@@ -934,7 +1055,7 @@ impl ExplainEndpoint {
             grain_prompt(grain),
             truncate(content, config.max_prompt_bytes),
         );
-        self.ask(inv, &config.file_provider, &prompt, config.file_max_tokens)
+        self.ask(inv, provider, &prompt, config.file_max_tokens)
             .await
     }
 
@@ -942,7 +1063,19 @@ impl ExplainEndpoint {
     /// child's OWN explanation, sourced through the kernel — the recursion
     /// that bottoms out at files, and the reason one edit recomputes exactly
     /// one path up the tree (unchanged children are archive hits).
-    async fn derive_dir(&self, inv: &Invocation<'_>, repo: &str, rel: &str) -> Result<String> {
+    ///
+    /// `provider` selects the backend for THIS rollup only. The children are
+    /// plain sub-resolutions of their own `explain` IRIs and carry no
+    /// argument, so they derive (or hit) under their own tier's tag — the
+    /// same mixing the two-tier default already does, and the reason a
+    /// rollup's tag has never described the material fed to it.
+    async fn derive_dir(
+        &self,
+        inv: &Invocation<'_>,
+        repo: &str,
+        rel: &str,
+        provider: &str,
+    ) -> Result<String> {
         let config = &self.config;
         let tree = inv.source(&parse_iri(&tree_iri(repo, rel))?).await?;
         let listing = String::from_utf8_lossy(&tree.bytes).to_string();
@@ -986,7 +1119,7 @@ impl ExplainEndpoint {
             entries.join(", "),
             truncate(&sections, config.max_prompt_bytes),
         );
-        self.ask(inv, &config.dir_provider, &prompt, config.dir_max_tokens)
+        self.ask(inv, provider, &prompt, config.dir_max_tokens)
             .await
     }
 
@@ -1149,7 +1282,13 @@ pub(crate) fn explain_turtle(entry: &ArchiveEntry) -> String {
 
 /// `repo` is not an ArgSpec: every advertised row fixes the root in its
 /// pattern (see `crate::bind_family`); the binding is grammar-injected.
-fn explain_description() -> Description {
+///
+/// Takes the config because the `provider` argument's `one_of` IS this host's
+/// allowlist ([`ExplainConfig::selectable`]) — the manifold must state which
+/// backends a caller may actually name, not a hard-coded guess, so that
+/// `urn:kernel:validate` can reject a bad one before dispatch and a UI can
+/// build its menu from the description alone.
+fn explain_description(config: &ExplainConfig) -> Description {
     Description::new("browse-explain")
         .title("Repository explanation (archived derivation)")
         .summary(
@@ -1158,7 +1297,9 @@ fn explain_description() -> Description {
              version-tag) so it derives once per content version and is reused forever. \
              Directories synthesize their children's explanations (one edit re-derives \
              exactly the path to the root); the version tag folds prompt version and model \
-             identity; version= addresses an older tag. text/plain (default) is the text; \
+             identity; version= addresses an older tag; provider= derives this one against \
+             a different (host-allowed) backend, keyed by that backend's own model identity. \
+             text/plain (default) is the text; \
              as=application/json adds {content_hash, version_tag, derived}; as=text/html \
              renders the page face with provenance; as=text/turtle emits the archive \
              entry's graph. annotations=include folds the target's annotations in \
@@ -1179,6 +1320,20 @@ fn explain_description() -> Description {
         .input(ArgSpec::new("version").optional().summary(
             "an archived version tag (e.g. code-v1@qwen3-coder:30b) instead of the current one",
         ))
+        .input(
+            ArgSpec::new("provider")
+                .optional()
+                .summary(
+                    "the LLM provider IRI that derives THIS explanation, instead of the \
+                     configured tier default (file grain vs directory rollup); one_of is what \
+                     this host allows. That backend's own model identity keys the archive \
+                     entry, so two models yield two coexisting entries. A directory rollup \
+                     applies it to the rollup only — the children keep their own tags. \
+                     Mutually exclusive with version=, which addresses an entry instead of \
+                     deriving one.",
+                )
+                .one_of(config.selectable()),
+        )
         .input(
             ArgSpec::new("annotations")
                 .optional()
@@ -1345,6 +1500,9 @@ mod tests {
 
     const FILE_PROVIDER: &str = "urn:llm:coder:ask";
     const DIR_PROVIDER: &str = "urn:llm:ask";
+    /// A third bound backend that NO default config asks — the one the
+    /// allowlist tests gate on.
+    const BATCH_PROVIDER: &str = "urn:llm:batch:ask";
 
     /// Deterministic fake LLM backends: each answer is `EXPL#{n}` (n = global
     /// ask count), each ask recorded — the counters are how the tests observe
@@ -1352,7 +1510,7 @@ mod tests {
     /// the net wildcard, like the real module.
     fn fake_llm_space(log: &Arc<Log>) -> EndpointSpace {
         let mut space = EndpointSpace::new();
-        for provider in [FILE_PROVIDER, DIR_PROVIDER] {
+        for provider in [FILE_PROVIDER, DIR_PROVIDER, BATCH_PROVIDER] {
             let log = Arc::clone(log);
             space = space.bind(
                 Exact::new(provider),
@@ -2019,7 +2177,35 @@ mod tests {
         // No `repo` ArgSpec: every advertised row fixes the root in its
         // pattern; the binding is grammar-injected.
         let names: Vec<&str> = description.inputs.iter().map(|i| i.name.as_str()).collect();
-        assert_eq!(names, ["path", "version", "annotations", "as"]);
+        assert_eq!(names, ["path", "version", "provider", "annotations", "as"]);
+
+        // The manifold publishes the allowlist: `provider`'s one_of IS what
+        // this host permits, so validate can reject before dispatch and a UI
+        // can build its menu from the description alone. By default that is
+        // exactly the two backends explain already asks — no new reach.
+        let provider_spec = description
+            .inputs
+            .iter()
+            .find(|i| i.name == "provider")
+            .unwrap();
+        assert_eq!(provider_spec.one_of, ["urn:llm:ask", "urn:llm:coder:ask"]);
+        let widened = ExplainEndpoint {
+            roots: Arc::clone(&roots),
+            config: Arc::new(
+                ExplainConfig::new(Arc::new(Store::new().unwrap()))
+                    .allow_provider("urn:llm:batch:ask"),
+            ),
+        }
+        .describe();
+        let widened = widened
+            .inputs
+            .iter()
+            .find(|i| i.name == "provider")
+            .unwrap();
+        assert_eq!(
+            widened.one_of,
+            ["urn:llm:ask", "urn:llm:batch:ask", "urn:llm:coder:ask"]
+        );
 
         // The versions listing never derives — it must NOT demand net.
         use ikigai_core::Endpoint as _;
@@ -2095,6 +2281,217 @@ mod tests {
             rollup.contains("src/lib.rs L1 \"fn main()\" -- the entry point"),
             "{rollup}"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The arc: a caller names the backend for THIS derivation, and the
+    /// archive keys on that backend's OWN model identity — so two models
+    /// coexist, both list, and either is addressable afterwards.
+    #[test]
+    fn a_request_provider_derives_against_it_and_keys_by_its_own_model() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "// a\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        // No labels: the tags must come from each provider's own :model.
+        let k = kernel_with_real_llm(&root, ExplainConfig::new(Arc::clone(&store)));
+
+        // Default: the configured file tier (coder ⇒ qwen-test:9b).
+        let default = json(&k, "urn:repo:demo:explain:a.rs", &[]);
+        assert_eq!(default["version_tag"], "code-v1@qwen-test:9b");
+
+        // The same file, the OTHER backend — allowed by default because it is
+        // the configured dir tier. Its own model identity keys the entry.
+        let picked = json(
+            &k,
+            "urn:repo:demo:explain:a.rs",
+            &[("provider", "urn:llm:ask")],
+        );
+        assert_eq!(picked["version_tag"], "code-v1@big-test:70b");
+        assert_eq!(picked["model"], "big-test:70b");
+        assert_eq!(picked["derived"], true);
+
+        // Two coexisting entries at ONE content hash, both listed.
+        let rows = json(&k, "urn:repo:demo:explain-versions:a.rs", &[]);
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let tags: std::collections::BTreeSet<&str> = rows
+            .iter()
+            .map(|r| r["version_tag"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            tags,
+            ["code-v1@big-test:70b", "code-v1@qwen-test:9b"]
+                .into_iter()
+                .collect()
+        );
+        let hashes: std::collections::BTreeSet<&str> = rows
+            .iter()
+            .map(|r| r["content_hash"].as_str().unwrap())
+            .collect();
+        assert_eq!(hashes.len(), 1, "same content, two models: {rows:?}");
+
+        // And version= still fetches either, from the archive.
+        for tag in ["code-v1@qwen-test:9b", "code-v1@big-test:70b"] {
+            let old = json(&k, "urn:repo:demo:explain:a.rs", &[("version", tag)]);
+            assert_eq!(old["version_tag"], tag);
+            assert_eq!(old["derived"], false, "{tag}");
+        }
+
+        // Re-asking for the picked backend is an archive hit, not a re-derive.
+        let again = json(
+            &k,
+            "urn:repo:demo:explain:a.rs",
+            &[("provider", "urn:llm:ask")],
+        );
+        assert_eq!(again["derived"], false);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The precedence trap: the operator's label describes the OPERATOR'S
+    /// backend. A request that picks a different one must resolve that one's
+    /// identity — stamping the override onto another model's output would
+    /// write a wrong model identity into the archive KEY, indistinguishable
+    /// from a legitimate entry ever after.
+    #[test]
+    fn a_request_provider_never_inherits_the_operators_label() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "// a\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel_with_real_llm(
+            &root,
+            ExplainConfig::new(Arc::clone(&store)).file_model_label("pinned"),
+        );
+
+        // Omitted: exactly today's behaviour — the operator's label wins.
+        let default = json(&k, "urn:repo:demo:explain:a.rs", &[]);
+        assert_eq!(default["version_tag"], "code-v1@pinned");
+
+        // Naming the configured provider explicitly is the SAME request: the
+        // label describes that backend, so it still applies (archive hit).
+        let same = json(
+            &k,
+            "urn:repo:demo:explain:a.rs",
+            &[("provider", "urn:llm:coder:ask")],
+        );
+        assert_eq!(same["version_tag"], "code-v1@pinned");
+        assert_eq!(same["derived"], false, "identical to omitting the argument");
+
+        // A DIFFERENT backend resolves its own identity, never "pinned".
+        let other = json(
+            &k,
+            "urn:repo:demo:explain:a.rs",
+            &[("provider", "urn:llm:ask")],
+        );
+        assert_eq!(other["version_tag"], "code-v1@big-test:70b");
+        assert_eq!(other["model"], "big-test:70b");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The authority boundary: only what the operator configured or allowed.
+    /// A refusal names what was asked for and what is on offer, and nothing
+    /// is asked of any backend.
+    #[test]
+    fn a_provider_outside_the_allowlist_is_refused_loudly() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "// a\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, |c| c);
+
+        // Bound in the kernel, but not offered by this host's explain config.
+        let err = source(
+            &k,
+            "urn:repo:demo:explain:a.rs",
+            &[("provider", BATCH_PROVIDER)],
+            &cap(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Denied(_)), "{err:?}");
+        let text = format!("{err:?}");
+        assert!(
+            text.contains(BATCH_PROVIDER),
+            "names what was asked: {text}"
+        );
+        assert!(
+            text.contains(FILE_PROVIDER),
+            "names what is offered: {text}"
+        );
+        assert_eq!(log.count(BATCH_PROVIDER), 0, "refused before any ask");
+        assert_eq!(log.count(FILE_PROVIDER), 0, "and never fell back");
+
+        // A provider that does not exist at all is the same refusal.
+        let err = source(
+            &k,
+            "urn:repo:demo:explain:a.rs",
+            &[("provider", "urn:llm:vendor:ask")],
+            &cap(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Denied(_)), "{err:?}");
+
+        // The operator opts in, and the same request now derives — under the
+        // NEW backend's label (never the operator's dir/file override).
+        let store2 = Arc::new(Store::new().unwrap());
+        let k2 = kernel_with(&root, &store2, &log, |c| c.allow_provider(BATCH_PROVIDER));
+        let row = json(
+            &k2,
+            "urn:repo:demo:explain:a.rs",
+            &[("provider", BATCH_PROVIDER)],
+        );
+        assert_eq!(row["version_tag"], "code-v1@batch");
+        assert_eq!(log.count(BATCH_PROVIDER), 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A rollup applies the chosen backend to ITSELF; the children are plain
+    /// sub-resolutions carrying no argument, so they keep their own tier and
+    /// their own tags — the same mixing the two-tier default already does.
+    #[test]
+    fn a_rollups_provider_does_not_propagate_to_its_children() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "// a\n").unwrap();
+        std::fs::write(root.join("b.rs"), "// b\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, |c| c.allow_provider(BATCH_PROVIDER));
+
+        let row = json(&k, "urn:repo:demo:explain", &[("provider", BATCH_PROVIDER)]);
+        assert_eq!(row["version_tag"], "dir-v1@batch");
+        assert_eq!(log.count(BATCH_PROVIDER), 1, "the rollup only");
+        assert_eq!(log.count(FILE_PROVIDER), 2, "children keep their tier");
+        assert_eq!(log.count(DIR_PROVIDER), 0);
+
+        // The children archived under the untouched file-tier tag.
+        let child = json(&k, "urn:repo:demo:explain:a.rs", &[]);
+        assert_eq!(child["version_tag"], "code-v1@m1");
+        assert_eq!(child["derived"], false);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Two ways to name the model in one request, and they can disagree —
+    /// `version=` addresses an archived entry and derives nothing, so pairing
+    /// it with `provider=` is a contradiction, not a preference.
+    #[test]
+    fn version_and_provider_together_are_refused() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "// a\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, |c| c);
+
+        let err = source(
+            &k,
+            "urn:repo:demo:explain:a.rs",
+            &[("version", "code-v1@m1"), ("provider", FILE_PROVIDER)],
+            &cap(),
+        )
+        .unwrap_err();
+        let text = format!("{err:?}");
+        assert!(
+            text.contains("code-v1@m1") && text.contains(FILE_PROVIDER),
+            "{text}"
+        );
+        assert_eq!(log.count(FILE_PROVIDER), 0);
         std::fs::remove_dir_all(&root).ok();
     }
 

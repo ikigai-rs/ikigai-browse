@@ -11,7 +11,7 @@ pairs), and each root answers these resource families:
 | `urn:repo:{repo}:file:{path}` | file content — raw bytes under an extension-mapped media type; `as=text/html` for a syntax-highlighted, line-numbered view with `#L{n}` anchors, inline markers at annotated lines, and (explanations mounted) an explain link; `annotations=include` (S3, store mounted) serves the text plus a compact, drift-reconciled margin-notes section — content and human annotations in one resolution |
 | `urn:repo:{repo}:state` | the **freshness oracle** — HEAD sha + `clean`/`dirty:{n}` on one line; `as=application/json` for `{head, dirty: [paths]}` |
 | `urn:repo:{repo}:hash[:{path}]` | the **content hash** (S1) — `sha256:{hex}` of a file's bytes, or the **merkle** construction over a directory's entries (ignore-filtered), so one edit re-keys exactly the path to the root |
-| `urn:repo:{repo}:explain[:{path}]` | an **LLM-derived orientation explanation** (S1), archived by `(path, content-hash, version-tag)` — derived once per content version, reused forever; `as=application/json` adds `{content_hash, version_tag, derived}`, `as=text/html` the page face with provenance and a backlink to the explained resource, `as=text/turtle` the archive entry's graph; `version=` addresses an older tag; `annotations=include` (S3) folds the target's annotations in — the json face gains an `annotations` array, the text face appends margin notes, the html face renders the annotation cards, and a directory rollup folds its subtree's |
+| `urn:repo:{repo}:explain[:{path}]` | an **LLM-derived orientation explanation** (S1), archived by `(path, content-hash, version-tag)` — derived once per content version, reused forever; `as=application/json` adds `{content_hash, version_tag, derived}`, `as=text/html` the page face with provenance and a backlink to the explained resource, `as=text/turtle` the archive entry's graph; `version=` addresses an older tag; `provider=` derives this one against a different host-allowed backend (keyed by that backend's own model identity, so two models coexist); `annotations=include` (S3) folds the target's annotations in — the json face gains an `annotations` array, the text face appends margin notes, the html face renders the annotation cards, and a directory rollup folds its subtree's |
 | `urn:repo:{repo}:explain-versions[:{path}]` | what the archive holds for a path — one row per entry (tag, hash, model, derived-at), across content versions and tags; a pure store read (no net capability) |
 | `urn:annotation[:{id}]` | a **W3C Web Annotation** (S2) on a file — Sink creates/updates (anchoring the quoted text; the bare `urn:annotation` mints a uuid id), Source reads with drift **re-anchoring**, Delete removes; faces: `text/plain` (the body), `as=application/json`, `as=text/turtle` |
 | `urn:repo:{repo}:annotations[:{path}]` | every annotation on one file (or the whole repo, path omitted) in reading order, drift-reconciled on each read; faces: `application/json` (default), `as=text/html` (panel fragment), `as=text/turtle` |
@@ -63,6 +63,26 @@ model answer is an error, never archived. Prompts are type-aware (code /
 note / skill-or-agent definition / plain text, by extension + path heuristics)
 and individually versioned: a prompt edit bumps its version constant, which
 lazily re-derives while old tags stay addressable via `version=`.
+
+**Choosing the backend per request.** `provider={iri}` derives THIS
+explanation against a backend the caller names instead of the tier default.
+The selectable set is the operator's: the two configured tier providers plus
+whatever `ExplainConfig::allow_provider` adds — anything else is `Denied`,
+naming what was asked for and what is on offer, never a silent fall back. The
+set is published as the `provider` ArgSpec's `one_of`, so `urn:kernel:validate`
+can reject a bad one before dispatch and a UI can build its menu from
+`describe()` alone. The reason the allowlist exists is that `explain` declares
+one capability (`urn:cap:net:*`) and an `ActionSpec` cannot express a
+capability that varies by argument value — the cap means "may derive", not
+"may derive against the metered vendor". Two further rules: the model label
+follows the backend that ANSWERED (a request-selected provider never inherits
+`file_model_label`, which would write a wrong model identity into the archive
+key), and the tag folds MODEL identity rather than backend identity, so two
+providers serving the same model id share one archive entry — deliberate,
+since the explanation is a function of the model and the prompt, not of the
+serving layer. On a directory rollup the argument applies to the rollup only;
+the children keep their own tier and tags. `provider=` and `version=` are
+mutually exclusive.
 
 **Live, uncacheable reads.** The browsing families are live reads — cheap by
 design; the hash is the probe the archive keys on. `ExplainConfig` model
