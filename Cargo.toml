@@ -1,7 +1,7 @@
 [package]
 name = "ikigai-browse"
 description = "Repository browsing as ikigai resources: per-root tree / file / git-state / hash endpoints, an archived LLM explanation layer, W3C Web Annotations that re-anchor under drift, a machine review pass that mints its findings as provenance-distinguished annotations, and a pull-request family (listing, annotatable diff pages, head-commit-keyed explains and reviews) - capability-gated, with text, htmx-HTML, and Turtle faces."
-version = "0.2.13"
+version = "0.2.14"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -70,8 +70,15 @@ oxttl = "0.2"
 # The real-model demo (examples/explain-demo.rs) and the identity tests: mounts
 # the actual LLM module so `cargo run --example explain-demo` derives genuine
 # explanations against local Ollama models, and the tests exercise version-tag
-# resolution against real endpoints. 0.10 is the true minimum: it introduced
-# urn:llm:{provider}:model, the identity resource the tags fold.
-ikigai-llm = "0.10"
+# resolution against real endpoints. 0.10 introduced urn:llm:{provider}:model,
+# the identity resource the tags fold; **0.12 is the true minimum now**, on two
+# counts the option menu is written against: `urn:llm:models` reports a
+# provider whose model is not pinned as a null `model` rather than omitting it
+# (a provider may name only its server and discover what it serves), which is
+# exactly the "unknown model" row the menu must not collapse; and the inventory
+# is cacheable only while no provider is discovering, which is what makes
+# opening a menu one sub-request instead of one probe per backend. A caret pin
+# on "0.10" would let CI resolve a registry index where neither holds.
+ikigai-llm = "0.12"
 ikigai-http = "0.1.7"
 ureq = "2"
