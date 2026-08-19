@@ -1322,6 +1322,10 @@ fn explain_description(config: &ExplainConfig) -> Description {
         ))
         .input(
             ArgSpec::new("provider")
+                // The value is an endpoint IRI, not free text — the class says
+                // so, so type-based selection can offer it a resource rather
+                // than a string.
+                .class("http://www.w3.org/2001/XMLSchema#anyURI")
                 .optional()
                 .summary(
                     "the LLM provider IRI that derives THIS explanation, instead of the \
