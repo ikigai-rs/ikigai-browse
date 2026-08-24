@@ -30,7 +30,7 @@ ikigai-core = "0.1.56"
 # theme's own default foreground. `features = ["themes"]` is the syntect/two-face
 # bridge (name → embedded theme); the crate's default build is wasm-clean
 # without it.
-ikigai-a11y = { version = "0.1.0", features = ["themes"] }
+ikigai-a11y = { version = "0.2.1", features = ["themes"] }
 # Syntax highlighting for the file HTML face. The pure-Rust regex engine
 # (default-fancy) so CI never needs a C toolchain for oniguruma; yaml-load
 # compiles the embedded Turtle .sublime-syntax (assets/) at first use.
