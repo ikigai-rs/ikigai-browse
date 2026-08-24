@@ -194,8 +194,37 @@ pub fn space_with_explain(
 pub struct Mount {
     roots: Roots,
     app: Option<String>,
+    config_home: ConfigHome,
     store: Option<Arc<Store>>,
     explain: Option<ExplainConfig>,
+}
+
+/// Where a [`Mount`]'s [`STYLE_IRI`] reads its `a11y.toml` layers from.
+///
+/// Private, and the arm that matters is the distinction it carries: a host that
+/// has said NOTHING (read this machine's) is not the same as a host that has
+/// STATED a home — including stating that there is none. A bare `Option<PathBuf>`
+/// could not hold both, because `None` is a legal stated value: a process with no
+/// config home is under-configured, not broken, which is
+/// `ikigai_core::config::config_home`'s own contract carried up one level.
+enum ConfigHome {
+    /// This machine's, per `ikigai_core::config::config_home`.
+    Ambient,
+    /// Stated by the host. `None` states that this process has no config home.
+    Stated(Option<PathBuf>),
+}
+
+impl ConfigHome {
+    /// The home to layer within. For [`ConfigHome::Ambient`] this is the one
+    /// ambient read, and it happens in [`Mount::space`] — a fact about the
+    /// process, established where the host builds its mount, never a hidden
+    /// input to a resolution.
+    fn resolve(self) -> Option<PathBuf> {
+        match self {
+            ConfigHome::Ambient => ikigai_core::config::config_home(),
+            ConfigHome::Stated(home) => home,
+        }
+    }
 }
 
 impl Mount {
@@ -205,6 +234,7 @@ impl Mount {
         Mount {
             roots: build_roots(roots),
             app: None,
+            config_home: ConfigHome::Ambient,
             store: None,
             explain: None,
         }
@@ -222,6 +252,41 @@ impl Mount {
     /// never wrong.
     pub fn app(mut self, app: impl Into<String>) -> Self {
         self.app = Some(app.into());
+        self
+    }
+
+    /// The config home [`STYLE_IRI`] layers its `a11y.toml` within — **stated by
+    /// the host**, rather than read from the process environment at the moment
+    /// something resolves.
+    ///
+    /// A mount that never calls this reads this machine's config home, which is
+    /// what every host wants and what every host already got. The reason to state
+    /// one is that `config_home()` reads process-global environment: a test that
+    /// does not own the file it asserts against is asserting about the developer's
+    /// machine, and `cargo test` shares one process across a crate's tests, so
+    /// `set_var` is not an answer either. See `ikigai-core/docs/design/
+    /// hermetic-endpoint-tests.md`.
+    ///
+    /// `Option<PathBuf>`, not a path: **`None` is a legal value, and a different
+    /// statement from not calling this at all.** It says *this process has no
+    /// config home* — built-in themes, the default floor, no candidate files and
+    /// so no golden threads. That is the shape of a CI runner, and a mount on a
+    /// machine that HAS a config home has no other way to ask for it.
+    ///
+    /// ★ What is held is the HOME, never a parsed config. [`STYLE_IRI`] is
+    /// `.cacheable()` with a golden thread per candidate file, and the contract of
+    /// that thread is that cutting it RECOMPUTES the answer; a mount that parsed
+    /// its config here would serve the config the process started with forever
+    /// while the watcher cut and the kernel re-resolved. `ikigai-a11y`'s
+    /// `A11yHandle` holds the home for exactly this reason.
+    ///
+    /// Spelled as a builder method rather than as the `*_with` constructor pair
+    /// `ikigai-a11y` grew, because that dialect is for FREE FUNCTIONS that had to
+    /// stay additive: [`Mount`] already is this crate's injection seam. The home
+    /// lands beside [`Mount::app`] and for the same reason — it is a property of
+    /// the mount, not of the process.
+    pub fn config_home(mut self, home: Option<PathBuf>) -> Self {
+        self.config_home = ConfigHome::Stated(home);
         self
     }
 
@@ -246,13 +311,18 @@ impl Mount {
         let Mount {
             roots,
             app,
+            config_home,
             store,
             explain,
         } = self;
         let app = app.as_deref();
+        // The ambient read, if there is one, happens HERE — once, in the host's
+        // own mount call — and everything below it takes a stated home.
+        let home = config_home.resolve();
+        let home = home.as_deref();
         let Some(config) = explain else {
             let ignore = Arc::new(hash::default_ignore());
-            let space = base_space(&roots, &ignore, store.as_ref(), false, app);
+            let space = base_space(&roots, &ignore, store.as_ref(), false, app, home);
             return match store {
                 Some(store) => annotate::bind(space, &roots, &store),
                 None => space,
@@ -261,7 +331,7 @@ impl Mount {
         let ignore = Arc::new(config.ignore.clone());
         let store = Arc::clone(&config.store);
         let shared = Arc::new(config.clone());
-        let space = base_space(&roots, &ignore, Some(&store), true, app);
+        let space = base_space(&roots, &ignore, Some(&store), true, app, home);
         let space = explain::bind(space, &roots, config);
         // The S4 review pass (machine-minted annotations) rides with the
         // explanation family: it needs the same LLM seam and the same store.
@@ -301,6 +371,7 @@ fn base_space(
     store: Option<&Arc<Store>>,
     explain: bool,
     app: Option<&str>,
+    home: Option<&Path>,
 ) -> EndpointSpace {
     let tree: Arc<dyn Endpoint> = Arc::new(tree_endpoint(roots, explain));
     let file: Arc<dyn Endpoint> = Arc::new(file_endpoint(roots, store, explain));
@@ -312,7 +383,7 @@ fn base_space(
     let space = bind_family(space, roots, state, Some("state"), None);
     let space = bind_family(space, roots, hash, Some("hash"), Some("hash:{path}"));
     // The theme stylesheet: one concrete row shared by all roots.
-    let space = space.bind(StyleRow, style_endpoint(app));
+    let space = space.bind(StyleRow, style_endpoint(app, home));
     // The pull-request pages ride with every variant: they need no store and
     // no LLM — only ikigai-repo's pr facades resolved through the kernel at
     // runtime (unmounted facades answer a typed NotFound, not a panic).
@@ -1215,10 +1286,12 @@ pub const STYLE_IRI: &str = "urn:repo:style";
 /// each theme's foreground/background, which the `<pre>` opts into.
 ///
 /// **Which themes, and which floor, are configuration** — the layered
-/// `a11y.toml` ⊕ `{app}.a11y.toml`, read through `ikigai-a11y`. With no config
-/// files present the defaults are `InspiredGithub` / `Base16OceanDark` / 4.5,
-/// which are the constants this function used to hard-code, so a machine that
-/// has written no `a11y.toml` sees no change but the floor pass.
+/// `a11y.toml` ⊕ `{app}.a11y.toml`, read through `ikigai-a11y` from the config
+/// home the MOUNT states ([`Mount::config_home`]; by default this machine's).
+/// With no config files present the defaults are `InspiredGithub` /
+/// `Base16OceanDark` / 4.5, which are the constants this function used to
+/// hard-code, so a machine that has written no `a11y.toml` sees no change but
+/// the floor pass.
 ///
 /// **The floor pass replaces hand-patching.** Until 0.2.12 one dark rule was
 /// corrected by a typed constant (`.hl-variable.hl-parameter { color: #c0c5ce }`,
@@ -1322,7 +1395,10 @@ fn scheme_css(
     })
 }
 
-/// The effective accessibility PRESENTATION for this mount's application.
+/// The effective accessibility PRESENTATION for this mount's application, read
+/// from the config home the HOST stated ([`Mount::config_home`], or this
+/// machine's resolved once at [`Mount::space`]) — never from the process
+/// environment at the moment something resolves.
 ///
 /// The rendering half only — themes, contrast floors — and not the whole config,
 /// because this crate derives an ARTIFACT. `motion.reduce` and `text.scale` are
@@ -1331,18 +1407,19 @@ fn scheme_css(
 /// that cannot reach them cannot leak them. Same files, same layering, same
 /// golden threads as the whole-config read — only the view narrows.
 ///
-/// A machine with **no config home at all** (no `HOME`, no `XDG_CONFIG_HOME`)
-/// gets the built-in defaults rather than an error: it has not misconfigured
-/// anything, it simply has nowhere to configure, and a stylesheet is the wrong
-/// place to discover that. Every other failure — an unreadable file, a
-/// misspelled theme, an out-of-range floor — is returned loud, because those are
-/// an operator having changed something and being owed the news.
-fn a11y_config(app: Option<&str>) -> Result<ikigai_a11y::Presentation> {
-    match ikigai_a11y::load::presentation(app) {
-        Ok(config) => Ok(config),
-        Err(ikigai_a11y::ConfigError::NoConfigHome) => Ok(ikigai_a11y::Presentation::default()),
-        Err(e) => Err(Error::Endpoint(format!("browse: {e}"))),
-    }
+/// A mount with **no config home at all** (`home` is `None`: no `HOME`, no
+/// `XDG_CONFIG_HOME`, or a host that stated it has none) gets the built-in
+/// defaults rather than an error: it has not misconfigured anything, it simply
+/// has nowhere to configure, and a stylesheet is the wrong place to discover
+/// that. Every other failure — an unreadable file, a misspelled theme, an
+/// out-of-range floor — is returned loud, because those are an operator having
+/// changed something and being owed the news.
+fn a11y_config(home: Option<&Path>, app: Option<&str>) -> Result<ikigai_a11y::Presentation> {
+    let Some(home) = home else {
+        return Ok(ikigai_a11y::Presentation::default());
+    };
+    ikigai_a11y::load::presentation_in(home, app)
+        .map_err(|e| Error::Endpoint(format!("browse: {e}")))
 }
 
 fn file_html(
@@ -1530,16 +1607,23 @@ impl Grammar for StyleRow {
 /// invalidates this too — on a host that watches the config home and cuts those
 /// threads. No host does yet; until one does, the threads are declared and
 /// never cut, which costs a restart to pick up an edit and costs nothing else.
-fn style_endpoint(app: Option<&str>) -> FnEndpoint {
+fn style_endpoint(app: Option<&str>, home: Option<&Path>) -> FnEndpoint {
     let app = app.map(str::to_string);
+    // The HOME, not a parsed config: the threads below promise that cutting one
+    // recomputes this sheet, and a closure holding a `Presentation` would hand
+    // back the startup config forever. See [`Mount::config_home`].
+    let home = home.map(Path::to_path_buf);
     FnEndpoint::new("browse-style", move |_inv: &Invocation<'_>| {
         let app = app.as_deref();
-        let config = a11y_config(app)?;
+        let home = home.as_deref();
+        let config = a11y_config(home, app)?;
         let mut repr = repr_utf8("text/css", style_css(&config)?).cacheable();
-        // Threads even when there is no config home: `threads` errors there, and
-        // an absent config home is exactly the case `a11y_config` already
-        // decided is not an error. Nothing to watch, nothing to declare.
-        for thread in ikigai_a11y::load::threads(app).unwrap_or_default() {
+        // No config home means no candidate files: nothing to watch, nothing to
+        // declare — the same case `a11y_config` already decided is not an error.
+        for thread in home
+            .map(|home| ikigai_a11y::load::threads_in(home, app))
+            .unwrap_or_default()
+        {
             repr = repr.depends_on(thread);
         }
         Ok(repr)
@@ -2102,12 +2186,16 @@ mod tests {
     }
 
     /// The stylesheet face: both scheme blocks in one text/css representation,
-    /// classed to match the markup, and cacheable (a pure function of the
-    /// build).
+    /// classed to match the markup, and cacheable.
+    ///
+    /// It STATES that it has no config home, because the colours below are the
+    /// BUILT-IN themes' and nothing else may decide them. Resolved over an
+    /// ambient mount this test asserted the defaults while reading the
+    /// developer's `a11y.toml`, so setting a theme turned it red — on that
+    /// machine only, never on CI.
     #[test]
     fn the_style_face_serves_both_scheme_blocks_and_is_cacheable() {
-        let root = demo_root();
-        let k = kernel(vec![("demo".to_string(), root.clone())]);
+        let k = styled_kernel(None, None);
         let cap = demo_cap();
         let out = source(&k, STYLE_IRI, &[], &cap).unwrap();
         assert_eq!(out.repr_type.media_type, "text/css");
@@ -2143,7 +2231,28 @@ mod tests {
         let unrelated = Capability::scoped(["urn:cap:unrelated"]);
         let err = source(&k, STYLE_IRI, &[], &unrelated).unwrap_err();
         assert!(matches!(err, Error::Denied(_)), "{err:?}");
-        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A kernel whose mount STATES its config home — the only form a test that
+    /// resolves [`STYLE_IRI`] may use. Resolving it over an ambient mount asserts
+    /// against whatever `a11y.toml` the developer's machine happens to hold, and
+    /// that is a trap rather than a nuisance: CI has no config home, so the suite
+    /// stays green there and turns red only on the machine of someone who uses
+    /// the feature this crate ships, during unrelated work, looking like a
+    /// regression they caused.
+    ///
+    /// No roots: the stylesheet is root-independent (one concrete grammar row),
+    /// and `demo_cap`'s grant sits under the wildcard the style action declares.
+    ///
+    /// `home` is an `Option` because "this machine has NO config home" is a state
+    /// a test must be able to STATE. It is CI's state, and a developer's machine
+    /// can otherwise never reproduce it.
+    fn styled_kernel(app: Option<&str>, home: Option<PathBuf>) -> Kernel {
+        let mut mount = Mount::new(Vec::<(String, PathBuf)>::new()).config_home(home);
+        if let Some(app) = app {
+            mount = mount.app(app);
+        }
+        Kernel::new(Arc::new(mount.space()))
     }
 
     /// The stylesheet under the BUILT-IN defaults — never this machine's
@@ -2164,6 +2273,30 @@ mod tests {
             .expect("the light block exists")
             .1;
         (light.to_string(), dark.to_string())
+    }
+
+    /// A scheme block's own ground and foreground: the `.hl-code` base rule the
+    /// theme generated, read back OUT of the sheet rather than restated beside
+    /// it — so a retuned theme carries the baseline with it instead of turning
+    /// every assertion about the floor into a chore.
+    fn base_colours(block: &str) -> (ikigai_a11y::Rgba, ikigai_a11y::Rgba) {
+        let decls = block
+            .split_once(".hl-code {")
+            .and_then(|(_, rest)| rest.split_once('}'))
+            .map(|(decls, _)| decls)
+            .expect("the block declares .hl-code");
+        let value = |prop: &str| {
+            decls
+                .lines()
+                .map(str::trim)
+                // `color` cannot match `background-color: …`: the prefix is
+                // anchored at the start of the trimmed declaration.
+                .find_map(|line| line.strip_prefix(prop))
+                .map(|rest| rest.trim_start_matches(':').trim().trim_end_matches(';'))
+                .and_then(|value| ikigai_a11y::Rgba::parse(value).ok())
+                .unwrap_or_else(|| panic!("the .hl-code rule declares {prop}: {decls}"))
+        };
+        (value("background-color"), value("color"))
     }
 
     /// The colour a browser paints on an element carrying exactly `classes`,
@@ -2378,11 +2511,8 @@ mod tests {
     /// made every read a cold generation (~1.4ms against ~2µs).
     #[test]
     fn the_stylesheet_is_cacheable_and_declares_the_config_files() {
-        let root = demo_root();
-        let space = Mount::new(vec![("demo".to_string(), root.clone())])
-            .app("browse-test")
-            .space();
-        let k = Kernel::new(Arc::new(space));
+        let home = temp_dir();
+        let k = styled_kernel(Some("browse-test"), Some(home.clone()));
         let rep = block_on(k.issue(
             Request::new(Verb::Source, Iri::parse(STYLE_IRI).unwrap()),
             &demo_cap(),
@@ -2390,22 +2520,101 @@ mod tests {
         .expect("the stylesheet resolves");
         assert_eq!(rep.expiry, ikigai_core::Expiry::Never, "cacheable");
         let threads: Vec<String> = rep.threads().iter().map(|t| t.to_string()).collect();
-        match ikigai_core::config::config_home() {
-            // The shared layer and the app one, in that order.
-            Some(_) => {
-                assert_eq!(threads.len(), 2, "{threads:?}");
-                assert!(threads[0].ends_with("/a11y.toml"), "{threads:?}");
-                assert!(
-                    threads[1].ends_with("/browse-test.a11y.toml"),
-                    "{threads:?}"
-                );
-            }
-            // No config home on this machine: nothing to watch, nothing declared,
-            // and the sheet still renders from the built-in defaults.
-            None => assert!(threads.is_empty(), "{threads:?}"),
+        // The shared layer and the app one, in that order — under the home this
+        // test STATED, so the exact files can be named. Neither exists in the
+        // scratch home, and that is the assertion: an operator CREATING an
+        // override must invalidate the sheet, so the candidate is declared
+        // before it is written.
+        assert_eq!(threads.len(), 2, "{threads:?}");
+        for (thread, file) in threads.iter().zip(["a11y.toml", "browse-test.a11y.toml"]) {
+            let expected = home.join(file);
+            assert!(
+                thread.ends_with(&expected.display().to_string()),
+                "expected a thread on {}, got {thread}",
+                expected.display()
+            );
         }
         assert!(String::from_utf8_lossy(&rep.bytes).starts_with(".hl-code {"));
-        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// A mount that states it has NO config home: the built-in defaults render
+    /// and nothing is declared to watch.
+    ///
+    /// This is CI's shape, and before the mount could state it the suite covered
+    /// it only by accident — on a developer's machine the branch never ran, and
+    /// on CI it was the only branch that ran. Now both are asserted in one place
+    /// by every machine.
+    #[test]
+    fn a_mount_with_no_config_home_watches_nothing_and_serves_the_defaults() {
+        let k = styled_kernel(Some("browse-test"), None);
+        let rep = block_on(k.issue(
+            Request::new(Verb::Source, Iri::parse(STYLE_IRI).unwrap()),
+            &demo_cap(),
+        ))
+        .expect("the stylesheet resolves without a config home");
+        assert_eq!(rep.expiry, ikigai_core::Expiry::Never, "still cacheable");
+        assert!(
+            rep.threads().is_empty(),
+            "nothing to watch, nothing declared"
+        );
+        assert_eq!(String::from_utf8_lossy(&rep.bytes), default_css());
+    }
+
+    /// The configured contrast floor REACHES the stylesheet — asserted as the
+    /// mechanism, not as a colour count.
+    ///
+    /// `contrast.min` is the one key this machine's real `a11y.toml` sets, and
+    /// it currently sets it to the DEFAULT — which is the only reason the suite
+    /// was green. Raising it to 7.0 took the generated sheet from 22 distinct
+    /// colours to 14, same byte length, entirely different content, with every
+    /// test still passing. Those counts are not what is pinned here: 22 and 14
+    /// are today's numbers and a test holding them becomes a chore the first
+    /// time a theme is retuned. What is pinned is that the sheet SATISFIES the
+    /// floor it was generated under — the floor pass, re-run at the raised floor
+    /// over the bytes the endpoint served, finds nothing left to lift.
+    ///
+    /// End to end through the kernel from a seeded `a11y.toml`, because the gap
+    /// was in the WIRING: every link from the file to `apply_floor`'s `min`
+    /// argument lies inside what this resolves.
+    #[test]
+    fn a_raised_contrast_floor_reaches_the_stylesheet() {
+        // WCAG AAA: legal in a11y.toml, and above the 4.5 default.
+        const STRICT: f64 = 7.0;
+        let home = temp_dir();
+        std::fs::write(
+            home.join("a11y.toml"),
+            format!("[contrast]\nmin = {STRICT:.1}\n"),
+        )
+        .unwrap();
+        let k = styled_kernel(None, Some(home.clone()));
+        let css = body(&source(&k, STYLE_IRI, &[], &demo_cap()).unwrap());
+        let (light, dark) = scheme_blocks(&css);
+        for (scheme, block) in [("light", &light), ("dark", &dark)] {
+            let (ground, foreground) = base_colours(block);
+            let again = ikigai_a11y::apply_floor(block, ground, foreground, STRICT);
+            assert!(
+                again.lifted.is_empty(),
+                "the configured {STRICT}:1 floor did not reach the {scheme} block \
+                 — {:?} still sit below it",
+                again.lifted
+            );
+        }
+        // …and that is not vacuously true: the sheet generated at the DEFAULT
+        // floor does NOT clear 7:1. base16-ocean.dark was never built to, which
+        // is what this machine's a11y.toml records trying and reverting.
+        let default = default_css();
+        let (_, dark) = scheme_blocks(&default);
+        let (ground, foreground) = base_colours(&dark);
+        assert!(
+            !ikigai_a11y::apply_floor(&dark, ground, foreground, STRICT)
+                .lifted
+                .is_empty(),
+            "the default sheet already clears {STRICT}:1, so this test no longer \
+             proves a raised floor reached anything — raise STRICT, or state a \
+             control theme that does not clear it"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]

@@ -186,7 +186,24 @@ repairing a colour pair would mean inventing one.
 
 `{app}` is the **process's** name (`dev-server`, `web`), so it comes from the
 host at mount time: `Mount::new(roots).app("dev-server").space()`. A host that
-names none reads the shared `a11y.toml` only. The stylesheet stays
+names none reads the shared `a11y.toml` only.
+
+The config **home** those layers sit in comes from the host too. By default it
+is this machine's (`$XDG_CONFIG_HOME/ikigai`, else `$HOME/.config/ikigai`),
+resolved **once at mount** rather than at every resolution — a fact about the
+process, established where the host builds its mount. Since 0.2.15 a host may
+state one instead: `Mount::new(roots).config_home(Some(dir))`, and
+`.config_home(None)` states that this process has **no** config home at all —
+a legal answer (built-in themes, the default floor, no candidate files and so
+nothing to watch), not an error. It exists for the reason `ikigai-a11y`'s
+`A11yHandle` does: a test that reads the ambient home is asserting about the
+machine it happens to run on, so it either goes red the day a developer sets a
+theme or quietly asserts nothing. What the mount holds is the **home**, never a
+parsed config — the golden threads below promise that cutting one recomputes
+the sheet, and a mount that parsed its config at startup would serve that
+config forever.
+
+The stylesheet stays
 `.cacheable()` and declares a **golden thread per candidate config file**,
 including files that do not exist yet, so creating an override invalidates it on
 a host that watches the config home. That is not decoration: effective expiry
