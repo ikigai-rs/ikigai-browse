@@ -1253,7 +1253,7 @@ pub const STYLE_IRI: &str = "urn:repo:style";
 /// always report `light` or `dark` (the `no-preference` value was dropped from
 /// the spec), so in practice one block always matches and the floor is belt and
 /// braces — a monochrome-but-readable fallback, never a wrong-colour one.
-fn style_css(config: &ikigai_a11y::A11y) -> Result<String> {
+fn style_css(config: &ikigai_a11y::Presentation) -> Result<String> {
     let themes = theme_set();
     let light = scheme_css(themes, &config.theme.light, config.contrast.min)?;
     let dark = scheme_css(themes, &config.theme.dark, config.contrast.min)?;
@@ -1322,7 +1322,14 @@ fn scheme_css(
     })
 }
 
-/// The effective accessibility config for this mount's application.
+/// The effective accessibility PRESENTATION for this mount's application.
+///
+/// The rendering half only — themes, contrast floors — and not the whole config,
+/// because this crate derives an ARTIFACT. `motion.reduce` and `text.scale` are
+/// assistive-technology facts about the human at the keyboard; a stylesheet
+/// served to whoever asks for `urn:repo:style` has no use for them, and a read
+/// that cannot reach them cannot leak them. Same files, same layering, same
+/// golden threads as the whole-config read — only the view narrows.
 ///
 /// A machine with **no config home at all** (no `HOME`, no `XDG_CONFIG_HOME`)
 /// gets the built-in defaults rather than an error: it has not misconfigured
@@ -1330,10 +1337,10 @@ fn scheme_css(
 /// place to discover that. Every other failure — an unreadable file, a
 /// misspelled theme, an out-of-range floor — is returned loud, because those are
 /// an operator having changed something and being owed the news.
-fn a11y_config(app: Option<&str>) -> Result<ikigai_a11y::A11y> {
-    match ikigai_a11y::load::load(app) {
+fn a11y_config(app: Option<&str>) -> Result<ikigai_a11y::Presentation> {
+    match ikigai_a11y::load::presentation(app) {
         Ok(config) => Ok(config),
-        Err(ikigai_a11y::ConfigError::NoConfigHome) => Ok(ikigai_a11y::A11y::default()),
+        Err(ikigai_a11y::ConfigError::NoConfigHome) => Ok(ikigai_a11y::Presentation::default()),
         Err(e) => Err(Error::Endpoint(format!("browse: {e}"))),
     }
 }
@@ -2144,7 +2151,7 @@ mod tests {
     /// change what these tests measure, and CI (which has no config home
     /// contents) must measure the same thing they do.
     fn default_css() -> String {
-        style_css(&ikigai_a11y::A11y::default()).expect("the default themes generate CSS")
+        style_css(&ikigai_a11y::Presentation::default()).expect("the default themes generate CSS")
     }
 
     /// The two scheme blocks' inner text, light first.
@@ -2303,7 +2310,7 @@ mod tests {
     /// one: `ikigai-a11y`'s defaults ARE the constants this crate hard-coded.
     #[test]
     fn the_defaults_are_the_themes_this_crate_used_to_hard_code() {
-        let default = ikigai_a11y::A11y::default();
+        let default = ikigai_a11y::Presentation::default();
         assert_eq!(default.theme.light, "InspiredGithub");
         assert_eq!(default.theme.dark, "Base16OceanDark");
         assert_eq!(default.contrast.min, 4.5, "WCAG AA body text");
@@ -2343,7 +2350,7 @@ mod tests {
     /// depending on this machine's config home.
     #[test]
     fn a_configured_theme_reaches_the_stylesheet() {
-        let mut config = ikigai_a11y::A11y::default();
+        let mut config = ikigai_a11y::Presentation::default();
         config.theme.dark = "Nord".to_string();
         let css = style_css(&config).expect("Nord generates CSS");
         let (_, dark) = scheme_blocks(&css);
@@ -2359,7 +2366,7 @@ mod tests {
     /// defaulted: an operator who misspells a theme is owed the news.
     #[test]
     fn an_unknown_theme_is_an_error_not_a_fallback() {
-        let mut config = ikigai_a11y::A11y::default();
+        let mut config = ikigai_a11y::Presentation::default();
         config.theme.light = "Base16OceanDrak".to_string();
         assert!(matches!(style_css(&config), Err(Error::Endpoint(_))));
     }
