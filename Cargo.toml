@@ -10,7 +10,15 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 #     prefix urn:annotation:  urn:iki:annotation:
 #     exact  urn:annotation   urn:iki:annotation      # the bare minting IRI
 # — BOTH rules; a prefix rule alone does not match the bare `urn:annotation`.
-version = "0.3.0"
+#
+# 0.3.1 — PATCH, and deliberately not a minor: it adds the one-shot that moves
+# an EXISTING store's annotations into the new namespace (the `migrate` module,
+# the gated `migrate-annotation-ns` binary, the rehearsal example). Purely
+# additive — no resource name, capability, face or host-facing signature moves,
+# and a host that never runs the tool cannot tell 0.3.1 from 0.3.0. The alias
+# rule above is what 0.3.0 asked hosts for; this is what it forgot to give them,
+# because an alias rewrites incoming NAMES and does nothing to stored data.
+version = "0.3.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -18,6 +26,32 @@ repository = "https://github.com/ikigai-rs/ikigai-browse"
 readme = "README.md"
 keywords = ["ikigai", "roc", "resolution", "module", "capability"]
 categories = ["development-tools", "filesystem"]
+
+[features]
+# The one-shot store migration (`migrate-annotation-ns`). It is the ONLY thing
+# in this crate that opens a store on DISK, and RocksDB is what the host's
+# persistent store is — so the binary, and only the binary, needs oxigraph's
+# `rocksdb` feature and the C++ toolchain that comes with it. The library's
+# `migrate` module is feature-free and tested against the in-memory store, so
+# ordinary CI proves the transform without ever building RocksDB.
+migrate = ["oxigraph/rocksdb"]
+
+# The migration binary is gated: a default `cargo build` of this crate must
+# stay pure-Rust (the same reason syntect uses fancy-regex and the hash is
+# sha2 rather than blake3). Build it with:
+#     cargo build --release --features migrate --bin migrate-annotation-ns
+[[bin]]
+name = "migrate-annotation-ns"
+path = "src/bin/migrate-annotation-ns.rs"
+required-features = ["migrate"]
+
+# The rehearsal fixture: a throwaway on-disk store in the PRE-0.3.0 shape, so
+# the migration can be run end-to-end against real RocksDB before it is run
+# against the real store. Same gate, same reason.
+[[example]]
+name = "migration-rehearsal"
+path = "examples/migration-rehearsal.rs"
+required-features = ["migrate"]
 
 [dependencies]
 # The released kernel, consumed from crates.io. 0.1.54 is the true minimum:

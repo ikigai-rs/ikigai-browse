@@ -287,6 +287,74 @@ unknowns are two rows, because they may well be two models.
 >   as the alias stands.
 >
 > Nothing in this crate installs an alias; binding authority is the host's.
+>
+> **An alias does not migrate the DATA.** It rewrites incoming names; the
+> stored subject IRIs stay where they were, and `list_annotations` strip-
+> prefixes the *new* prefix over the *stored* one — so every pre-0.3.0 row
+> returns `None`, the loop continues, and the annotation goes **invisible with
+> no error**. Empty panels, empty `annotations=include` folds, review passes
+> that lost their findings, and nothing anywhere reporting a failure. Existing
+> stores need the one-shot below.
+
+### Migrating a pre-0.3.0 store
+
+```text
+cargo build --release --features migrate --bin migrate-annotation-ns
+
+migrate-annotation-ns <store-path>            # DRY RUN — the default
+migrate-annotation-ns <store-path> --commit   # apply
+```
+
+A replace-subgraph in one transaction: every quad carrying an IRI under
+`urn:annotation:` in **any** position is removed and its rewritten twin
+inserted. It prints the four counts before and after —
+
+```text
+                         before    after
+oa:Annotation subjects   14        14
+old-prefix quads         168       0
+new-prefix quads         0         168
+dangling hasSelector     28        0
+
+PASS: annotations equal · old -> 0 · new -> old's former count · dangling -> 0
+```
+
+— and exits non-zero unless all four hold.
+
+- ⚠ **Both positions or nothing.** `oa:hasSelector` and `prov:generated` point
+  *at* annotation IRIs; a subject-only rewrite leaves them aimed at IRIs that
+  no longer exist, which is a worse store than the one it started from — the
+  annotations are visible and their selectors are gone. The test suite
+  performs that ablation (`Scope::SubjectOnly`) and asserts the 28 dangling
+  references it produces, so the object half is pinned by a failure that was
+  actually observed rather than by a comment.
+- **Literal safety is structural.** The rewrite pattern-matches parsed
+  `NamedNode` terms; literals have no arm at all. `oa:exact`/`prefix`/`suffix`
+  hold source-code quotes, and an annotation on a line that mentions
+  `urn:annotation:` stores that string as data — a text substitution would
+  corrupt the anchor and orphan the annotation on the next read.
+- **Idempotent.** Selection is by the old prefix and `urn:iki:annotation:`
+  does not start with `urn:annotation:`, so a second run plans zero quads.
+- **It refuses a locked store**, naming the process that holds it: RocksDB's
+  lock is exclusive, so the server must be stopped first. It also refuses a
+  directory that is not already a store, rather than creating an empty one and
+  reporting a serene `0/0/0/0` PASS over data it never saw.
+- Back the store directory up before `--commit`.
+  `cargo run --features migrate --example migration-rehearsal -- <scratch-dir>`
+  builds a throwaway store in the pre-0.3.0 shape to rehearse against.
+
+The `migrate` feature exists because this is the only thing here that opens a
+store on *disk*, and that needs oxigraph's RocksDB backend (and a C++
+toolchain). The transform itself is feature-free and tested against the
+in-memory store, so ordinary CI proves it.
+
+> ★ **This binary is a stopgap for a missing primitive.** The ecosystem's
+> SPARQL surface is `ask` / `construct` / `describe` / `select` — there is no
+> `urn:sparql:update`, no writing verb anywhere. The entire operation is one
+> `DELETE … INSERT … WHERE` against a bound store. When an UPDATE mechanism
+> lands, this becomes a query and the binary should be **deleted rather than
+> generalized**; said out loud so a bespoke migration binary does not become
+> the permanent answer that the next namespace move copies.
 
 `space_with_annotations(roots, store)` mounts W3C Web Annotations over the
 same host-injected Oxigraph store the explanation archive uses
