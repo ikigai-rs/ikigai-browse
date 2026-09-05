@@ -115,6 +115,14 @@ use syntect::util::LinesWithEndings;
 mod annotate;
 mod explain;
 mod hash;
+/// The one-shot that moves a pre-0.3.0 store's annotations into the
+/// `urn:iki:` namespace. Public because the `migrate-annotation-ns` binary
+/// (feature `migrate`) is a separate crate target and because the transform
+/// is the interesting part — the binary is `Store::open` and a table.
+///
+/// ★ A stopgap for a missing primitive: with a `urn:sparql:update` this would
+/// be a query, not a program. See the module docs.
+pub mod migrate;
 mod pr;
 mod review;
 
