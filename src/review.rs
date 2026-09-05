@@ -2,7 +2,7 @@
 //! region-grain LLM commentary on a file, minted as REAL annotations. The
 //! explain family answers "what is this file?"; the review pass answers "what
 //! would a careful reviewer say about these lines?" — and its findings live in
-//! the same `urn:annotation:` family as human notes, distinguished by
+//! the same `urn:iki:annotation:` family as human notes, distinguished by
 //! provenance, queryable on one axis.
 //!
 //! ## Derive-once, mint-once
@@ -116,7 +116,7 @@ const REVIEW_REMINDER: &str =
 ///     prov:used <urn:repo:demo:file:src/lib.rs> ;
 ///     ik:contentHash "sha256:…" ; ik:versionTag "review-v1@qwen3-coder:30b" ;
 ///     ik:model "qwen3-coder:30b" ;
-///     prov:generated <urn:annotation:{id}> , … ;
+///     prov:generated <urn:iki:annotation:{id}> , … ;
 ///     ik:orphanedItems "1"^^xsd:nonNegativeInteger ;
 ///     ik:derivedAt "2026-08-09T17:00:00.000Z"^^xsd:dateTime .
 /// ```
@@ -739,7 +739,7 @@ fn review_description() -> Description {
         .summary(
             "A region-grain machine review of one file — urn:repo:{repo}:review:{path}. \
              Source asks the review model for findings (each an exact quote plus a \
-             reviewer's note), mints every anchored finding as a real urn:annotation: \
+             reviewer's note), mints every anchored finding as a real urn:iki:annotation: \
              (provenance: dcterms:creator = the model, oa:motivatedBy oa:assessing, \
              prov:wasGeneratedBy = this pass) and ARCHIVES the pass by (path, \
              content-hash, review-tag) — re-sourcing unchanged content is an archive hit \
@@ -967,7 +967,7 @@ mod tests {
         issue(
             &k,
             Verb::Sink,
-            "urn:annotation:h1",
+            "urn:iki:annotation:h1",
             &[
                 ("target", "urn:repo:demo:file:a.rs"),
                 ("exact", "fn gamma() {}"),
@@ -1188,7 +1188,7 @@ mod tests {
         let ttl = body(&out);
         assert!(ttl.contains("a ik:Review"), "{ttl}");
         assert!(ttl.contains("prov:used <urn:repo:demo:file:a.rs>"), "{ttl}");
-        assert!(ttl.contains("prov:generated <urn:annotation:"), "{ttl}");
+        assert!(ttl.contains("prov:generated <urn:iki:annotation:"), "{ttl}");
         assert!(ttl.contains("ik:versionTag \"review-v2@r1\""), "{ttl}");
         assert!(
             ttl.contains("ik:orphanedItems \"0\"^^xsd:nonNegativeInteger"),

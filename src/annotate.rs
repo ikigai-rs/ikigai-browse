@@ -1,4 +1,4 @@
-//! `urn:annotation:{id}` + `urn:repo:{repo}:annotations[:{path}]` — W3C **Web
+//! `urn:iki:annotation:{id}` + `urn:repo:{repo}:annotations[:{path}]` — W3C **Web
 //! Annotation** (`oa:`) annotations on browse resources (S2), stored in the
 //! SAME shared Oxigraph store as the explanation archive: explanations and
 //! annotations are one graph, queryable together.
@@ -12,19 +12,19 @@
 //! *property* names are kept.
 //!
 //! ```turtle
-//! <urn:annotation:{id}> a oa:Annotation ;
+//! <urn:iki:annotation:{id}> a oa:Annotation ;
 //!     oa:bodyValue "the note text" ;
 //!     ik:annotates <urn:repo:demo:file:src/lib.rs> ;
 //!     ik:repo "demo" ; ik:path "src/lib.rs" ;
 //!     ik:contentHash "sha256:…" ;              # the file version annotated
-//!     oa:hasSelector <urn:annotation:{id}:selector:quote> ,
-//!                    <urn:annotation:{id}:selector:position> ;
+//!     oa:hasSelector <urn:iki:annotation:{id}:selector:quote> ,
+//!                    <urn:iki:annotation:{id}:selector:position> ;
 //!     dcterms:created "2026-08-08T17:00:00.000Z"^^xsd:dateTime .
 //!
-//! <urn:annotation:{id}:selector:quote> a oa:TextQuoteSelector ;
+//! <urn:iki:annotation:{id}:selector:quote> a oa:TextQuoteSelector ;
 //!     oa:prefix "…" ; oa:exact "the quoted text" ; oa:suffix "…" .
 //!
-//! <urn:annotation:{id}:selector:position> a oa:TextPositionSelector ;
+//! <urn:iki:annotation:{id}:selector:position> a oa:TextPositionSelector ;
 //!     oa:start "120"^^xsd:nonNegativeInteger ;
 //!     oa:end "135"^^xsd:nonNegativeInteger .
 //! ```
@@ -37,8 +37,8 @@
 //!
 //! ## Ids
 //!
-//! `Sink urn:annotation:{id}` creates (or updates) under a CALLER-SUPPLIED
-//! slug (`[A-Za-z0-9._~-]+`); `Sink urn:annotation` (no id) MINTS a v4 uuid
+//! `Sink urn:iki:annotation:{id}` creates (or updates) under a CALLER-SUPPLIED
+//! slug (`[A-Za-z0-9._~-]+`); `Sink urn:iki:annotation` (no id) MINTS a v4 uuid
 //! and the acknowledgement names the new IRI. Source/Delete require the id.
 //!
 //! ## Anchoring and re-anchoring under drift
@@ -121,15 +121,15 @@ fn oa(term: &str) -> NamedNode {
 // --- IRIs -------------------------------------------------------------------
 
 pub(crate) fn annotation_iri(id: &str) -> String {
-    format!("urn:annotation:{id}")
+    format!("urn:iki:annotation:{id}")
 }
 
 fn quote_iri(id: &str) -> String {
-    format!("urn:annotation:{id}:selector:quote")
+    format!("urn:iki:annotation:{id}:selector:quote")
 }
 
 fn position_iri(id: &str) -> String {
-    format!("urn:annotation:{id}:selector:position")
+    format!("urn:iki:annotation:{id}:selector:position")
 }
 
 /// Caller-supplied slugs must embed cleanly in the URN (and must not collide
@@ -573,7 +573,7 @@ fn list_annotations(store: &Store, repo: &str, rel: Option<&str>) -> Result<Vec<
         let quad = quad.map_err(store_err)?;
         let subject = quad.subject.to_string();
         let iri = subject.trim_start_matches('<').trim_end_matches('>');
-        let Some(id) = iri.strip_prefix("urn:annotation:") else {
+        let Some(id) = iri.strip_prefix("urn:iki:annotation:") else {
             continue;
         };
         let Some(ann) = load_annotation(store, id)? else {
@@ -1141,7 +1141,7 @@ pub(crate) fn bind(space: EndpointSpace, roots: &Roots, store: &Arc<Store>) -> E
     )
 }
 
-/// `urn:annotation:{id}`, plus the bare `urn:annotation` (Sink mints an id).
+/// `urn:iki:annotation:{id}`, plus the bare `urn:iki:annotation` (Sink mints an id).
 struct AnnotationGrammar {
     with_id: UriTemplate,
 }
@@ -1149,7 +1149,7 @@ struct AnnotationGrammar {
 impl AnnotationGrammar {
     fn new() -> Self {
         AnnotationGrammar {
-            with_id: UriTemplate::parse("urn:annotation:{id}")
+            with_id: UriTemplate::parse("urn:iki:annotation:{id}")
                 .expect("the annotation template is valid"),
         }
     }
@@ -1157,7 +1157,7 @@ impl AnnotationGrammar {
 
 impl Grammar for AnnotationGrammar {
     fn match_iri(&self, iri: &Iri) -> Option<Bindings> {
-        if iri.as_str() == "urn:annotation" {
+        if iri.as_str() == "urn:iki:annotation" {
             return Some(Bindings::new());
         }
         self.with_id.match_iri(iri)
@@ -1167,11 +1167,11 @@ impl Grammar for AnnotationGrammar {
         // The advertised row is the template — a real pattern a probe can
         // expand and every verb can drive (Sink's `id` is optional there, and
         // the description documents the minting form). The bare
-        // `urn:annotation` stays resolvable but UNLISTED: as a row of its own
+        // `urn:iki:annotation` stays resolvable but UNLISTED: as a row of its own
         // it would offer Source/Delete actions that cannot succeed without an
         // id, and `[:{id}]` display sugar is not a template any grammar
         // matches (it kept every annotation row out of every manifold).
-        "urn:annotation:{id}".to_string()
+        "urn:iki:annotation:{id}".to_string()
     }
 }
 
@@ -1373,10 +1373,10 @@ fn annotation_description() -> Description {
     Description::new("annotation")
         .title("Web Annotation (oa:) on a browse resource")
         .summary(
-            "A W3C Web Annotation on a repository file — urn:annotation:{id}, stored as \
+            "A W3C Web Annotation on a repository file — urn:iki:annotation:{id}, stored as \
              skolemized RDF in the same shared store as the explanation archive. Sink \
              creates or updates (anchoring the quoted text in the target's current \
-             content; sink the bare urn:annotation to mint a uuid id); Source reads it \
+             content; sink the bare urn:iki:annotation to mint a uuid id); Source reads it \
              back, re-anchoring the selectors when the target has drifted (ik:reanchored) \
              and flagging quotes that are gone (ik:orphaned — never silently dropped); \
              Delete removes it. Selectors are stored as BOTH oa:TextQuoteSelector \
@@ -1415,7 +1415,7 @@ fn annotation_description() -> Description {
                 // capability that cannot read the target cannot annotate it.
                 .requires(CAP_WILDCARD)
                 .input(ArgSpec::new("id").binding().optional().summary(
-                    "caller-supplied slug ([A-Za-z0-9._~-]+); sink the bare urn:annotation to \
+                    "caller-supplied slug ([A-Za-z0-9._~-]+); sink the bare urn:iki:annotation to \
                      mint a uuid",
                 ))
                 .input(
@@ -1715,12 +1715,12 @@ fn annotation_card_html(ann: &Annotation, line: Option<u64>, show_path: bool) ->
 }
 
 /// The create affordance: a server-rendered form the HOST's `/k/` adapter
-/// turns into a Sink of `urn:annotation` (form fields become sink args — the
+/// turns into a Sink of `urn:iki:annotation` (form fields become sink args — the
 /// same adapter assumption the S0 faces document for `hx-get`). htmx
 /// attributes only; no scripts.
 fn annotation_form_html(target_iri: &str) -> String {
     format!(
-        "<form class=\"browse-annotate\" hx-post=\"/k/sink urn:annotation\" \
+        "<form class=\"browse-annotate\" hx-post=\"/k/sink urn:iki:annotation\" \
          hx-target=\"#browse\" hx-swap=\"innerHTML\">\
          <input type=\"hidden\" name=\"target\" value=\"{target}\">\
          <input name=\"exact\" placeholder=\"quote to anchor\" required>\
@@ -1871,7 +1871,7 @@ pub(crate) fn included_for_ids(store: &Store, iris: &[String], text: &str) -> Re
     let current = CurrentContent::Text(text.to_string(), content_hash(text.as_bytes()));
     let mut rows: Vec<(Annotation, Option<u64>)> = Vec::with_capacity(iris.len());
     for iri in iris {
-        let Some(id) = iri.strip_prefix("urn:annotation:") else {
+        let Some(id) = iri.strip_prefix("urn:iki:annotation:") else {
             continue;
         };
         let Some(mut ann) = load_annotation(store, id)? else {
@@ -1907,7 +1907,7 @@ fn list_annotations_for_target(store: &Store, target_iri: &str) -> Result<Vec<An
             let quad = quad.map_err(store_err)?;
             let subject = quad.subject.to_string();
             let iri = subject.trim_start_matches('<').trim_end_matches('>');
-            if let Some(id) = iri.strip_prefix("urn:annotation:") {
+            if let Some(id) = iri.strip_prefix("urn:iki:annotation:") {
                 ids.insert(id.to_string());
             }
         }
@@ -2039,7 +2039,7 @@ mod tests {
         let out = issue(
             k,
             Verb::Sink,
-            &format!("urn:annotation:{id}"),
+            &format!("urn:iki:annotation:{id}"),
             &[
                 ("target", &format!("urn:repo:demo:file:{path}")),
                 ("exact", exact),
@@ -2064,7 +2064,7 @@ mod tests {
         let k = kernel(&root, &store);
 
         let created = annotate(&k, "note-1", "a.rs", "fn two()", "the middle function");
-        assert_eq!(created["iri"], "urn:annotation:note-1");
+        assert_eq!(created["iri"], "urn:iki:annotation:note-1");
         assert_eq!(created["annotates"], "urn:repo:demo:file:a.rs");
         assert_eq!(created["line"], 2);
         assert_eq!(created["start"], 12);
@@ -2075,13 +2075,13 @@ mod tests {
             .starts_with("sha256:"));
 
         // Source: text/plain is the body; json carries the whole record.
-        let plain = issue(&k, Verb::Source, "urn:annotation:note-1", &[], &cap()).unwrap();
+        let plain = issue(&k, Verb::Source, "urn:iki:annotation:note-1", &[], &cap()).unwrap();
         assert_eq!(body(&plain), "the middle function");
         let full = json_of(
             &issue(
                 &k,
                 Verb::Source,
-                "urn:annotation:note-1",
+                "urn:iki:annotation:note-1",
                 &[("as", "application/json")],
                 &cap(),
             )
@@ -2102,9 +2102,9 @@ mod tests {
         );
 
         // Delete removes it and every selector quad with it.
-        let ack = issue(&k, Verb::Delete, "urn:annotation:note-1", &[], &cap()).unwrap();
-        assert_eq!(body(&ack), "deleted urn:annotation:note-1");
-        let err = issue(&k, Verb::Source, "urn:annotation:note-1", &[], &cap()).unwrap_err();
+        let ack = issue(&k, Verb::Delete, "urn:iki:annotation:note-1", &[], &cap()).unwrap();
+        assert_eq!(body(&ack), "deleted urn:iki:annotation:note-1");
+        let err = issue(&k, Verb::Source, "urn:iki:annotation:note-1", &[], &cap()).unwrap_err();
         assert!(matches!(err, Error::NotFound(_)), "{err:?}");
         assert_eq!(
             store.len().unwrap(),
@@ -2124,7 +2124,7 @@ mod tests {
         let ack = issue(
             &k,
             Verb::Sink,
-            "urn:annotation",
+            "urn:iki:annotation",
             &[
                 ("target", "urn:repo:demo:file:a.rs"),
                 ("exact", "fn one()"),
@@ -2134,14 +2134,14 @@ mod tests {
         )
         .unwrap();
         let iri = body(&ack);
-        let id = iri.strip_prefix("urn:annotation:").unwrap();
+        let id = iri.strip_prefix("urn:iki:annotation:").unwrap();
         assert_eq!(id.len(), 36, "a v4 uuid: {iri}");
         // The minted IRI resolves.
         let read = issue(&k, Verb::Source, &iri, &[], &cap()).unwrap();
         assert_eq!(body(&read), "minted");
 
         // Source/Delete on the bare IRI have no id to work with.
-        let err = issue(&k, Verb::Source, "urn:annotation", &[], &cap()).unwrap_err();
+        let err = issue(&k, Verb::Source, "urn:iki:annotation", &[], &cap()).unwrap_err();
         assert!(matches!(err, Error::MissingArgument(_)), "{err:?}");
         std::fs::remove_dir_all(&root).ok();
     }
@@ -2155,7 +2155,7 @@ mod tests {
         issue(
             &k,
             Verb::Sink,
-            "urn:annotation:piped",
+            "urn:iki:annotation:piped",
             &[
                 ("target", "urn:repo:demo:file:a.rs"),
                 ("exact", "fn one()"),
@@ -2164,14 +2164,14 @@ mod tests {
             &cap(),
         )
         .unwrap();
-        let read = issue(&k, Verb::Source, "urn:annotation:piped", &[], &cap()).unwrap();
+        let read = issue(&k, Verb::Source, "urn:iki:annotation:piped", &[], &cap()).unwrap();
         assert_eq!(body(&read), "the piped note");
 
         // Neither body nor content: a typed missing-argument error.
         let err = issue(
             &k,
             Verb::Sink,
-            "urn:annotation:empty",
+            "urn:iki:annotation:empty",
             &[("target", "urn:repo:demo:file:a.rs"), ("exact", "fn one()")],
             &cap(),
         )
@@ -2194,7 +2194,7 @@ mod tests {
         let err = issue(
             &k,
             Verb::Sink,
-            "urn:annotation:x",
+            "urn:iki:annotation:x",
             &[
                 ("target", "urn:repo:demo:file:a.rs"),
                 ("exact", "fn one()"),
@@ -2207,17 +2207,24 @@ mod tests {
 
         // Source without any browse read: denied at the baseline.
         let annotate_only = Capability::scoped([CAP_ANNOTATE]);
-        let err = issue(&k, Verb::Source, "urn:annotation:n", &[], &annotate_only).unwrap_err();
+        let err = issue(
+            &k,
+            Verb::Source,
+            "urn:iki:annotation:n",
+            &[],
+            &annotate_only,
+        )
+        .unwrap_err();
         assert!(matches!(err, Error::Denied(_)), "{err:?}");
 
         // Source with a browse grant on the WRONG root: past the baseline
         // wildcard, denied by the per-root check on the annotation's repo.
         let wrong_root = Capability::scoped(["urn:cap:browse:read:other"]);
-        let err = issue(&k, Verb::Source, "urn:annotation:n", &[], &wrong_root).unwrap_err();
+        let err = issue(&k, Verb::Source, "urn:iki:annotation:n", &[], &wrong_root).unwrap_err();
         assert!(matches!(err, Error::Denied(_)), "{err:?}");
 
         // Delete without annotate: denied.
-        let err = issue(&k, Verb::Delete, "urn:annotation:n", &[], &browse_only).unwrap_err();
+        let err = issue(&k, Verb::Delete, "urn:iki:annotation:n", &[], &browse_only).unwrap_err();
         assert!(matches!(err, Error::Denied(_)), "{err:?}");
 
         // The listing requires a browse grant like every browse read.
@@ -2352,7 +2359,7 @@ mod tests {
             &issue(
                 &k,
                 Verb::Source,
-                "urn:annotation:n",
+                "urn:iki:annotation:n",
                 &[("as", "application/json")],
                 &cap(),
             )
@@ -2386,7 +2393,7 @@ mod tests {
             &issue(
                 &k,
                 Verb::Source,
-                "urn:annotation:n",
+                "urn:iki:annotation:n",
                 &[("as", "application/json")],
                 &cap(),
             )
@@ -2424,8 +2431,8 @@ mod tests {
         annotate(&k, "n", "a.rs", "fn target()", "watch this");
         std::fs::write(root.join("a.rs"), "fn renamed() {}\n").unwrap();
 
-        issue(&k, Verb::Source, "urn:annotation:n", &[], &cap()).unwrap();
-        issue(&k, Verb::Source, "urn:annotation:n", &[], &cap()).unwrap();
+        issue(&k, Verb::Source, "urn:iki:annotation:n", &[], &cap()).unwrap();
+        issue(&k, Verb::Source, "urn:iki:annotation:n", &[], &cap()).unwrap();
         issue(
             &k,
             Verb::Source,
@@ -2436,7 +2443,7 @@ mod tests {
         .unwrap();
 
         // Exactly ONE orphaned triple, no duplicates from the repeat reads.
-        let subject = NamedNode::new("urn:annotation:n").unwrap();
+        let subject = NamedNode::new("urn:iki:annotation:n").unwrap();
         let orphan_quads: Vec<_> = store
             .quads_for_pattern(
                 Some(subject.as_ref().into()),
@@ -2463,7 +2470,7 @@ mod tests {
             &issue(
                 &k,
                 Verb::Source,
-                "urn:annotation:n",
+                "urn:iki:annotation:n",
                 &[("as", "application/json")],
                 &cap(),
             )
@@ -2477,7 +2484,7 @@ mod tests {
             &issue(
                 &k,
                 Verb::Source,
-                "urn:annotation:n",
+                "urn:iki:annotation:n",
                 &[("as", "application/json")],
                 &cap(),
             )
@@ -2498,7 +2505,7 @@ mod tests {
         let with_context = issue(
             &k,
             Verb::Sink,
-            "urn:annotation:ctx",
+            "urn:iki:annotation:ctx",
             &[
                 ("target", "urn:repo:demo:file:a.rs"),
                 ("exact", "= 1;"),
@@ -2562,7 +2569,7 @@ mod tests {
         let err = issue(
             &k,
             Verb::Sink,
-            "urn:annotation:x",
+            "urn:iki:annotation:x",
             &[
                 ("target", "urn:repo:demo:file:a.rs"),
                 ("exact", "nowhere to be found"),
@@ -2588,7 +2595,7 @@ mod tests {
         annotate(&k, "n1", "a.rs", "fn one()", "first");
         annotate(&k, "n2", "a.rs", "fn two()", "second");
 
-        for iri in ["urn:annotation:n1", "urn:repo:demo:annotations:a.rs"] {
+        for iri in ["urn:iki:annotation:n1", "urn:repo:demo:annotations:a.rs"] {
             let out = issue(&k, Verb::Source, iri, &[("as", "text/turtle")], &cap()).unwrap();
             assert_eq!(out.repr_type.media_type, "text/turtle");
             let ttl = body(&out);
@@ -2609,7 +2616,7 @@ mod tests {
             assert!(!ttl.contains("ik:target"), "the retired term: {ttl}");
             assert!(ttl.contains("oa:exact \"fn one()\""), "{ttl}");
             assert!(
-                ttl.contains("<urn:annotation:n1:selector:position> a oa:TextPositionSelector"),
+                ttl.contains("<urn:iki:annotation:n1:selector:position> a oa:TextPositionSelector"),
                 "{ttl}"
             );
             assert!(ttl.contains("ik:contentHash \"sha256:"), "{ttl}");
@@ -2653,7 +2660,7 @@ mod tests {
             &issue(
                 &k,
                 Verb::Source,
-                "urn:annotation:old",
+                "urn:iki:annotation:old",
                 &[("as", "application/json")],
                 &cap(),
             )
@@ -2713,7 +2720,7 @@ mod tests {
             "{html}"
         );
         assert!(
-            html.contains("hx-post=\"/k/sink urn:annotation\""),
+            html.contains("hx-post=\"/k/sink urn:iki:annotation\""),
             "{html}"
         );
         assert!(html.contains("value=\"urn:repo:demo:file:a.rs\""), "{html}");
@@ -2806,7 +2813,7 @@ mod tests {
         issue(
             &k,
             Verb::Sink,
-            "urn:annotation:n",
+            "urn:iki:annotation:n",
             &[
                 ("target", "urn:repo:demo:file:a.rs"),
                 ("exact", "fn one()"),
@@ -2858,7 +2865,7 @@ mod tests {
         // And both resource families still answer off that one store.
         let explained = issue(&k, Verb::Source, "urn:repo:demo:explain:a.rs", &[], &full).unwrap();
         assert_eq!(body(&explained), "An explanation.");
-        let annotated = issue(&k, Verb::Source, "urn:annotation:n", &[], &full).unwrap();
+        let annotated = issue(&k, Verb::Source, "urn:iki:annotation:n", &[], &full).unwrap();
         assert_eq!(body(&annotated), "note");
         std::fs::remove_dir_all(&root).ok();
     }
@@ -3051,7 +3058,7 @@ mod tests {
         let err = issue(
             &k,
             Verb::Sink,
-            "urn:annotation:has%3Acolon",
+            "urn:iki:annotation:has%3Acolon",
             &[
                 ("target", "urn:repo:demo:file:a.rs"),
                 ("exact", "fn one()"),
@@ -3067,7 +3074,7 @@ mod tests {
             let err = issue(
                 &k,
                 Verb::Sink,
-                "urn:annotation:x",
+                "urn:iki:annotation:x",
                 &[("target", target), ("exact", "fn one()"), ("body", "no")],
                 &cap(),
             )
@@ -3077,6 +3084,88 @@ mod tests {
                 "{target}: {err:?}"
             );
         }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // --- the `urn:iki:` migration (0.3.0) ------------------------------------
+
+    /// ★ PREFIX SURGERY — the class a binding sweep misses, pinned.
+    ///
+    /// The namespace rename moved one *binding* (`AnnotationGrammar`'s
+    /// template) and three *literal prefix scans* over stored subject IRIs:
+    /// [`list_annotations`] (the repo listing), [`list_annotations_for_target`]
+    /// (the PR page's overlay) and [`included_for_ids`] (a review pass's minted
+    /// set). None of the three is a binding — no `UriTemplate` or `Exact` grep
+    /// reaches them and the compiler cannot see inside the string — and all
+    /// three fail the SAME quiet way if one is left behind: `strip_prefix`
+    /// returns `None`, the loop `continue`s, and the caller gets an EMPTY
+    /// result rather than an error.
+    ///
+    /// So every assertion below is a non-emptiness: the shape a missed rename
+    /// produces is a zero, not a panic, which is why the minting/read/delete
+    /// round trip on its own would have passed over all three.
+    #[test]
+    fn every_stored_iri_scan_reads_the_migrated_namespace() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "fn one() {}\nfn two() {}\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+
+        // Minted through the bare IRI, so the id comes from the endpoint and
+        // the new prefix is the one the store actually receives.
+        let ack = issue(
+            &k,
+            Verb::Sink,
+            "urn:iki:annotation",
+            &[
+                ("target", "urn:repo:demo:file:a.rs"),
+                ("exact", "fn one()"),
+                ("body", "migrated"),
+            ],
+            &cap(),
+        )
+        .unwrap();
+        let iri = body(&ack);
+        assert!(iri.starts_with("urn:iki:annotation:"), "{iri}");
+        assert_eq!(
+            body(&issue(&k, Verb::Source, &iri, &[], &cap()).unwrap()),
+            "migrated"
+        );
+
+        // Site 1 — `list_annotations`, reached through the repo listing row.
+        let listed =
+            body(&issue(&k, Verb::Source, "urn:repo:demo:annotations", &[], &cap()).unwrap());
+        assert!(
+            listed.contains("migrated"),
+            "the repo listing went empty: {listed}"
+        );
+
+        // Site 2 — `list_annotations_for_target`, the PR/target overlay's scan.
+        let rows = list_annotations_for_target(&store, "urn:repo:demo:file:a.rs").unwrap();
+        assert_eq!(rows.len(), 1, "the target scan went empty");
+        assert_eq!(rows[0].iri(), iri);
+
+        // Site 3 — `included_for_ids`, a review pass's minted set by IRI.
+        let text = std::fs::read_to_string(root.join("a.rs")).unwrap();
+        let included = included_for_ids(&store, std::slice::from_ref(&iri), &text).unwrap();
+        assert_eq!(included.rows.len(), 1, "the minted-set scan went empty");
+
+        // The selector sub-IRIs are minted under the new prefix too, so a
+        // Turtle consumer sees one namespace and not two.
+        let ttl = body(&issue(&k, Verb::Source, &iri, &[("as", "text/turtle")], &cap()).unwrap());
+        assert!(
+            !ttl.contains("urn:annotation:"),
+            "an old-name IRI leaked: {ttl}"
+        );
+        assert!(ttl.contains(":selector:quote"), "{ttl}");
+
+        // Delete takes it back out of every scan.
+        issue(&k, Verb::Delete, &iri, &[], &cap()).unwrap();
+        assert!(
+            list_annotations_for_target(&store, "urn:repo:demo:file:a.rs")
+                .unwrap()
+                .is_empty()
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 }

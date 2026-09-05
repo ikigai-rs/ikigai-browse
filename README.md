@@ -13,7 +13,7 @@ pairs), and each root answers these resource families:
 | `urn:repo:{repo}:hash[:{path}]` | the **content hash** (S1) — `sha256:{hex}` of a file's bytes, or the **merkle** construction over a directory's entries (ignore-filtered), so one edit re-keys exactly the path to the root |
 | `urn:repo:{repo}:explain[:{path}]` | an **LLM-derived orientation explanation** (S1), archived by `(path, content-hash, version-tag)` — derived once per content version, reused forever; `as=application/json` adds `{content_hash, version_tag, derived}`, `as=text/html` the page face with provenance and a backlink to the explained resource, `as=text/turtle` the archive entry's graph; `version=` addresses an older tag; `provider=` derives this one against a different host-allowed backend (keyed by that backend's own model identity, so two models coexist); `annotations=include` (S3) folds the target's annotations in — the json face gains an `annotations` array, the text face appends margin notes, the html face renders the annotation cards, and a directory rollup folds its subtree's |
 | `urn:repo:{repo}:explain-versions[:{path}]` | what the archive holds for a path — one row per entry (tag, hash, model, derived-at), across content versions and tags; derives nothing and needs no net capability; `as=text/html` is the **option menu** the faces open beside their explain button — the entries the current content can reopen (free) above the models this host will derive a new one with, one row per MODEL |
-| `urn:annotation[:{id}]` | a **W3C Web Annotation** (S2) on a file — Sink creates/updates (anchoring the quoted text; the bare `urn:annotation` mints a uuid id), Source reads with drift **re-anchoring**, Delete removes; faces: `text/plain` (the body), `as=application/json`, `as=text/turtle` |
+| `urn:iki:annotation[:{id}]` | a **W3C Web Annotation** (S2) on a file — Sink creates/updates (anchoring the quoted text; the bare `urn:iki:annotation` mints a uuid id), Source reads with drift **re-anchoring**, Delete removes; faces: `text/plain` (the body), `as=application/json`, `as=text/turtle` |
 | `urn:repo:{repo}:annotations[:{path}]` | every annotation on one file (or the whole repo, path omitted) in reading order, drift-reconciled on each read; faces: `application/json` (default), `as=text/html` (panel fragment), `as=text/turtle` |
 | `urn:repo:{repo}:review:{path}` | the **machine review pass** (S4) — region-grain LLM commentary minted as real annotations (provenance-distinguished), the pass archived by `(path, content-hash, review-tag)` so re-sourcing unchanged content mints nothing; faces: `text/plain` (the margin digest), `as=application/json` (`{minted, orphaned_items, reviewed_bytes, total_bytes, annotations, …}`), `as=text/html` (the card page), `as=text/turtle` (the pass's provenance graph); `debug=raw` derives and returns the model's **unparsed answer** (nothing minted or archived) — the parse-failure diagnosis face |
 | `urn:repo:style` | the **theme stylesheet** the classed highlight faces bind to — `text/css`, root-independent, cacheable: each theme inside its OWN `@media (prefers-color-scheme: …)` block, above an unconditional `.hl-code` floor, all targeting the `hl-` classes the HTML faces emit, with the themes and the contrast floor read from the layered `a11y.toml` (see the host contract below) |
@@ -38,8 +38,8 @@ enumerates **per-configured-root rows**: for each root, the concrete resources
 entries. The catalog and the capability-scoped action manifold
 (`urn:kernel:actions`) therefore advertise exactly the repos an agent can
 actually browse, and every templated row survives the kernel's
-probe-expansion. `urn:annotation:{id}` is the annotation family's row; the
-bare `urn:annotation` (Sink mints a uuid id) stays resolvable but unlisted.
+probe-expansion. `urn:iki:annotation:{id}` is the annotation family's row; the
+bare `urn:iki:annotation` (Sink mints a uuid id) stays resolvable but unlisted.
 
 **Capabilities.** Every action declares `urn:cap:browse:read:*` — the wildcard
 *offering* form ("holds some grant under this prefix"). A **grant** names
@@ -227,7 +227,7 @@ anchor down to the annotation's card whose native `title` tooltip reveals
 the note; hosts may style it as a margin dot), and appends an annotations
 panel: one card per annotation at its `#L{n}` anchor (orphans visually
 flagged, listed without a marker) plus a create form that `hx-post`s a Sink
-of `urn:annotation` through the host's `/k/` adapter (form fields become
+of `urn:iki:annotation` through the host's `/k/` adapter (form fields become
 sink args — htmx only, no scripts). With the explanation family mounted,
 the tree and file faces carry explain links (`browse-explain-link` — the
 tree face one per entry plus the directory's own under a
@@ -262,6 +262,31 @@ heuristic its version tag will fall back to and marked as unidentified: two
 unknowns are two rows, because they may well be two models.
 
 ## Annotations (S2)
+
+> **⚠ The namespace moved in 0.3.0** — `urn:annotation:` → `urn:iki:annotation:`,
+> part of the ecosystem-wide `urn:iki:` migration. A module crate's resource
+> names are its public interface, so this is a minor bump and not a patch: a
+> host that adopts it must install the alias in the SAME release, and needs
+> **two** rules, because a prefix rule does not match the bare minting IRI.
+>
+> ```text
+> prefix  urn:annotation:  urn:iki:annotation:
+> exact   urn:annotation   urn:iki:annotation
+> ```
+>
+> ⚠ The alias covers *resolution* and nothing else, and the two things it does
+> not cover fail in opposite directions:
+>
+> - **Mounts sit INSIDE it.** `with_aliases` wraps the root space, so the mount
+>   table sees the *canonical* name. A `mount = "prefer
+>   urn:annotation:=<sock>"` line stops matching the moment the alias fires —
+>   rewrite the line to `urn:iki:annotation:`; the alias will not save it.
+> - **HTTP route gates sit OUTSIDE it.** An allowlist that inspects the request
+>   path before the kernel (`ikigai-web`'s `POST /urn:annotation…` route) sees
+>   the name the *caller* wrote, so it must accept BOTH spellings for as long
+>   as the alias stands.
+>
+> Nothing in this crate installs an alias; binding authority is the host's.
 
 `space_with_annotations(roots, store)` mounts W3C Web Annotations over the
 same host-injected Oxigraph store the explanation archive uses
@@ -309,7 +334,7 @@ a capability that cannot read a file cannot annotate it.
 `urn:repo:{repo}:review:{path}` (mounted by `space_with_explain`) is the
 review layer: Source asks the review model for findings — each an **exact
 quote** from the file plus a reviewer's note — anchors every quote, and mints
-each anchored finding as a real `urn:annotation:` through the same machinery
+each anchored finding as a real `urn:iki:annotation:` through the same machinery
 human notes use. Machine and human annotations live on ONE queryable axis,
 distinguished only by provenance (all standard terms — no vocab publish):
 

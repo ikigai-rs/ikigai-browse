@@ -19,7 +19,7 @@
 //! TEXT is the anchor surface: annotations target the PR IRI itself and quote
 //! diff lines, re-anchoring or orphaning as the diff drifts (a force-push
 //! changes the text) exactly like file annotations. Human notes and the
-//! machine review pass land in the same `urn:annotation:` family.
+//! machine review pass land in the same `urn:iki:annotation:` family.
 //!
 //! ## Archives key on the head commit
 //!
@@ -1608,7 +1608,7 @@ fn pr_review_description() -> Description {
             "A region-grain machine review of one pull request — \
              urn:repo:{repo}:pr:{n}:review. Source asks the review model for findings on \
              the DIFF (each an exact quote plus a reviewer's note), mints every anchored \
-             finding as a real urn:annotation: targeting the PR IRI (provenance: \
+             finding as a real urn:iki:annotation: targeting the PR IRI (provenance: \
              dcterms:creator = the model, oa:motivatedBy oa:assessing, \
              prov:wasGeneratedBy = this pass) and ARCHIVES the pass by (repo, pr, \
              headRefOid, review-tag) — re-sourcing an unchanged head is an archive hit \
@@ -2343,7 +2343,7 @@ mod tests {
         let ack = issue(
             &k,
             Verb::Sink,
-            "urn:annotation:pr-note",
+            "urn:iki:annotation:pr-note",
             &[
                 ("target", "urn:repo:demo:pr:3"),
                 ("exact", "+fn beta() {}"),
@@ -2414,7 +2414,7 @@ mod tests {
             &issue(
                 &bare,
                 Verb::Source,
-                "urn:annotation:pr-note",
+                "urn:iki:annotation:pr-note",
                 &[("as", "application/json")],
                 &cap(),
             )
@@ -2550,7 +2550,7 @@ mod tests {
         let ttl = body(&source(&k, "urn:repo:demo:pr:3:review", &[("as", "text/turtle")]).unwrap());
         assert!(ttl.contains("a ik:Review"), "{ttl}");
         assert!(ttl.contains("prov:used <urn:repo:demo:pr:3>"), "{ttl}");
-        assert!(ttl.contains("prov:generated <urn:annotation:"), "{ttl}");
+        assert!(ttl.contains("prov:generated <urn:iki:annotation:"), "{ttl}");
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -2633,7 +2633,7 @@ index 3f9c2d1..8a41b77 100644
         let ack = issue(
             &k,
             Verb::Sink,
-            "urn:annotation:pr-multiline",
+            "urn:iki:annotation:pr-multiline",
             &[
                 ("target", "urn:repo:demo:pr:3"),
                 (
