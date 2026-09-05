@@ -2254,7 +2254,7 @@ mod tests {
             crate::CAP_ANNOTATE,
         ]);
         // An annotation on the file, created through the kernel.
-        let mut req = Request::new(Verb::Sink, Iri::parse("urn:annotation:n1").unwrap());
+        let mut req = Request::new(Verb::Sink, Iri::parse("urn:iki:annotation:n1").unwrap());
         for (name, value) in [
             ("target", "urn:repo:demo:file:src/lib.rs"),
             ("exact", "fn main()"),
@@ -2296,7 +2296,7 @@ mod tests {
         assert!(html.contains("browse-annotation"), "{html}");
         assert!(html.contains("the entrypoint"), "{html}");
         assert!(
-            html.contains("hx-post=\"/k/sink urn:annotation\""),
+            html.contains("hx-post=\"/k/sink urn:iki:annotation\""),
             "{html}"
         );
 
@@ -2654,7 +2654,7 @@ mod tests {
 
         // Annotate through the kernel — space_with_explain carries S2 too.
         let annotate_cap = Capability::scoped(["urn:cap:browse:read:demo", crate::CAP_ANNOTATE]);
-        let request = Request::new(Verb::Sink, Iri::parse("urn:annotation:n1").unwrap())
+        let request = Request::new(Verb::Sink, Iri::parse("urn:iki:annotation:n1").unwrap())
             .with_arg(
                 "target",
                 ArgRef::Inline(b"urn:repo:demo:file:src/lib.rs".to_vec()),

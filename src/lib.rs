@@ -29,7 +29,7 @@
 //!   S1 **explanation archive** ([`space_with_explain`]): LLM-derived
 //!   orientation, derived once per `(path, content-hash, version-tag)` and
 //!   persisted in a host-injected Oxigraph store.
-//! - `urn:annotation:{id}` + `urn:repo:{repo}:annotations[:{path}]` — S2 **Web
+//! - `urn:iki:annotation:{id}` + `urn:repo:{repo}:annotations[:{path}]` — S2 **Web
 //!   Annotations** (`oa:`) on files ([`space_with_annotations`], and included
 //!   by [`space_with_explain`] — one shared store): quote + position selectors
 //!   that RE-ANCHOR when the target drifts and are orphan-flagged (never
@@ -80,8 +80,8 @@
 //! the capability-scoped action manifold (`urn:kernel:actions`) advertise
 //! exactly the repos an agent can actually browse, and every templated row
 //! survives the kernel's probe-expansion (a `{repo}` template cannot: no
-//! placeholder names a configured root). The bare `urn:annotation` (Sink mints
-//! an id) stays resolvable but unlisted; `urn:annotation:{id}` is its row.
+//! placeholder names a configured root). The bare `urn:iki:annotation` (Sink mints
+//! an id) stays resolvable but unlisted; `urn:iki:annotation:{id}` is its row.
 //!
 //! ## Capabilities
 //!
@@ -149,7 +149,7 @@ pub fn space(roots: impl IntoIterator<Item = (String, PathBuf)>) -> EndpointSpac
 }
 
 /// [`space`] plus the S2 **annotation** family over a host-injected Oxigraph
-/// store — no LLM anywhere: `urn:annotation:{id}` (Sink creates/updates,
+/// store — no LLM anywhere: `urn:iki:annotation:{id}` (Sink creates/updates,
 /// Source reads with drift re-anchoring, Delete removes) and
 /// `urn:repo:{repo}:annotations[:{path}]` (the per-target listing), and the
 /// file HTML face gains its annotations panel. [`space_with_explain`] includes
@@ -2822,7 +2822,7 @@ mod tests {
             "urn:repo:demo:explain-versions:{path}",
             "urn:repo:demo:annotations",
             "urn:repo:demo:annotations:{path}",
-            "urn:annotation:{id}",
+            "urn:iki:annotation:{id}",
             "urn:repo:style",
         ] {
             assert!(

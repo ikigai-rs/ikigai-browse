@@ -1,7 +1,16 @@
 [package]
 name = "ikigai-browse"
 description = "Repository browsing as ikigai resources: per-root tree / file / git-state / hash endpoints, an archived LLM explanation layer, W3C Web Annotations that re-anchor under drift, a machine review pass that mints its findings as provenance-distinguished annotations, and a pull-request family (listing, annotatable diff pages, head-commit-keyed explains and reviews) - capability-gated, with text, htmx-HTML, and Turtle faces."
-version = "0.2.15"
+# 0.3.0 — MINOR, and deliberately not a patch: the annotation namespace moved
+# from `urn:annotation:` to `urn:iki:annotation:` (the `urn:iki:` migration).
+# A module crate's RESOURCE NAMES are its public interface even when its Rust
+# API is untouched, so a patch would be picked up by a bare `cargo update` and
+# take the old names out from under a host that had not installed an alias.
+# The minor bump forces the manifest edit the host's alias rule must ride in:
+#     prefix urn:annotation:  urn:iki:annotation:
+#     exact  urn:annotation   urn:iki:annotation      # the bare minting IRI
+# — BOTH rules; a prefix rule alone does not match the bare `urn:annotation`.
+version = "0.3.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -59,7 +68,7 @@ oxigraph = { version = "0.5", default-features = false }
 # async trait objects for the explain endpoint (it must await sub-requests —
 # FnEndpoint is sync-only), matching ikigai-core's own endpoint plumbing.
 async-trait = "0.1"
-# Minted annotation ids (S2): a Sink of the bare urn:annotation creates the
+# Minted annotation ids (S2): a Sink of the bare urn:iki:annotation creates the
 # annotation under a fresh v4 uuid.
 uuid = { version = "1", features = ["v4"] }
 
