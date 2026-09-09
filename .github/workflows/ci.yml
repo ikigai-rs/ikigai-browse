@@ -1,44 +1,12 @@
-# CI for ikigai-browse. Native-only (the crate reads the filesystem and spawns
-# `git` — the platform seam), so no wasm-lib job: fmt · clippy --all-targets
-# -D warnings · test.
 name: ci
 on:
+  push: { branches: [main] }
   pull_request:
-  push:
-    branches: [main]
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}   # never cancel main
 jobs:
-  check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - name: fmt
-        run: cargo fmt --all -- --check
-      - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
-      - name: test
-        run: cargo test
-
-  # The `migrate` feature builds oxrocksdb-sys from source, so it is a job of
-  # its own rather than a flag on the one above: the default build must stay
-  # pure-Rust and fast. It still has to run — `migrate-annotation-ns` is a
-  # one-shot destructive rewrite of production RDF, and the default job cannot
-  # even see the binary target (`required-features` excludes it), so without
-  # this job the tool would ship unlinted and untested. ~40s of RocksDB.
-  migrate-tool:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: migrate
-      - name: clippy (migrate)
-        run: cargo clippy --all-targets --features migrate -- -D warnings
-      - name: test (migrate)
-        run: cargo test --features migrate
+  ci:
+    uses: ikigai-rs/.github/.github/workflows/rust.yml@main
+    with:
+      features: migrate

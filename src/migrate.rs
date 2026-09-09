@@ -32,7 +32,7 @@
 //! plasma, 28 and 14 references respectively. A subject-only rewrite leaves
 //! every one of them aimed at an IRI that no longer exists, which is a worse
 //! store than the one it started from: the annotations are visible and their
-//! selectors are gone. [`Scope::SubjectOnly`] exists so the test suite can
+//! selectors are gone. [`Scope::SubjectOnly`](crate::migrate::Scope::SubjectOnly) exists so the test suite can
 //! produce that failure on purpose rather than trusting a comment about it.
 //!
 //! ## Counts, and what PASS means
@@ -48,7 +48,7 @@
 //! | `new_prefix` | quads touching the new prefix — must reach the old's former count |
 //! | `dangling_selectors` | `oa:hasSelector` objects not under the new prefix — must reach 0 |
 //!
-//! See [`Counts::passed`].
+//! See [`Counts::passed`](crate::migrate::Counts::passed).
 
 use std::collections::BTreeSet;
 
