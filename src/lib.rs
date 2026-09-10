@@ -56,6 +56,9 @@
 //!   from the layered `a11y.toml` via `ikigai-a11y` (see [`Mount::app`]), and
 //!   every colour below that floor is lifted to its own theme's default
 //!   foreground — repaired in the theme's palette, nothing invented.
+//!   Cacheable with a golden thread per candidate config file, and
+//!   [`Mount::space_watched`] hands the host the watch that cuts them, so an
+//!   edited `a11y.toml` lands on the next read instead of the next restart.
 //! - `urn:repo:{repo}:prs:{path}` — the **contextual** listing: the PRs that
 //!   touched anything at or under a path, newest first — open PRs by
 //!   intersecting their changed files (`urn:repo:pr:files`), merged PRs mined
@@ -125,9 +128,12 @@ mod hash;
 pub mod migrate;
 mod pr;
 mod review;
+/// The watch that keeps `urn:repo:style` fresh — see [`Mount::space_watched`].
+mod watch;
 
 pub use annotate::CAP_ANNOTATE;
 pub use explain::ExplainConfig;
+pub use watch::{ConfigWatch, StyleWatch, WatchError};
 
 /// The wildcard capability every browse action declares: an agent is offered
 /// these resources iff it holds *some* grant under this prefix. Held literally,
@@ -286,7 +292,8 @@ impl Mount {
     /// that thread is that cutting it RECOMPUTES the answer; a mount that parsed
     /// its config here would serve the config the process started with forever
     /// while the watcher cut and the kernel re-resolved. `ikigai-a11y`'s
-    /// `A11yHandle` holds the home for exactly this reason.
+    /// `A11yHandle` holds the home for exactly this reason. The watcher itself
+    /// is [`Mount::space_watched`]'s second half, over this same home.
     ///
     /// Spelled as a builder method rather than as the `*_with` constructor pair
     /// `ikigai-a11y` grew, because that dialect is for FREE FUNCTIONS that had to
@@ -315,7 +322,46 @@ impl Mount {
     }
 
     /// Build the space.
+    ///
+    /// [`space_watched`](Self::space_watched) with the watch dropped: the same
+    /// space, the same threads declared on [`STYLE_IRI`], and nothing cutting
+    /// them — an `a11y.toml` edit lands at the next restart. Legal, and what
+    /// every host did before 0.3.2; a host that wants the edit to land calls the
+    /// other one.
     pub fn space(self) -> EndpointSpace {
+        self.space_watched().0
+    }
+
+    /// Build the space **and** hand back what keeps [`STYLE_IRI`] fresh.
+    ///
+    /// The stylesheet is `.cacheable()` with a golden thread per candidate
+    /// `a11y.toml` layer, and a declared thread is a promise that something cuts
+    /// it. The [`StyleWatch`] is that something, not yet started: a host starts
+    /// it once its kernel exists, and from then on an edited or newly created
+    /// layer file cuts exactly the threads the sheet declared — by name, with the
+    /// kernel neither restarted nor rebuilt.
+    ///
+    /// ```no_run
+    /// # use std::path::PathBuf;
+    /// # use std::sync::Arc;
+    /// use ikigai_core::Kernel;
+    /// let (space, style) =
+    ///     ikigai_browse::Mount::new([("core".to_string(), PathBuf::from("/src/core"))])
+    ///         .app("dev-server")
+    ///         .space_watched();
+    /// let kernel = Arc::new(Kernel::new(Arc::new(space)));
+    /// if let Err(e) = style.spawn(Arc::clone(&kernel)) {
+    ///     // Not fatal — the sheet still serves — but the one symptom (an edit
+    ///     // that does not land) is silent, so say it once at startup.
+    ///     eprintln!("urn:repo:style will not follow a11y.toml edits: {e}");
+    /// }
+    /// ```
+    ///
+    /// The two halves come from ONE resolution of the config home, which is why
+    /// they are returned together rather than the watch being built from the
+    /// environment a second time: a watch over a different directory than the
+    /// endpoint reads would cut threads nothing declared.
+    pub fn space_watched(self) -> (EndpointSpace, StyleWatch) {
         let Mount {
             roots,
             app,
@@ -323,18 +369,20 @@ impl Mount {
             store,
             explain,
         } = self;
-        let app = app.as_deref();
         // The ambient read, if there is one, happens HERE — once, in the host's
         // own mount call — and everything below it takes a stated home.
         let home = config_home.resolve();
+        let style = StyleWatch::new(home.clone(), app.clone());
+        let app = app.as_deref();
         let home = home.as_deref();
         let Some(config) = explain else {
             let ignore = Arc::new(hash::default_ignore());
             let space = base_space(&roots, &ignore, store.as_ref(), false, app, home);
-            return match store {
+            let space = match store {
                 Some(store) => annotate::bind(space, &roots, &store),
                 None => space,
             };
+            return (space, style);
         };
         let ignore = Arc::new(config.ignore.clone());
         let store = Arc::clone(&config.store);
@@ -346,7 +394,7 @@ impl Mount {
         let space = review::bind(space, &roots, &shared);
         // So do the pull-request derived layers (pr:{n}:explain / pr:{n}:review).
         let space = pr::bind_explain(space, &roots, &shared);
-        annotate::bind(space, &roots, &store)
+        (annotate::bind(space, &roots, &store), style)
     }
 }
 
@@ -1613,8 +1661,9 @@ impl Grammar for StyleRow {
 /// declares a **golden thread per candidate config file**, including the ones
 /// that do not exist yet, so an operator creating `dev-server.a11y.toml`
 /// invalidates this too — on a host that watches the config home and cuts those
-/// threads. No host does yet; until one does, the threads are declared and
-/// never cut, which costs a restart to pick up an edit and costs nothing else.
+/// threads. [`Mount::space_watched`] hands the host that watch ([`StyleWatch`]);
+/// a host that never starts it has the threads declared and never cut, which
+/// costs a restart to pick up an edit and costs nothing else.
 fn style_endpoint(app: Option<&str>, home: Option<&Path>) -> FnEndpoint {
     let app = app.map(str::to_string);
     // The HOME, not a parsed config: the threads below promise that cutting one

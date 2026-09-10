@@ -212,6 +212,33 @@ uncacheable-because-it-reads-a-file would have turned a 2µs cached read into a
 ~450µs generation on every page — measured by `cargo run --release --example
 style_cache`.
 
+**Since 0.3.2 the crate supplies that watch.** A declared thread is a promise
+that something cuts it, and until now nothing did — an edited `a11y.toml` was
+served stale until the process restarted (ikigai-a11y #8 pinned exactly that:
+the edit with no cut is stale, and `kernel.cut()` on those names recomputes).
+`Mount::space_watched()` returns the space **and** a `StyleWatch` from the same
+resolution of the config home; once the kernel exists the host starts it:
+
+```rust,ignore
+let (space, style) = Mount::new(roots).app("dev-server").space_watched();
+let kernel = Arc::new(Kernel::new(Arc::new(space)));
+if let Err(e) = style.spawn(Arc::clone(&kernel)) {
+    eprintln!("urn:repo:style will not follow a11y.toml edits: {e}");
+}
+```
+
+The watch is the platform's (FSEvents / inotify) over the config home
+DIRECTORY, non-recursive, matching candidate file NAMES — so an editor's atomic
+save and an override created after mount both land, and the platform's
+canonical spelling of the path (`/private/var` for `/var`) cannot make it cut a
+thread nothing declared. It cuts **by name**: the kernel is neither restarted
+nor rebuilt, and only the stylesheet (and anything a host composed over it,
+such as `ikigai-a11y`'s own `urn:a11y:config`, which declares the same names)
+recomputes on its next read. `Mount::space()` is `space_watched()` with the
+watch dropped — the pre-0.3.2 behaviour, still legal. A missing config home is
+a named `WatchError`, never a quiet no-watch: the one symptom of a watch that
+is not running is an edit that does not land, and that is silent.
+
 Syntax coverage is [two-face](https://crates.io/crates/two-face)'s extended
 set (~100 formats the stock syntect set misses — TOML, TypeScript,
 Dockerfile, …) under the pure-Rust fancy-regex engine, plus an embedded house
