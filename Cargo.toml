@@ -18,7 +18,14 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # and a host that never runs the tool cannot tell 0.3.1 from 0.3.0. The alias
 # rule above is what 0.3.0 asked hosts for; this is what it forgot to give them,
 # because an alias rewrites incoming NAMES and does nothing to stored data.
-version = "0.3.1"
+#
+# 0.3.2 — PATCH, additive: `Mount::space_watched` returns the space AND a
+# `StyleWatch`, the watch over the config home that cuts `urn:repo:style`'s
+# golden threads when an `a11y.toml` layer is edited or created. `Mount::space`
+# is unchanged (it is `space_watched` with the watch dropped), no resource name,
+# capability or face moves, and a host that keeps calling `space` keeps the
+# behaviour it had — an edit lands at the next restart instead of the next read.
+version = "0.3.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -105,6 +112,12 @@ async-trait = "0.1"
 # Minted annotation ids (S2): a Sink of the bare urn:iki:annotation creates the
 # annotation under a fresh v4 uuid.
 uuid = { version = "1", features = ["v4"] }
+# The watch over the config home (`Mount::space_watched`): FSEvents / inotify
+# on the directory the `a11y.toml` layers live in, cutting `urn:repo:style`'s
+# golden threads by name when one is edited or created. The same watcher the
+# embedded host uses for its workspace, at the same major, so a host linking
+# both builds one copy. Native by construction, like the rest of this crate.
+notify = "6.1"
 
 [dev-dependencies]
 futures = "0.3"
