@@ -121,9 +121,15 @@ const REVIEW_REMINDER: &str =
 ///     ik:derivedAt "2026-08-09T17:00:00.000Z"^^xsd:dateTime .
 /// ```
 ///
-/// `ik:Review` and `ik:orphanedItems` are the two terms the vocab does not
-/// hold yet (reported up, not added here); every provenance link is standard
-/// PROV / DC / OA.
+/// Every `ik:` term here is published: `ikigai-vocab` 0.1.69 added `ik:Review`,
+/// `ik:orphanedItems`, `ik:reviewedBytes` and `ik:totalBytes`, which is what put
+/// this face under the conformance walk's `VOCABULARY` check. Every provenance
+/// link is standard PROV / DC / OA.
+///
+/// ⚠ `ik:versionTag` and `ik:derivedAt` are shared with the EXPLANATION archive
+/// and deliberately carry NO `rdfs:domain`. It was `ik:Explanation` until 0.1.69,
+/// which under entailment typed every entry here as an explanation as well —
+/// giving either term a domain again re-breaks this graph.
 pub(crate) struct PassEntry {
     pub(crate) iri: String,
     pub(crate) repo: String,

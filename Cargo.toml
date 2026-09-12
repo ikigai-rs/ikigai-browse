@@ -134,6 +134,16 @@ notify = "6.1"
 # check this crate's by-hand `declared_outputs_are_the_media_types_served`
 # anticipates, and the day it publishes the walk should pick it up.
 ikigai-conformance = "0.1.0"
+# A FLOOR DECLARATION, not a code dependency: no line in this crate calls it.
+# The suite's `VOCABULARY` check reads `ikigai_vocab::VOCABULARY` as its oracle,
+# and the suite's own pin (`^0.1.66`) is the floor for the SUITE's API, not for
+# this module's terms. The review face uses `ik:Review`, `ik:orphanedItems`,
+# `ik:reviewedBytes` and `ik:totalBytes`, which landed in **0.1.69** — below it
+# `tests/conformance.rs` goes red with four "invented term" findings that are
+# really "the registry index is stale". Cargo unifies to the greater of the two
+# requirements, so saying it here raises the floor without touching the suite.
+# Dev-dependencies do not propagate, so no consumer of this crate pays for it.
+ikigai-vocab = "0.1.69"
 futures = "0.3"
 # Validates the Turtle face in tests — the graph must actually parse.
 oxttl = "0.2"

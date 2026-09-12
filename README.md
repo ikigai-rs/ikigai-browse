@@ -520,14 +520,17 @@ use the external `oa:` (`http://www.w3.org/ns/oa#`) terms `oa:Annotation`,
 and `dcterms:created`. The S4 review layer adds the standard provenance terms
 `dcterms:creator`, `oa:motivatedBy` (`oa:assessing` / `oa:commenting`), and
 `prov:` (`http://www.w3.org/ns/prov#`) `prov:wasGeneratedBy` /
-`prov:generated` / `prov:used`, plus **four `ik:` terms the published
-vocabulary does not yet define**: `ik:Review` (the pass-entry class),
-`ik:orphanedItems` (the count of findings whose quotes did not anchor),
-`ik:reviewedBytes` and `ik:totalBytes` (how much of the file the pass actually
-read, when the prompt ceiling truncated it). They are reported for a vocabulary
-arc — `vocabulary.ttl` lives in `ikigai-core` — and pinned as an exact list by
-`tests/conformance.rs`, so a fifth invented term is a failing test and so is the
-day these four land.
+`prov:generated` / `prov:used`, plus four `ik:` terms of its own: `ik:Review`
+(the pass-entry class), `ik:orphanedItems` (the count of findings whose quotes
+did not anchor), `ik:reviewedBytes` and `ik:totalBytes` (how much of the file
+the pass actually read, when the prompt ceiling truncated it). **All four are in
+the published vocabulary since `ikigai-vocab` 0.1.69**, which is what took the
+review pass out of the conformance suite's opt-out list: `urn:repo:{repo}:review:
+{path}` is now walked like every other face, with `tests/conformance.rs` pinning
+its undefined-term set as EMPTY so a fifth invented term is still a failing test.
+That release also removed `rdfs:domain ik:Explanation` from `ik:versionTag` and
+`ik:derivedAt`, which the review entries carry too — under entailment the old
+domain typed every review as an explanation.
 
 ## Conformance
 
