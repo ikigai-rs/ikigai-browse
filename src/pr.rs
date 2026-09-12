@@ -559,6 +559,7 @@ fn prs_description() -> Description {
         .input(
             ArgSpec::new("state")
                 .optional()
+                .class(crate::XSD_STRING)
                 .summary("filter by state, forwarded to the facade")
                 .one_of(["open", "closed", "merged", "all"])
                 .default_value("open"),
@@ -572,6 +573,7 @@ fn prs_description() -> Description {
         .input(
             ArgSpec::new("chrome")
                 .optional()
+                .class(crate::XSD_STRING)
                 .summary("embed renders the html rows only (no crumbs/wrapper)")
                 .one_of(["full", "embed"])
                 .default_value("full"),
@@ -579,6 +581,7 @@ fn prs_description() -> Description {
         .input(
             ArgSpec::new("as")
                 .optional()
+                .class(crate::XSD_STRING)
                 .summary("the face to render")
                 .one_of(["text/plain", "application/json", "text/html"])
                 .default_value("text/plain"),
@@ -933,13 +936,19 @@ fn prs_scoped_description() -> Description {
         .verb(Verb::Source)
         .verb(Verb::Meta)
         .requires(CAP_WILDCARD)
-        .input(ArgSpec::new("path").binding().summary(
-            "the scope: a directory or file path within the root, percent-encoded \
+        .input(
+            ArgSpec::new("path")
+                .binding()
+                .class(crate::XSD_STRING)
+                .summary(
+                    "the scope: a directory or file path within the root, percent-encoded \
                      — filters history, need not exist on disk",
-        ))
+                ),
+        )
         .input(
             ArgSpec::new("state")
                 .optional()
+                .class(crate::XSD_STRING)
                 .summary(
                     "open (probed via changed files), merged (mined from the path-scoped \
                      log), or all",
@@ -956,6 +965,7 @@ fn prs_scoped_description() -> Description {
         .input(
             ArgSpec::new("chrome")
                 .optional()
+                .class(crate::XSD_STRING)
                 .summary("embed renders the html rows only (no crumbs/scope label)")
                 .one_of(["full", "embed"])
                 .default_value("full"),
@@ -963,6 +973,7 @@ fn prs_scoped_description() -> Description {
         .input(
             ArgSpec::new("as")
                 .optional()
+                .class(crate::XSD_STRING)
                 .summary("the face to render")
                 .one_of(["text/plain", "application/json", "text/html"])
                 .default_value("text/plain"),
@@ -1120,6 +1131,7 @@ fn pr_description(has_store: bool, explain: bool) -> Description {
         description = description.input(
             ArgSpec::new("annotations")
                 .optional()
+                .class(crate::XSD_STRING)
                 .summary(
                     "include folds the PR's annotations in, drift-reconciled against the \
                      very diff served (the html face already renders them)",
@@ -1132,6 +1144,7 @@ fn pr_description(has_store: bool, explain: bool) -> Description {
         .input(
             ArgSpec::new("as")
                 .optional()
+                .class(crate::XSD_STRING)
                 .summary("the face to render")
                 .one_of(["text/plain", "application/json", "text/html"])
                 .default_value("text/plain"),
@@ -1349,12 +1362,19 @@ fn pr_explain_description() -> Description {
                 .class("http://www.w3.org/2001/XMLSchema#integer")
                 .summary("the pull-request number"),
         )
-        .input(ArgSpec::new("version").optional().summary(
-            "an archived version tag (e.g. pr-v1@qwen3-coder:30b) instead of the current one",
-        ))
+        .input(
+            ArgSpec::new("version")
+                .optional()
+                .class(crate::XSD_STRING)
+                .summary(
+                    "an archived version tag (e.g. pr-v1@qwen3-coder:30b) instead of the \
+                     current one",
+                ),
+        )
         .input(
             ArgSpec::new("as")
                 .optional()
+                .class(crate::XSD_STRING)
                 .summary("the face to render")
                 .one_of(["text/plain", "application/json", "text/html", "text/turtle"])
                 .default_value("text/plain"),
@@ -1635,6 +1655,7 @@ fn pr_review_description() -> Description {
         .input(
             ArgSpec::new("as")
                 .optional()
+                .class(crate::XSD_STRING)
                 .summary("the face to render")
                 .one_of(["text/plain", "application/json", "text/html", "text/turtle"])
                 .default_value("text/plain"),
@@ -1642,6 +1663,7 @@ fn pr_review_description() -> Description {
         .input(
             ArgSpec::new("debug")
                 .optional()
+                .class(crate::XSD_STRING)
                 .summary(
                     "raw: derive and return the model's unparsed answer (text/plain) — \
                      nothing parsed, minted, or archived; the parse-failure diagnosis face",

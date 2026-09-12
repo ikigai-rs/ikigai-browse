@@ -25,6 +25,14 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # is unchanged (it is `space_watched` with the watch dropped), no resource name,
 # capability or face moves, and a host that keeps calling `space` keeps the
 # behaviour it had — an edit lands at the next restart instead of the next read.
+#
+# 0.3.2 also adopts `ikigai-conformance` (`tests/conformance.rs`, 40 findings to
+# 0). Everything that moved is ADDITIVE to the manifold and invisible to a Rust
+# caller: every untyped input gained a `class`, three `as` inputs gained the
+# `text/plain` their own `default_value` already named (the enum omitted the
+# default), and the annotation Sink DECLARES the `content` it has read as the
+# piped form of `body` since the family shipped. A consumer reading the manifold
+# sees a truer contract; none sees a narrower one.
 version = "0.3.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
@@ -120,6 +128,12 @@ uuid = { version = "1", features = ["v4"] }
 notify = "6.1"
 
 [dev-dependencies]
+# The module recipe as one test (`tests/conformance.rs`): the suite walks every
+# endpoint this crate binds and reports every violation of the recipe at once.
+# 0.1.0 is what crates.io holds; the caret is deliberate — 0.1.1 adds an OUTPUTS
+# check this crate's by-hand `declared_outputs_are_the_media_types_served`
+# anticipates, and the day it publishes the walk should pick it up.
+ikigai-conformance = "0.1.0"
 futures = "0.3"
 # Validates the Turtle face in tests — the graph must actually parse.
 oxttl = "0.2"

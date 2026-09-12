@@ -1337,11 +1337,18 @@ fn explain_description(config: &ExplainConfig) -> Description {
             ArgSpec::new("path")
                 .binding()
                 .optional()
+                .class(crate::XSD_STRING)
                 .summary("path within the root, percent-encoded (omitted = the whole-repo rollup)"),
         )
-        .input(ArgSpec::new("version").optional().summary(
-            "an archived version tag (e.g. code-v1@qwen3-coder:30b) instead of the current one",
-        ))
+        .input(
+            ArgSpec::new("version")
+                .optional()
+                .class(crate::XSD_STRING)
+                .summary(
+                    "an archived version tag (e.g. code-v1@qwen3-coder:30b) instead of the \
+                     current one",
+                ),
+        )
         .input(
             ArgSpec::new("provider")
                 // The value is an endpoint IRI, not free text — the class says
@@ -1363,6 +1370,7 @@ fn explain_description(config: &ExplainConfig) -> Description {
         .input(
             ArgSpec::new("annotations")
                 .optional()
+                .class(crate::XSD_STRING)
                 .summary(
                     "include folds the target's annotations into the json, text, and \
                      html faces (a directory rollup folds its subtree's)",
@@ -1373,6 +1381,7 @@ fn explain_description(config: &ExplainConfig) -> Description {
         .input(
             ArgSpec::new("as")
                 .optional()
+                .class(crate::XSD_STRING)
                 .summary("the face to render")
                 .one_of(["text/plain", "application/json", "text/html", "text/turtle"])
                 .default_value("text/plain"),
@@ -1857,11 +1866,13 @@ fn versions_description() -> Description {
             ArgSpec::new("path")
                 .binding()
                 .optional()
+                .class(crate::XSD_STRING)
                 .summary("path within the root, percent-encoded (omitted = the root rollup)"),
         )
         .input(
             ArgSpec::new("as")
                 .optional()
+                .class(crate::XSD_STRING)
                 .summary("application/json for the structured rows, text/html for the option menu")
                 .one_of(["text/plain", "application/json", "text/html"])
                 .default_value("text/plain"),

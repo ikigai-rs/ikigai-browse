@@ -504,8 +504,11 @@ graph is diffable, SPARQL-able, *and navigable*. It uses these `ik:`
 `ik:byteSize`, `ik:about` (an explanation's subject), `ik:annotates` (an
 annotation's target), `ik:contentHash`, `ik:versionTag`, `ik:model`,
 `ik:promptKind`, `ik:explanation`, `ik:derivedAt`, and (S2) `ik:reanchored`,
-`ik:orphaned` (properties). These are pending addition to the published
-vocabulary (`ik:model` already exists). Before 0.2.2 both families wrote
+`ik:orphaned` (properties). **All nineteen are in the published vocabulary** —
+the `ikigai-conformance` walk checks every term of every Turtle face against
+`ikigai-vocab` and finds none of them invented. (This paragraph said they were
+"pending addition" long after they landed; the walk is what caught that, and is
+now what keeps it true.) Before 0.2.2 both families wrote
 `ik:target` for the subject/target link; that term belongs to the inbound-HTTP
 routing family, so browse retired it. Stores written by older versions read
 fine — both loaders and the versions listing accept the legacy predicate, all
@@ -517,9 +520,37 @@ use the external `oa:` (`http://www.w3.org/ns/oa#`) terms `oa:Annotation`,
 and `dcterms:created`. The S4 review layer adds the standard provenance terms
 `dcterms:creator`, `oa:motivatedBy` (`oa:assessing` / `oa:commenting`), and
 `prov:` (`http://www.w3.org/ns/prov#`) `prov:wasGeneratedBy` /
-`prov:generated` / `prov:used`, plus two `ik:` terms pending addition to the
-published vocabulary: `ik:Review` (the pass-entry class) and
-`ik:orphanedItems` (the count of findings whose quotes did not anchor).
+`prov:generated` / `prov:used`, plus **four `ik:` terms the published
+vocabulary does not yet define**: `ik:Review` (the pass-entry class),
+`ik:orphanedItems` (the count of findings whose quotes did not anchor),
+`ik:reviewedBytes` and `ik:totalBytes` (how much of the file the pass actually
+read, when the prompt ceiling truncated it). They are reported for a vocabulary
+arc — `vocabulary.ttl` lives in `ikigai-core` — and pinned as an exact list by
+`tests/conformance.rs`, so a fifth invented term is a failing test and so is the
+day these four land.
+
+## Conformance
+
+This crate **passes [`ikigai-conformance`](https://github.com/ikigai-rs/ikigai-conformance)**:
+one test (`tests/conformance.rs`) walks every endpoint the mount binds, fires
+every action it can, and holds all eight checks — ArgSpecs, declared-equals-
+enforced, skolemization, vocabulary, cacheability, pipeline citizenship,
+naming. It went from 40 findings to 0.
+
+Three things a reader of that test should know:
+
+* **The `oa:` namespace is registered.** The W3C Web Annotation Data Model is
+  not in the suite's well-known list, and the annotation overlay speaks it end
+  to end — eleven standard terms would otherwise read as invented, 31 findings
+  of noise.
+* **The pull-request family is opted out of the invoking checks**, because on a
+  real host those five endpoints resolve `urn:repo:pr:*` and shell out to `gh`.
+  The one check an opt-out should not drop — that each is refused with a typed
+  `Denied` under no grants, before anything is spawned — is asserted by hand.
+* **`urn:repo:{repo}:file:{path}`'s raw face is a pass-through**: with no `as=`
+  it serves the file's extension-mapped media type, which `Description::outputs`
+  (a closed list) has no way to say. The declaration is the three faces the
+  endpoint chooses for itself, and the extension contract is pinned separately.
 
 ## License
 

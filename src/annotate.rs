@@ -1369,7 +1369,7 @@ impl AnnotationEndpoint {
 }
 
 fn annotation_description() -> Description {
-    const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+    use crate::XSD_STRING;
     Description::new("annotation")
         .title("Web Annotation (oa:) on a browse resource")
         .summary(
@@ -1391,11 +1391,13 @@ fn annotation_description() -> Description {
                 .input(
                     ArgSpec::new("id")
                         .binding()
+                        .class(XSD_STRING)
                         .summary("the annotation id (a slug or minted uuid)"),
                 )
                 .input(
                     ArgSpec::new("as")
                         .optional()
+                        .class(XSD_STRING)
                         .summary("the face to render")
                         .one_of(["text/plain", "application/json", "text/turtle"])
                         .default_value("text/plain"),
@@ -1414,10 +1416,16 @@ fn annotation_description() -> Description {
                 // Anchoring sources the target through the kernel — a
                 // capability that cannot read the target cannot annotate it.
                 .requires(CAP_WILDCARD)
-                .input(ArgSpec::new("id").binding().optional().summary(
-                    "caller-supplied slug ([A-Za-z0-9._~-]+); sink the bare urn:iki:annotation to \
-                     mint a uuid",
-                ))
+                .input(
+                    ArgSpec::new("id")
+                        .binding()
+                        .optional()
+                        .class(XSD_STRING)
+                        .summary(
+                            "caller-supplied slug ([A-Za-z0-9._~-]+); sink the bare \
+                             urn:iki:annotation to mint a uuid",
+                        ),
+                )
                 .input(
                     ArgSpec::new("target")
                         .class("https://ikigai-rs.dev/ns#File")
@@ -1427,6 +1435,18 @@ fn annotation_description() -> Description {
                     "the note text (oa:bodyValue); falls back to piped content — one of the \
                      two must be present",
                 ))
+                // Pipeline citizenship: the Sink has read a piped body since the
+                // family shipped and never SAID so, so `… | sink
+                // urn:iki:annotation:{id}` was a write path no manifold announced.
+                .input(
+                    ArgSpec::new("content")
+                        .class(XSD_STRING)
+                        .optional()
+                        .summary(
+                            "the piped form of body — where a pipe's value and a sink's \
+                             request body arrive; body= wins when both are present",
+                        ),
+                )
                 .input(
                     ArgSpec::new("exact")
                         .class(XSD_STRING)
@@ -1445,8 +1465,9 @@ fn annotation_description() -> Description {
                 .input(
                     ArgSpec::new("as")
                         .optional()
+                        .class(XSD_STRING)
                         .summary("application/json for the structured acknowledgement")
-                        .one_of(["application/json"])
+                        .one_of(["text/plain", "application/json"])
                         .default_value("text/plain"),
                 )
                 .output("text/plain;charset=utf-8")
@@ -1456,7 +1477,12 @@ fn annotation_description() -> Description {
             ActionSpec::new(Verb::Delete)
                 .summary("remove an annotation and its selectors from the store")
                 .requires(CAP_ANNOTATE)
-                .input(ArgSpec::new("id").binding().summary("the annotation id"))
+                .input(
+                    ArgSpec::new("id")
+                        .binding()
+                        .class(XSD_STRING)
+                        .summary("the annotation id"),
+                )
                 .output("text/plain;charset=utf-8"),
         )
 }
@@ -1540,11 +1566,13 @@ fn annotations_description() -> Description {
             ArgSpec::new("path")
                 .binding()
                 .optional()
+                .class(crate::XSD_STRING)
                 .summary("file path within the root, percent-encoded (omitted = the whole repo)"),
         )
         .input(
             ArgSpec::new("as")
                 .optional()
+                .class(crate::XSD_STRING)
                 .summary("the face to render")
                 .one_of(["application/json", "text/html", "text/turtle"])
                 .default_value("application/json"),
@@ -2890,7 +2918,10 @@ mod tests {
         let sink_inputs: Vec<&str> = sink.inputs.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(
             sink_inputs,
-            ["id", "target", "body", "exact", "prefix", "suffix", "as"]
+            ["id", "target", "body", "content", "exact", "prefix", "suffix", "as"],
+            "`content` is declared beside `body`: the Sink has read a piped body \
+             since the family shipped, and a mutating action that reads its payload \
+             from somewhere the manifold does not name is a contract bug"
         );
         assert!(
             sink.inputs
