@@ -145,13 +145,15 @@ fn hash_description() -> Description {
             ArgSpec::new("path")
                 .binding()
                 .optional()
+                .class(crate::XSD_STRING)
                 .summary("path within the root, percent-encoded (omitted = the whole root)"),
         )
         .input(
             ArgSpec::new("as")
                 .optional()
+                .class(crate::XSD_STRING)
                 .summary("application/json for the structured form")
-                .one_of(["application/json"])
+                .one_of(["text/plain", "application/json"])
                 .default_value("text/plain"),
         )
         .output("text/plain;charset=utf-8")

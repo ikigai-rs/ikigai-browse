@@ -143,6 +143,15 @@ pub const CAP_WILDCARD: &str = "urn:cap:browse:read:*";
 /// The grant prefix: `urn:cap:browse:read:{repo}` grants one configured root.
 pub const CAP_PREFIX: &str = "urn:cap:browse:read:";
 
+/// The datatype every scalar input in this crate declares.
+///
+/// Paths, face labels, enum-valued switches and annotation slugs are all
+/// strings on the wire and strings in the value — there is no narrower XSD
+/// datatype that is TRUE of them. The two exceptions declare their own: a pull
+/// request number is `xsd:integer`, and an annotation's `target` is the
+/// `ik:File` entity it names.
+pub(crate) const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+
 pub(crate) type Roots = Arc<BTreeMap<String, PathBuf>>;
 
 /// Mount the browse module over `roots` — `(name, directory)` pairs.
@@ -854,11 +863,13 @@ fn tree_description(explain: bool) -> Description {
             ArgSpec::new("path")
                 .binding()
                 .optional()
+                .class(XSD_STRING)
                 .summary("directory path within the root, percent-encoded (omitted = the top)"),
         )
         .input(
             ArgSpec::new("as")
                 .optional()
+                .class(XSD_STRING)
                 .summary("the face to render")
                 .one_of(["text/plain", "text/html", "text/turtle"])
                 .default_value("text/plain"),
@@ -1228,6 +1239,7 @@ fn file_description(has_store: bool, explain: bool) -> Description {
         .input(
             ArgSpec::new("path")
                 .binding()
+                .class(XSD_STRING)
                 .summary("file path within the root, percent-encoded"),
         );
     // Declared only when a store is mounted — offering the arg on a plain
@@ -1236,6 +1248,7 @@ fn file_description(has_store: bool, explain: bool) -> Description {
         description = description.input(
             ArgSpec::new("annotations")
                 .optional()
+                .class(XSD_STRING)
                 .summary(
                     "include folds the file's annotations in: the text face appends a \
                      margin-notes section, drift-reconciled against the very content served \
@@ -1249,6 +1262,7 @@ fn file_description(has_store: bool, explain: bool) -> Description {
         .input(
             ArgSpec::new("as")
                 .optional()
+                .class(XSD_STRING)
                 .summary("text/html for the highlighted, line-anchored view")
                 .one_of(["text/html"]),
         )
@@ -1809,8 +1823,9 @@ fn state_description() -> Description {
         .input(
             ArgSpec::new("as")
                 .optional()
+                .class(XSD_STRING)
                 .summary("application/json for the structured form")
-                .one_of(["application/json"])
+                .one_of(["text/plain", "application/json"])
                 .default_value("text/plain"),
         )
         .output("text/plain;charset=utf-8")

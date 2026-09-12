@@ -758,11 +758,13 @@ fn review_description() -> Description {
         .input(
             ArgSpec::new("path")
                 .binding()
+                .class(crate::XSD_STRING)
                 .summary("file path within the root, percent-encoded"),
         )
         .input(
             ArgSpec::new("as")
                 .optional()
+                .class(crate::XSD_STRING)
                 .summary("the face to render")
                 .one_of(["text/plain", "application/json", "text/html", "text/turtle"])
                 .default_value("text/plain"),
@@ -770,6 +772,7 @@ fn review_description() -> Description {
         .input(
             ArgSpec::new("debug")
                 .optional()
+                .class(crate::XSD_STRING)
                 .summary(
                     "raw: derive and return the model's unparsed answer (text/plain) — \
                      nothing parsed, minted, or archived; the parse-failure diagnosis face",
