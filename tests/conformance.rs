@@ -109,13 +109,6 @@ const PR_FACADES: [(&str, &str); 5] = [
 /// Why they are not fired: true of the module, not of this fixture.
 const REACHES_GITHUB: &str = "resolves urn:repo:pr:* / urn:repo:log, which shell out to `gh`";
 
-/// Why the review pass is not fired: one CHECK is wrong for it, and 0.1.0 has no
-/// way to say that — see [`the_review_graph_uses_four_terms_the_vocabulary_owes_it`],
-/// which is everything this opt-out drops, pinned by hand.
-const UNDEFINED_REVIEW_TERMS: &str =
-    "its text/turtle face uses four ik: terms the vocabulary does not define yet \
-     (a vocab arc, reported up); 0.1.0 has no per-check opt-out";
-
 /// Every description id this crate binds. A sixteenth endpoint bound without a
 /// line here is held to a weaker standard than the fifteen; a listed id that binds
 /// nothing is a stale list.
@@ -303,7 +296,7 @@ fn suite() -> Suite {
     for (id, _) in PR_FACADES {
         suite = suite.opt_out(id, None, REACHES_GITHUB);
     }
-    suite.opt_out("browse-review", None, UNDEFINED_REVIEW_TERMS)
+    suite
 }
 
 // ---------------------------------------------------------------------------
@@ -358,8 +351,8 @@ fn conforms() {
     );
     assert_eq!(
         report.declared.opted_out.len(),
-        PR_FACADES.len() + 1,
-        "only the pull-request family and the review pass are opted out: {report}"
+        PR_FACADES.len(),
+        "only the pull-request family is opted out: {report}"
     );
 }
 
@@ -604,43 +597,44 @@ fn the_raw_file_face_serves_the_extension_mapped_type() {
     );
 }
 
-/// ★ **What the `browse-review` opt-out drops, pinned by hand — and the four terms
-/// the vocabulary owes this face, pinned as an EXACT list.**
+/// ★ **The review graph introduces no undefined term — and the graph the walk
+/// checks that over is not empty, and is live.**
 ///
-/// The review pass's `text/turtle` graph uses `ik:Review`, `ik:orphanedItems`,
-/// `ik:reviewedBytes` and `ik:totalBytes`, none of which `ikigai-vocab` defines.
-/// Two of them have carried a "reported up, not added here" comment since the pass
-/// shipped; the other two arrived later and carried nothing. Adding them is a
-/// vocabulary arc (`vocabulary.ttl` lives in `ikigai-core`, which this crate must
-/// not edit), and until it lands `VOCABULARY` is right and the module cannot be
-/// clean.
+/// Until `ikigai-vocab` 0.1.69 this face used four `ik:` terms nothing defined —
+/// `ik:Review`, `ik:orphanedItems`, `ik:reviewedBytes`, `ik:totalBytes` — and
+/// `browse-review` was the one endpoint here opted out of the INVOKING checks
+/// solely because of them. They are published now (`ikigai-core` #107), the
+/// `opt_out` in [`suite()`] is gone, and ENFORCED / CACHEABLE / SKOLEM-RDF /
+/// VOCABULARY reach the review pass for the first time. The hand-written
+/// ENFORCED (`Denied` under no grants) and SKOLEM-RDF (no blank nodes) this test
+/// used to carry went with the opt-out: the walk does exactly those, over exactly
+/// this face.
 ///
-/// `Suite::opt_out` is the only per-id lever 0.1.0 has, and it drops the other
-/// three invoking checks with it (conformance PENDING #6/#21), so they are asserted
-/// here: the graph is skolemized, the result is live, and the action is refused
-/// under no grants. The undefined set is pinned EXACTLY, so a fifth invented term
-/// goes red, and so does the day the vocabulary gains these four — which is when
-/// the opt-out comes out.
+/// What the walk still cannot say, and this does:
+///
+/// * **`OWED` is EMPTY, pinned.** VOCABULARY says the same thing across every face
+///   at once and names the term in a report; this says it about THIS face, and it
+///   is the guard for the next term the review pass invents — the failure arrives
+///   with the instruction ("define it in `ikigai-vocab` first") attached.
+/// * **The graph is NON-EMPTY.** A face over an empty store passes SKOLEM-RDF and
+///   VOCABULARY without ever seeing a triple (conformance PENDING #26/#142). What
+///   makes those two non-vacuous here is that the stub model's one `QUOTE:`
+///   anchors in `src/lib.rs` and the pass mints a finding; nothing in the suite
+///   asserts that it did.
+/// * **The result is LIVE.** `CACHEABLE` reports an endpoint DECLARED cacheable
+///   that is not; it is silent about one that is neither declared nor cacheable.
+///   "A derivation over a working tree is `Expiry::Always`" is a decision of this
+///   module (the same one [`the_style_sheet_is_the_only_threaded_representation_and_the_watch_names_its_threads`]
+///   pins for every other face, and whose probe list this target cannot join —
+///   it needs a model), so it is pinned by hand.
 #[test]
-fn the_review_graph_uses_four_terms_the_vocabulary_owes_it() {
-    const OWED: [&str; 4] = [
-        "https://ikigai-rs.dev/ns#Review",
-        "https://ikigai-rs.dev/ns#orphanedItems",
-        "https://ikigai-rs.dev/ns#reviewedBytes",
-        "https://ikigai-rs.dev/ns#totalBytes",
-    ];
+fn the_review_graph_introduces_no_undefined_term() {
+    const OWED: [&str; 0] = [];
     let scratch = Scratch::new();
     let (kernel, _watch) = seeded(&scratch);
     let target = "urn:repo:demo:review:src/lib.rs";
 
-    // ENFORCED, the check the opt-out drops that never reaches a model.
-    let none = Capability::scoped(Vec::<String>::new());
-    let err = issue(&kernel, request(Verb::Source, target, &[]), &none)
-        .expect_err("the review pass is refused under no grants");
-    assert!(matches!(err, Error::Denied(_)), "{err:?}");
-    assert!(!err.is_transient(), "{err:?}");
-
-    // CACHEABLE: a derivation over a working tree is live.
+    // A derivation over a working tree is live: nothing here watches the tree.
     let root = Capability::root();
     let turtle = issue(
         &kernel,
@@ -651,14 +645,9 @@ fn the_review_graph_uses_four_terms_the_vocabulary_owes_it() {
     assert_eq!(turtle.expiry, Expiry::Always);
     assert!(turtle.threads().is_empty());
 
-    // SKOLEM-RDF, and the vocabulary set, exactly.
     let triples = ikigai_conformance::rdf::parse("text/turtle", &turtle.bytes)
         .expect("the review face parses");
     assert!(!triples.is_empty(), "the pass minted a graph to check");
-    assert!(
-        ikigai_conformance::rdf::blank_nodes(&triples).is_empty(),
-        "the review graph is skolemized"
-    );
     let undefined: BTreeSet<String> = ikigai_conformance::rdf::terms(&triples)
         .into_iter()
         .filter(|t| !ikigai_conformance::rdf::is_defined(t, &[OA.to_string()]))
@@ -668,8 +657,8 @@ fn the_review_graph_uses_four_terms_the_vocabulary_owes_it() {
         OWED.into_iter()
             .map(str::to_string)
             .collect::<BTreeSet<_>>(),
-        "the review face's undefined terms changed: either a new one was invented, \
-         or the vocabulary gained these and the opt-out in `suite()` can come out"
+        "the review face invented a term: define it in `ikigai-vocab` (a core arc) \
+         before it ships, or the whole walk goes red on VOCABULARY with it"
     );
 }
 
