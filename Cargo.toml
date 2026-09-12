@@ -130,10 +130,12 @@ notify = "6.1"
 [dev-dependencies]
 # The module recipe as one test (`tests/conformance.rs`): the suite walks every
 # endpoint this crate binds and reports every violation of the recipe at once.
-# 0.1.0 is what crates.io holds; the caret is deliberate — 0.1.1 adds an OUTPUTS
-# check this crate's by-hand `declared_outputs_are_the_media_types_served`
-# anticipates, and the day it publishes the walk should pick it up.
-ikigai-conformance = "0.1.0"
+# 0.2.0 is a FLOOR, not just what resolves: `Suite::opt_out_check` arrived in it,
+# and `tests/conformance.rs` needs it. The 0.1.1 OUTPUTS check this pin's previous
+# comment anticipated did land, did report `browse-file`'s pass-through raw face,
+# and is waived per-rule there — with the whole endpoint still under the other
+# nine checks, which is exactly what only 0.2.0 can express.
+ikigai-conformance = "0.2.0"
 # A FLOOR DECLARATION, not a code dependency: no line in this crate calls it.
 # The suite's `VOCABULARY` check reads `ikigai_vocab::VOCABULARY` as its oracle,
 # and the suite's own pin (`^0.1.66`) is the floor for the SUITE's API, not for
