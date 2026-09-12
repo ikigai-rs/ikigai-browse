@@ -49,6 +49,14 @@
 //!   31 findings of pure noise). `Suite::namespace` documents itself as "a
 //!   vocabulary this module serves"; this one is published by the W3C and merely
 //!   spoken here, so the use is a stated deviation rather than a clean fit.
+//! * `opt_out_check("browse-file", Check::Outputs, …)` — the ONE per-rule waiver,
+//!   on the one endpoint whose raw face is a pass-through (see
+//!   [`the_raw_file_face_serves_the_extension_mapped_type`]). `opt_out` would have
+//!   been the wrong lever and this crate knows the cost first-hand: one
+//!   legitimately red `VOCABULARY` on `browse-review` took `ENFORCED`, `CACHEABLE`
+//!   and `SKOLEM-RDF` off the crate's most security-relevant endpoint for a release
+//!   cycle. The waiver names its own removal condition (core PENDING §20) in the
+//!   reason string, so it travels into every report rather than living in a comment.
 //! * `cacheable("browse-style")` — the one representation in the crate that is
 //!   `.cacheable()`. Everything else reads a working tree and is `Expiry::Always`,
 //!   which is the honest spelling for a read of a tree nothing here watches; the
@@ -71,7 +79,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use ikigai_browse::{ExplainConfig, Mount, StyleWatch, CAP_ANNOTATE, CAP_WILDCARD};
-use ikigai_conformance::{Fixture, Suite};
+use ikigai_conformance::{Check, Fixture, Suite};
 use ikigai_core::{
     ArgRef, Capability, Description, EndpointSpace, Error, Exact, Expiry, Fallback, FnEndpoint,
     Iri, Kernel, ReprType, Representation, Request, Verb,
@@ -108,6 +116,18 @@ const PR_FACADES: [(&str, &str); 5] = [
 
 /// Why they are not fired: true of the module, not of this fixture.
 const REACHES_GITHUB: &str = "resolves urn:repo:pr:* / urn:repo:log, which shell out to `gh`";
+
+/// Why `browse-file` waives `OUTPUTS` and nothing else, printed in every report.
+///
+/// The removal condition is named so the waiver cannot outlive its cause: core
+/// PENDING §20 is the pass-through output spelling `Description` does not have.
+const RAW_FACE_IS_A_PASS_THROUGH: &str =
+    "the raw face serves the file's EXTENSION-mapped type (a property of the path, not \
+     of the endpoint); the closed 26-type map cannot be declared because three of them \
+     are RDF faces and declaring one makes SKOLEM-RDF/VOCABULARY parse an arbitrary \
+     file as a graph. Pinned by hand in \
+     `the_raw_file_face_serves_the_extension_mapped_type`; remove this waiver when \
+     `Description` grows a pass-through output marker (core PENDING §20)";
 
 /// Every description id this crate binds. A sixteenth endpoint bound without a
 /// line here is held to a weaker standard than the fifteen; a listed id that binds
@@ -292,7 +312,12 @@ fn suite() -> Suite {
                 .arg("exact", QUOTE),
         )
         .namespace(OA)
-        .cacheable("browse-style");
+        .cacheable("browse-style")
+        // ★ ONE check, on ONE endpoint. `opt_out` would have been the wrong lever
+        // here and this crate already knows why: it cost `browse-review` ENFORCED,
+        // CACHEABLE and SKOLEM-RDF for a release cycle over a single legitimately
+        // red VOCABULARY. `browse-file` keeps all nine of the others.
+        .opt_out_check("browse-file", Check::Outputs, RAW_FACE_IS_A_PASS_THROUGH);
     for (id, _) in PR_FACADES {
         suite = suite.opt_out(id, None, REACHES_GITHUB);
     }
@@ -353,6 +378,65 @@ fn conforms() {
         report.declared.opted_out.len(),
         PR_FACADES.len(),
         "only the pull-request family is opted out: {report}"
+    );
+    // ★ The waiver is EXACTLY one rule on exactly one endpoint — the only thing
+    // standing between this report and a whole-suite pass. A second entry appearing
+    // here without a line in this test is a rule somebody silenced quietly.
+    assert_eq!(
+        report
+            .declared
+            .opted_out_checks
+            .iter()
+            .map(|o| (o.endpoint.as_str(), o.check))
+            .collect::<Vec<_>>(),
+        vec![("browse-file", Check::Outputs)],
+        "the per-check waiver list changed: {report}"
+    );
+
+    // ★ **The walk REACHED the faces the waiver is about.** A clean report and a
+    // report over nothing that resolved read identically, and the waiver added here
+    // is exactly the kind of change that could hide more than intended — so the
+    // 0.2.0 `probed:` lines are read, not merely printed. `browse-file`'s raw face
+    // is among them (as `text/markdown`, the very type OUTPUTS reported), which is
+    // what makes the waiver a subtraction of one rule rather than of the endpoint.
+    let probed: BTreeSet<String> = report
+        .probed
+        .iter()
+        .map(|p| {
+            // `Verb` implements neither `Display` nor a public spelling helper —
+            // the report's own `verb_name` is `pub(crate)`, so an adopter reading
+            // `Probed.verb` re-derives it. `Debug` is the only public handle.
+            let verb = format!("{:?}", p.verb).to_ascii_lowercase();
+            format!("{} {verb} {}", p.endpoint, p.face)
+        })
+        .collect();
+    assert_eq!(
+        probed,
+        [
+            "annotation sink text/plain",
+            "annotation source text/plain",
+            "annotation source text/turtle",
+            "browse-annotations source application/json",
+            "browse-annotations source text/turtle",
+            "browse-explain source text/plain",
+            "browse-explain source text/turtle",
+            "browse-explain-versions source text/plain",
+            // ★ The waived endpoint IS reached, under the very type OUTPUTS
+            // reported — so the waiver subtracts one rule, not the endpoint.
+            "browse-file source text/markdown",
+            "browse-hash source text/plain",
+            "browse-review source text/plain",
+            "browse-review source text/turtle",
+            "browse-state source text/plain",
+            "browse-style source text/css",
+            "browse-tree source text/plain",
+            "browse-tree source text/turtle",
+            "stub-llm source text/plain",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<BTreeSet<String>>(),
+        "the faces the walk reached changed: {report}"
     );
 }
 
@@ -461,14 +545,14 @@ fn the_style_sheet_is_the_only_threaded_representation_and_the_watch_names_its_t
     );
 }
 
-/// What `ikigai-conformance` 0.1.0 does not check (its PENDING #11, landed in the
-/// unpublished 0.1.1 as `OUTPUTS`): a declared output is never compared with what
-/// the action serves.
+/// What `ikigai-conformance`'s `OUTPUTS` check still does not reach, now that it
+/// is published and running here: it compares only the MINIMAL resolution (no
+/// `as=`) against the declared list, in one direction.
 ///
 /// Read by hand for every face the module announces: each `as=` value serves a
-/// media type the description declares, and every declared output is served by
-/// some call. The pull-request facades are excluded for the same reason they are
-/// opted out of the walk.
+/// media type the description declares, and — the converse direction, which no
+/// check does — every declared output is served by some call. The pull-request
+/// facades are excluded for the same reason they are opted out of the walk.
 #[test]
 fn declared_outputs_are_the_media_types_served() {
     let scratch = Scratch::new();
@@ -557,10 +641,18 @@ fn declared_outputs_are_the_media_types_served() {
 ///
 /// So the declaration stays the three faces the endpoint chooses for itself, and
 /// the contract the pass-through actually keeps is pinned here instead: the served
-/// type is the extension's, and `charset=utf-8` rides on the textual ones. When
-/// `ikigai-conformance` 0.1.1's `OUTPUTS` check lands, this endpoint is where this
-/// crate will have to subtract it and say why — which is the suite README's own
-/// answer for a pass-through output.
+/// type is the extension's, and `charset=utf-8` rides on the textual ones.
+///
+/// ★ **That prediction came true, and this test is now what stands in the waiver's
+/// place.** `ikigai-conformance` 0.2.0's `OUTPUTS` reported exactly this endpoint
+/// (`served text/markdown … declares only application/octet-stream, text/html,
+/// text/plain`), and [`suite`] subtracts it with
+/// [`Suite::opt_out_check`](ikigai_conformance::Suite::opt_out_check) — ONE rule,
+/// leaving the other nine on the endpoint. Nothing mechanical looks at this
+/// endpoint's minimal resolution any more, so everything the waiver gives up is
+/// asserted below by hand: the full media type INCLUDING the charset parameter,
+/// both no-extension outcomes, and that each of the three declared faces is
+/// reachable.
 #[test]
 fn the_raw_file_face_serves_the_extension_mapped_type() {
     let scratch = Scratch::new();
@@ -570,24 +662,39 @@ fn the_raw_file_face_serves_the_extension_mapped_type() {
         ("a.png", &[0x89, b'P', b'N', b'G'][..]),
         ("a.txt", &b"plain\n"[..]),
         ("a.unknown", &[0xff, 0xfe, 0x00][..]),
+        ("a.unknown-text", &b"still words\n"[..]),
+        ("noextension", &b"words, no dot\n"[..]),
     ] {
         std::fs::write(scratch.tree.join(name), bytes).expect("fixture file");
     }
     let (kernel, _watch) = kernel_over(&scratch);
     let root = Capability::root();
+    // The served type follows the EXTENSION, and `charset=utf-8` rides on the
+    // textual ones. The charset half is asserted, not merely documented: it is a
+    // claim about bytes leaving the process, and the waiver above means the suite
+    // no longer looks at this endpoint's minimal resolution at all.
     for (name, expected) in [
-        ("a.md", "text/markdown"),
-        ("a.ttl", "text/turtle"),
+        ("a.md", "text/markdown;charset=utf-8"),
+        ("a.ttl", "text/turtle;charset=utf-8"),
         ("a.png", "image/png"),
-        ("a.txt", "text/plain"),
+        ("a.txt", "text/plain;charset=utf-8"),
+        // ★ Both halves of "the extension says nothing": binary falls back to
+        // `application/octet-stream`, valid UTF-8 is sniffed to `text/plain`. Two
+        // of the three DECLARED outputs are exactly these, so a test that reached
+        // only one of them left a declared face unpinned.
         ("a.unknown", "application/octet-stream"),
+        ("a.unknown-text", "text/plain;charset=utf-8"),
+        ("noextension", "text/plain;charset=utf-8"),
     ] {
         let target = format!("urn:repo:demo:file:{name}");
         let repr = issue(&kernel, request(Verb::Source, &target, &[]), &root)
             .unwrap_or_else(|e| panic!("`{target}`: {e}"));
-        assert_eq!(bare(&repr.repr_type.media_type), expected, "{target}");
+        // `canonical()`, not `media_type`: the charset is a PARAMETER, and the
+        // bare field would silently pass an endpoint that stopped emitting it.
+        assert_eq!(repr.repr_type.canonical(), expected, "{target}");
     }
-    // And the three the endpoint chooses for itself are what it declares.
+    // And the three the endpoint chooses for itself are what it declares — the
+    // list the waiver leaves nothing else checking.
     assert_eq!(
         declared_outputs(&kernel, "urn:repo:demo:file:README.md"),
         ["application/octet-stream", "text/html", "text/plain"]
@@ -595,6 +702,20 @@ fn the_raw_file_face_serves_the_extension_mapped_type() {
             .map(str::to_string)
             .collect::<BTreeSet<String>>()
     );
+    // Each of those three is reachable: `text/html` by `as=`, and the other two by
+    // the two no-extension outcomes above. A declared face nothing can serve is the
+    // same over-offer the OUTPUTS check exists to report.
+    let html = issue(
+        &kernel,
+        request(
+            Verb::Source,
+            "urn:repo:demo:file:a.md",
+            &[("as", "text/html")],
+        ),
+        &root,
+    )
+    .expect("the html face resolves");
+    assert_eq!(bare(&html.repr_type.media_type), "text/html");
 }
 
 /// ★ **The review graph introduces no undefined term — and the graph the walk
