@@ -8,7 +8,7 @@ pairs), and each root answers these resource families:
 | resource | what it is |
 |----------|------------|
 | `urn:repo:{repo}:tree` / `urn:repo:{repo}:tree:{path}` | a directory listing — `text/plain` (default; `name`⇥`kind`⇥`size` per line), `as=text/html` (htmx-navigable; with the explanation family mounted, an explain link for the directory and one per entry), `as=text/turtle` (the skolemized graph) |
-| `urn:repo:{repo}:file:{path}` | file content — raw bytes under an extension-mapped media type; `as=text/html` for a syntax-highlighted, line-numbered view with `#L{n}` anchors, inline markers at annotated lines, and (explanations mounted) an explain link; `annotations=include` (S3, store mounted) serves the text plus a compact, drift-reconciled margin-notes section — content and human annotations in one resolution |
+| `urn:repo:{repo}:file:{path}` | file content — raw bytes under an extension-mapped media type; `as=text/html` for a syntax-highlighted, line-numbered view with `#L{n}` anchors, inline markers at annotated lines, and (explanations mounted) an explain link; `annotations=include` (store mounted) serves the text plus a compact, drift-reconciled margin-notes section — content and human annotations in one resolution |
 | `urn:repo:{repo}:state` | the **freshness oracle** — HEAD sha + `clean`/`dirty:{n}` on one line; `as=application/json` for `{head, dirty: [paths]}` |
 | `urn:repo:{repo}:hash[:{path}]` | the **content hash** (S1) — `sha256:{hex}` of a file's bytes, or the **merkle** construction over a directory's entries (ignore-filtered), so one edit re-keys exactly the path to the root |
 | `urn:repo:{repo}:explain[:{path}]` | an **LLM-derived orientation explanation** (S1), archived by `(path, content-hash, version-tag)` — derived once per content version, reused forever; `as=application/json` adds `{content_hash, version_tag, derived}`, `as=text/html` the page face with provenance and a backlink to the explained resource, `as=text/turtle` the archive entry's graph; `version=` addresses an older tag; `provider=` derives this one against a different host-allowed backend (keyed by that backend's own model identity, so two models coexist); `annotations=include` (S3) folds the target's annotations in — the json face gains an `annotations` array, the text face appends margin notes, the html face renders the annotation cards, and a directory rollup folds its subtree's |
@@ -214,8 +214,8 @@ style_cache`.
 
 **Since 0.3.2 the crate supplies that watch.** A declared thread is a promise
 that something cuts it, and until now nothing did — an edited `a11y.toml` was
-served stale until the process restarted (ikigai-a11y #8 pinned exactly that:
-the edit with no cut is stale, and `kernel.cut()` on those names recomputes).
+served stale until the process restarted. The failure is exact: an edit with no
+cut is stale, and `kernel.cut()` on those names is what recomputes it.
 `Mount::space_watched()` returns the space **and** a `StyleWatch` from the same
 resolution of the config home; once the kernel exists the host starts it:
 
@@ -436,7 +436,8 @@ distinguished only by provenance (all standard terms — no vocab publish):
 - `dcterms:creator` — the model identity (its presence IS the machine
   discriminator; the JSON rows also carry a `machine` boolean).
 - `oa:motivatedBy` — `oa:assessing` on review findings; the human Sink stamps
-  `oa:commenting` (absent on pre-S4 stores — read compatibility).
+  `oa:commenting` (absent on stores written before the review layer existed, so a
+  reader must tolerate it missing).
 - `prov:wasGeneratedBy` — the pass entry that minted the finding; the pass
   records the inverse as `prov:generated` and the reviewed file as
   `prov:used`.
@@ -517,7 +518,7 @@ new writes (and any annotation rewrite) use the new terms, and lingering
 use the external `oa:` (`http://www.w3.org/ns/oa#`) terms `oa:Annotation`,
 `oa:TextQuoteSelector`, `oa:TextPositionSelector`, `oa:bodyValue`,
 `oa:hasSelector`, `oa:prefix`, `oa:exact`, `oa:suffix`, `oa:start`, `oa:end`,
-and `dcterms:created`. The S4 review layer adds the standard provenance terms
+and `dcterms:created`. The review layer adds the standard provenance terms
 `dcterms:creator`, `oa:motivatedBy` (`oa:assessing` / `oa:commenting`), and
 `prov:` (`http://www.w3.org/ns/prov#`) `prov:wasGeneratedBy` /
 `prov:generated` / `prov:used`, plus four `ik:` terms of its own: `ik:Review`
