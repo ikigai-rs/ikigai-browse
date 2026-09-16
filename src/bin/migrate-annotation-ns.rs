@@ -73,7 +73,9 @@ fn run() -> Result<ExitCode, String> {
 
     println!("  store    : {}", path.display());
     if let Some(GraphName::NamedNode(g)) = &graph {
-        println!("  graph    : <{g}>");
+        // `NamedNode`'s Display already brackets the IRI — `<{g}>` prints
+        // `<<urn:…>>`, which reads like a different IRI in a deploy window.
+        println!("  graph    : {g}");
     }
     println!("  moving   : {} quads", plan.len());
     println!();
