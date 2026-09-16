@@ -94,7 +94,6 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::archive::Archive;
 use async_trait::async_trait;
 use ikigai_core::{
     ArgRef, ArgSpec, Description, Endpoint, EndpointSpace, Error, Invocation, Iri, Representation,
@@ -104,6 +103,7 @@ use oxigraph::model::{GraphName, Literal, NamedNode, Quad, Term};
 use oxigraph::store::Store;
 
 use crate::annotate::{self, Included, TargetFilter};
+use crate::archive::Archive;
 use crate::hash::hash_iri;
 use crate::{
     crumbs_html, esc, file_iri, granted, human_size, include_annotations, iri_encode,

@@ -44,7 +44,6 @@
 
 use std::sync::Arc;
 
-use crate::archive::Archive;
 use async_trait::async_trait;
 use ikigai_core::{
     ArgRef, ArgSpec, Description, Endpoint, EndpointSpace, Error, Invocation, Representation,
@@ -53,6 +52,7 @@ use ikigai_core::{
 use oxigraph::model::{Literal, NamedNode, Quad, Term};
 
 use crate::annotate::{self, Included, CAP_ANNOTATE, PROV};
+use crate::archive::Archive;
 use crate::explain::{
     ik, iso8601, parse_iri, provider_label, resolve_model, truncate, truncated_len, CAP_NET, IK,
 };

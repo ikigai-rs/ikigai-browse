@@ -75,7 +75,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::archive::Archive;
 use async_trait::async_trait;
 use ikigai_core::{
     ActionSpec, ArgSpec, Bindings, Description, Endpoint, EndpointSpace, Error, Grammar,
@@ -84,6 +83,7 @@ use ikigai_core::{
 use oxigraph::model::{Literal, NamedNode, Quad, Term};
 use sha2::{Digest, Sha256};
 
+use crate::archive::Archive;
 use crate::explain::{ik, iso8601, parse_iri, IK};
 use crate::{
     crumbs_html, esc, file_iri, granted, iri_decode, path_binding, repo_root, repr, repr_utf8,

@@ -43,7 +43,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::archive::Archive;
 use async_trait::async_trait;
 use ikigai_core::{
     ArgRef, ArgSpec, Bindings, Description, Endpoint, EndpointSpace, Error, Grammar, Invocation,
@@ -51,6 +50,7 @@ use ikigai_core::{
 };
 
 use crate::annotate::{self, Included, CAP_ANNOTATE};
+use crate::archive::Archive;
 use crate::explain::{
     entry_iri, explain_turtle, iso8601, load_entry, parse_iri, provider_label, resolve_model,
     store_entry, truncate, truncated_len, ArchiveEntry, CAP_NET, SYSTEM_PROMPT,
