@@ -2305,6 +2305,29 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// `ExplainConfig::graph` ALONE — the only spelling a host calling
+    /// `space_with_explain` has, which is what `ikigai-cli`'s embedded host
+    /// does. `Mount::graph` never being called must not quietly win.
+    #[test]
+    fn a_config_graph_alone_governs_the_whole_mount() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "fn one() {}\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let space = crate::space_with_explain(
+            vec![("demo".to_string(), root.clone())],
+            crate::ExplainConfig::new(Arc::clone(&store))
+                .graph(NamedNode::new("urn:iki:graph:from-config").unwrap()),
+        );
+        let k = Kernel::new(Arc::new(space));
+        annotate(&k, "c1", "a.rs", "fn one()", "config named the graph");
+        assert_eq!(
+            graphs_of(&store),
+            std::collections::BTreeSet::from(["<urn:iki:graph:from-config>".to_string()]),
+            "the annotation family follows the graph the EXPLAIN config named"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// The claim `crate::archive` and `crate::migrate::BROWSE_SUBJECT_PREFIXES`
     /// both rest on: browse writes no quad about a subject it did not mint. It
     /// is what makes the graph migration's subject-selection COMPLETE — a
