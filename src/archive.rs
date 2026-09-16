@@ -30,9 +30,7 @@
 
 use std::sync::Arc;
 
-use oxigraph::model::{
-    GraphName, NamedNodeRef, NamedOrBlankNodeRef, Quad, TermRef,
-};
+use oxigraph::model::{GraphName, NamedNodeRef, NamedOrBlankNodeRef, Quad, TermRef};
 use oxigraph::store::{QuadIter, StorageError, Store};
 
 /// A store handle bound to one graph.

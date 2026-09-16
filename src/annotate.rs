@@ -75,13 +75,13 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::archive::Archive;
 use async_trait::async_trait;
 use ikigai_core::{
     ActionSpec, ArgSpec, Bindings, Description, Endpoint, EndpointSpace, Error, Grammar,
     Invocation, Iri, Representation, Result, UriTemplate, Verb,
 };
 use oxigraph::model::{Literal, NamedNode, Quad, Term};
-use crate::archive::Archive;
 use sha2::{Digest, Sha256};
 
 use crate::explain::{ik, iso8601, parse_iri, IK};
@@ -810,7 +810,11 @@ pub(crate) fn content_hash(bytes: &[u8]) -> String {
 /// Returns the line its anchor renders at (`None` when no content is in
 /// hand). Persists to the store ONLY when something changed — repeat reads of
 /// an unchanged (or already-orphaned) annotation touch nothing.
-fn refresh(archive: &Archive, ann: &mut Annotation, current: &CurrentContent) -> Result<Option<u64>> {
+fn refresh(
+    archive: &Archive,
+    ann: &mut Annotation,
+    current: &CurrentContent,
+) -> Result<Option<u64>> {
     match current {
         // Served exactly as recorded, flags untouched: no content was in
         // hand, so nothing can honestly be said about drift.
@@ -1925,11 +1929,9 @@ fn list_annotations_for_target(archive: &Archive, target_iri: &str) -> Result<Ve
     };
     let mut ids = std::collections::BTreeSet::new();
     for predicate in [ik("annotates"), ik("target")] {
-        for quad in archive.quads_for_pattern(
-            None,
-            Some(predicate.as_ref()),
-            Some(target.as_ref().into()),
-        ) {
+        for quad in
+            archive.quads_for_pattern(None, Some(predicate.as_ref()), Some(target.as_ref().into()))
+        {
             let quad = quad.map_err(store_err)?;
             let subject = quad.subject.to_string();
             let iri = subject.trim_start_matches('<').trim_end_matches('>');
@@ -2008,12 +2010,12 @@ pub(crate) fn included_for_target_text(
 
 #[cfg(test)]
 mod tests {
-    use oxigraph::model::GraphName;
-    use oxigraph::store::Store;
     use super::*;
     use futures::executor::block_on;
     use ikigai_core::{ArgRef, Capability, Kernel, Request};
     use oxigraph::model::vocab::rdf;
+    use oxigraph::model::GraphName;
+    use oxigraph::store::Store;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -2078,6 +2080,271 @@ mod tests {
         )
         .unwrap();
         json_of(&out)
+    }
+
+    /// A mount that NAMES its graph: `Mount::graph`, over the same store the
+    /// helper above uses without one.
+    fn kernel_in_graph(root: &std::path::Path, store: &Arc<Store>, graph: &str) -> Kernel {
+        Kernel::new(Arc::new(
+            crate::Mount::new(vec![("demo".to_string(), root.to_path_buf())])
+                .annotations(Arc::clone(store))
+                .graph(NamedNode::new(graph).unwrap())
+                .space(),
+        ))
+    }
+
+    /// The graph names of everything in the store, so a test can say WHERE a
+    /// quad landed and not only that it exists.
+    fn graphs_of(store: &Store) -> std::collections::BTreeSet<String> {
+        store
+            .iter()
+            .map(|q| q.unwrap().graph_name.to_string())
+            .collect()
+    }
+
+    /// ★ The half that is easy to miss. Before 0.4.0 the reads passed `None`
+    /// for the graph, and `None` in `quads_for_pattern` means EVERY graph in
+    /// the store — so a knob that moved only the writes would have left browse
+    /// writing into its own graph and still answering out of anyone else's.
+    ///
+    /// This is also the answer to "is confining the DEFAULT case to the
+    /// default graph the same as matching all graphs?" It is not, and the
+    /// difference is exactly this decoy: for a store browse is the only writer
+    /// of they coincide, and for a shared one they do not. That is a real
+    /// behaviour change in 0.4.0, and it is the change that closes the hole.
+    #[test]
+    fn a_default_mount_does_not_read_another_graph() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "fn one() {}\nfn two() {}\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        annotate(&k, "mine", "a.rs", "fn one()", "the default graph's own");
+
+        // A decoy shaped exactly like a real annotation — same predicates,
+        // same type, same repo — sitting in SOMEONE ELSE'S graph.
+        let other = NamedNode::new("urn:iki:graph:another-tenant").unwrap();
+        let decoy = NamedNode::new("urn:iki:annotation:theirs").unwrap();
+        for (p, o) in [
+            (
+                NamedNode::new("http://www.w3.org/1999/02/22-rdf-syntax-ns#type").unwrap(),
+                Term::NamedNode(oa("Annotation")),
+            ),
+            (
+                oa("bodyValue"),
+                Term::Literal(Literal::new_simple_literal("not ours")),
+            ),
+            (
+                ik("repo"),
+                Term::Literal(Literal::new_simple_literal("demo")),
+            ),
+            (
+                ik("path"),
+                Term::Literal(Literal::new_simple_literal("a.rs")),
+            ),
+            (
+                ik("annotates"),
+                Term::NamedNode(NamedNode::new("urn:repo:demo:file:a.rs").unwrap()),
+            ),
+        ] {
+            store
+                .insert(Quad::new(decoy.clone(), p, o, other.clone()).as_ref())
+                .unwrap();
+        }
+
+        let listed =
+            body(&issue(&k, Verb::Source, "urn:repo:demo:annotations", &[], &cap()).unwrap());
+        assert!(listed.contains("urn:iki:annotation:mine"), "{listed}");
+        assert!(
+            !listed.contains("urn:iki:annotation:theirs"),
+            "a read reached into another graph: {listed}"
+        );
+        let err = issue(&k, Verb::Source, "urn:iki:annotation:theirs", &[], &cap()).unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The other direction: a mount that names a graph writes there and reads
+    /// there, and the two mounts over ONE store cannot see each other.
+    #[test]
+    fn a_named_graph_mount_writes_and_reads_only_its_graph() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "fn one() {}\nfn two() {}\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let tenant = kernel_in_graph(&root, &store, "urn:iki:graph:tenant-a");
+        annotate(&tenant, "t1", "a.rs", "fn one()", "tenant a's note");
+
+        assert_eq!(
+            graphs_of(&store),
+            std::collections::BTreeSet::from(["<urn:iki:graph:tenant-a>".to_string()]),
+            "every quad landed in the named graph, and none in the default one"
+        );
+        let read = json_of(
+            &issue(
+                &tenant,
+                Verb::Source,
+                "urn:iki:annotation:t1",
+                &[("as", "application/json")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(read["exact"], "fn one()");
+
+        // The default mount over the SAME store is blind to it, which is the
+        // whole point of the boundary.
+        let plain = kernel(&root, &store);
+        let err = issue(&plain, Verb::Source, "urn:iki:annotation:t1", &[], &cap()).unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+        assert!(!body(
+            &issue(
+                &plain,
+                Verb::Source,
+                "urn:repo:demo:annotations",
+                &[],
+                &cap()
+            )
+            .unwrap()
+        )
+        .contains("t1"));
+
+        // Delete stays inside the graph too — and takes every selector quad.
+        issue(&tenant, Verb::Delete, "urn:iki:annotation:t1", &[], &cap()).unwrap();
+        assert_eq!(store.len().unwrap(), 0);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The knob and the migration compose: data written by a default mount is
+    /// readable by a graph-naming mount AFTER `migrate::plan_into_graph`, and
+    /// not before. Without this step the archive looks EMPTY — the silent
+    /// failure the namespace rename had, which is why the move ships with the
+    /// knob.
+    #[test]
+    fn a_migrated_store_reads_back_under_the_named_graph() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "fn one() {}\nfn two() {}\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        annotate(
+            &kernel(&root, &store),
+            "legacy",
+            "a.rs",
+            "fn two()",
+            "written before the host opted in",
+        );
+
+        let graph = GraphName::NamedNode(NamedNode::new("urn:iki:graph:browse").unwrap());
+        let tenant = kernel_in_graph(&root, &store, "urn:iki:graph:browse");
+        assert!(
+            issue(
+                &tenant,
+                Verb::Source,
+                "urn:iki:annotation:legacy",
+                &[],
+                &cap()
+            )
+            .is_err(),
+            "unmigrated data is invisible to the mount that named the graph"
+        );
+
+        let before = crate::migrate::counts_for_graph(&store, Some(&graph)).unwrap();
+        let plan = crate::migrate::plan_into_graph(&store, &graph).unwrap();
+        crate::migrate::apply(&store, &plan).unwrap();
+        let after = crate::migrate::counts_for_graph(&store, Some(&graph)).unwrap();
+        assert!(
+            crate::migrate::Counts::passed(&before, &after),
+            "{}",
+            crate::migrate::report(&before, &after, "after")
+        );
+
+        let read = json_of(
+            &issue(
+                &tenant,
+                Verb::Source,
+                "urn:iki:annotation:legacy",
+                &[("as", "application/json")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(read["exact"], "fn two()");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Two knobs, one decision: a disagreement is a misconfiguration, and it
+    /// fails at mount time like a bad root name rather than splitting a host's
+    /// data across two graphs where only a store audit would find it.
+    #[test]
+    #[should_panic(expected = "name different graphs")]
+    fn a_mount_and_a_config_that_name_different_graphs_fail_loud() {
+        let store = Arc::new(Store::new().unwrap());
+        let config = crate::ExplainConfig::new(store)
+            .graph(NamedNode::new("urn:iki:graph:from-config").unwrap());
+        let _ = crate::Mount::new(vec![("demo".to_string(), temp_dir())])
+            .graph(NamedNode::new("urn:iki:graph:from-mount").unwrap())
+            .explain(config)
+            .space();
+    }
+
+    /// The same two knobs AGREEING is legal — a host wiring both from one
+    /// setting must not have to pick which call site to leave out.
+    #[test]
+    fn a_mount_and_a_config_that_agree_are_accepted() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "fn one() {}\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let g = NamedNode::new("urn:iki:graph:agreed").unwrap();
+        let space = crate::Mount::new(vec![("demo".to_string(), root.clone())])
+            .graph(g.clone())
+            .explain(crate::ExplainConfig::new(Arc::clone(&store)).graph(g))
+            .space();
+        let k = Kernel::new(Arc::new(space));
+        annotate(&k, "agreed", "a.rs", "fn one()", "one graph");
+        assert_eq!(
+            graphs_of(&store),
+            std::collections::BTreeSet::from(["<urn:iki:graph:agreed>".to_string()])
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The claim `crate::archive` and `crate::migrate::BROWSE_SUBJECT_PREFIXES`
+    /// both rest on: browse writes no quad about a subject it did not mint. It
+    /// is what makes the graph migration's subject-selection COMPLETE — a
+    /// writer that stored a triple on, say, the annotated file's own IRI would
+    /// leave that quad behind in the default graph, silently.
+    #[test]
+    fn every_quad_browse_writes_has_a_browse_minted_subject() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "fn one() {}\nfn two() {}\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        annotate(&k, "n1", "a.rs", "fn one()", "first");
+        annotate(&k, "n2", "a.rs", "fn two()", "second");
+        // Re-anchoring rewrites the graph on a Source — another write path.
+        std::fs::write(root.join("a.rs"), "// moved\nfn one() {}\nfn two() {}\n").unwrap();
+        issue(&k, Verb::Source, "urn:iki:annotation:n1", &[], &cap()).unwrap();
+
+        assert!(store.len().unwrap() > 0);
+        for quad in store.iter() {
+            let subject = quad.unwrap().subject.to_string();
+            let iri = subject.trim_start_matches('<').trim_end_matches('>');
+            assert!(
+                crate::migrate::BROWSE_SUBJECT_PREFIXES
+                    .iter()
+                    .any(|p| iri.starts_with(p)),
+                "a stored quad hangs off a subject browse did not mint: {iri}"
+            );
+        }
+
+        // The other two writers store every quad under ONE subject each, and
+        // these are the functions that mint it.
+        assert!(
+            crate::explain::entry_iri("demo", "a.rs", "sha256:abc", "code-v1")
+                .starts_with("urn:ikigai:browse:")
+        );
+        assert!(
+            crate::review::pass_iri("demo", "a.rs", "sha256:abc", "review-v1")
+                .starts_with("urn:ikigai:browse:")
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

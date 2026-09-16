@@ -50,7 +50,13 @@ target's root against the grant.
 
 **The explanation archive (S1).** `space_with_explain` takes an
 `ExplainConfig` around a host-injected Oxigraph store handle (`Arc<Store>`) —
-ONE shared store; later stages (annotations) join it. Explanations are derived
+ONE shared store; later stages (annotations) join it. Since 0.4.0 a host can
+also name the **graph** within that store (`Mount::graph` /
+`ExplainConfig::graph`); unset, everything is in the default graph as before,
+and reads are confined to whichever graph is in force. See
+[Moving a store into a named graph](#moving-a-store-into-a-named-graph-040) and
+the ★ note on `Mount::graph` about what opting in costs a host that shares the
+dataset with a graph-scoped store. Explanations are derived
 THROUGH the kernel (`urn:repo:…:hash`, `:file`/`:tree`, the children's own
 `:explain`, and `urn:llm:{provider}:ask` are all sub-requests) and persist as
 skolemized RDF (`ik:Explanation` entries keyed by content hash + version tag).
@@ -342,11 +348,15 @@ oa:Annotation subjects   14        14
 old-prefix quads         168       0
 new-prefix quads         0         168
 dangling hasSelector     28        0
+total quads              169       169
 
-PASS: annotations equal · old -> 0 · new -> old's former count · dangling -> 0
+PASS: annotations equal · old -> 0 · new -> old's former count · dangling -> 0 · total equal
 ```
 
-— and exits non-zero unless all four hold.
+— and exits non-zero unless all of them hold. **`total quads` is the clause
+that is true of every transform**, including the ones the four columns above do
+not describe: a migration creates and destroys nothing, so a store that comes
+back one quad smaller is a FAIL even when nothing else moved.
 
 - ⚠ **Both positions or nothing.** `oa:hasSelector` and `prov:generated` point
   *at* annotation IRIs; a subject-only rewrite leaves them aimed at IRIs that
@@ -369,6 +379,33 @@ PASS: annotations equal · old -> 0 · new -> old's former count · dangling -> 
 - Back the store directory up before `--commit`.
   `cargo run --features migrate --example migration-rehearsal -- <scratch-dir>`
   builds a throwaway store in the pre-0.3.0 shape to rehearse against.
+
+### Moving a store into a named graph (0.4.0)
+
+`--graph <iri>` is the same tool doing the other move a browse store can need:
+every browse-owned quad into that named graph, which is what a host calling
+`Mount::graph` needs run once against its existing data.
+
+```text
+migrate-annotation-ns <store-path> --graph urn:iki:graph:browse            # dry run
+migrate-annotation-ns <store-path> --graph urn:iki:graph:browse --commit   # apply
+```
+
+It adds one column, `outside target graph`, which must reach 0, and it carries
+the namespace move with it — **one pass, one transaction, both moves**, so a
+pre-0.3.0 store opting into a graph is migrated once rather than twice in an
+order nothing would enforce.
+
+- **It selects browse's own subjects, not the default graph.** Browse writes no
+  quad about a subject it did not mint (`urn:iki:annotation:…` for annotations
+  and their selectors, `urn:ikigai:browse:…` for the explanation archive and
+  the review passes), so subject-selection is complete — and a quad someone
+  ELSE put in the shared default graph is left exactly where it is. Both halves
+  are pinned by tests, one against the real writers and one against a stranger
+  quad in the fixture.
+- **Skipping it fails silently, in the way the rename did.** Browse reads are
+  confined to its graph from 0.4.0, so unmigrated quads are still in the store
+  and no longer visible: empty panels, empty folds, no error.
 
 The `migrate` feature exists because this is the only thing here that opens a
 store on *disk*, and that needs oxigraph's RocksDB backend (and a C++

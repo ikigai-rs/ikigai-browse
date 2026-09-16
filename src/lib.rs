@@ -430,7 +430,10 @@ impl Mount {
         let Some(mut config) = explain else {
             let ignore = Arc::new(hash::default_ignore());
             let archive = store.map(|store| {
-                Arc::new(Archive::new(store, graph_name(graph.clone(), None, "Mount")))
+                Arc::new(Archive::new(
+                    store,
+                    graph_name(graph.clone(), None, "Mount"),
+                ))
             });
             let space = base_space(&roots, &ignore, archive.as_ref(), false, app, home);
             let space = match archive {

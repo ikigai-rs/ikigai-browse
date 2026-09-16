@@ -66,6 +66,29 @@ pub const OLD_PREFIX: &str = "urn:annotation:";
 /// The 0.3.0 annotation namespace.
 pub const NEW_PREFIX: &str = "urn:iki:annotation:";
 
+/// Every IRI prefix browse mints a **subject** under.
+///
+/// The graph move below selects on this and nothing else, which is complete
+/// because browse never writes a quad about a subject someone else minted:
+/// annotations and their two selector children are `urn:iki:annotation:…`
+/// (`urn:annotation:…` before 0.3.0, which is why the legacy prefix is here
+/// too — the two migrations must not strand each other's rows), and the
+/// explanation archive and the review passes are `urn:ikigai:browse:…`.
+/// `crate::archive` states the same fact from the writing side, and
+/// `every_quad_browse_writes_has_a_browse_minted_subject` pins it against the
+/// real writers rather than against either comment.
+pub const BROWSE_SUBJECT_PREFIXES: [&str; 3] = [OLD_PREFIX, NEW_PREFIX, "urn:ikigai:browse:"];
+
+/// Whether `quad` is one browse wrote — see [`BROWSE_SUBJECT_PREFIXES`].
+fn browse_owned(quad: &Quad) -> bool {
+    match &quad.subject {
+        NamedOrBlankNode::NamedNode(n) => BROWSE_SUBJECT_PREFIXES
+            .iter()
+            .any(|p| n.as_str().starts_with(p)),
+        _ => false,
+    }
+}
+
 const OA_HAS_SELECTOR: &str = "http://www.w3.org/ns/oa#hasSelector";
 const OA_ANNOTATION: &str = "http://www.w3.org/ns/oa#Annotation";
 
@@ -119,8 +142,18 @@ fn moved(node: &NamedNode) -> Option<NamedNode> {
 /// lexical proxy for a type distinction and is correct only for as long as
 /// the serializer never writes an IRI any other way. Operating on parsed
 /// terms removes the question instead of answering it.
-fn rewrite(quad: &Quad, scope: Scope) -> Option<Quad> {
+fn rewrite(quad: &Quad, scope: Scope, into: Option<&GraphName>) -> Option<Quad> {
     let mut moved_any = false;
+
+    // The graph move, when one is asked for: a browse-owned quad that is not
+    // already in the target graph. Computed first so it composes with the
+    // namespace rewrite below — a pre-0.3.0 store opting into a graph moves
+    // both in ONE transaction rather than in two runs whose order would then
+    // matter.
+    let into = into.filter(|g| browse_owned(quad) && quad.graph_name != **g);
+    if into.is_some() {
+        moved_any = true;
+    }
 
     let subject = match &quad.subject {
         NamedOrBlankNode::NamedNode(n) => match moved(n) {
@@ -141,7 +174,7 @@ fn rewrite(quad: &Quad, scope: Scope) -> Option<Quad> {
                 subject,
                 quad.predicate.clone(),
                 quad.object.clone(),
-                quad.graph_name.clone(),
+                into.cloned().unwrap_or_else(|| quad.graph_name.clone()),
             )
         });
     }
@@ -165,15 +198,18 @@ fn rewrite(quad: &Quad, scope: Scope) -> Option<Quad> {
         other => other.clone(),
     };
 
-    let graph_name = match &quad.graph_name {
-        GraphName::NamedNode(n) => match moved(n) {
+    // The target graph wins when there is one: it is the destination, not a
+    // term to be namespace-rewritten.
+    let graph_name = match (into, &quad.graph_name) {
+        (Some(g), _) => g.clone(),
+        (None, GraphName::NamedNode(n)) => match moved(n) {
             Some(m) => {
                 moved_any = true;
                 GraphName::NamedNode(m)
             }
             None => quad.graph_name.clone(),
         },
-        other => other.clone(),
+        (None, other) => other.clone(),
     };
 
     moved_any.then(|| Quad::new(subject, predicate, object, graph_name))
@@ -212,16 +248,40 @@ impl Plan {
 /// store is thousands of quads, so the scan is the simple thing rather than
 /// the expensive one.
 pub fn plan(store: &Store) -> Result<Plan> {
-    plan_with_scope(store, Scope::AllIriPositions)
+    plan_with(store, Scope::AllIriPositions, None)
 }
 
 /// [`plan`] under an explicit [`Scope`]. Callers other than the ablation test
 /// want [`plan`].
 pub fn plan_with_scope(store: &Store, scope: Scope) -> Result<Plan> {
+    plan_with(store, scope, None)
+}
+
+/// [`plan`] that ALSO moves every browse-owned quad into `into` — the second
+/// half of `Mount::graph`, for a store that already holds data.
+///
+/// Existing archives are entirely in the default graph (browse had no other
+/// option before 0.4.0), so a host that names a graph must move its quads or
+/// the mount reads an empty archive: the data is still there, and browse is
+/// confined to a graph it is not in. That failure is SILENT in exactly the way
+/// the namespace rename was — empty panels, empty folds, no error anywhere —
+/// which is why the fix ships with the knob rather than after it.
+///
+/// One pass, one transaction, both moves. The namespace rewrite still runs, so
+/// a pre-0.3.0 store opting into a graph is migrated once instead of twice in
+/// an order nothing would enforce.
+pub fn plan_into_graph(store: &Store, into: &GraphName) -> Result<Plan> {
+    plan_with(store, Scope::AllIriPositions, Some(into))
+}
+
+/// The one planner: a full scan, one predicate, both moves. [`plan`],
+/// [`plan_with_scope`] and [`plan_into_graph`] are the three spellings callers
+/// actually want.
+pub fn plan_with(store: &Store, scope: Scope, into: Option<&GraphName>) -> Result<Plan> {
     let mut out = Plan::default();
     for quad in store.iter() {
         let quad = quad.map_err(store_err)?;
-        if let Some(rewritten) = rewrite(&quad, scope) {
+        if let Some(rewritten) = rewrite(&quad, scope, into) {
             out.remove.push(quad);
             out.insert.push(rewritten);
         }
@@ -277,6 +337,7 @@ pub fn project(store: &Store, plan: &Plan) -> Result<Store> {
 /// The four numbers the shell harness printed, computed over a store instead
 /// of over an exported file.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Counts {
     /// Distinct subjects typed `oa:Annotation`. The population under
     /// migration: it must be IDENTICAL before and after, because a namespace
@@ -290,6 +351,23 @@ pub struct Counts {
     /// `oa:hasSelector` objects that are not under the new prefix — the
     /// count a subject-only rewrite leaves standing. Must reach 0.
     pub dangling_selectors: u64,
+    /// **Every quad in the store.** A migration creates and destroys nothing,
+    /// so this must be IDENTICAL before and after.
+    ///
+    /// The four columns above describe one particular transform; this one is
+    /// true of every transform this module can express, including the ones it
+    /// does not have a column for. It is what catches the failure a rewrite
+    /// can produce without touching any of the others: two distinct quads
+    /// whose rewritten twins are EQUAL collapse into one on insert, and the
+    /// store is quietly one quad smaller with every other number unmoved.
+    pub total: u64,
+    /// Browse-owned quads (see [`BROWSE_SUBJECT_PREFIXES`]) that are **not**
+    /// in the graph the migration targets. Must reach 0.
+    ///
+    /// `None` when no graph migration is in view — the namespace move alone
+    /// has no target graph, and a 0 there would claim a check that was never
+    /// run. [`Counts::passed`] treats `None` on both sides as "not asked".
+    pub outside_target_graph: Option<u64>,
 }
 
 /// Count the four. Both prefix counts are per-QUAD (a quad whose subject and
@@ -298,10 +376,23 @@ pub struct Counts {
 /// real data, since no predicate or graph name has ever carried the
 /// annotation prefix, and a genuine residue check if one ever did.
 pub fn counts(store: &Store) -> Result<Counts> {
+    counts_for_graph(store, None)
+}
+
+/// [`counts`] with [`Counts::outside_target_graph`] measured against `into` —
+/// what a run that names a graph reports. `None` is exactly [`counts`].
+pub fn counts_for_graph(store: &Store, into: Option<&GraphName>) -> Result<Counts> {
     let mut annotations: BTreeSet<String> = BTreeSet::new();
     let mut out = Counts::default();
+    let mut outside = 0u64;
     for quad in store.iter() {
         let quad = quad.map_err(store_err)?;
+        out.total += 1;
+        if let Some(g) = into {
+            if browse_owned(&quad) && quad.graph_name != *g {
+                outside += 1;
+            }
+        }
 
         if quad.predicate.as_str() == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
             && matches!(&quad.object, Term::NamedNode(n) if n.as_str() == OA_ANNOTATION)
@@ -326,6 +417,7 @@ pub fn counts(store: &Store) -> Result<Counts> {
         }
     }
     out.annotations = annotations.len() as u64;
+    out.outside_target_graph = into.map(|_| outside);
     Ok(out)
 }
 
@@ -354,11 +446,25 @@ impl Counts {
     /// already-migrated one, where `before.old` is 0). It would fail if a
     /// single quad ever mixed the two prefixes — no writer mints such a quad,
     /// and if one appeared, a FAIL that says so is the right outcome.
+    ///
+    /// Two more clauses, added in 0.4.0 with the graph move: **total equal**
+    /// (a migration creates and destroys nothing, and this is the clause that
+    /// holds for a transform these columns do not otherwise describe), and
+    /// **outside the target graph → 0** when a graph was named at all. A run
+    /// with no graph in view reports `None` on both sides and the clause is
+    /// vacuous — never a silent pass for a check that was not run, because
+    /// `None` on ONE side is a disagreement and fails.
     pub fn passed(before: &Counts, after: &Counts) -> bool {
+        let graph_ok = matches!(
+            (before.outside_target_graph, after.outside_target_graph),
+            (None, None) | (Some(_), Some(0))
+        );
         after.annotations == before.annotations
             && after.old_prefix == 0
             && after.new_prefix == before.old_prefix + before.new_prefix
             && after.dangling_selectors == 0
+            && after.total == before.total
+            && graph_ok
     }
 }
 
@@ -388,13 +494,19 @@ pub fn report(before: &Counts, after: &Counts, after_label: &str) -> String {
         before.dangling_selectors,
         after.dangling_selectors,
     ));
+    out.push_str(&row("total quads", before.total, after.total));
+    // Printed only when a graph was named: an "outside target graph  0  0" row
+    // on a namespace-only run would read as a check that passed.
+    if let (Some(b), Some(a)) = (before.outside_target_graph, after.outside_target_graph) {
+        out.push_str(&row("outside target graph", b, a));
+    }
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxigraph::model::{Literal, NamedNode, Quad};
+    use oxigraph::model::{GraphNameRef, Literal, NamedNode, Quad};
 
     fn iri(s: &str) -> NamedNode {
         NamedNode::new(s).unwrap()
@@ -725,19 +837,122 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The graph move, over the same fixture the namespace move is proved on —
+    /// plus a quad browse did NOT write, sitting in the default graph, which
+    /// must still be there afterwards. A migration that swept the default
+    /// graph rather than selecting browse's own subjects would take it too,
+    /// and on a shared dataset that quad belongs to someone else.
     #[test]
-    fn the_report_names_all_four_counts() {
+    fn a_graph_move_takes_every_browse_quad_and_nothing_else() {
+        let store = plasma_shaped_store();
+        let stranger = quad(
+            "urn:iki:ledger:item:7",
+            &format!("{IK}title"),
+            Term::Literal(Literal::new_simple_literal("not browse's")),
+        );
+        store.insert(stranger.as_ref()).unwrap();
+
+        let graph = GraphName::NamedNode(iri("urn:iki:graph:browse"));
+        let before = counts_for_graph(&store, Some(&graph)).unwrap();
+        assert_eq!(
+            before.outside_target_graph,
+            Some(211),
+            "14 annotations x 15 quads, plus the explanation-archive entry"
+        );
+        assert_eq!(before.total, 212, "211 browse quads and one stranger");
+
+        let plan = plan_into_graph(&store, &graph).unwrap();
+        assert_eq!(plan.len(), 211, "the stranger is not in the plan");
+        apply(&store, &plan).unwrap();
+
+        let after = counts_for_graph(&store, Some(&graph)).unwrap();
+        assert!(
+            Counts::passed(&before, &after),
+            "{}",
+            report(&before, &after, "after")
+        );
+        assert_eq!(after.outside_target_graph, Some(0));
+        assert_eq!(after.total, before.total, "not one quad lost");
+
+        // The stranger did not move.
+        assert_eq!(
+            store
+                .quads_for_pattern(None, None, None, Some(GraphNameRef::DefaultGraph))
+                .count(),
+            1
+        );
+        assert!(store.contains(stranger.as_ref()).unwrap());
+    }
+
+    /// One pass, both moves: a store that never ran the namespace migration
+    /// and now opts into a graph is migrated ONCE, in one transaction. The
+    /// alternative — two runs — has an order, and nothing would enforce it.
+    #[test]
+    fn a_graph_move_carries_the_namespace_move_with_it() {
+        let store = plasma_shaped_store();
+        let graph = GraphName::NamedNode(iri("urn:iki:graph:browse"));
+        let before = counts_for_graph(&store, Some(&graph)).unwrap();
+        assert_eq!(before.old_prefix, 210, "the fixture is pre-0.3.0");
+
+        apply(&store, &plan_into_graph(&store, &graph).unwrap()).unwrap();
+
+        let after = counts_for_graph(&store, Some(&graph)).unwrap();
+        assert!(
+            Counts::passed(&before, &after),
+            "{}",
+            report(&before, &after, "after")
+        );
+        assert_eq!(after.old_prefix, 0);
+        assert_eq!(after.new_prefix, 210);
+        assert_eq!(after.dangling_selectors, 0);
+        assert_eq!(after.outside_target_graph, Some(0));
+    }
+
+    /// A second run is a no-op, like the namespace move's: the selection is by
+    /// "not already there", and after one pass nothing matches.
+    #[test]
+    fn a_graph_move_is_idempotent() {
+        let store = plasma_shaped_store();
+        let graph = GraphName::NamedNode(iri("urn:iki:graph:browse"));
+        apply(&store, &plan_into_graph(&store, &graph).unwrap()).unwrap();
+        let settled = counts_for_graph(&store, Some(&graph)).unwrap();
+
+        assert!(plan_into_graph(&store, &graph).unwrap().is_empty());
+        assert_eq!(counts_for_graph(&store, Some(&graph)).unwrap(), settled);
+    }
+
+    /// The dry run and the commit agree — the same property the namespace move
+    /// has, and for the same reason: the "would be" column is `counts` over
+    /// `project`, which is the function that produces the "after" column.
+    #[test]
+    fn the_projection_of_a_graph_move_equals_the_committed_store() {
+        let store = plasma_shaped_store();
+        let graph = GraphName::NamedNode(iri("urn:iki:graph:browse"));
+        let plan = plan_into_graph(&store, &graph).unwrap();
+        let projected = project(&store, &plan).unwrap();
+        let would_be = counts_for_graph(&projected, Some(&graph)).unwrap();
+
+        apply(&store, &plan).unwrap();
+        assert_eq!(counts_for_graph(&store, Some(&graph)).unwrap(), would_be);
+    }
+
+    #[test]
+    fn the_report_names_every_count_it_was_given() {
         let before = Counts {
             annotations: 14,
             old_prefix: 224,
             new_prefix: 0,
             dangling_selectors: 28,
+            total: 500,
+            outside_target_graph: None,
         };
         let after = Counts {
             annotations: 14,
             old_prefix: 0,
             new_prefix: 224,
             dangling_selectors: 0,
+            total: 500,
+            outside_target_graph: None,
         };
         let text = report(&before, &after, "after");
         for row in [
@@ -745,9 +960,88 @@ mod tests {
             "old-prefix quads",
             "new-prefix quads",
             "dangling hasSelector",
+            "total quads",
         ] {
             assert!(text.contains(row), "{text}");
         }
         assert!(text.contains("224"), "{text}");
+        // The graph row is printed only when a graph was named — otherwise a
+        // `0  0` row would read as a check that ran and passed.
+        assert!(!text.contains("outside target graph"), "{text}");
+
+        let before = Counts {
+            outside_target_graph: Some(224),
+            ..before
+        };
+        let after = Counts {
+            outside_target_graph: Some(0),
+            ..after
+        };
+        let text = report(&before, &after, "after");
+        assert!(text.contains("outside target graph"), "{text}");
+    }
+
+    #[test]
+    fn a_lost_quad_fails_even_when_every_other_column_agrees() {
+        // The failure `total` exists for: nothing about the four namespace
+        // columns notices a store that came back one quad smaller.
+        let before = Counts {
+            annotations: 14,
+            old_prefix: 224,
+            new_prefix: 0,
+            dangling_selectors: 28,
+            total: 500,
+            outside_target_graph: None,
+        };
+        let honest = Counts {
+            old_prefix: 0,
+            new_prefix: 224,
+            dangling_selectors: 0,
+            ..before
+        };
+        assert!(Counts::passed(&before, &honest));
+        assert!(!Counts::passed(
+            &before,
+            &Counts {
+                total: 499,
+                ..honest
+            }
+        ));
+    }
+
+    #[test]
+    fn a_graph_check_that_was_not_run_cannot_pass_as_zero() {
+        let before = Counts {
+            annotations: 1,
+            old_prefix: 0,
+            new_prefix: 4,
+            dangling_selectors: 0,
+            total: 10,
+            outside_target_graph: Some(4),
+        };
+        // Asked for, and done.
+        assert!(Counts::passed(
+            &before,
+            &Counts {
+                outside_target_graph: Some(0),
+                ..before
+            }
+        ));
+        // Asked for, and not done.
+        assert!(!Counts::passed(
+            &before,
+            &Counts {
+                outside_target_graph: Some(1),
+                ..before
+            }
+        ));
+        // Asked for BEFORE and not measured after: a disagreement, not a pass.
+        assert!(!Counts::passed(
+            &before,
+            &Counts {
+                outside_target_graph: None,
+                ..before
+            }
+        ));
     }
 }

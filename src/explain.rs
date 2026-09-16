@@ -94,6 +94,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::archive::Archive;
 use async_trait::async_trait;
 use ikigai_core::{
     ArgRef, ArgSpec, Description, Endpoint, EndpointSpace, Error, Invocation, Iri, Representation,
@@ -101,7 +102,6 @@ use ikigai_core::{
 };
 use oxigraph::model::{GraphName, Literal, NamedNode, Quad, Term};
 use oxigraph::store::Store;
-use crate::archive::Archive;
 
 use crate::annotate::{self, Included, TargetFilter};
 use crate::hash::hash_iri;
@@ -633,12 +633,7 @@ pub(crate) fn store_entry(archive: &Archive, entry: &ArchiveEntry) -> Result<()>
             Literal::new_simple_literal(&entry.rel),
             g.clone(),
         ),
-        Quad::new(
-            subject.clone(),
-            ik("about"),
-            target,
-            g.clone(),
-        ),
+        Quad::new(subject.clone(), ik("about"), target, g.clone()),
         Quad::new(
             subject.clone(),
             ik("contentHash"),
@@ -753,11 +748,9 @@ fn list_versions(archive: &Archive, target_iri: &str) -> Result<Vec<ArchiveEntry
     };
     let mut subjects = std::collections::BTreeSet::new();
     for predicate in [ik("about"), ik("target")] {
-        for quad in archive.quads_for_pattern(
-            None,
-            Some(predicate.as_ref()),
-            Some(target.as_ref().into()),
-        ) {
+        for quad in
+            archive.quads_for_pattern(None, Some(predicate.as_ref()), Some(target.as_ref().into()))
+        {
             let quad = quad.map_err(store_err)?;
             subjects.insert(quad.subject.to_string());
         }

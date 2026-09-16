@@ -43,12 +43,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::archive::Archive;
 use async_trait::async_trait;
 use ikigai_core::{
     ArgRef, ArgSpec, Bindings, Description, Endpoint, EndpointSpace, Error, Grammar, Invocation,
     Iri, Representation, Request, Result, UriTemplate, Verb,
 };
-use crate::archive::Archive;
 
 use crate::annotate::{self, Included, CAP_ANNOTATE};
 use crate::explain::{
@@ -1680,10 +1680,10 @@ fn pr_review_description() -> Description {
 
 #[cfg(test)]
 mod tests {
-    use oxigraph::store::Store;
     use super::*;
     use futures::executor::block_on;
     use ikigai_core::{Capability, Exact, Fallback, FnEndpoint, Kernel};
+    use oxigraph::store::Store;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
