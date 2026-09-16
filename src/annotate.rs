@@ -80,8 +80,8 @@ use ikigai_core::{
     ActionSpec, ArgSpec, Bindings, Description, Endpoint, EndpointSpace, Error, Grammar,
     Invocation, Iri, Representation, Result, UriTemplate, Verb,
 };
-use oxigraph::model::{GraphName, Literal, NamedNode, Quad, Term};
-use oxigraph::store::Store;
+use oxigraph::model::{Literal, NamedNode, Quad, Term};
+use crate::archive::Archive;
 use sha2::{Digest, Sha256};
 
 use crate::explain::{ik, iso8601, parse_iri, IK};
@@ -292,13 +292,13 @@ fn store_err(e: impl std::fmt::Display) -> Error {
 
 /// Insert the annotation's quads (the annotation node plus both selector
 /// nodes). Flags are stored only when true — absence means false.
-fn store_annotation(store: &Store, ann: &Annotation) -> Result<()> {
+fn store_annotation(archive: &Archive, ann: &Annotation) -> Result<()> {
     use oxigraph::model::vocab::{rdf, xsd};
     let subject = NamedNode::new(ann.iri()).map_err(store_err)?;
     let quote = NamedNode::new(quote_iri(&ann.id)).map_err(store_err)?;
     let position = NamedNode::new(position_iri(&ann.id)).map_err(store_err)?;
     let target = NamedNode::new(&ann.target_iri).map_err(store_err)?;
-    let g = GraphName::DefaultGraph;
+    let g = archive.graph().clone();
     let mut quads: Vec<Quad> = vec![
         Quad::new(subject.clone(), rdf::TYPE, oa("Annotation"), g.clone()),
         Quad::new(
@@ -428,21 +428,21 @@ fn store_annotation(store: &Store, ann: &Annotation) -> Result<()> {
         ));
     }
     for quad in &quads {
-        store.insert(quad).map_err(store_err)?;
+        archive.insert(quad).map_err(store_err)?;
     }
     Ok(())
 }
 
 /// Remove every quad under the annotation's three subjects.
-fn remove_annotation(store: &Store, id: &str) -> Result<()> {
+fn remove_annotation(archive: &Archive, id: &str) -> Result<()> {
     for iri in [annotation_iri(id), quote_iri(id), position_iri(id)] {
         let subject = NamedNode::new(&iri).map_err(store_err)?;
-        let quads: Vec<Quad> = store
-            .quads_for_pattern(Some(subject.as_ref().into()), None, None, None)
+        let quads: Vec<Quad> = archive
+            .quads_for_pattern(Some(subject.as_ref().into()), None, None)
             .collect::<std::result::Result<_, _>>()
             .map_err(store_err)?;
         for quad in &quads {
-            store.remove(quad).map_err(store_err)?;
+            archive.remove(quad).map_err(store_err)?;
         }
     }
     Ok(())
@@ -450,14 +450,14 @@ fn remove_annotation(store: &Store, id: &str) -> Result<()> {
 
 /// Replace the annotation's stored state (the update path and the
 /// re-anchor/orphan persistence path).
-fn rewrite_annotation(store: &Store, ann: &Annotation) -> Result<()> {
-    remove_annotation(store, &ann.id)?;
-    store_annotation(store, ann)
+fn rewrite_annotation(archive: &Archive, ann: &Annotation) -> Result<()> {
+    remove_annotation(archive, &ann.id)?;
+    store_annotation(archive, ann)
 }
 
 /// Load one annotation by id — `None` when the store holds no `oa:bodyValue`
 /// for it.
-fn load_annotation(store: &Store, id: &str) -> Result<Option<Annotation>> {
+fn load_annotation(archive: &Archive, id: &str) -> Result<Option<Annotation>> {
     let mut ann = Annotation {
         id: id.to_string(),
         body: String::new(),
@@ -486,7 +486,7 @@ fn load_annotation(store: &Store, id: &str) -> Result<Option<Annotation>> {
         Ok(node) => node,
         Err(_) => return Ok(None),
     };
-    for quad in store.quads_for_pattern(Some(subject.as_ref().into()), None, None, None) {
+    for quad in archive.quads_for_pattern(Some(subject.as_ref().into()), None, None) {
         let quad = quad.map_err(store_err)?;
         let predicate = quad.predicate.as_str();
         if let Some(term) = predicate.strip_prefix(OA) {
@@ -542,7 +542,7 @@ fn load_annotation(store: &Store, id: &str) -> Result<Option<Annotation>> {
     }
     for (iri, is_quote) in [(quote_iri(id), true), (position_iri(id), false)] {
         let subject = NamedNode::new(&iri).map_err(store_err)?;
-        for quad in store.quads_for_pattern(Some(subject.as_ref().into()), None, None, None) {
+        for quad in archive.quads_for_pattern(Some(subject.as_ref().into()), None, None) {
             let quad = quad.map_err(store_err)?;
             match (is_quote, quad.predicate.as_str().strip_prefix(OA)) {
                 (true, Some("prefix")) => ann.prefix = literal(&quad.object),
@@ -561,14 +561,13 @@ fn load_annotation(store: &Store, id: &str) -> Result<Option<Annotation>> {
 /// path. Filters by `rdf:type oa:Annotation` (the shared store also holds
 /// `ik:Explanation` entries with `ik:repo`/`ik:about` triples — type is the
 /// discriminator). Sorted by (path, start, id) for a stable reading order.
-fn list_annotations(store: &Store, repo: &str, rel: Option<&str>) -> Result<Vec<Annotation>> {
+fn list_annotations(archive: &Archive, repo: &str, rel: Option<&str>) -> Result<Vec<Annotation>> {
     use oxigraph::model::vocab::rdf;
     let mut out = Vec::new();
-    for quad in store.quads_for_pattern(
+    for quad in archive.quads_for_pattern(
         None,
         Some(rdf::TYPE),
         Some(oa("Annotation").as_ref().into()),
-        None,
     ) {
         let quad = quad.map_err(store_err)?;
         let subject = quad.subject.to_string();
@@ -576,7 +575,7 @@ fn list_annotations(store: &Store, repo: &str, rel: Option<&str>) -> Result<Vec<
         let Some(id) = iri.strip_prefix("urn:iki:annotation:") else {
             continue;
         };
-        let Some(ann) = load_annotation(store, id)? else {
+        let Some(ann) = load_annotation(archive, id)? else {
             continue;
         };
         if ann.repo == repo && rel.is_none_or(|rel| ann.rel == rel) {
@@ -811,7 +810,7 @@ pub(crate) fn content_hash(bytes: &[u8]) -> String {
 /// Returns the line its anchor renders at (`None` when no content is in
 /// hand). Persists to the store ONLY when something changed — repeat reads of
 /// an unchanged (or already-orphaned) annotation touch nothing.
-fn refresh(store: &Store, ann: &mut Annotation, current: &CurrentContent) -> Result<Option<u64>> {
+fn refresh(archive: &Archive, ann: &mut Annotation, current: &CurrentContent) -> Result<Option<u64>> {
     match current {
         // Served exactly as recorded, flags untouched: no content was in
         // hand, so nothing can honestly be said about drift.
@@ -819,7 +818,7 @@ fn refresh(store: &Store, ann: &mut Annotation, current: &CurrentContent) -> Res
         CurrentContent::Unavailable => {
             if !ann.orphaned {
                 ann.orphaned = true;
-                rewrite_annotation(store, ann)?;
+                rewrite_annotation(archive, ann)?;
             }
             Ok(None)
         }
@@ -830,7 +829,7 @@ fn refresh(store: &Store, ann: &mut Annotation, current: &CurrentContent) -> Res
                 // whole again.
                 if ann.orphaned {
                     ann.orphaned = false;
-                    rewrite_annotation(store, ann)?;
+                    rewrite_annotation(archive, ann)?;
                 }
                 return Ok(Some(line_of(text, ann.start)));
             }
@@ -857,13 +856,13 @@ fn refresh(store: &Store, ann: &mut Annotation, current: &CurrentContent) -> Res
                     ann.hash = hash.clone();
                     ann.reanchored = true;
                     ann.orphaned = false;
-                    rewrite_annotation(store, ann)?;
+                    rewrite_annotation(archive, ann)?;
                     Ok(Some(anchor.line))
                 }
                 None => {
                     if !ann.orphaned {
                         ann.orphaned = true;
-                        rewrite_annotation(store, ann)?;
+                        rewrite_annotation(archive, ann)?;
                     }
                     // Flagged, but still rendered — at its RECORDED position
                     // projected onto the current text (clamped).
@@ -880,7 +879,7 @@ fn refresh(store: &Store, ann: &mut Annotation, current: &CurrentContent) -> Res
 /// endpoint and the `annotations=include` fetch.
 async fn reconcile(
     inv: &Invocation<'_>,
-    store: &Store,
+    archive: &Archive,
     roots: &BTreeMap<String, std::path::PathBuf>,
     repo: &str,
     mut anns: Vec<Annotation>,
@@ -895,7 +894,7 @@ async fn reconcile(
     let mut rows: Vec<(Annotation, Option<u64>)> = Vec::with_capacity(anns.len());
     for mut ann in anns.drain(..) {
         let current = contents.get(&ann.target_iri).expect("fetched above");
-        let line = refresh(store, &mut ann, current)?;
+        let line = refresh(archive, &mut ann, current)?;
         rows.push((ann, line));
     }
     // Re-anchoring may have moved positions — restore reading order.
@@ -906,16 +905,16 @@ async fn reconcile(
 /// The drift pass against content already in hand (the file face's path — no
 /// kernel fetch), rows in reading order.
 fn reconcile_against_text(
-    store: &Store,
+    archive: &Archive,
     repo: &str,
     rel: &str,
     text: &str,
 ) -> Result<Vec<(Annotation, Option<u64>)>> {
-    let mut anns = list_annotations(store, repo, Some(rel))?;
+    let mut anns = list_annotations(archive, repo, Some(rel))?;
     let current = CurrentContent::Text(text.to_string(), content_hash(text.as_bytes()));
     let mut rows: Vec<(Annotation, Option<u64>)> = Vec::with_capacity(anns.len());
     for mut ann in anns.drain(..) {
-        let line = refresh(store, &mut ann, &current)?;
+        let line = refresh(archive, &mut ann, &current)?;
         rows.push((ann, line));
     }
     rows.sort_by(|(a, _), (b, _)| (a.start, &a.id).cmp(&(b.start, &b.id)));
@@ -1030,17 +1029,17 @@ fn collapse(s: &str) -> String {
 /// root).
 pub(crate) async fn included_for(
     inv: &Invocation<'_>,
-    store: &Store,
+    archive: &Archive,
     roots: &BTreeMap<String, std::path::PathBuf>,
     repo: &str,
     filter: TargetFilter<'_>,
 ) -> Result<Included> {
     let anns = match filter {
-        TargetFilter::File(rel) => list_annotations(store, repo, Some(rel))?,
+        TargetFilter::File(rel) => list_annotations(archive, repo, Some(rel))?,
         TargetFilter::Subtree(rel) => {
             // File annotations only: a subtree is a directory concept, and a
             // PR annotation lives under no directory (its own page folds it).
-            let all = list_annotations(store, repo, None)?;
+            let all = list_annotations(archive, repo, None)?;
             let files = all
                 .into_iter()
                 .filter(|ann| matches!(ann.target_ref(), TargetRef::File(_)));
@@ -1052,7 +1051,7 @@ pub(crate) async fn included_for(
             }
         }
     };
-    let rows = reconcile(inv, store, roots, repo, anns).await?;
+    let rows = reconcile(inv, archive, roots, repo, anns).await?;
     Ok(Included {
         rows,
         with_paths: matches!(filter, TargetFilter::Subtree(_)),
@@ -1062,13 +1061,13 @@ pub(crate) async fn included_for(
 /// The `annotations=include` payload for a file face whose content is already
 /// in hand — the drift pass runs against the very text being served.
 pub(crate) fn included_for_text(
-    store: &Store,
+    archive: &Archive,
     repo: &str,
     rel: &str,
     text: &str,
 ) -> Result<Included> {
     Ok(Included {
-        rows: reconcile_against_text(store, repo, rel, text)?,
+        rows: reconcile_against_text(archive, repo, rel, text)?,
         with_paths: false,
     })
 }
@@ -1120,17 +1119,17 @@ async fn current_content_for(
 
 // --- binding ----------------------------------------------------------------
 
-pub(crate) fn bind(space: EndpointSpace, roots: &Roots, store: &Arc<Store>) -> EndpointSpace {
+pub(crate) fn bind(space: EndpointSpace, roots: &Roots, archive: &Arc<Archive>) -> EndpointSpace {
     let space = space.bind(
         AnnotationGrammar::new(),
         AnnotationEndpoint {
             roots: Arc::clone(roots),
-            store: Arc::clone(store),
+            archive: Arc::clone(archive),
         },
     );
     let listing: Arc<dyn Endpoint> = Arc::new(AnnotationsEndpoint {
         roots: Arc::clone(roots),
-        store: Arc::clone(store),
+        archive: Arc::clone(archive),
     });
     crate::bind_family(
         space,
@@ -1179,7 +1178,7 @@ impl Grammar for AnnotationGrammar {
 
 struct AnnotationEndpoint {
     roots: Roots,
-    store: Arc<Store>,
+    archive: Arc<Archive>,
 }
 
 #[async_trait]
@@ -1213,7 +1212,7 @@ impl AnnotationEndpoint {
     }
 
     fn load_required(&self, id: &str) -> Result<Annotation> {
-        load_annotation(&self.store, id)?.ok_or_else(|| {
+        load_annotation(&self.archive, id)?.ok_or_else(|| {
             Error::NotFound(format!("browse: no annotation `{}`", annotation_iri(id)))
         })
     }
@@ -1227,7 +1226,7 @@ impl AnnotationEndpoint {
         let mut ann = self.load_required(&id)?;
         granted(inv, &ann.repo)?;
         let current = current_content_for(inv, &self.roots, &ann.repo, &ann.target_ref()).await?;
-        let line = refresh(&self.store, &mut ann, &current)?;
+        let line = refresh(&self.archive, &mut ann, &current)?;
         match inv.inline_str("as").unwrap_or("text/plain") {
             t if t.starts_with("application/json") => Ok(repr(
                 "application/json",
@@ -1320,7 +1319,7 @@ impl AnnotationEndpoint {
         let (prefix, suffix) = context_around(&text, &anchor);
 
         // An update keeps its original creation instant.
-        let created = match load_annotation(&self.store, &id)? {
+        let created = match load_annotation(&self.archive, &id)? {
             Some(existing) if existing.created.is_some() => existing.created,
             _ => inv.now().map(|t| iso8601(t.as_millis())),
         };
@@ -1347,7 +1346,7 @@ impl AnnotationEndpoint {
             motivation: Some(MOTIVATION_HUMAN.to_string()),
             generated_by: None,
         };
-        rewrite_annotation(&self.store, &ann)?;
+        rewrite_annotation(&self.archive, &ann)?;
         match inv.inline_str("as").unwrap_or("text/plain") {
             t if t.starts_with("application/json") => {
                 let mut json = annotation_json(&ann, Some(anchor.line));
@@ -1363,7 +1362,7 @@ impl AnnotationEndpoint {
     fn delete(&self, inv: &Invocation<'_>) -> Result<Representation> {
         let id = Self::id_binding(inv)?;
         let ann = self.load_required(&id)?;
-        remove_annotation(&self.store, &id)?;
+        remove_annotation(&self.archive, &id)?;
         Ok(repr_utf8("text/plain", format!("deleted {}", ann.iri())))
     }
 }
@@ -1494,7 +1493,7 @@ fn annotation_description() -> Description {
 /// content fetch per distinct target.
 struct AnnotationsEndpoint {
     roots: Roots,
-    store: Arc<Store>,
+    archive: Arc<Archive>,
 }
 
 #[async_trait]
@@ -1510,9 +1509,9 @@ impl Endpoint for AnnotationsEndpoint {
         granted(inv, repo)?;
         let rel = path_binding(inv)?;
         let filter = (!rel.is_empty()).then_some(rel.as_str());
-        let anns = list_annotations(&self.store, repo, filter)?;
+        let anns = list_annotations(&self.archive, repo, filter)?;
         // One content fetch per distinct target, then the drift pass each.
-        let rows = reconcile(inv, &self.store, &self.roots, repo, anns).await?;
+        let rows = reconcile(inv, &self.archive, &self.roots, repo, anns).await?;
 
         match inv.inline_str("as").unwrap_or("application/json") {
             t if t.starts_with("text/html") => Ok(repr_utf8(
@@ -1806,12 +1805,12 @@ pub(crate) struct Marker {
 /// (their quote is at no current line). Runs the same drift pass as Source,
 /// against the content the view already read.
 pub(crate) fn file_overlay(
-    store: &Store,
+    archive: &Archive,
     repo: &str,
     rel: &str,
     text: &str,
 ) -> Result<(BTreeMap<u64, Vec<Marker>>, String)> {
-    let rows = reconcile_against_text(store, repo, rel, text)?;
+    let rows = reconcile_against_text(archive, repo, rel, text)?;
     let mut marked: BTreeMap<u64, Vec<Marker>> = BTreeMap::new();
     for (ann, line) in &rows {
         if ann.orphaned {
@@ -1845,7 +1844,7 @@ pub(crate) fn file_overlay(
 /// PR.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn mint_review_annotation(
-    store: &Store,
+    archive: &Archive,
     target_iri: &str,
     repo: &str,
     rel: &str,
@@ -1886,7 +1885,7 @@ pub(crate) fn mint_review_annotation(
         motivation: Some(MOTIVATION_REVIEW.to_string()),
         generated_by: Some(pass_iri.to_string()),
     };
-    store_annotation(store, &ann)?;
+    store_annotation(archive, &ann)?;
     Ok(Some(ann.iri()))
 }
 
@@ -1895,17 +1894,17 @@ pub(crate) fn mint_review_annotation(
 /// longer load (someone deleted the annotation) are skipped: the pass entry
 /// records history, the store records the present. Same [`Included`] the
 /// `annotations=include` folds serve, so the faces are shared.
-pub(crate) fn included_for_ids(store: &Store, iris: &[String], text: &str) -> Result<Included> {
+pub(crate) fn included_for_ids(archive: &Archive, iris: &[String], text: &str) -> Result<Included> {
     let current = CurrentContent::Text(text.to_string(), content_hash(text.as_bytes()));
     let mut rows: Vec<(Annotation, Option<u64>)> = Vec::with_capacity(iris.len());
     for iri in iris {
         let Some(id) = iri.strip_prefix("urn:iki:annotation:") else {
             continue;
         };
-        let Some(mut ann) = load_annotation(store, id)? else {
+        let Some(mut ann) = load_annotation(archive, id)? else {
             continue;
         };
-        let line = refresh(store, &mut ann, &current)?;
+        let line = refresh(archive, &mut ann, &current)?;
         rows.push((ann, line));
     }
     rows.sort_by(|(a, _), (b, _)| (a.start, &a.id).cmp(&(b.start, &b.id)));
@@ -1919,18 +1918,17 @@ pub(crate) fn included_for_ids(store: &Store, iris: &[String], text: &str) -> Re
 
 /// Every annotation whose recorded target is `target_iri` (matching the
 /// legacy `ik:target` predicate too), in (position, id) order.
-fn list_annotations_for_target(store: &Store, target_iri: &str) -> Result<Vec<Annotation>> {
+fn list_annotations_for_target(archive: &Archive, target_iri: &str) -> Result<Vec<Annotation>> {
     let target = match NamedNode::new(target_iri) {
         Ok(node) => node,
         Err(_) => return Ok(Vec::new()),
     };
     let mut ids = std::collections::BTreeSet::new();
     for predicate in [ik("annotates"), ik("target")] {
-        for quad in store.quads_for_pattern(
+        for quad in archive.quads_for_pattern(
             None,
             Some(predicate.as_ref()),
             Some(target.as_ref().into()),
-            None,
         ) {
             let quad = quad.map_err(store_err)?;
             let subject = quad.subject.to_string();
@@ -1942,7 +1940,7 @@ fn list_annotations_for_target(store: &Store, target_iri: &str) -> Result<Vec<An
     }
     let mut out = Vec::new();
     for id in &ids {
-        if let Some(ann) = load_annotation(store, id)? {
+        if let Some(ann) = load_annotation(archive, id)? {
             out.push(ann);
         }
     }
@@ -1953,15 +1951,15 @@ fn list_annotations_for_target(store: &Store, target_iri: &str) -> Result<Vec<An
 /// The drift pass for one target against content already in hand — the PR
 /// page's path (its diff is the anchor surface), rows in reading order.
 fn reconcile_target_against_text(
-    store: &Store,
+    archive: &Archive,
     target_iri: &str,
     text: &str,
 ) -> Result<Vec<(Annotation, Option<u64>)>> {
-    let mut anns = list_annotations_for_target(store, target_iri)?;
+    let mut anns = list_annotations_for_target(archive, target_iri)?;
     let current = CurrentContent::Text(text.to_string(), content_hash(text.as_bytes()));
     let mut rows: Vec<(Annotation, Option<u64>)> = Vec::with_capacity(anns.len());
     for mut ann in anns.drain(..) {
-        let line = refresh(store, &mut ann, &current)?;
+        let line = refresh(archive, &mut ann, &current)?;
         rows.push((ann, line));
     }
     rows.sort_by(|(a, _), (b, _)| (a.start, &a.id).cmp(&(b.start, &b.id)));
@@ -1972,11 +1970,11 @@ fn reconcile_target_against_text(
 /// (the PR page's diff view): markers per annotated line plus the panel with
 /// its create form targeting that IRI. The [`file_overlay`] of the PR world.
 pub(crate) fn target_overlay(
-    store: &Store,
+    archive: &Archive,
     target_iri: &str,
     text: &str,
 ) -> Result<(BTreeMap<u64, Vec<Marker>>, String)> {
-    let rows = reconcile_target_against_text(store, target_iri, text)?;
+    let rows = reconcile_target_against_text(archive, target_iri, text)?;
     let mut marked: BTreeMap<u64, Vec<Marker>> = BTreeMap::new();
     for (ann, line) in &rows {
         if ann.orphaned {
@@ -1996,12 +1994,12 @@ pub(crate) fn target_overlay(
 /// The `annotations=include` payload for a target whose text is already in
 /// hand — the PR page's fold.
 pub(crate) fn included_for_target_text(
-    store: &Store,
+    archive: &Archive,
     target_iri: &str,
     text: &str,
 ) -> Result<Included> {
     Ok(Included {
-        rows: reconcile_target_against_text(store, target_iri, text)?,
+        rows: reconcile_target_against_text(archive, target_iri, text)?,
         with_paths: false,
     })
 }
@@ -2010,6 +2008,8 @@ pub(crate) fn included_for_target_text(
 
 #[cfg(test)]
 mod tests {
+    use oxigraph::model::GraphName;
+    use oxigraph::store::Store;
     use super::*;
     use futures::executor::block_on;
     use ikigai_core::{ArgRef, Capability, Kernel, Request};
@@ -2400,7 +2400,8 @@ mod tests {
 
         // The re-anchor PERSISTED: the stored graph carries the new hash and
         // positions (checked straight in the store, not through the face).
-        let stored = load_annotation(&store, "n").unwrap().unwrap();
+        let archive = Archive::new(Arc::clone(&store), GraphName::DefaultGraph);
+        let stored = load_annotation(&archive, "n").unwrap().unwrap();
         assert_eq!(stored.hash, read["content_hash"].as_str().unwrap());
         assert_eq!(stored.start, read["start"].as_u64().unwrap());
         assert!(stored.reanchored);
@@ -3172,13 +3173,14 @@ mod tests {
         );
 
         // Site 2 — `list_annotations_for_target`, the PR/target overlay's scan.
-        let rows = list_annotations_for_target(&store, "urn:repo:demo:file:a.rs").unwrap();
+        let archive = Archive::new(Arc::clone(&store), GraphName::DefaultGraph);
+        let rows = list_annotations_for_target(&archive, "urn:repo:demo:file:a.rs").unwrap();
         assert_eq!(rows.len(), 1, "the target scan went empty");
         assert_eq!(rows[0].iri(), iri);
 
         // Site 3 — `included_for_ids`, a review pass's minted set by IRI.
         let text = std::fs::read_to_string(root.join("a.rs")).unwrap();
-        let included = included_for_ids(&store, std::slice::from_ref(&iri), &text).unwrap();
+        let included = included_for_ids(&archive, std::slice::from_ref(&iri), &text).unwrap();
         assert_eq!(included.rows.len(), 1, "the minted-set scan went empty");
 
         // The selector sub-IRIs are minted under the new prefix too, so a
@@ -3193,7 +3195,7 @@ mod tests {
         // Delete takes it back out of every scan.
         issue(&k, Verb::Delete, &iri, &[], &cap()).unwrap();
         assert!(
-            list_annotations_for_target(&store, "urn:repo:demo:file:a.rs")
+            list_annotations_for_target(&archive, "urn:repo:demo:file:a.rs")
                 .unwrap()
                 .is_empty()
         );

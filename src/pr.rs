@@ -48,7 +48,7 @@ use ikigai_core::{
     ArgRef, ArgSpec, Bindings, Description, Endpoint, EndpointSpace, Error, Grammar, Invocation,
     Iri, Representation, Request, Result, UriTemplate, Verb,
 };
-use oxigraph::store::Store;
+use crate::archive::Archive;
 
 use crate::annotate::{self, Included, CAP_ANNOTATE};
 use crate::explain::{
@@ -417,7 +417,7 @@ impl Grammar for PrPageRow {
 pub(crate) fn bind_pages(
     space: EndpointSpace,
     roots: &Roots,
-    store: Option<&Arc<Store>>,
+    archive: Option<&Arc<Archive>>,
     explain: bool,
 ) -> EndpointSpace {
     let prs: Arc<dyn Endpoint> = Arc::new(PrsEndpoint {
@@ -434,7 +434,7 @@ pub(crate) fn bind_pages(
     let mut space = bind_family(space, roots, scoped, None, Some("prs:{path}"));
     let page: Arc<dyn Endpoint> = Arc::new(PrEndpoint {
         roots: Arc::clone(roots),
-        store: store.map(Arc::clone),
+        archive: archive.map(Arc::clone),
         explain,
     });
     for name in roots.keys() {
@@ -987,7 +987,7 @@ fn prs_scoped_description() -> Description {
 
 struct PrEndpoint {
     roots: Roots,
-    store: Option<Arc<Store>>,
+    archive: Option<Arc<Archive>>,
     explain: bool,
 }
 
@@ -1013,9 +1013,9 @@ impl Endpoint for PrEndpoint {
                 // annotated diff lines plus the panel with its create form
                 // targeting THIS PR — the diff text is the anchor surface.
                 let overlay = self
-                    .store
+                    .archive
                     .as_deref()
-                    .map(|store| annotate::target_overlay(store, &target, &diff))
+                    .map(|archive| annotate::target_overlay(archive, &target, &diff))
                     .transpose()?;
                 let (marked, panel) = overlay.unwrap_or_default();
                 Ok(repr_utf8(
@@ -1074,7 +1074,7 @@ impl Endpoint for PrEndpoint {
     }
 
     fn describe(&self) -> Description {
-        pr_description(self.store.is_some(), self.explain)
+        pr_description(self.archive.is_some(), self.explain)
     }
 }
 
@@ -1083,7 +1083,7 @@ impl PrEndpoint {
     /// against the very diff being served. Fails loud when no store is
     /// mounted — the manifold only offers the arg when one is.
     fn included(&self, target: &str, diff: &str) -> Result<Included> {
-        let Some(store) = self.store.as_deref() else {
+        let Some(archive) = self.archive.as_deref() else {
             return Err(Error::InvalidArgument {
                 name: "annotations".to_string(),
                 detail: "no annotation store is mounted (space_with_annotations / \
@@ -1091,7 +1091,7 @@ impl PrEndpoint {
                     .to_string(),
             });
         };
-        annotate::included_for_target_text(store, target, diff)
+        annotate::included_for_target_text(archive, target, diff)
     }
 }
 
@@ -1226,7 +1226,7 @@ impl Endpoint for PrExplainEndpoint {
         let tag = requested.clone().unwrap_or_else(|| current_tag.clone());
 
         let iri = entry_iri(repo, &pr_rel(n), &view.head_oid, &tag);
-        if let Some(entry) = load_entry(&config.store, &iri)? {
+        if let Some(entry) = load_entry(&config.archive, &iri)? {
             return pr_explain_face(inv, repo, n, &entry, false);
         }
         if let Some(tag) = requested {
@@ -1268,7 +1268,7 @@ impl Endpoint for PrExplainEndpoint {
             text,
             derived_at: inv.now().map(|t| iso8601(t.as_millis())),
         };
-        store_entry(&config.store, &entry)?;
+        store_entry(&config.archive, &entry)?;
         pr_explain_face(inv, repo, n, &entry, true)
     }
 
@@ -1429,10 +1429,10 @@ impl Endpoint for PrReviewEndpoint {
 
         let iri = pass_iri(repo, &pr_rel(n), &view.head_oid, &tag);
         if !debug_raw {
-            if let Some(entry) = load_pass(&config.store, &iri)? {
+            if let Some(entry) = load_pass(&config.archive, &iri)? {
                 // The hit path mints NOTHING; the recorded set is reconciled
                 // against the diff in hand.
-                let included = annotate::included_for_ids(&config.store, &entry.minted, &diff)?;
+                let included = annotate::included_for_ids(&config.archive, &entry.minted, &diff)?;
                 return pr_review_face(inv, repo, n, &entry, false, &included);
             }
         }
@@ -1481,7 +1481,7 @@ impl Endpoint for PrReviewEndpoint {
         let mut orphaned_items = malformed;
         for finding in &findings {
             match annotate::mint_review_annotation(
-                &config.store,
+                &config.archive,
                 &target,
                 repo,
                 "",
@@ -1520,8 +1520,8 @@ impl Endpoint for PrReviewEndpoint {
             total_bytes: Some(diff.len() as u64),
             derived_at: created,
         };
-        store_pass(&config.store, &entry)?;
-        let included = annotate::included_for_ids(&config.store, &entry.minted, &diff)?;
+        store_pass(&config.archive, &entry)?;
+        let included = annotate::included_for_ids(&config.archive, &entry.minted, &diff)?;
         pr_review_face(inv, repo, n, &entry, true, &included)
     }
 
@@ -1680,6 +1680,7 @@ fn pr_review_description() -> Description {
 
 #[cfg(test)]
 mod tests {
+    use oxigraph::store::Store;
     use super::*;
     use futures::executor::block_on;
     use ikigai_core::{Capability, Exact, Fallback, FnEndpoint, Kernel};
@@ -2720,7 +2721,7 @@ index 3f9c2d1..8a41b77 100644
                 "demo".to_string(),
                 root.clone(),
             )])),
-            store: None,
+            archive: None,
             explain: false,
         };
         let description = page.describe();

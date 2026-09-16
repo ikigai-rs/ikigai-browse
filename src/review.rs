@@ -49,8 +49,8 @@ use ikigai_core::{
     ArgRef, ArgSpec, Description, Endpoint, EndpointSpace, Error, Invocation, Representation,
     Request, Result, Verb,
 };
-use oxigraph::model::{GraphName, Literal, NamedNode, Quad, Term};
-use oxigraph::store::Store;
+use oxigraph::model::{Literal, NamedNode, Quad, Term};
+use crate::archive::Archive;
 
 use crate::annotate::{self, Included, CAP_ANNOTATE, PROV};
 use crate::explain::{
@@ -197,11 +197,11 @@ fn prov(term: &str) -> NamedNode {
     NamedNode::new(format!("{PROV}{term}")).expect("prov terms are valid IRIs")
 }
 
-pub(crate) fn store_pass(store: &Store, entry: &PassEntry) -> Result<()> {
+pub(crate) fn store_pass(archive: &Archive, entry: &PassEntry) -> Result<()> {
     use oxigraph::model::vocab::{rdf, xsd};
     let subject = NamedNode::new(&entry.iri).map_err(store_err)?;
     let target = NamedNode::new(&entry.target_iri).map_err(store_err)?;
-    let g = GraphName::DefaultGraph;
+    let g = archive.graph().clone();
     let mut quads: Vec<Quad> = vec![
         Quad::new(subject.clone(), rdf::TYPE, ik("Review"), g.clone()),
         Quad::new(
@@ -272,14 +272,14 @@ pub(crate) fn store_pass(store: &Store, entry: &PassEntry) -> Result<()> {
         ));
     }
     for quad in &quads {
-        store.insert(quad).map_err(store_err)?;
+        archive.insert(quad).map_err(store_err)?;
     }
     Ok(())
 }
 
 /// Load one archived pass by its key IRI — `None` on a miss (no
 /// `ik:versionTag` under that subject).
-pub(crate) fn load_pass(store: &Store, iri: &str) -> Result<Option<PassEntry>> {
+pub(crate) fn load_pass(archive: &Archive, iri: &str) -> Result<Option<PassEntry>> {
     let subject = match NamedNode::new(iri) {
         Ok(node) => node,
         Err(_) => return Ok(None),
@@ -299,7 +299,7 @@ pub(crate) fn load_pass(store: &Store, iri: &str) -> Result<Option<PassEntry>> {
         derived_at: None,
     };
     let mut found = false;
-    for quad in store.quads_for_pattern(Some(subject.as_ref().into()), None, None, None) {
+    for quad in archive.quads_for_pattern(Some(subject.as_ref().into()), None, None) {
         let quad = quad.map_err(store_err)?;
         let literal = |term: &Term| match term {
             Term::Literal(l) => l.value().to_string(),
@@ -484,10 +484,10 @@ impl Endpoint for ReviewEndpoint {
 
         let iri = pass_iri(repo, &rel, &hash, &tag);
         if !debug_raw {
-            if let Some(entry) = load_pass(&config.store, &iri)? {
+            if let Some(entry) = load_pass(&config.archive, &iri)? {
                 // The hit path: mints NOTHING. The recorded annotations are
                 // drift-reconciled against the very content in hand.
-                let included = annotate::included_for_ids(&config.store, &entry.minted, &text)?;
+                let included = annotate::included_for_ids(&config.archive, &entry.minted, &text)?;
                 return face(inv, repo, &rel, &entry, false, &included);
             }
         }
@@ -539,7 +539,7 @@ impl Endpoint for ReviewEndpoint {
         let mut orphaned_items = malformed;
         for finding in &findings {
             match annotate::mint_review_annotation(
-                &config.store,
+                &config.archive,
                 &file_iri(repo, &rel),
                 repo,
                 &rel,
@@ -581,8 +581,8 @@ impl Endpoint for ReviewEndpoint {
             total_bytes: Some(text.len() as u64),
             derived_at: created,
         };
-        store_pass(&config.store, &entry)?;
-        let included = annotate::included_for_ids(&config.store, &entry.minted, &text)?;
+        store_pass(&config.archive, &entry)?;
+        let included = annotate::included_for_ids(&config.archive, &entry.minted, &text)?;
         face(inv, repo, &rel, &entry, true, &included)
     }
 
@@ -795,6 +795,7 @@ fn review_description() -> Description {
 
 #[cfg(test)]
 mod tests {
+    use oxigraph::store::Store;
     use super::*;
     use futures::executor::block_on;
     use ikigai_core::{Capability, Exact, Fallback, FnEndpoint, Iri, Kernel};
