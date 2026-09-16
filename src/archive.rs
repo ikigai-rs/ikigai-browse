@@ -54,8 +54,8 @@ impl Archive {
         Archive { store, graph }
     }
 
-    /// The graph this mount owns. For the Turtle faces, which name it, and for
-    /// the tests that pin confinement.
+    /// The graph this mount owns — the graph name every stored quad is built
+    /// with, and what the confinement tests assert against.
     pub(crate) fn graph(&self) -> &GraphName {
         &self.graph
     }
@@ -77,7 +77,7 @@ impl Archive {
     pub(crate) fn insert(&self, quad: &Quad) -> Result<(), StorageError> {
         debug_assert_eq!(
             quad.graph_name, self.graph,
-            "browse: a quad built outside Archive::quad reached Archive::insert"
+            "browse: a quad not built with Archive::graph() reached Archive::insert"
         );
         self.store.insert(quad)
     }
