@@ -7,6 +7,10 @@
 //! cargo run --features migrate --bin migrate-annotation-ns -- /tmp/rehearsal
 //! cargo run --features migrate --bin migrate-annotation-ns -- /tmp/rehearsal --commit
 //!
+//! # …and the 0.4.0 move, which a host calling Mount::graph needs run once:
+//! cargo run --features migrate --bin migrate-annotation-ns -- \\
+//!     /tmp/rehearsal --graph urn:iki:graph:browse --commit
+//!
 //! # …and to see the lock refusal the tool is supposed to give a live store:
 //! cargo run --features migrate --example migration-rehearsal -- /tmp/rehearsal --hold 30 &
 //! cargo run --features migrate --bin migrate-annotation-ns -- /tmp/rehearsal

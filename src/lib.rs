@@ -110,12 +110,14 @@ use ikigai_core::{
     ArgSpec, Bindings, Description, Endpoint, EndpointSpace, Error, FnEndpoint, Grammar,
     Invocation, Iri, ReprType, Representation, Result, UriTemplate, Verb,
 };
+use oxigraph::model::{GraphName, NamedNode};
 use oxigraph::store::Store;
 use syntect::html::{css_for_theme_with_class_style, line_tokens_to_classed_spans, ClassStyle};
 use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxDefinition, SyntaxSet};
 use syntect::util::LinesWithEndings;
 
 mod annotate;
+mod archive;
 mod explain;
 mod hash;
 /// The one-shot that moves a pre-0.3.0 store's annotations into the
@@ -130,6 +132,8 @@ mod pr;
 mod review;
 /// The watch that keeps `urn:repo:style` fresh — see [`Mount::space_watched`].
 mod watch;
+
+use archive::Archive;
 
 pub use annotate::CAP_ANNOTATE;
 pub use explain::ExplainConfig;
@@ -219,6 +223,11 @@ pub struct Mount {
     app: Option<String>,
     config_home: ConfigHome,
     store: Option<Arc<Store>>,
+    /// The graph the mount owns, as STATED by the host. `None` is not "the
+    /// default graph chosen" but "the host said nothing", which is what lets
+    /// [`Mount::space_watched`] tell a real disagreement with an
+    /// [`ExplainConfig::graph`] from an absence.
+    graph: Option<NamedNode>,
     explain: Option<ExplainConfig>,
 }
 
@@ -259,6 +268,7 @@ impl Mount {
             app: None,
             config_home: ConfigHome::Ambient,
             store: None,
+            graph: None,
             explain: None,
         }
     }
@@ -321,11 +331,43 @@ impl Mount {
         self
     }
 
+    /// The **graph** every quad this mount stores is written to and read back
+    /// from — annotations, the explanation archive, the review passes.
+    ///
+    /// A mount that never calls this uses the store's **default graph**, which
+    /// is exactly what every host had before 0.4.0, byte for byte. Calling it
+    /// is how a host puts browse's data inside a tenancy boundary: the default
+    /// graph has no IRI, so no `urn:cap:store:{read,write}:graph:<iri>` token
+    /// can name it and no graph-scoped query can see it — browse data in the
+    /// default graph sits OUTSIDE the per-graph capability boundary entirely.
+    ///
+    /// ★ **Opting in is not free, and the cost is not in this crate.** A host
+    /// that shares one dataset between browse and a graph-scoped store may be
+    /// relying on browse being invisible to scoped reads in order to call them
+    /// cacheable (`ikigai-gonk`'s `freshness` module does exactly this, and
+    /// measures ~1000× on the ledger's hot read). Naming a graph here makes
+    /// browse's writes visible to a scoped read of that graph, so that
+    /// freshness argument no longer holds for it and the host must redo it —
+    /// by declaring the browse-graph reads uncacheable, or by cutting their
+    /// threads on a browse write. This crate cannot make that choice for a
+    /// host, so it makes it **stated**: nothing changes until someone calls
+    /// this.
+    ///
+    /// Reads move with writes. Before 0.4.0 the reads passed no graph at all,
+    /// which in `quads_for_pattern` means *every graph in the store*; a knob
+    /// that moved only the writes would have left browse writing into its own
+    /// graph and still answering out of anyone else's. See [`crate::migrate`]
+    /// for moving an existing store's quads into the graph named here.
+    pub fn graph(mut self, graph: NamedNode) -> Self {
+        self.graph = Some(graph);
+        self
+    }
+
     /// Mount the S1 **explanation** family (and the S4 review pass, and the
     /// derived pull-request layers) — the store rides in the config. See
     /// [`space_with_explain`].
     pub fn explain(mut self, config: ExplainConfig) -> Self {
-        self.store = Some(Arc::clone(&config.store));
+        self.store = Some(Arc::clone(config.archive.store()));
         self.explain = Some(config);
         self
     }
@@ -376,6 +418,7 @@ impl Mount {
             app,
             config_home,
             store,
+            graph,
             explain,
         } = self;
         // The ambient read, if there is one, happens HERE — once, in the host's
@@ -384,26 +427,68 @@ impl Mount {
         let style = StyleWatch::new(home.clone(), app.clone());
         let app = app.as_deref();
         let home = home.as_deref();
-        let Some(config) = explain else {
+        let Some(mut config) = explain else {
             let ignore = Arc::new(hash::default_ignore());
-            let space = base_space(&roots, &ignore, store.as_ref(), false, app, home);
-            let space = match store {
-                Some(store) => annotate::bind(space, &roots, &store),
+            let archive = store.map(|store| {
+                Arc::new(Archive::new(
+                    store,
+                    graph_name(graph.clone(), None, "Mount"),
+                ))
+            });
+            let space = base_space(&roots, &ignore, archive.as_ref(), false, app, home);
+            let space = match archive {
+                Some(archive) => annotate::bind(space, &roots, &archive),
                 None => space,
             };
             return (space, style);
         };
         let ignore = Arc::new(config.ignore.clone());
-        let store = Arc::clone(&config.store);
+        // ONE archive for the whole mount: the annotation family, the
+        // explanation archive, the review passes and the pull-request layers
+        // have always shared one store, and now share one graph within it.
+        // Rebuilding it here (rather than trusting the config's) is what makes
+        // `Mount::graph` and `ExplainConfig::graph` a single decision with one
+        // answer instead of two knobs that can drift apart unnoticed.
+        let archive = Arc::new(Archive::new(
+            Arc::clone(config.archive.store()),
+            graph_name(graph, config.graph.clone(), "Mount"),
+        ));
+        config.archive = Arc::clone(&archive);
         let shared = Arc::new(config.clone());
-        let space = base_space(&roots, &ignore, Some(&store), true, app, home);
+        let space = base_space(&roots, &ignore, Some(&archive), true, app, home);
         let space = explain::bind(space, &roots, config);
         // The S4 review pass (machine-minted annotations) rides with the
         // explanation family: it needs the same LLM seam and the same store.
         let space = review::bind(space, &roots, &shared);
         // So do the pull-request derived layers (pr:{n}:explain / pr:{n}:review).
         let space = pr::bind_explain(space, &roots, &shared);
-        (annotate::bind(space, &roots, &store), style)
+        (annotate::bind(space, &roots, &archive), style)
+    }
+}
+
+/// The one graph a mount owns, from the two places a host can state it.
+///
+/// `None` from both is the default graph — today's behaviour, and the reason
+/// this is `Option<NamedNode>` rather than `GraphName` all the way down: a
+/// `GraphName::DefaultGraph` sitting in the config would be indistinguishable
+/// from a host that never spoke, and the disagreement below could not be seen.
+///
+/// # Panics
+///
+/// When [`Mount::graph`] and [`ExplainConfig::graph`] name DIFFERENT graphs.
+/// Fails loud at mount time, like a bad root name: a mount where the two
+/// disagree has no correct reading — silently preferring either one would put
+/// half a host's data somewhere it did not ask for, and only a store audit
+/// would ever say so.
+fn graph_name(mount: Option<NamedNode>, config: Option<NamedNode>, who: &str) -> GraphName {
+    match (mount, config) {
+        (Some(a), Some(b)) if a != b => panic!(
+            "browse: {who}::graph(<{a}>) and ExplainConfig::graph(<{b}>) name different graphs; \
+             a mount stores its annotations, explanations and review passes in ONE graph"
+        ),
+        (Some(a), _) => GraphName::NamedNode(a),
+        (None, Some(b)) => GraphName::NamedNode(b),
+        (None, None) => GraphName::DefaultGraph,
     }
 }
 
@@ -433,13 +518,13 @@ fn build_roots(roots: impl IntoIterator<Item = (String, PathBuf)>) -> Roots {
 fn base_space(
     roots: &Roots,
     ignore: &Arc<BTreeSet<String>>,
-    store: Option<&Arc<Store>>,
+    archive: Option<&Arc<Archive>>,
     explain: bool,
     app: Option<&str>,
     home: Option<&Path>,
 ) -> EndpointSpace {
     let tree: Arc<dyn Endpoint> = Arc::new(tree_endpoint(roots, explain));
-    let file: Arc<dyn Endpoint> = Arc::new(file_endpoint(roots, store, explain));
+    let file: Arc<dyn Endpoint> = Arc::new(file_endpoint(roots, archive, explain));
     let state: Arc<dyn Endpoint> = Arc::new(state_endpoint(roots));
     let hash: Arc<dyn Endpoint> = Arc::new(hash::hash_endpoint(roots, ignore));
     let space = EndpointSpace::new();
@@ -452,7 +537,7 @@ fn base_space(
     // The pull-request pages ride with every variant: they need no store and
     // no LLM — only ikigai-repo's pr facades resolved through the kernel at
     // runtime (unmounted facades answer a typed NotFound, not a panic).
-    pr::bind_pages(space, roots, store, explain)
+    pr::bind_pages(space, roots, archive, explain)
 }
 
 // --- grammar ----------------------------------------------------------------
@@ -1148,10 +1233,10 @@ fn tree_turtle(repo: &str, rel: &str, entries: &[Entry]) -> String {
 
 // --- file endpoint ----------------------------------------------------------
 
-fn file_endpoint(roots: &Roots, store: Option<&Arc<Store>>, explain: bool) -> FnEndpoint {
+fn file_endpoint(roots: &Roots, archive: Option<&Arc<Archive>>, explain: bool) -> FnEndpoint {
     let held = Arc::clone(roots);
-    let store = store.map(Arc::clone);
-    let has_store = store.is_some();
+    let archive = archive.map(Arc::clone);
+    let has_store = archive.is_some();
     FnEndpoint::new("browse-file", move |inv: &Invocation<'_>| {
         let (repo, root) = repo_root(inv, &held)?;
         granted(inv, repo)?;
@@ -1174,13 +1259,13 @@ fn file_endpoint(roots: &Roots, store: Option<&Arc<Store>>, explain: bool) -> Fn
             // store is mounted — `annotations=include` changes nothing there.
             t if t.starts_with("text/html") => Ok(repr_utf8(
                 "text/html",
-                file_html(repo, &rel, &bytes, store.as_deref(), explain)?,
+                file_html(repo, &rel, &bytes, archive.as_deref(), explain)?,
             )),
             _ if include => {
                 // One resolution = content + human margin notes (the
                 // agent-grounding face). Only a mounted store and textual
                 // content can honor it — anything else fails loud.
-                let Some(store) = store.as_deref() else {
+                let Some(archive) = archive.as_deref() else {
                     return Err(Error::InvalidArgument {
                         name: "annotations".to_string(),
                         detail: "no annotation store is mounted (space_with_annotations / \
@@ -1196,7 +1281,7 @@ fn file_endpoint(roots: &Roots, store: Option<&Arc<Store>>, explain: bool) -> Fn
                         ),
                     });
                 };
-                let included = annotate::included_for_text(store, repo, &rel, text)?;
+                let included = annotate::included_for_text(archive, repo, &rel, text)?;
                 let mut out = text.to_string();
                 if !out.ends_with('\n') {
                     out.push('\n');
@@ -1496,7 +1581,7 @@ fn file_html(
     repo: &str,
     rel: &str,
     bytes: &[u8],
-    store: Option<&Store>,
+    archive: Option<&Archive>,
     explain: bool,
 ) -> Result<String> {
     let mut out = String::from("<div class=\"browse\">");
@@ -1513,8 +1598,8 @@ fn file_html(
             // lines carry a live anchor (marked in the view) plus the
             // annotations panel with its create affordance. The drift pass
             // runs against the very content being rendered.
-            let overlay = store
-                .map(|store| annotate::file_overlay(store, repo, rel, text))
+            let overlay = archive
+                .map(|archive| annotate::file_overlay(archive, repo, rel, text))
                 .transpose()?;
             let (marked, panel) = overlay.unwrap_or_default();
             out.push_str(&highlight_html(rel, text, &marked));
@@ -2842,7 +2927,8 @@ mod tests {
             let bare = file_endpoint(&roots, None, false).describe();
             assert!(!bare.inputs.iter().any(|i| i.name == "annotations"));
             let store = Arc::new(oxigraph::store::Store::new().unwrap());
-            let with_store = file_endpoint(&roots, Some(&store), false).describe();
+            let archive = Arc::new(Archive::new(store, GraphName::DefaultGraph));
+            let with_store = file_endpoint(&roots, Some(&archive), false).describe();
             let ann = with_store
                 .inputs
                 .iter()

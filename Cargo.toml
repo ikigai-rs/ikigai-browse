@@ -33,7 +33,38 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # default), and the annotation Sink DECLARES the `content` it has read as the
 # piped form of `body` since the family shipped. A consumer reading the manifold
 # sees a truer contract; none sees a narrower one.
-version = "0.3.2"
+#
+# 0.4.0 — MINOR, and deliberately not a patch, on three counts.
+#
+# 1. **Read confinement is an observable change, and it is the whole point.**
+#    Before this, every write named `GraphName::DefaultGraph` and every read
+#    passed `None` for the graph — which in `quads_for_pattern` means EVERY
+#    graph in the store. `Mount::graph` / `ExplainConfig::graph` move both, and
+#    the DEFAULT case moves with them: a mount that names no graph now reads the
+#    default graph rather than the whole dataset. For a store browse is the only
+#    writer of, those two are the same answer and nothing changes. For a SHARED
+#    store they are not, and browse will stop returning quads someone else put
+#    in a named graph — which is the tenancy hole being closed, not a regression,
+#    but it is a behaviour change and a patch would carry it in unannounced.
+# 2. `migrate::Counts` gains `total` and `outside_target_graph` (and
+#    `#[non_exhaustive]`, so this is the last such flag day): adding a public
+#    field to a struct with public fields is a breaking change, whatever the
+#    fields mean.
+# 3. ★ **A host must be able to decide, and a minor forces the manifest edit
+#    where the decision gets made.** Naming a graph is not free: a host sharing
+#    one dataset between browse and a graph-scoped store may be relying on
+#    browse being invisible to scoped reads in order to call them cacheable
+#    (`ikigai-gonk`'s `freshness` module does exactly this, and measures ~1000x
+#    on the ledger's hot read). The default stays `GraphName::DefaultGraph` so
+#    that nothing changes until someone asks — and the bump is what puts the ask
+#    in front of them. Same argument 0.3.0 made for the namespace rename.
+#
+# Additive beside that: `migrate::plan_into_graph` / `plan_with` /
+# `counts_for_graph` / `BROWSE_SUBJECT_PREFIXES`, and `--graph <iri>` on the
+# `migrate-annotation-ns` binary — the one-shot an existing store needs before
+# a host's `Mount::graph` can see its data (the failure mode of skipping it is
+# silent, exactly as it was for the namespace rename).
+version = "0.4.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]

@@ -103,6 +103,7 @@ use oxigraph::model::{GraphName, Literal, NamedNode, Quad, Term};
 use oxigraph::store::Store;
 
 use crate::annotate::{self, Included, TargetFilter};
+use crate::archive::Archive;
 use crate::hash::hash_iri;
 use crate::{
     crumbs_html, esc, file_iri, granted, human_size, include_annotations, iri_encode,
@@ -181,7 +182,15 @@ const BINARY_TAG: &str = "binary-v1";
 /// ```
 #[derive(Clone)]
 pub struct ExplainConfig {
-    pub(crate) store: Arc<Store>,
+    /// The store handle paired with the graph this config names. Rebuilt by
+    /// [`crate::Mount`] at mount time so the whole mount shares ONE archive,
+    /// which is why this is not the authority on the graph — [`Self::graph`]
+    /// below is what the host stated, and what `Mount` reconciles.
+    pub(crate) archive: Arc<Archive>,
+    /// The graph the host stated HERE, kept beside the archive rather than
+    /// only inside it: `Mount` has to be able to tell "the host named this
+    /// graph" from "the archive happens to sit in the default graph".
+    pub(crate) graph: Option<NamedNode>,
     file_provider: String,
     dir_provider: String,
     pub(crate) review_provider: String,
@@ -212,7 +221,8 @@ impl ExplainConfig {
     /// prompts fed at most 16 KiB of content.
     pub fn new(store: Arc<Store>) -> Self {
         ExplainConfig {
-            store,
+            archive: Arc::new(Archive::new(store, GraphName::DefaultGraph)),
+            graph: None,
             file_provider: "urn:llm:coder:ask".to_string(),
             dir_provider: "urn:llm:ask".to_string(),
             review_provider: "urn:llm:coder:ask".to_string(),
@@ -230,6 +240,26 @@ impl ExplainConfig {
             ignore: crate::hash::default_ignore(),
             max_prompt_bytes: 16 * 1024,
         }
+    }
+
+    /// The **graph** the explanation archive, the review passes and the
+    /// annotation family store their quads in — and read them back from.
+    ///
+    /// Unset (the default), everything lands in the store's default graph,
+    /// exactly as it did before 0.4.0. See [`crate::Mount::graph`] for what
+    /// opting in costs a host that shares the dataset with a graph-scoped
+    /// store, and [`crate::migrate`] for moving an existing store's quads.
+    ///
+    /// Stating it on BOTH this and [`crate::Mount::graph`] is allowed while
+    /// they agree; a disagreement panics at mount time rather than splitting a
+    /// host's data across two graphs.
+    pub fn graph(mut self, graph: NamedNode) -> Self {
+        self.archive = Arc::new(Archive::new(
+            Arc::clone(self.archive.store()),
+            GraphName::NamedNode(graph.clone()),
+        ));
+        self.graph = Some(graph);
+        self
     }
 
     /// The provider IRI the file grain asks (default `urn:llm:coder:ask`).
@@ -580,7 +610,8 @@ fn store_err(e: impl std::fmt::Display) -> Error {
     Error::Endpoint(format!("browse: explanation archive: {e}"))
 }
 
-pub(crate) fn store_entry(store: &Store, entry: &ArchiveEntry) -> Result<()> {
+pub(crate) fn store_entry(archive: &Archive, entry: &ArchiveEntry) -> Result<()> {
+    let g = archive.graph().clone();
     let subject = NamedNode::new(&entry.iri).map_err(store_err)?;
     let target = NamedNode::new(&entry.target_iri).map_err(store_err)?;
     let mut quads: Vec<Quad> = vec![
@@ -588,55 +619,50 @@ pub(crate) fn store_entry(store: &Store, entry: &ArchiveEntry) -> Result<()> {
             subject.clone(),
             oxigraph::model::vocab::rdf::TYPE,
             ik("Explanation"),
-            GraphName::DefaultGraph,
+            g.clone(),
         ),
         Quad::new(
             subject.clone(),
             ik("repo"),
             Literal::new_simple_literal(&entry.repo),
-            GraphName::DefaultGraph,
+            g.clone(),
         ),
         Quad::new(
             subject.clone(),
             ik("path"),
             Literal::new_simple_literal(&entry.rel),
-            GraphName::DefaultGraph,
+            g.clone(),
         ),
-        Quad::new(
-            subject.clone(),
-            ik("about"),
-            target,
-            GraphName::DefaultGraph,
-        ),
+        Quad::new(subject.clone(), ik("about"), target, g.clone()),
         Quad::new(
             subject.clone(),
             ik("contentHash"),
             Literal::new_simple_literal(&entry.hash),
-            GraphName::DefaultGraph,
+            g.clone(),
         ),
         Quad::new(
             subject.clone(),
             ik("versionTag"),
             Literal::new_simple_literal(&entry.tag),
-            GraphName::DefaultGraph,
+            g.clone(),
         ),
         Quad::new(
             subject.clone(),
             ik("model"),
             Literal::new_simple_literal(&entry.model),
-            GraphName::DefaultGraph,
+            g.clone(),
         ),
         Quad::new(
             subject.clone(),
             ik("promptKind"),
             Literal::new_simple_literal(&entry.kind),
-            GraphName::DefaultGraph,
+            g.clone(),
         ),
         Quad::new(
             subject.clone(),
             ik("explanation"),
             Literal::new_simple_literal(&entry.text),
-            GraphName::DefaultGraph,
+            g.clone(),
         ),
     ];
     if let Some(at) = &entry.derived_at {
@@ -644,18 +670,18 @@ pub(crate) fn store_entry(store: &Store, entry: &ArchiveEntry) -> Result<()> {
             subject,
             ik("derivedAt"),
             Literal::new_typed_literal(at, oxigraph::model::vocab::xsd::DATE_TIME),
-            GraphName::DefaultGraph,
+            g.clone(),
         ));
     }
     for quad in &quads {
-        store.insert(quad).map_err(store_err)?;
+        archive.insert(quad).map_err(store_err)?;
     }
     Ok(())
 }
 
 /// Load one archived entry by its key IRI — `None` on a miss (no
 /// `ik:explanation` triple under that subject).
-pub(crate) fn load_entry(store: &Store, iri: &str) -> Result<Option<ArchiveEntry>> {
+pub(crate) fn load_entry(archive: &Archive, iri: &str) -> Result<Option<ArchiveEntry>> {
     let subject = match NamedNode::new(iri) {
         Ok(node) => node,
         Err(_) => return Ok(None),
@@ -673,7 +699,7 @@ pub(crate) fn load_entry(store: &Store, iri: &str) -> Result<Option<ArchiveEntry
         derived_at: None,
     };
     let mut found = false;
-    for quad in store.quads_for_pattern(Some(subject.as_ref().into()), None, None, None) {
+    for quad in archive.quads_for_pattern(Some(subject.as_ref().into()), None, None) {
         let quad = quad.map_err(store_err)?;
         let literal = |term: &Term| match term {
             Term::Literal(l) => l.value().to_string(),
@@ -715,19 +741,16 @@ pub(crate) fn load_entry(store: &Store, iri: &str) -> Result<Option<ArchiveEntry
 /// (pre-0.2.2 archives), so old entries stay listed without a migration.
 /// Sorted newest-first by `ik:derivedAt` (entries without a timestamp sort
 /// last), then by tag for determinism.
-fn list_versions(store: &Store, target_iri: &str) -> Result<Vec<ArchiveEntry>> {
+fn list_versions(archive: &Archive, target_iri: &str) -> Result<Vec<ArchiveEntry>> {
     let target = match NamedNode::new(target_iri) {
         Ok(node) => node,
         Err(_) => return Ok(Vec::new()),
     };
     let mut subjects = std::collections::BTreeSet::new();
     for predicate in [ik("about"), ik("target")] {
-        for quad in store.quads_for_pattern(
-            None,
-            Some(predicate.as_ref()),
-            Some(target.as_ref().into()),
-            None,
-        ) {
+        for quad in
+            archive.quads_for_pattern(None, Some(predicate.as_ref()), Some(target.as_ref().into()))
+        {
             let quad = quad.map_err(store_err)?;
             subjects.insert(quad.subject.to_string());
         }
@@ -735,7 +758,7 @@ fn list_versions(store: &Store, target_iri: &str) -> Result<Vec<ArchiveEntry>> {
     let mut entries = Vec::new();
     for subject in &subjects {
         let iri = subject.trim_start_matches('<').trim_end_matches('>');
-        if let Some(entry) = load_entry(store, iri)? {
+        if let Some(entry) = load_entry(archive, iri)? {
             entries.push(entry);
         }
     }
@@ -898,7 +921,7 @@ impl Endpoint for ExplainEndpoint {
         let tag = requested.clone().unwrap_or_else(|| current_tag.clone());
 
         let iri = entry_iri(repo, &rel, &hash, &tag);
-        if let Some(entry) = load_entry(&config.store, &iri)? {
+        if let Some(entry) = load_entry(&config.archive, &iri)? {
             let included = self
                 .included(inv, repo, &rel, grain == Grain::Directory)
                 .await?;
@@ -952,7 +975,7 @@ impl Endpoint for ExplainEndpoint {
             text,
             derived_at: inv.now().map(|t| iso8601(t.as_millis())),
         };
-        store_entry(&config.store, &entry)?;
+        store_entry(&config.archive, &entry)?;
         let included = self
             .included(inv, repo, &rel, grain == Grain::Directory)
             .await?;
@@ -1005,7 +1028,7 @@ impl ExplainEndpoint {
         } else {
             TargetFilter::File(rel)
         };
-        annotate::included_for(inv, &self.config.store, &self.roots, repo, filter)
+        annotate::included_for(inv, &self.config.archive, &self.roots, repo, filter)
             .await
             .map(Some)
     }
@@ -1776,8 +1799,8 @@ impl Endpoint for VersionsEndpoint {
         let rel = path_binding(inv)?;
         // A path is a file target or a tree target; the archive knows which —
         // list both (no filesystem touch, so deleted paths still answer).
-        let mut entries = list_versions(&self.config.store, &file_iri(repo, &rel))?;
-        entries.extend(list_versions(&self.config.store, &tree_iri(repo, &rel))?);
+        let mut entries = list_versions(&self.config.archive, &file_iri(repo, &rel))?;
+        entries.extend(list_versions(&self.config.archive, &tree_iri(repo, &rel))?);
         match inv.inline_str("as").unwrap_or("text/plain") {
             t if t.starts_with("application/json") => {
                 let rows: Vec<serde_json::Value> = entries

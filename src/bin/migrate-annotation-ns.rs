@@ -6,6 +6,13 @@
 //! migrate-annotation-ns <store-path> --commit   # write
 //! ```
 //!
+//! Since 0.4.0 it is also the tool for the OTHER move a browse store can need:
+//! `--graph <iri>` puts every browse-owned quad into that named graph, which is
+//! what `Mount::graph` needs an existing store to have done. Both moves in one
+//! pass and one transaction — see [`ikigai_browse::migrate::plan_into_graph`]
+//! for why they are not two runs. The binary keeps its name because operators'
+//! notes, runbooks and shell history name it; what it does has grown.
+//!
 //! ★ **This binary is a stopgap for a missing primitive.** The ecosystem's
 //! SPARQL surface is `urn:sparql:ask` / `construct` / `describe` / `select` —
 //! there is no writing verb anywhere. When `urn:sparql:update` exists this is
@@ -22,13 +29,22 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use ikigai_browse::migrate::{self, Counts};
+use oxigraph::model::{GraphName, NamedNode};
 use oxigraph::store::Store;
 
 const USAGE: &str = "\
-migrate-annotation-ns — move a browse store's annotations to urn:iki:annotation:
+migrate-annotation-ns — move a browse store's annotations to urn:iki:annotation:,
+and optionally into a named graph (ikigai-browse 0.4.0's Mount::graph).
 
-    migrate-annotation-ns <store-path>            dry run (default): report only
-    migrate-annotation-ns <store-path> --commit   apply the migration
+    migrate-annotation-ns <store-path>                  dry run (default): report only
+    migrate-annotation-ns <store-path> --commit         apply the migration
+    migrate-annotation-ns <store-path> --graph <iri>    ALSO move every browse-owned
+                                                        quad into that named graph
+
+--graph is what a host that calls Mount::graph(<iri>) needs run once against its
+existing store: browse reads are confined to its graph from 0.4.0, so quads left
+in the default graph are still there and no longer visible. Both moves happen in
+one pass and one transaction.
 
 The store must be CLOSED: RocksDB holds an exclusive lock, so stop the ikigai
 server that owns it first. ⚠ Back the directory up before --commit; this is a
@@ -46,13 +62,21 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<ExitCode, String> {
-    let (path, commit) = parse_args()?;
+    let (path, commit, graph) = parse_args()?;
     let store = open(&path)?;
 
-    let before = migrate::counts(&store).map_err(|e| e.to_string())?;
-    let plan = migrate::plan(&store).map_err(|e| e.to_string())?;
+    // One planner, one set of counts — the graph is simply absent when no one
+    // asked for it, and `counts_for_graph(.., None)` is exactly `counts`.
+    let before = migrate::counts_for_graph(&store, graph.as_ref()).map_err(|e| e.to_string())?;
+    let plan = migrate::plan_with(&store, migrate::Scope::AllIriPositions, graph.as_ref())
+        .map_err(|e| e.to_string())?;
 
     println!("  store    : {}", path.display());
+    if let Some(GraphName::NamedNode(g)) = &graph {
+        // `NamedNode`'s Display already brackets the IRI — `<{g}>` prints
+        // `<<urn:…>>`, which reads like a different IRI in a deploy window.
+        println!("  graph    : {g}");
+    }
     println!("  moving   : {} quads", plan.len());
     println!();
 
@@ -61,11 +85,14 @@ fn run() -> Result<ExitCode, String> {
     // the store itself.
     let (after, label) = if commit {
         migrate::apply(&store, &plan).map_err(|e| e.to_string())?;
-        (migrate::counts(&store).map_err(|e| e.to_string())?, "after")
+        (
+            migrate::counts_for_graph(&store, graph.as_ref()).map_err(|e| e.to_string())?,
+            "after",
+        )
     } else {
         let projected = migrate::project(&store, &plan).map_err(|e| e.to_string())?;
         (
-            migrate::counts(&projected).map_err(|e| e.to_string())?,
+            migrate::counts_for_graph(&projected, graph.as_ref()).map_err(|e| e.to_string())?,
             "would be",
         )
     };
@@ -74,10 +101,13 @@ fn run() -> Result<ExitCode, String> {
     println!();
 
     let passed = Counts::passed(&before, &after);
-    println!(
-        "  {}: annotations equal · old -> 0 · new -> old's former count · dangling -> 0",
-        if passed { "PASS" } else { "FAIL" }
-    );
+    let clauses = if graph.is_some() {
+        "annotations equal · old -> 0 · new -> old's former count · dangling -> 0 · \
+         total equal · outside target graph -> 0"
+    } else {
+        "annotations equal · old -> 0 · new -> old's former count · dangling -> 0 · total equal"
+    };
+    println!("  {}: {clauses}", if passed { "PASS" } else { "FAIL" });
     if !commit {
         println!();
         println!("  DRY RUN — nothing was written. Re-run with --commit to apply.");
@@ -91,12 +121,22 @@ fn run() -> Result<ExitCode, String> {
     })
 }
 
-fn parse_args() -> Result<(PathBuf, bool), String> {
+fn parse_args() -> Result<(PathBuf, bool, Option<GraphName>), String> {
     let mut path: Option<PathBuf> = None;
     let mut commit = false;
+    let mut graph: Option<GraphName> = None;
+    let mut want_graph = false;
     for arg in std::env::args().skip(1) {
+        if want_graph {
+            want_graph = false;
+            let node = NamedNode::new(&arg)
+                .map_err(|e| format!("--graph {arg} is not an IRI: {e}\n\n{USAGE}"))?;
+            graph = Some(GraphName::NamedNode(node));
+            continue;
+        }
         match arg.as_str() {
             "--commit" => commit = true,
+            "--graph" => want_graph = true,
             "-h" | "--help" => {
                 print!("{USAGE}");
                 std::process::exit(0);
@@ -111,8 +151,11 @@ fn parse_args() -> Result<(PathBuf, bool), String> {
             other => return Err(format!("unexpected argument {other}\n\n{USAGE}")),
         }
     }
+    if want_graph {
+        return Err(format!("--graph needs an IRI\n\n{USAGE}"));
+    }
     let path = path.ok_or_else(|| format!("a store path is required\n\n{USAGE}"))?;
-    Ok((path, commit))
+    Ok((path, commit, graph))
 }
 
 /// Open the store, refusing every way this can go quietly wrong.
