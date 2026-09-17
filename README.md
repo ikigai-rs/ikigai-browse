@@ -412,13 +412,70 @@ store on *disk*, and that needs oxigraph's RocksDB backend (and a C++
 toolchain). The transform itself is feature-free and tested against the
 in-memory store, so ordinary CI proves it.
 
-> ★ **This binary is a stopgap for a missing primitive.** The ecosystem's
-> SPARQL surface is `ask` / `construct` / `describe` / `select` — there is no
-> `urn:sparql:update`, no writing verb anywhere. The entire operation is one
-> `DELETE … INSERT … WHERE` against a bound store. When an UPDATE mechanism
-> lands, this becomes a query and the binary should be **deleted rather than
-> generalized**; said out loud so a bespoke migration binary does not become
-> the permanent answer that the next namespace move copies.
+> ★ **The primitive this was a stopgap for has landed.** These paragraphs used
+> to say there was no writing verb in `urn:sparql:*` and that this binary should
+> be deleted when one arrived. One arrived: `ikigai-sparql` binds
+> `urn:sparql:update` (a `Sink` under `urn:cap:sparql:update`, one transaction,
+> all-or-nothing) and `ikigai-store` binds `urn:iki:store:update` /
+> `urn:iki:store:graph-update`. Both moves above are now expressible as one
+> `DELETE … INSERT … WHERE` against a host binding one of those over the browse
+> store, and this binary is a convenience that predates them. Retiring it is an
+> open option. The cross-store tool below is a different case, and says why.
+
+### Moving an archive into ANOTHER host's store (`migrate-archive-roots`)
+
+Two hosts can name the same directories differently — a dev server whose root
+names came from the path basename (`ikigai-core`) and a host that names each
+root explicitly (`core`). An archive keyed `(repo, path, content-hash,
+version-tag)` stays valid wherever it lives, so moving it is a data move, not a
+re-derivation — *provided the names in it become the names the new host asks
+with*.
+
+```text
+cargo build --release --features migrate --bin migrate-archive-roots
+
+migrate-archive-roots <source-store> <target-store> \
+    --root ikigai-core=core --root ikigai-cli=cli --drop folio \
+    --graph urn:iki:browse:graph:default            # DRY RUN — the default
+                                             ... --commit   # apply
+```
+
+⚠ **The root name is inside the data in four places, and a missed one is
+SILENT.** The quads land, SPARQL finds them, and every real read misses —
+because a read builds its IRI from the *target's* root name:
+
+| position | read that notices it is wrong |
+| --- | --- |
+| the subject IRI `urn:ikigai:browse:explain:{root}:…` | `urn:repo:{root}:explain:{path}` — it IS the archive key |
+| `ik:about` / `ik:annotates` / `prov:used` → `urn:repo:{root}:…` | `urn:repo:{root}:explain-versions:{path}`, which joins on it |
+| `prov:wasGeneratedBy` → `urn:ikigai:browse:review:{root}:…` | nothing, until a review pass is followed from its finding |
+| the `ik:repo` LITERAL | nothing that resolves — only the Turtle and HTML faces print it |
+
+`migrate::RootScope` keeps the two partial rewrites compiled as **ablations**,
+and the suite migrates a store with each one and asserts exactly which read
+breaks. The acceptance for this tool is a resolution, not a count:
+`the_migrated_archive_answers_the_target_hosts_own_iri_without_deriving` mounts
+browse over the migrated store under the target's root name and checks the
+explanation comes back with `derived: false` and **no LLM ask**, because a cache
+miss would derive a fresh one and look exactly like success.
+
+- **Every root must be DECIDED.** `--root <from>=<to>` carries one (identity,
+  `--root folio=folio`, is how you carry a root under its own name — the same
+  gesture as any other mapping, so it is always something someone typed);
+  `--drop <root>` leaves one behind. A root nobody decided is **refused**, with
+  the option lines that would fix it printed — so a first run with no `--root`
+  at all is the survey.
+- **The source is never written**, so it may stay live: it is opened read-only,
+  a holder is named as a warning, and because the transfer is idempotent a
+  re-run picks up anything written since. Only the TARGET must be stopped, and
+  only for `--commit`.
+- **Stale entries are kept.** An entry whose content hash no longer matches the
+  working tree is not garbage; it is what `explain-versions` shows.
+- `cargo run --release --features migrate --example root-migration-rehearsal`
+  does the whole thing into a throwaway store and then READS every entry it
+  carried, with **no LLM bound** so a miss cannot quietly derive a replacement.
+  It reports, per root, how many entries `explain-versions` lists, how many
+  still describe today's content, and how many are history.
 
 `space_with_annotations(roots, store)` mounts W3C Web Annotations over the
 same host-injected Oxigraph store the explanation archive uses

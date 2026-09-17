@@ -64,7 +64,28 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # `migrate-annotation-ns` binary — the one-shot an existing store needs before
 # a host's `Mount::graph` can see its data (the failure mode of skipping it is
 # silent, exactly as it was for the namespace rename).
-version = "0.4.0"
+#
+# 0.4.1 — PATCH, additive, and deliberately not a minor: the cross-store root
+# move (`migrate::plan_transfer` and friends, the `migrate-archive-roots`
+# binary, the `root-migration-rehearsal` example). Nothing a host calls changes
+# shape — no resource name, capability, face or existing signature moves, and a
+# host that never runs the tool cannot tell 0.4.1 from 0.4.0. It answers a
+# question 0.4.0's `--graph` did not: an archive is keyed
+# `(repo, path, content-hash, version-tag)` and stays valid wherever it lives,
+# but `repo` is a ROOT NAME, and two hosts can name the same directory
+# differently. Carrying an archive between them is a rename in four IRI
+# positions plus one literal, and getting it partly right produces a store that
+# is present, countable and answered by nothing — the same silent shape as the
+# namespace rename and the graph move, for the third time.
+#
+# ⚠ It also CORRECTS a claim: `migrate`'s module doc, both binaries and the
+# README said there was no writing verb in the ecosystem's SPARQL surface and
+# that the migration binary should be deleted when one arrived. One arrived —
+# `urn:sparql:update` (ikigai-sparql) and `urn:iki:store:update` /
+# `urn:iki:store:graph-update` (ikigai-store). The in-place moves are now
+# expressible as a query against a host binding one of those; the cross-store
+# one is not, and says why in one place rather than four.
+version = "0.4.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -91,12 +112,30 @@ name = "migrate-annotation-ns"
 path = "src/bin/migrate-annotation-ns.rs"
 required-features = ["migrate"]
 
+# The cross-store move: a browse archive from one host's store into another's,
+# renaming repository roots on the way. Same gate and the same reason — it is
+# the second thing in this crate that opens a store on DISK. Build it with:
+#     cargo build --release --features migrate --bin migrate-archive-roots
+[[bin]]
+name = "migrate-archive-roots"
+path = "src/bin/migrate-archive-roots.rs"
+required-features = ["migrate"]
+
 # The rehearsal fixture: a throwaway on-disk store in the PRE-0.3.0 shape, so
 # the migration can be run end-to-end against real RocksDB before it is run
 # against the real store. Same gate, same reason.
 [[example]]
 name = "migration-rehearsal"
 path = "examples/migration-rehearsal.rs"
+required-features = ["migrate"]
+
+# The cross-store rehearsal: run the root migration into a throwaway RocksDB
+# store and then READ every entry it carried, with no LLM bound — so an archive
+# miss cannot derive a replacement and look like success. Same gate, same
+# reason.
+[[example]]
+name = "root-migration-rehearsal"
+path = "examples/root-migration-rehearsal.rs"
 required-features = ["migrate"]
 
 [dependencies]

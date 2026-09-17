@@ -1,16 +1,38 @@
 //! The one-shot that moves a pre-0.3.0 store's annotations from
 //! `urn:annotation:` to `urn:iki:annotation:`.
 //!
-//! ## ★ This is a STOPGAP standing in for a missing primitive
+//! ## ★ This was a STOPGAP for a missing primitive, and the primitive LANDED
 //!
-//! **When `urn:sparql:update` exists, this is a query rather than a program.**
-//! The whole operation is one `DELETE { ?s ?p ?o } INSERT { … } WHERE { … }`
-//! over a bound store, and the only reason it is a Rust binary is that the
-//! ecosystem's SPARQL surface (`urn:sparql:ask` / `construct` / `describe` /
-//! `select`) has no writing verb at all. Read this module as a placeholder:
-//! the day an UPDATE mechanism lands, delete the binary and keep the counts.
-//! Left unsaid, a bespoke migration binary becomes the permanent answer and
-//! the next namespace move copies it.
+//! This module was written saying "when `urn:sparql:update` exists, this is a
+//! query rather than a program". **It exists.** `ikigai-sparql` binds
+//! `urn:sparql:update` (a `Sink` under `urn:cap:sparql:update`, one
+//! transaction, all-or-nothing) over the host's shared store, and
+//! `ikigai-store` binds `urn:iki:store:update` / `urn:iki:store:graph-update`
+//! over the persistent one — the dev server and gonk respectively. So the
+//! in-place moves below, [`plan`](crate::migrate::plan) and
+//! [`plan_into_graph`](crate::migrate::plan_into_graph), ARE now one
+//! `DELETE … INSERT … WHERE` against a host that binds a writing verb over the
+//! browse store, and the binary that runs them is a convenience rather than a
+//! necessity. Retiring it is a real option, not a hypothetical one.
+//!
+//! What the writing verb does NOT give, and why
+//! [`plan_transfer`](crate::migrate::plan_transfer) below is
+//! still a program:
+//!
+//! - **One endpoint writes ONE store.** The cross-store move reads a store one
+//!   host owns and writes a store another host owns; there is no single
+//!   transaction spanning both, and no verb that takes a source.
+//! - **The root rename is not safely expressible as SPARQL string surgery.**
+//!   It renames one path segment in four IRI positions AND one literal, and it
+//!   has to assign each annotation's selector children to the root named only
+//!   on their parent. `IRI(CONCAT(…))` over `STR(?s)` can approximate the first
+//!   half and cannot express the second.
+//! - **The refusals are the point.** An undecided root, an unassignable
+//!   subject, a rename collision and a dangling root reference are what stop a
+//!   silent half-migration, and an UPDATE has nowhere to put them.
+//!
+//! Said plainly because the note this replaces was load-bearing for a whole
+//! class of decision, and it went stale without anything going red.
 //!
 //! ## What went wrong, and why it was silent
 //!
@@ -50,10 +72,10 @@
 //!
 //! See [`Counts::passed`](crate::migrate::Counts::passed).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ikigai_core::{Error, Result};
-use oxigraph::model::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
+use oxigraph::model::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
 use oxigraph::store::Store;
 
 /// The pre-0.3.0 annotation namespace.
@@ -500,6 +522,647 @@ pub fn report(before: &Counts, after: &Counts, after_label: &str) -> String {
     if let (Some(b), Some(a)) = (before.outside_target_graph, after.outside_target_graph) {
         out.push_str(&row("outside target graph", b, a));
     }
+    out
+}
+
+// --- operational preconditions ----------------------------------------------
+//
+// Feature-free on purpose: these touch the filesystem and `ps`, never RocksDB,
+// so they compile and are reachable in the default build even though only the
+// gated binaries call them. Two binaries with two copies of a lock refusal is
+// how one of them stops matching the other.
+
+/// Refuse a path that is not an existing Oxigraph/RocksDB store.
+///
+/// ⚠ `Store::open` CREATES a store at a path that has none. A typo would
+/// otherwise produce a brand-new empty store and a serene all-zero PASS — the
+/// exact shape of a successful migration, reported over data that was never
+/// touched. Require the RocksDB marker instead.
+pub fn require_store_dir(path: &std::path::Path) -> std::result::Result<(), String> {
+    if !path.is_dir() {
+        return Err(format!("{} is not a directory", path.display()));
+    }
+    if !path.join("CURRENT").exists() {
+        return Err(format!(
+            "{} does not look like an Oxigraph/RocksDB store (no CURRENT file). \
+             Refusing rather than creating an empty one.",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Who holds a store's RocksDB lock, if anyone.
+///
+/// A locked store is the *expected* failure for a migration: somebody in a hurry
+/// runs one against a live deployment, and "IO error: lock hold by current
+/// process" is not an answer they can act on. Ask the operating system which
+/// process has the LOCK file open and name it. Best-effort by design — no
+/// `lsof`, or a platform where this does not work, degrades to letting
+/// `Store::open` produce its own error rather than blocking the migration.
+pub fn lock_holder(path: &std::path::Path) -> Option<String> {
+    let lock = path.join("LOCK");
+    if !lock.exists() {
+        return None;
+    }
+    let out = std::process::Command::new("lsof")
+        .args(["-t", "--"])
+        .arg(&lock)
+        .output()
+        .ok()?;
+    let pids: Vec<&str> = std::str::from_utf8(&out.stdout)
+        .ok()?
+        .split_whitespace()
+        .collect();
+    if pids.is_empty() {
+        return None;
+    }
+    let described: Vec<String> = pids
+        .iter()
+        .map(|pid| {
+            match std::process::Command::new("ps")
+                .args(["-o", "command=", "-p", pid])
+                .output()
+            {
+                Ok(o) => {
+                    let command = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if command.is_empty() {
+                        format!("pid {pid}")
+                    } else {
+                        format!("pid {pid} ({command})")
+                    }
+                }
+                Err(_) => format!("pid {pid}"),
+            }
+        })
+        .collect();
+    Some(described.join(", "))
+}
+
+// --- the cross-store root move ----------------------------------------------
+//
+// The second migration this module carries, and a different shape from the one
+// above: the namespace and graph moves rewrite a store IN PLACE, this one reads
+// a SOURCE store and writes rewritten quads into a DIFFERENT one. It exists
+// because two hosts named the same repositories differently — a dev server that
+// took its root names from the path basename (`ikigai-core`) and a host that
+// names them explicitly (`core`) — and an archive is only worth moving if the
+// names in it are the names the new host asks with.
+
+/// `urn:repo:{root}` — the join spine. An explanation's `ik:about`, an
+/// annotation's `ik:annotates` and a review pass's `prov:used` all point here.
+pub const REPO_PREFIX: &str = "urn:repo:";
+/// An archived explanation's subject: `urn:ikigai:browse:explain:{root}:{hash}:{tag}:{path}`.
+pub const EXPLAIN_PREFIX: &str = "urn:ikigai:browse:explain:";
+/// A review pass's subject: `urn:ikigai:browse:review:{root}:{hash}:{tag}:{path}`.
+pub const REVIEW_PREFIX: &str = "urn:ikigai:browse:review:";
+
+/// Every prefix under which the NEXT path segment is a root name.
+///
+/// ⚠ `urn:ikigai:browse:review:` is here because it occurs as an OBJECT as well
+/// as a subject: an annotation minted by a review pass carries
+/// `prov:wasGeneratedBy <urn:ikigai:browse:review:{root}:…>` — 14 of them on
+/// plasma. A rewrite that walked only subjects and `urn:repo:` objects would
+/// leave every one of those aimed at a pass IRI that no longer exists. It is the
+/// same argument the namespace move makes for `oa:hasSelector`, one family
+/// further out, and it is why this list is the authority rather than a list of
+/// predicates: the position is what carries the name, not the property.
+pub const ROOT_BEARING_PREFIXES: [&str; 3] = [REPO_PREFIX, EXPLAIN_PREFIX, REVIEW_PREFIX];
+
+/// `ik:repo` — the root name as a LITERAL, on explanations, review passes and
+/// annotations alike. Not addressable, so no resolution test can catch it being
+/// wrong; it is what the JSON and HTML faces print.
+const IK_REPO: &str = "https://ikigai-rs.dev/ns#repo";
+const IK_EXPLANATION: &str = "https://ikigai-rs.dev/ns#Explanation";
+const IK_REVIEW: &str = "https://ikigai-rs.dev/ns#Review";
+const RDF_TYPE_IRI: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+
+/// What a source root's quads should become.
+///
+/// There is deliberately no "default" behaviour. A root the operator has said
+/// nothing about is [`RootDecision::Unmapped`], which is not an outcome — it is
+/// a question the run has not answered, and [`Transfer::unmapped`] is what the
+/// binary refuses on. Carrying an unmapped root silently would put an archive in
+/// the target under a name no root of the target produces: present, countable,
+/// SPARQL-visible, and unreachable by every actual read.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum RootDecision {
+    /// Carry this root's quads, renaming to the given name. The identity rename
+    /// (`--root folio=folio`) is how an operator says "carry it verbatim" —
+    /// deliberately the same gesture as any other mapping, so that carrying a
+    /// root the target cannot serve is always something someone TYPED.
+    Rename(String),
+    /// Leave this root's quads in the source. Counted and reported, never
+    /// silent.
+    Drop,
+    /// The operator has not decided. Never carried, never dropped: refused.
+    #[default]
+    Unmapped,
+}
+
+/// The source-root → target-root decisions for one run.
+#[derive(Clone, Debug, Default)]
+pub struct RootMap(BTreeMap<String, RootDecision>);
+
+impl RootMap {
+    /// An empty map — every root [`RootDecision::Unmapped`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Carry `from`'s quads as `to`. `from == to` is the identity rename.
+    #[must_use]
+    pub fn rename(mut self, from: impl Into<String>, to: impl Into<String>) -> Self {
+        self.0.insert(from.into(), RootDecision::Rename(to.into()));
+        self
+    }
+
+    /// Leave `from`'s quads behind.
+    #[must_use]
+    pub fn dropped(mut self, from: impl Into<String>) -> Self {
+        self.0.insert(from.into(), RootDecision::Drop);
+        self
+    }
+
+    /// What was decided for `root`.
+    pub fn decide(&self, root: &str) -> RootDecision {
+        self.0.get(root).cloned().unwrap_or_default()
+    }
+
+    /// Whether anything was decided at all.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Which of the THREE root-bearing positions the rewrite touches.
+///
+/// Production always uses [`RootScope::All`]. The two below it are ablations
+/// kept compiled for the same reason [`Scope::SubjectOnly`] is: each one names a
+/// read that breaks, and the suite produces that break on purpose rather than
+/// trusting a comment that it would.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootScope {
+    /// Subject IRI, object IRI and the `ik:repo` literal. The correct rewrite,
+    /// and the only one the binary offers.
+    All,
+    /// ⚠ **ABLATION ONLY.** Subject IRIs alone. `urn:repo:{root}:explain:{path}`
+    /// then HITS the archive — the subject is the key — while
+    /// `urn:repo:{root}:explain-versions:{path}` returns nothing, because the
+    /// listing joins on `ik:about`, an object.
+    SubjectOnly,
+    /// ⚠ **ABLATION ONLY.** Both IRI positions, leaving `ik:repo` holding the
+    /// old name. Every read succeeds and every face prints a repository that
+    /// does not exist on this host: the position no resolution test can catch.
+    IrisOnly,
+}
+
+/// Split a root-bearing IRI into `(prefix, root, rest)`.
+///
+/// `rest` keeps its leading colon, or is empty — `urn:repo:folio:tree` has root
+/// `folio` and rest `:tree`, and `urn:repo:folio` has the same root and no rest.
+/// Reassembly is concatenation, so it can neither lose a delimiter nor invent
+/// one.
+fn split_root(iri: &str) -> Option<(&'static str, &str, &str)> {
+    for prefix in ROOT_BEARING_PREFIXES {
+        let Some(rest) = iri.strip_prefix(prefix) else {
+            continue;
+        };
+        let (root, tail) = match rest.find(':') {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, ""),
+        };
+        if root.is_empty() {
+            return None;
+        }
+        return Some((prefix, root, tail));
+    }
+    None
+}
+
+/// The annotation id a browse-minted annotation subject belongs to — the
+/// annotation node and both of its `:selector:` children answer the same id.
+///
+/// Annotations are the one browse family whose subject carries NO root: the IRI
+/// is a uuid. Their root is discoverable only from the `ik:repo` literal on the
+/// annotation node, which is why the planner needs a first pass before it can
+/// decide anything about a selector quad.
+fn annotation_cluster(iri: &str) -> Option<&str> {
+    let rest = iri
+        .strip_prefix(NEW_PREFIX)
+        .or_else(|| iri.strip_prefix(OLD_PREFIX))?;
+    Some(match rest.find(':') {
+        Some(i) => &rest[..i],
+        None => rest,
+    })
+}
+
+/// `iri` with its root renamed, or `None` when nothing about it moves (not
+/// root-bearing, not carried, or renamed to the same name).
+///
+/// `new_unchecked` is sound for the same reason [`moved`]'s is: the input parsed
+/// as an IRI, and the edit replaces one path segment with another the binary has
+/// already refused unless it is a bare root name.
+fn renamed_iri(iri: &str, map: &RootMap) -> Option<NamedNode> {
+    let (prefix, root, rest) = split_root(iri)?;
+    let RootDecision::Rename(to) = map.decide(root) else {
+        return None;
+    };
+    if to == root {
+        return None;
+    }
+    Some(NamedNode::new_unchecked(format!("{prefix}{to}{rest}")))
+}
+
+/// Per-root arithmetic for one run — one line each in the dry run's table.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RootTally {
+    /// What the operator asked for this root.
+    pub decision: RootDecision,
+    /// Browse-owned quads in the source belonging to this root.
+    pub quads: u64,
+    /// How many of those would land in the target.
+    pub carried: u64,
+    /// How many of the carried ones actually CHANGED. A root renamed to itself
+    /// carries everything and rewrites nothing, and the two columns disagreeing
+    /// is how that shows on the table rather than in a comment.
+    pub rewritten: u64,
+    /// `ik:Explanation` subjects.
+    pub explanations: u64,
+    /// `ik:Review` subjects.
+    pub reviews: u64,
+    /// `oa:Annotation` subjects.
+    pub annotations: u64,
+}
+
+/// The cross-store plan: rewritten quads, and everything the operator has to
+/// look at before letting them land. Building it reads both stores and writes
+/// neither.
+#[derive(Debug, Default)]
+#[non_exhaustive]
+pub struct Transfer {
+    /// The rewritten quads, already carrying the target graph name.
+    pub insert: Vec<Quad>,
+    /// Every root the source MENTIONS — as an owner or only as a reference —
+    /// with what happens to it.
+    pub roots: BTreeMap<String, RootTally>,
+    /// Browse-owned subjects no root could be assigned to: an annotation with no
+    /// `ik:repo`, or a subject shape this module does not know. Neither carried
+    /// nor dropped, because "I do not know whose this is" is not a thing to
+    /// decide silently.
+    pub unassigned: BTreeSet<String>,
+    /// Quads that WOULD be carried but reference a root that is not — the
+    /// dangling-reference check for this transform, and the direct analogue of
+    /// [`Counts::dangling_selectors`]. Must be empty.
+    pub dangling_root_refs: Vec<Quad>,
+}
+
+impl Transfer {
+    /// Roots the operator said nothing about. The binary refuses on this.
+    pub fn unmapped(&self) -> Vec<&str> {
+        self.roots
+            .iter()
+            .filter(|(_, t)| t.decision == RootDecision::Unmapped)
+            .map(|(name, _)| name.as_str())
+            .collect()
+    }
+
+    /// Quads that would land.
+    pub fn carried(&self) -> u64 {
+        self.roots.values().map(|t| t.carried).sum()
+    }
+
+    /// Quads deliberately left in the source.
+    pub fn dropped(&self) -> u64 {
+        self.roots
+            .values()
+            .filter(|t| t.decision == RootDecision::Drop)
+            .map(|t| t.quads)
+            .sum()
+    }
+}
+
+/// Which root a browse-minted subject's quads belong to.
+fn owner_root(subject: &str, annotation_roots: &BTreeMap<String, String>) -> Option<String> {
+    if let Some((prefix, root, _)) = split_root(subject) {
+        // `urn:repo:` is never a browse-minted SUBJECT; only the two archive
+        // families are. Guarding on the prefix keeps a subject shape added later
+        // from being silently mis-assigned instead of reported as unassigned.
+        if prefix == EXPLAIN_PREFIX || prefix == REVIEW_PREFIX {
+            return Some(root.to_string());
+        }
+    }
+    let id = annotation_cluster(subject)?;
+    annotation_roots.get(id).cloned()
+}
+
+/// The root each annotation belongs to, read from its `ik:repo` literal.
+fn annotation_roots(source: &Store) -> Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    for quad in source.iter() {
+        let quad = quad.map_err(store_err)?;
+        if quad.predicate.as_str() != IK_REPO {
+            continue;
+        }
+        let NamedOrBlankNode::NamedNode(subject) = &quad.subject else {
+            continue;
+        };
+        let Some(id) = annotation_cluster(subject.as_str()) else {
+            continue;
+        };
+        if let Term::Literal(value) = &quad.object {
+            out.insert(id.to_string(), value.value().to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// Plan the move of every browse-owned quad in `source` into `into` in some
+/// OTHER store, renaming roots by `map`.
+///
+/// ★ **All three positions or nothing.** The subject IRI keys the archive, the
+/// object IRI is what `explain-versions` joins on, and the `ik:repo` literal is
+/// what the faces print. Each is read by a different thing, so leaving one behind
+/// produces a store that passes whichever check you happened to write and fails
+/// the one you did not. [`RootScope`]'s two ablations exist so the suite can show
+/// each of those failures rather than assert this paragraph.
+pub fn plan_transfer(source: &Store, map: &RootMap, into: &GraphName) -> Result<Transfer> {
+    plan_transfer_with(source, map, into, RootScope::All)
+}
+
+/// [`plan_transfer`] under an explicit [`RootScope`]. Callers other than the
+/// ablation tests want [`plan_transfer`].
+pub fn plan_transfer_with(
+    source: &Store,
+    map: &RootMap,
+    into: &GraphName,
+    scope: RootScope,
+) -> Result<Transfer> {
+    let annotations = annotation_roots(source)?;
+    let mut out = Transfer::default();
+
+    for quad in source.iter() {
+        let quad = quad.map_err(store_err)?;
+        if !browse_owned(&quad) {
+            continue;
+        }
+        let subject = match &quad.subject {
+            NamedOrBlankNode::NamedNode(n) => n.as_str().to_string(),
+            other => other.to_string(),
+        };
+        let Some(owner) = owner_root(&subject, &annotations) else {
+            out.unassigned.insert(subject);
+            continue;
+        };
+
+        // Every root this quad so much as mentions gets a row, so a root that
+        // owns nothing and is only POINTED AT still has to be decided.
+        for root in mentioned_roots(&quad) {
+            out.roots.entry(root.clone()).or_default().decision = map.decide(&root);
+        }
+
+        let decision = map.decide(&owner);
+        {
+            let tally = out.roots.entry(owner.clone()).or_default();
+            tally.decision = decision.clone();
+            tally.quads += 1;
+            if quad.predicate.as_str() == RDF_TYPE_IRI {
+                if let Term::NamedNode(class) = &quad.object {
+                    match class.as_str() {
+                        IK_EXPLANATION => tally.explanations += 1,
+                        IK_REVIEW => tally.reviews += 1,
+                        OA_ANNOTATION => tally.annotations += 1,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if !matches!(decision, RootDecision::Rename(_)) {
+            continue;
+        }
+
+        // The dangling check runs on the SOURCE quad, where the names are still
+        // the ones `map` is keyed on.
+        if mentioned_roots(&quad)
+            .iter()
+            .any(|root| !matches!(map.decide(root), RootDecision::Rename(_)))
+        {
+            out.dangling_root_refs.push(quad.clone());
+        }
+
+        let rewritten = rewrite_roots(&quad, map, scope, into);
+        let changed = rewritten.subject != quad.subject || rewritten.object != quad.object;
+        {
+            let tally = out.roots.entry(owner).or_default();
+            tally.carried += 1;
+            if changed {
+                tally.rewritten += 1;
+            }
+        }
+        out.insert.push(rewritten);
+    }
+    Ok(out)
+}
+
+/// Every root name a quad carries, in any of the three positions.
+fn mentioned_roots(quad: &Quad) -> Vec<String> {
+    let mut out: Vec<String> = iri_positions(quad)
+        .into_iter()
+        .filter_map(|iri| split_root(iri).map(|(_, root, _)| root.to_string()))
+        .collect();
+    if quad.predicate.as_str() == IK_REPO {
+        if let Term::Literal(value) = &quad.object {
+            out.push(value.value().to_string());
+        }
+    }
+    out
+}
+
+/// One quad, roots renamed in every position `scope` allows, in `into`.
+fn rewrite_roots(quad: &Quad, map: &RootMap, scope: RootScope, into: &GraphName) -> Quad {
+    let subject = match &quad.subject {
+        NamedOrBlankNode::NamedNode(n) => match renamed_iri(n.as_str(), map) {
+            Some(m) => NamedOrBlankNode::NamedNode(m),
+            None => quad.subject.clone(),
+        },
+        other => other.clone(),
+    };
+    if scope == RootScope::SubjectOnly {
+        return Quad::new(
+            subject,
+            quad.predicate.clone(),
+            quad.object.clone(),
+            into.clone(),
+        );
+    }
+
+    let object = match &quad.object {
+        Term::NamedNode(n) => match renamed_iri(n.as_str(), map) {
+            Some(m) => Term::NamedNode(m),
+            None => quad.object.clone(),
+        },
+        // ★ The `ik:repo` literal — a root name that is DATA, not a reference.
+        // `renamed_iri` cannot reach it (it takes IRIs), so the ONE place this
+        // module edits a literal is here, gated on the predicate. Every other
+        // literal is untouchable by construction, which is what keeps an
+        // `oa:exact` that quotes a root name from being rewritten — the same
+        // structural safety the namespace move relies on.
+        Term::Literal(value) if scope == RootScope::All && quad.predicate.as_str() == IK_REPO => {
+            match map.decide(value.value()) {
+                RootDecision::Rename(to) => Term::Literal(Literal::new_simple_literal(to)),
+                _ => quad.object.clone(),
+            }
+        }
+        other => other.clone(),
+    };
+
+    Quad::new(subject, quad.predicate.clone(), object, into.clone())
+}
+
+/// Target-side arithmetic: what `transfer.insert` actually ADDS to a store that
+/// may already hold some of it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Landing {
+    /// Quads the plan would insert.
+    pub rewritten: u64,
+    /// How many of those are DISTINCT. RDF is a set: two source quads whose
+    /// rewritten twins are equal land as one.
+    pub distinct: u64,
+    /// `rewritten - distinct` — quads a rename collapsed together. Must be 0:
+    /// two roots renamed to the same name can key two different archives to one
+    /// IRI, and nothing else in this table would move.
+    pub collapsed: u64,
+    /// Distinct quads the target already holds. A re-run lands nothing, which is
+    /// what makes this tool idempotent.
+    pub already_present: u64,
+    /// `distinct - already_present`: the growth the target graph must show.
+    pub new: u64,
+}
+
+/// Measure a plan against the store it would land in.
+pub fn landing(target: &Store, transfer: &Transfer) -> Result<Landing> {
+    let mut distinct: BTreeMap<String, &Quad> = BTreeMap::new();
+    for quad in &transfer.insert {
+        distinct.insert(quad.to_string(), quad);
+    }
+    let mut already = 0u64;
+    for quad in distinct.values() {
+        if target.contains(quad.as_ref()).map_err(store_err)? {
+            already += 1;
+        }
+    }
+    let rewritten = transfer.insert.len() as u64;
+    let distinct_n = distinct.len() as u64;
+    Ok(Landing {
+        rewritten,
+        distinct: distinct_n,
+        collapsed: rewritten - distinct_n,
+        already_present: already,
+        new: distinct_n - already,
+    })
+}
+
+/// How many quads a store holds in ONE graph — the before/after column of a
+/// cross-store run, since the target's other tenants (a ledger, a vocabulary)
+/// make a whole-store total meaningless here.
+pub fn quads_in_graph(store: &Store, graph: &GraphName) -> Result<u64> {
+    let mut n = 0u64;
+    for quad in store.quads_for_pattern(None, None, None, Some(graph.as_ref())) {
+        quad.map_err(store_err)?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// Apply a transfer to the TARGET store in one transaction.
+pub fn apply_transfer(target: &Store, transfer: &Transfer) -> Result<()> {
+    if transfer.insert.is_empty() {
+        return Ok(());
+    }
+    let mut tx = target.start_transaction().map_err(store_err)?;
+    for quad in &transfer.insert {
+        tx.insert(quad.as_ref());
+    }
+    tx.commit().map_err(store_err)
+}
+
+/// The target as it WOULD be — the same projection discipline as [`project`], so
+/// a dry run's "would be" column and a commit's "after" column come out of the
+/// same counting function rather than out of two implementations that can
+/// disagree.
+pub fn project_transfer(target: &Store, transfer: &Transfer) -> Result<Store> {
+    let projected = Store::new().map_err(store_err)?;
+    for quad in target.iter() {
+        projected
+            .insert(quad.map_err(store_err)?.as_ref())
+            .map_err(store_err)?;
+    }
+    for quad in &transfer.insert {
+        projected.insert(quad.as_ref()).map_err(store_err)?;
+    }
+    Ok(projected)
+}
+
+/// PASS for a cross-store root move: **nothing undecided · nothing unassigned ·
+/// no dangling root reference · nothing collapsed · the target graph grew by
+/// exactly what was new.**
+///
+/// The last clause is what makes the other four worth printing: it ties the
+/// plan's arithmetic to a count taken from the store itself, so a plan that was
+/// right about what it WOULD do and wrong about what it DID cannot pass.
+pub fn transfer_passed(transfer: &Transfer, land: &Landing, before: u64, after: u64) -> bool {
+    transfer.unmapped().is_empty()
+        && transfer.unassigned.is_empty()
+        && transfer.dangling_root_refs.is_empty()
+        && land.collapsed == 0
+        && after == before + land.new
+}
+
+/// The per-root table — what a dry run prints, and what Brian reads before
+/// typing `--commit`.
+pub fn transfer_report(transfer: &Transfer) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "  {:<16} {:<14} {:>6} {:>7} {:>8} {:>5} {:>4} {:>4}\n",
+        "source root", "becomes", "quads", "carried", "rewritten", "expl", "rev", "ann"
+    ));
+    for (name, tally) in &transfer.roots {
+        let becomes = match &tally.decision {
+            RootDecision::Rename(to) => to.clone(),
+            RootDecision::Drop => "(dropped)".to_string(),
+            RootDecision::Unmapped => "?? UNMAPPED".to_string(),
+        };
+        out.push_str(&format!(
+            "  {:<16} {:<14} {:>6} {:>7} {:>8} {:>5} {:>4} {:>4}\n",
+            name,
+            becomes,
+            tally.quads,
+            tally.carried,
+            tally.rewritten,
+            tally.explanations,
+            tally.reviews,
+            tally.annotations,
+        ));
+    }
+    out
+}
+
+/// The landing table: the plan's arithmetic beside the target graph's own count.
+pub fn landing_report(land: &Landing, before: u64, after: u64, after_label: &str) -> String {
+    let row = |name: &str, value: u64| format!("  {name:<24} {value}\n");
+    let mut out = String::new();
+    out.push_str(&row("quads rewritten", land.rewritten));
+    out.push_str(&row("distinct", land.distinct));
+    out.push_str(&row("collapsed by rename", land.collapsed));
+    out.push_str(&row("already in target", land.already_present));
+    out.push_str(&row("new to target", land.new));
+    out.push_str(&format!(
+        "  {:<24} {:<9} {}\n",
+        "target graph", "before", after_label
+    ));
+    out.push_str(&format!("  {:<24} {:<9} {}\n", "", before, after));
     out
 }
 
@@ -1043,5 +1706,674 @@ mod tests {
                 ..before
             }
         ));
+    }
+}
+// --- the cross-store root move: tests ---------------------------------------
+
+/// ★ **These are READS, not counts.**
+///
+/// A count proves a copy happened. Only a resolution proves the rewrite was
+/// right, because the failure this migration can produce is SILENT: the quads
+/// land, SPARQL finds them, and every actual read misses — a read builds its IRI
+/// from the TARGET host's root name and gets no hit. So the suite mounts browse
+/// over the migrated store under the target's root name and asks it the two
+/// questions a user asks, with a fake LLM counting derivations: an archive hit
+/// costs no ask, and a miss is visible as one.
+///
+/// Each of the three root-bearing positions gets a test that BREAKS it and names
+/// the read that notices. That is what makes "all three or nothing" a claim the
+/// compiler checks instead of a paragraph.
+#[cfg(test)]
+mod root_move_tests {
+    use super::*;
+    use crate::{repr_utf8, ExplainConfig, Mount};
+    use futures::executor::block_on;
+    use ikigai_core::{
+        ArgRef, Capability, Description, EndpointSpace, Exact, Fallback, FnEndpoint, Invocation,
+        Iri, Kernel, Representation, Request, Verb,
+    };
+    use oxigraph::model::Literal;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// The dev server's name for the root. The whole point of this migration is
+    /// that it is not the target's.
+    const DEV_ROOT: &str = "ikigai-core";
+    /// gonk's name for the same directory.
+    const GONK_ROOT: &str = "core";
+    /// gonk's browse graph. The dev server's quads are in the DEFAULT graph
+    /// (pre-0.4.0 shape); this is where they have to land.
+    const TARGET_GRAPH: &str = "urn:iki:browse:graph:default";
+
+    const FILE_PROVIDER: &str = "urn:llm:coder:ask";
+    const DIR_PROVIDER: &str = "urn:llm:ask";
+
+    fn temp_dir() -> PathBuf {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "ikigai-browse-rootmove-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "fn main() {}\n").unwrap();
+        dir
+    }
+
+    /// A fake LLM whose every answer is `EXPL#{n}` and whose ask count is the
+    /// observable: a resolution that costs no ask was served from the archive.
+    fn fake_llm(asks: &Arc<AtomicUsize>) -> EndpointSpace {
+        let mut space = EndpointSpace::new();
+        for provider in [FILE_PROVIDER, DIR_PROVIDER] {
+            let asks = Arc::clone(asks);
+            space = space.bind(
+                Exact::new(provider),
+                FnEndpoint::new("fake-llm", move |_: &Invocation<'_>| {
+                    let n = asks.fetch_add(1, Ordering::Relaxed) + 1;
+                    Ok(repr_utf8("text/plain", format!("EXPL#{n}")))
+                })
+                .with_description(
+                    Description::new("fake-llm")
+                        .verb(Verb::Source)
+                        .requires("urn:cap:net:*"),
+                ),
+            );
+        }
+        space
+    }
+
+    /// A browse kernel over `root`, mounted under `name`, archiving into
+    /// `store` — and into `graph` when one is named (a host that names none
+    /// writes the default graph, which is the dev server's shape).
+    fn kernel(
+        name: &str,
+        root: &Path,
+        store: &Arc<Store>,
+        graph: Option<&str>,
+        asks: &Arc<AtomicUsize>,
+    ) -> Kernel {
+        let config = ExplainConfig::new(Arc::clone(store))
+            .file_model_label("m1")
+            .dir_model_label("d1");
+        let mut mount = Mount::new([(name.to_string(), root.to_path_buf())]);
+        if let Some(graph) = graph {
+            mount = mount.graph(NamedNode::new(graph).unwrap());
+        }
+        Kernel::new(Arc::new(Fallback::new(vec![
+            Arc::new(mount.explain(config).space()),
+            Arc::new(fake_llm(asks)),
+        ])))
+    }
+
+    fn cap(root: &str) -> Capability {
+        Capability::scoped([
+            format!("urn:cap:browse:read:{root}"),
+            "urn:cap:net:localhost".to_string(),
+        ])
+    }
+
+    fn read(kernel: &Kernel, iri: &str, root: &str, args: &[(&str, &str)]) -> Result<String> {
+        let mut request = Request::new(Verb::Source, Iri::parse(iri).unwrap());
+        for (k, v) in args {
+            request = request.with_arg(*k, ArgRef::Inline(v.as_bytes().to_vec()));
+        }
+        let repr: Representation = block_on(kernel.issue(request, &cap(root)))?;
+        Ok(String::from_utf8_lossy(&repr.bytes).into_owned())
+    }
+
+    fn json(kernel: &Kernel, iri: &str, root: &str) -> serde_json::Value {
+        serde_json::from_str(&read(kernel, iri, root, &[("as", "application/json")]).unwrap())
+            .unwrap()
+    }
+
+    /// The dev server, reproduced: a repo whose root is named `ikigai-core`, an
+    /// archive in the DEFAULT graph, one derived explanation. Returns the repo
+    /// directory, the store, and the ask counter (which reads `1`).
+    fn dev_server_with_one_explanation() -> (PathBuf, Arc<Store>, Arc<AtomicUsize>) {
+        let root = temp_dir();
+        let store = Arc::new(Store::new().unwrap());
+        let asks = Arc::new(AtomicUsize::new(0));
+        let k = kernel(DEV_ROOT, &root, &store, None, &asks);
+        let first = read(&k, "urn:repo:ikigai-core:explain:src/lib.rs", DEV_ROOT, &[]).unwrap();
+        assert_eq!(first.trim(), "EXPL#1");
+        assert_eq!(asks.load(Ordering::Relaxed), 1);
+        (root, store, asks)
+    }
+
+    fn target_graph() -> GraphName {
+        GraphName::NamedNode(NamedNode::new(TARGET_GRAPH).unwrap())
+    }
+
+    /// Migrate `source` into a fresh target store under `scope`, returning the
+    /// target and the plan.
+    fn migrated(source: &Store, map: &RootMap, scope: RootScope) -> (Arc<Store>, Transfer) {
+        let target = Arc::new(Store::new().unwrap());
+        let transfer = plan_transfer_with(source, map, &target_graph(), scope).unwrap();
+        apply_transfer(&target, &transfer).unwrap();
+        (target, transfer)
+    }
+
+    fn dev_to_gonk() -> RootMap {
+        RootMap::new().rename(DEV_ROOT, GONK_ROOT)
+    }
+
+    // --- acceptance: the two reads --------------------------------------------
+
+    /// ACCEPTANCE 1 and 2, in one resolution each: after the move, the target
+    /// host's own IRI serves the migrated explanation **without inference**, and
+    /// `explain-versions` lists it.
+    #[test]
+    fn the_migrated_archive_answers_the_target_hosts_own_iri_without_deriving() {
+        let (root, source, asks) = dev_server_with_one_explanation();
+        let (target, _) = migrated(&source, &dev_to_gonk(), RootScope::All);
+
+        let k = kernel(GONK_ROOT, &root, &target, Some(TARGET_GRAPH), &asks);
+
+        // (1) The explanation itself — the text that was paid for once.
+        let hit = json(&k, "urn:repo:core:explain:src/lib.rs", GONK_ROOT);
+        assert_eq!(hit["text"], "EXPL#1");
+        assert_eq!(
+            hit["derived"], false,
+            "a cache MISS would derive a fresh explanation and look exactly like success"
+        );
+        assert_eq!(
+            asks.load(Ordering::Relaxed),
+            1,
+            "the archive hit must cost no inference"
+        );
+        // The join spine, rewritten: gonk's own root produces this IRI.
+        assert_eq!(hit["about"], "urn:repo:core:file:src/lib.rs");
+
+        // (2) The version listing — a different read, joining on ik:about.
+        let versions = json(&k, "urn:repo:core:explain-versions:src/lib.rs", GONK_ROOT);
+        let rows = versions.as_array().unwrap();
+        assert_eq!(rows.len(), 1, "the migrated version must be listed");
+        assert_eq!(rows[0]["version_tag"], "code-v1@m1");
+        assert_eq!(asks.load(Ordering::Relaxed), 1);
+
+        // (3) The `ik:repo` literal, which only the graph face prints.
+        let turtle = read(
+            &k,
+            "urn:repo:core:explain:src/lib.rs",
+            GONK_ROOT,
+            &[("as", "text/turtle")],
+        )
+        .unwrap();
+        assert!(
+            turtle.contains("ik:repo \"core\""),
+            "the stored repo literal must be the TARGET's name: {turtle}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★ The failure this tool exists to prevent, produced on purpose: copy the
+    /// archive with the names UNCHANGED and every count looks right while the
+    /// only read anyone performs misses and pays for inference again.
+    #[test]
+    fn an_unrenamed_archive_is_present_countable_and_unreachable() {
+        let (root, source, asks) = dev_server_with_one_explanation();
+        // The identity map: a faithful copy, no rename. Ten quads move.
+        let (target, transfer) = migrated(
+            &source,
+            &RootMap::new().rename(DEV_ROOT, DEV_ROOT),
+            RootScope::All,
+        );
+        // Nine quads: the archive entry's eight properties plus its type. There
+        // is no `ik:derivedAt` because this kernel has no clock bound — in
+        // production there is one, and the entry is ten.
+        assert_eq!(transfer.carried(), 9, "the copy itself succeeded");
+        assert_eq!(quads_in_graph(&target, &target_graph()).unwrap(), 9);
+
+        let k = kernel(GONK_ROOT, &root, &target, Some(TARGET_GRAPH), &asks);
+        let miss = json(&k, "urn:repo:core:explain:src/lib.rs", GONK_ROOT);
+        assert_eq!(
+            miss["derived"], true,
+            "the archive is right there and the read cannot see it"
+        );
+        assert_eq!(asks.load(Ordering::Relaxed), 2, "inference paid for twice");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ABLATION — subject only. The archive key is the subject, so the
+    /// explanation still HITS; `explain-versions` joins on `ik:about` and
+    /// returns nothing. One read right, one read wrong: the shape that makes a
+    /// partial rewrite look like a working migration.
+    #[test]
+    fn rewriting_only_the_subject_hits_the_explanation_and_loses_the_versions() {
+        let (root, source, asks) = dev_server_with_one_explanation();
+        let (target, _) = migrated(&source, &dev_to_gonk(), RootScope::SubjectOnly);
+        let k = kernel(GONK_ROOT, &root, &target, Some(TARGET_GRAPH), &asks);
+
+        let hit = json(&k, "urn:repo:core:explain:src/lib.rs", GONK_ROOT);
+        assert_eq!(hit["text"], "EXPL#1");
+        assert_eq!(
+            hit["derived"], false,
+            "the subject rewrite alone still hits"
+        );
+        assert_eq!(
+            hit["about"], "urn:repo:ikigai-core:file:src/lib.rs",
+            "and points at an IRI no root of this host produces"
+        );
+
+        let versions = json(&k, "urn:repo:core:explain-versions:src/lib.rs", GONK_ROOT);
+        assert!(
+            versions.as_array().unwrap().is_empty(),
+            "the listing joins on ik:about, so it finds nothing: {versions}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ABLATION — both IRI positions, leaving the `ik:repo` LITERAL. Every read
+    /// succeeds. The graph face prints a repository this host does not have, and
+    /// no resolution test can see it: the position that needs a test looking at
+    /// the data rather than at whether the data answered.
+    #[test]
+    fn rewriting_only_the_iris_leaves_every_read_working_and_the_repo_literal_lying() {
+        let (root, source, asks) = dev_server_with_one_explanation();
+        let (target, _) = migrated(&source, &dev_to_gonk(), RootScope::IrisOnly);
+        let k = kernel(GONK_ROOT, &root, &target, Some(TARGET_GRAPH), &asks);
+
+        let hit = json(&k, "urn:repo:core:explain:src/lib.rs", GONK_ROOT);
+        assert_eq!(hit["derived"], false);
+        let versions = json(&k, "urn:repo:core:explain-versions:src/lib.rs", GONK_ROOT);
+        assert_eq!(versions.as_array().unwrap().len(), 1);
+        assert_eq!(asks.load(Ordering::Relaxed), 1, "both reads hit");
+
+        let turtle = read(
+            &k,
+            "urn:repo:core:explain:src/lib.rs",
+            GONK_ROOT,
+            &[("as", "text/turtle")],
+        )
+        .unwrap();
+        assert!(
+            turtle.contains("ik:repo \"ikigai-core\""),
+            "the literal still names the dev server's root: {turtle}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The target graph is the OTHER half of the move: a dev-server archive is
+    /// in the default graph, and a host confined to a named one cannot see it.
+    #[test]
+    fn every_carried_quad_lands_in_the_target_graph() {
+        let (root, source, _) = dev_server_with_one_explanation();
+        let (target, transfer) = migrated(&source, &dev_to_gonk(), RootScope::All);
+        assert!(transfer
+            .insert
+            .iter()
+            .all(|q| q.graph_name == target_graph()));
+        assert_eq!(
+            quads_in_graph(&target, &GraphName::DefaultGraph).unwrap(),
+            0,
+            "nothing may be left in the default graph of the target"
+        );
+        assert_eq!(
+            quads_in_graph(&target, &target_graph()).unwrap(),
+            transfer.carried()
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A second run lands nothing: the rewritten quads are already there, and
+    /// RDF is a set. What makes re-running safe after an interrupted deploy.
+    #[test]
+    fn a_second_transfer_lands_nothing() {
+        let (root, source, _) = dev_server_with_one_explanation();
+        let (target, _) = migrated(&source, &dev_to_gonk(), RootScope::All);
+        let before = quads_in_graph(&target, &target_graph()).unwrap();
+
+        let again = plan_transfer(&source, &dev_to_gonk(), &target_graph()).unwrap();
+        let land = landing(&target, &again).unwrap();
+        assert_eq!(land.new, 0);
+        assert_eq!(land.already_present, land.distinct);
+        apply_transfer(&target, &again).unwrap();
+        let after = quads_in_graph(&target, &target_graph()).unwrap();
+        assert_eq!(after, before);
+        assert!(transfer_passed(&again, &land, before, after));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // --- the transform, over a hand-built store --------------------------------
+
+    fn iri(s: &str) -> NamedNode {
+        NamedNode::new(s).unwrap()
+    }
+
+    fn lit(s: &str) -> Term {
+        Term::Literal(Literal::new_simple_literal(s))
+    }
+
+    /// plasma's shape in miniature: one explanation under `ikigai-core`, one
+    /// review pass and one annotation under `ikigai-browse` (with the
+    /// `prov:wasGeneratedBy` back-reference the brief's list of three positions
+    /// did not mention), and one explanation under `folio`, which has no root on
+    /// the target at all.
+    fn plasma_shaped_source() -> Store {
+        let store = Store::new().unwrap();
+        let q = |s: &str, p: &str, o: Term| {
+            store
+                .insert(Quad::new(iri(s), iri(p), o, GraphName::DefaultGraph).as_ref())
+                .unwrap();
+        };
+        let ik = |t: &str| format!("https://ikigai-rs.dev/ns#{t}");
+        let oa = |t: &str| format!("http://www.w3.org/ns/oa#{t}");
+
+        let expl = "urn:ikigai:browse:explain:ikigai-core:sha256:abc:code-v1:src/lib.rs";
+        q(expl, RDF_TYPE_IRI, Term::NamedNode(iri(&ik("Explanation"))));
+        q(expl, &ik("repo"), lit("ikigai-core"));
+        q(expl, &ik("path"), lit("src/lib.rs"));
+        q(
+            expl,
+            &ik("about"),
+            Term::NamedNode(iri("urn:repo:ikigai-core:file:src/lib.rs")),
+        );
+        q(expl, &ik("explanation"), lit("what it does"));
+
+        let pass = "urn:ikigai:browse:review:ikigai-browse:sha256:def:review-v1:pr:11";
+        let ann = "urn:iki:annotation:a1";
+        q(pass, RDF_TYPE_IRI, Term::NamedNode(iri(&ik("Review"))));
+        q(pass, &ik("repo"), lit("ikigai-browse"));
+        q(
+            pass,
+            "http://www.w3.org/ns/prov#used",
+            Term::NamedNode(iri("urn:repo:ikigai-browse:pr:11")),
+        );
+        q(
+            pass,
+            "http://www.w3.org/ns/prov#generated",
+            Term::NamedNode(iri(ann)),
+        );
+
+        q(ann, RDF_TYPE_IRI, Term::NamedNode(iri(&oa("Annotation"))));
+        q(ann, &ik("repo"), lit("ikigai-browse"));
+        q(
+            ann,
+            &ik("annotates"),
+            Term::NamedNode(iri("urn:repo:ikigai-browse:pr:11")),
+        );
+        // ⚠ The fourth root-bearing position: an object under the REVIEW
+        // prefix. 14 of these on plasma.
+        q(
+            ann,
+            "http://www.w3.org/ns/prov#wasGeneratedBy",
+            Term::NamedNode(iri(pass)),
+        );
+        // A selector child: no root anywhere in it, and it must travel with its
+        // annotation or be left with it.
+        let sel = "urn:iki:annotation:a1:selector:quote";
+        q(ann, &oa("hasSelector"), Term::NamedNode(iri(sel)));
+        q(
+            sel,
+            RDF_TYPE_IRI,
+            Term::NamedNode(iri(&oa("TextQuoteSelector"))),
+        );
+        // ★ A quoted line of source that CONTAINS a root name. It is data, and
+        // the rewrite must not reach it.
+        q(sel, &oa("exact"), lit("let root = \"ikigai-core\";"));
+
+        let folio = "urn:ikigai:browse:explain:folio:sha256:ghi:code-v1:a.ts";
+        q(
+            folio,
+            RDF_TYPE_IRI,
+            Term::NamedNode(iri(&ik("Explanation"))),
+        );
+        q(folio, &ik("repo"), lit("folio"));
+        q(
+            folio,
+            &ik("about"),
+            Term::NamedNode(iri("urn:repo:folio:file:a.ts")),
+        );
+
+        // A tenant browse does not own: it must not move, whatever happens.
+        store
+            .insert(
+                Quad::new(
+                    iri("https://ikigai-rs.dev/ns#Explanation"),
+                    iri("http://www.w3.org/2000/01/rdf-schema#label"),
+                    lit("Explanation"),
+                    GraphName::NamedNode(iri("urn:ikigai:vocab")),
+                )
+                .as_ref(),
+            )
+            .unwrap();
+        store
+    }
+
+    fn full_map() -> RootMap {
+        RootMap::new()
+            .rename("ikigai-core", "core")
+            .rename("ikigai-browse", "browse")
+            .dropped("folio")
+    }
+
+    #[test]
+    fn the_review_back_reference_moves_with_everything_else() {
+        let source = plasma_shaped_source();
+        let (target, _) = migrated(&source, &full_map(), RootScope::All);
+        let generated_by = target
+            .quads_for_pattern(
+                None,
+                Some(iri("http://www.w3.org/ns/prov#wasGeneratedBy").as_ref()),
+                None,
+                None,
+            )
+            .map(|q| q.unwrap().object.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            generated_by,
+            ["<urn:ikigai:browse:review:browse:sha256:def:review-v1:pr:11>"],
+            "an object under the review prefix is the fourth root-bearing position"
+        );
+    }
+
+    #[test]
+    fn a_quoted_root_name_in_a_literal_is_untouched() {
+        let source = plasma_shaped_source();
+        let (target, _) = migrated(&source, &full_map(), RootScope::All);
+        let exact: Vec<String> = target
+            .quads_for_pattern(
+                None,
+                Some(iri("http://www.w3.org/ns/oa#exact").as_ref()),
+                None,
+                None,
+            )
+            .map(|q| match q.unwrap().object {
+                Term::Literal(l) => l.value().to_string(),
+                other => other.to_string(),
+            })
+            .collect();
+        assert_eq!(exact, ["let root = \"ikigai-core\";"]);
+    }
+
+    #[test]
+    fn a_dropped_root_leaves_its_quads_and_its_references_behind() {
+        let source = plasma_shaped_source();
+        let (target, transfer) = migrated(&source, &full_map(), RootScope::All);
+        assert_eq!(transfer.roots["folio"].decision, RootDecision::Drop);
+        assert_eq!(transfer.roots["folio"].quads, 3);
+        assert_eq!(transfer.roots["folio"].carried, 0);
+        assert_eq!(transfer.dropped(), 3);
+        for quad in target.iter() {
+            let quad = quad.unwrap();
+            assert!(
+                !quad.to_string().contains("folio"),
+                "a dropped root must leave nothing behind: {quad}"
+            );
+        }
+        assert!(transfer.dangling_root_refs.is_empty());
+    }
+
+    #[test]
+    fn an_annotations_selector_children_follow_its_repo_literal() {
+        let source = plasma_shaped_source();
+        // Drop the annotation's root and its selector — which names no root at
+        // all — must not be carried on its own.
+        let map = RootMap::new()
+            .rename("ikigai-core", "core")
+            .dropped("ikigai-browse")
+            .dropped("folio");
+        let (target, transfer) = migrated(&source, &map, RootScope::All);
+        assert_eq!(transfer.roots["ikigai-browse"].carried, 0);
+        for quad in target.iter() {
+            let quad = quad.unwrap();
+            assert!(
+                !quad.to_string().contains("urn:iki:annotation:"),
+                "the selector child travels with its annotation: {quad}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_root_nobody_decided_is_refused_rather_than_guessed() {
+        let source = plasma_shaped_source();
+        let partial = RootMap::new()
+            .rename("ikigai-core", "core")
+            .rename("ikigai-browse", "browse");
+        let transfer = plan_transfer(&source, &partial, &target_graph()).unwrap();
+        assert_eq!(transfer.unmapped(), ["folio"]);
+        assert_eq!(transfer.roots["folio"].decision, RootDecision::Unmapped);
+        assert_eq!(transfer.roots["folio"].carried, 0);
+        let land = landing(&Store::new().unwrap(), &transfer).unwrap();
+        assert!(
+            !transfer_passed(&transfer, &land, 0, land.new),
+            "an undecided root is a FAIL even when every other column agrees"
+        );
+    }
+
+    #[test]
+    fn nothing_browse_does_not_own_is_carried() {
+        let source = plasma_shaped_source();
+        let (target, _) = migrated(&source, &full_map(), RootScope::All);
+        assert_eq!(
+            quads_in_graph(&target, &GraphName::NamedNode(iri("urn:ikigai:vocab"))).unwrap(),
+            0,
+            "the vocabulary the dev server loaded into its store is not browse's to move"
+        );
+    }
+
+    /// Two source roots renamed to the SAME target name can key two different
+    /// archives to one IRI. Every per-root count still agrees; only the landing
+    /// arithmetic notices.
+    #[test]
+    fn a_rename_collision_collapses_quads_and_fails() {
+        let store = Store::new().unwrap();
+        let ik = |t: &str| format!("https://ikigai-rs.dev/ns#{t}");
+        for root in ["one", "two"] {
+            let subject = format!("urn:ikigai:browse:explain:{root}:sha256:abc:code-v1:a.rs");
+            for (p, o) in [
+                (ik("path"), lit("a.rs")),
+                (ik("explanation"), lit("same text")),
+            ] {
+                store
+                    .insert(Quad::new(iri(&subject), iri(&p), o, GraphName::DefaultGraph).as_ref())
+                    .unwrap();
+            }
+        }
+        let map = RootMap::new()
+            .rename("one", "merged")
+            .rename("two", "merged");
+        let transfer = plan_transfer(&store, &map, &target_graph()).unwrap();
+        assert_eq!(transfer.carried(), 4);
+        let target = Store::new().unwrap();
+        let land = landing(&target, &transfer).unwrap();
+        assert_eq!(land.collapsed, 2, "two pairs of quads became one pair");
+        apply_transfer(&target, &transfer).unwrap();
+        let after = quads_in_graph(&target, &target_graph()).unwrap();
+        assert_eq!(after, 2);
+        assert!(!transfer_passed(&transfer, &land, 0, after));
+    }
+
+    #[test]
+    fn a_browse_subject_with_no_assignable_root_is_reported_not_moved() {
+        let store = Store::new().unwrap();
+        // An annotation with no ik:repo: nothing says whose it is.
+        store
+            .insert(
+                Quad::new(
+                    iri("urn:iki:annotation:orphan"),
+                    iri("http://www.w3.org/ns/oa#bodyValue"),
+                    lit("a finding"),
+                    GraphName::DefaultGraph,
+                )
+                .as_ref(),
+            )
+            .unwrap();
+        let transfer = plan_transfer(&store, &RootMap::new(), &target_graph()).unwrap();
+        assert_eq!(
+            transfer.unassigned.iter().collect::<Vec<_>>(),
+            ["urn:iki:annotation:orphan"]
+        );
+        assert!(transfer.insert.is_empty());
+        let land = landing(&Store::new().unwrap(), &transfer).unwrap();
+        assert!(!transfer_passed(&transfer, &land, 0, 0));
+    }
+
+    /// A carried quad pointing at a root that is NOT carried is the silent
+    /// failure one family out: it resolves to an IRI the target cannot serve.
+    #[test]
+    fn a_reference_into_a_dropped_root_is_reported_as_dangling() {
+        let store = Store::new().unwrap();
+        let ik = |t: &str| format!("https://ikigai-rs.dev/ns#{t}");
+        let subject = "urn:ikigai:browse:explain:kept:sha256:abc:code-v1:a.rs";
+        store
+            .insert(
+                Quad::new(
+                    iri(subject),
+                    iri(&ik("about")),
+                    Term::NamedNode(iri("urn:repo:gone:file:a.rs")),
+                    GraphName::DefaultGraph,
+                )
+                .as_ref(),
+            )
+            .unwrap();
+        let map = RootMap::new().rename("kept", "kept").dropped("gone");
+        let transfer = plan_transfer(&store, &map, &target_graph()).unwrap();
+        assert_eq!(transfer.dangling_root_refs.len(), 1);
+        let land = landing(&Store::new().unwrap(), &transfer).unwrap();
+        assert!(!transfer_passed(&transfer, &land, 0, land.new));
+    }
+
+    #[test]
+    fn the_per_root_table_names_every_root_and_its_decision() {
+        let source = plasma_shaped_source();
+        let transfer = plan_transfer(&source, &full_map(), &target_graph()).unwrap();
+        let table = transfer_report(&transfer);
+        assert!(table.contains("ikigai-core"));
+        assert!(table.contains("ikigai-browse"));
+        assert!(table.contains("folio"));
+        assert!(table.contains("(dropped)"));
+        // The identity case reports carried without rewritten, which is the
+        // only signal that a root travelled under its old name on purpose.
+        let identity = plan_transfer(
+            &source,
+            &RootMap::new()
+                .rename("ikigai-core", "ikigai-core")
+                .dropped("ikigai-browse")
+                .dropped("folio"),
+            &target_graph(),
+        )
+        .unwrap();
+        assert_eq!(identity.roots["ikigai-core"].carried, 5);
+        assert_eq!(identity.roots["ikigai-core"].rewritten, 0);
+    }
+
+    #[test]
+    fn split_root_reads_a_bare_root_and_a_pathed_one_alike() {
+        assert_eq!(
+            split_root("urn:repo:folio"),
+            Some((REPO_PREFIX, "folio", ""))
+        );
+        assert_eq!(
+            split_root("urn:repo:folio:tree"),
+            Some((REPO_PREFIX, "folio", ":tree"))
+        );
+        assert_eq!(
+            split_root("urn:ikigai:browse:review:browse:sha:tag:pr:11"),
+            Some((REVIEW_PREFIX, "browse", ":sha:tag:pr:11"))
+        );
+        assert_eq!(split_root("urn:iki:annotation:abc"), None);
+        assert_eq!(split_root("urn:repo:"), None);
     }
 }
