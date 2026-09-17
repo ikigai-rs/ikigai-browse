@@ -13,11 +13,13 @@
 //! for why they are not two runs. The binary keeps its name because operators'
 //! notes, runbooks and shell history name it; what it does has grown.
 //!
-//! ★ **This binary is a stopgap for a missing primitive.** The ecosystem's
-//! SPARQL surface is `urn:sparql:ask` / `construct` / `describe` / `select` —
-//! there is no writing verb anywhere. When `urn:sparql:update` exists this is
-//! one `DELETE … INSERT … WHERE` against a bound store, and this file should
-//! be deleted rather than generalized. See [`ikigai_browse::migrate`].
+//! ★ **The primitive this was a stopgap for has LANDED.** `urn:sparql:update`
+//! (ikigai-sparql) and `urn:iki:store:update` (ikigai-store) are writing verbs
+//! over the dev server's and gonk's stores respectively, so both moves this
+//! binary makes are now expressible as one `DELETE … INSERT … WHERE` against a
+//! host that binds one. This file is a convenience that predates them, and
+//! retiring it is an open option rather than a hypothetical. See
+//! [`ikigai_browse::migrate`] for what a writing verb still does not give.
 //!
 //! Everything interesting lives in that module, which is compiled and tested
 //! by the DEFAULT build against an in-memory store. This file is only the
@@ -26,7 +28,7 @@
 //! transform be tested in ordinary CI without a C++ toolchain.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 
 use ikigai_browse::migrate::{self, Counts};
 use oxigraph::model::{GraphName, NamedNode};
@@ -159,22 +161,13 @@ fn parse_args() -> Result<(PathBuf, bool, Option<GraphName>), String> {
 }
 
 /// Open the store, refusing every way this can go quietly wrong.
+///
+/// The two refusals — "that is not a store" and "someone has it open" — live in
+/// [`ikigai_browse::migrate`] so that this binary and `migrate-archive-roots`
+/// cannot drift apart about what a safe store to touch looks like.
 fn open(path: &Path) -> Result<Store, String> {
-    // ⚠ `Store::open` CREATES a store at a path that has none. A typo would
-    // otherwise produce a brand-new empty store and a serene 0/0/0/0 PASS —
-    // the exact shape of a successful migration, reported over data that was
-    // never touched. Require the RocksDB marker instead.
-    if !path.is_dir() {
-        return Err(format!("{} is not a directory", path.display()));
-    }
-    if !path.join("CURRENT").exists() {
-        return Err(format!(
-            "{} does not look like an Oxigraph/RocksDB store (no CURRENT file). \
-             Refusing rather than creating an empty one.",
-            path.display()
-        ));
-    }
-    if let Some(holder) = lock_holder(path) {
+    migrate::require_store_dir(path)?;
+    if let Some(holder) = migrate::lock_holder(path) {
         return Err(format!(
             "the store is open: {holder}\n\
              RocksDB holds an exclusive lock, so this migration needs the server stopped. \
@@ -188,51 +181,4 @@ fn open(path: &Path) -> Result<Store, String> {
             path.display()
         )
     })
-}
-
-/// Who holds the store's RocksDB lock, if anyone.
-///
-/// A locked store is the *expected* failure here: somebody in a hurry runs
-/// this against a live deployment, and "IO error: lock hold by current
-/// process" is not an answer they can act on. Ask the operating system which
-/// process has the LOCK file open and name it. Best-effort by design — no
-/// `lsof`, or a platform where this does not work, degrades to letting
-/// `Store::open` produce its own error rather than blocking the migration.
-fn lock_holder(path: &Path) -> Option<String> {
-    let lock = path.join("LOCK");
-    if !lock.exists() {
-        return None;
-    }
-    let out = Command::new("lsof")
-        .args(["-t", "--"])
-        .arg(&lock)
-        .output()
-        .ok()?;
-    let pids: Vec<&str> = std::str::from_utf8(&out.stdout)
-        .ok()?
-        .split_whitespace()
-        .collect();
-    if pids.is_empty() {
-        return None;
-    }
-    let described: Vec<String> = pids
-        .iter()
-        .map(|pid| {
-            match Command::new("ps")
-                .args(["-o", "command=", "-p", pid])
-                .output()
-            {
-                Ok(o) => {
-                    let command = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                    if command.is_empty() {
-                        format!("pid {pid}")
-                    } else {
-                        format!("pid {pid} ({command})")
-                    }
-                }
-                Err(_) => format!("pid {pid}"),
-            }
-        })
-        .collect();
-    Some(described.join(", "))
 }
