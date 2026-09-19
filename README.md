@@ -18,6 +18,7 @@ pairs), and each root answers these resource families:
 | `urn:repo:{repo}:review:{path}` | the **machine review pass** (S4) — region-grain LLM commentary minted as real annotations (provenance-distinguished), the pass archived by `(path, content-hash, review-tag)` so re-sourcing unchanged content mints nothing; faces: `text/plain` (the margin digest), `as=application/json` (`{minted, orphaned_items, reviewed_bytes, total_bytes, annotations, …}`), `as=text/html` (the card page), `as=text/turtle` (the pass's provenance graph); `debug=raw` derives and returns the model's **unparsed answer** (nothing minted or archived) — the parse-failure diagnosis face; `provider={iri}` derives against a host-allowed backend, keyed by its own model identity (a second model is a second coexisting pass) |
 | `urn:repo:{repo}:review-options:{path}` | **which backends this host will review with** — its `provider=` allowlist grouped by the MODEL each serves, because the review archive keys on the model and two backends serving one model key ONE pass; derives nothing, asks no model, needs no net grant, and reads neither the working tree nor the archive (the rows are a property of the host, so a deleted path still answers); `text/plain` (default) is `label`⇥`providers`⇥`defaultFor` lines, `as=application/json` the structured rows, `as=text/html` the **option menu** the file face opens beside its review button, each row sending `provider=` to `urn:repo:{repo}:review:{path}`. ⚠ It is NOT a listing of archived passes: `urn:repo:{repo}:annotations:{path} as=application/json` already carries `creator` and `generated_by` on every finding, which is the same question answered by data that already exists |
 | `urn:repo:style` | the **theme stylesheet** the classed highlight faces bind to — `text/css`, root-independent, cacheable: each theme inside its OWN `@media (prefers-color-scheme: …)` block, above an unconditional `.hl-code` floor, all targeting the `hl-` classes the HTML faces emit, with the themes and the contrast floor read from the layered `a11y.toml` (see the host contract below) |
+| `urn:repo:style:layout` | the **layout stylesheet** for the `browse-*` classes the HTML faces emit — `text/css`, root-independent, cacheable, a build constant (no configuration, no golden thread): crumbs, entry lists, the action strip, the explain and review disclosure menus, annotation cards and the create form, the pull-request listings. A door links it BESIDE `urn:repo:style` — that one is the syntax theme inside a file view, this one is the page furniture. It styles **only what this crate emits** (no bare `body`/`button`/`pre` rules), so a host can link it inside its own chrome; `data-browse-posture="read-only"` on any ancestor hides the annotate form |
 | `urn:repo:{repo}:prs` | the root's **pull requests** — ikigai-repo's `urn:repo:pr:list` facade resolved through the kernel with `dir=` the root's directory; `state=` (`open`/`closed`/`merged`/`all`) and `limit=` forward to the facade (ikigai-repo ≥ 0.1.4 — omitted, the facade's defaults apply); `text/plain` (default) is `number`⇥`title`⇥`branch`⇥`updated`⇥`state` per line (empty = no matching PRs), `as=application/json` the facade's structured rows, `as=text/html` the listing with each PR linking its page (`chrome=embed` for the rows-only fragment other faces fold in) |
 | `urn:repo:{repo}:prs:{path}` | the **contextual listing** — the PRs that touched anything at or under a path, newest first: open PRs from `urn:repo:pr:list` intersected per-PR with `urn:repo:pr:files` (ikigai-repo ≥ 0.1.5; bounded to the 20 most recently updated open PRs), merged PRs mined from the path-scoped log (`urn:repo:log path=`, last 100 path-touching commits) by the squash-merge **convention** that a subject ends `(#N)` — a merge-commit repo yields fewer rows, never wrong ones; the path is a *history* scope (a deleted directory still lists; no history = empty listing); open rows first, then merged, deduped by number; `state=` (`open`/`merged`/`all`, default `all`) and `limit=` cap the synthesized listing; faces mirror `prs` (`as=application/json` is the synthesized `{number, title, state, branch, updated}` rows; the html face labels its scope) |
 | `urn:repo:{repo}:pr:{n}` | the **PR page** — metadata (`urn:repo:pr:view` json: author object, `headRefOid`) + the unified diff (`urn:repo:pr:diff`); the DIFF TEXT is an annotation surface (annotations target the PR IRI and quote diff lines, drifting like file annotations); `as=text/html` renders the highlighted, line-anchored diff with markers and the annotations panel; `annotations=include` folds the margin into the plain/json faces |
@@ -156,6 +157,50 @@ directory page shows the PRs that touched *it*. The tree face itself never consu
 renders instantly, and when the facades are not mounted the lazy fetch answers
 the typed 404-with-guidance, which the host renders per its own error
 handling (a host that shows kernel errors inline needs nothing extra).
+
+**Two stylesheets, and a door links both.** `urn:repo:style:layout` is the
+**layout** sheet for the `browse-*` classes every face here emits — crumbs,
+entry lists, the action strip, the explain and review disclosure menus,
+annotation cards and the create form, the pull-request listings. Until it
+existed those rules lived as a `const &str` inside `ikigai-web`'s binary, which made
+this family's premise false: browse emits the affordance, any host with a `/k/`
+route serves it — but the affordance arrived unstyled on every door but that
+one, and that binary is being retired. A door links it exactly as it links the
+theme:
+
+```html
+<link rel="stylesheet" href="/k/source urn:repo:style">
+<link rel="stylesheet" href="/k/source urn:repo:style:layout">
+```
+
+★ **It styles only what this crate emits.** No bare `body`, `button`, `pre`,
+`code`, `ul` or `h*` rules — element selectors appear only below a `browse-*`
+class — so a host can link it inside its own chrome without this sheet reaching
+the host's own markup. Its one door-level footprint is the `--browse-*` custom
+properties on `:root`, which paint nothing and exist so a door can override the
+palette. Light and dark come from a top-level block plus a
+`@media (prefers-color-scheme: dark)` override rather than `light-dark()`,
+because `light-dark()` silently resolves light unless the door has declared
+`color-scheme`.
+
+⚠ **One rule in it is behavioural, and the door states the fact it needs.**
+`ikigai-web` computed `.browse-annotate{display:none}` per request from the
+caller's posture, so a read-only caller was not offered a create form the
+annotation Sink would refuse. The sheet keeps that rule, keyed on an attribute
+a door sets on `<html>`, `<body>` or the container it swaps faces into:
+
+```html
+<html data-browse-posture="read-only">
+```
+
+A door that sets nothing shows the form, which is **safe**: the Sink is
+capability-gated by `urn:cap:annotate` regardless, so the worst case is a
+visible button whose submission is refused. Hiding it was only ever honesty of
+presentation, never the boundary.
+
+`cargo run --example page-preview` writes a standalone HTML file with the real
+tree, file, annotation and review-menu faces dressed by both sheets — the check
+a test suite cannot make.
 
 **Highlighting is class-based; the host includes the stylesheet.** The file
 and PR-diff faces emit syntect *classed* spans — `hl-`-prefixed scope-atom

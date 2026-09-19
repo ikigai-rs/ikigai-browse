@@ -78,7 +78,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use ikigai_browse::{ExplainConfig, Mount, StyleWatch, CAP_ANNOTATE, CAP_WILDCARD};
+use ikigai_browse::{ExplainConfig, Mount, StyleWatch, CAP_ANNOTATE, CAP_WILDCARD, LAYOUT_IRI};
 use ikigai_conformance::{Check, Fixture, Suite};
 use ikigai_core::{
     ArgRef, Capability, Description, EndpointSpace, Error, Exact, Expiry, Fallback, FnEndpoint,
@@ -132,13 +132,14 @@ const RAW_FACE_IS_A_PASS_THROUGH: &str =
 /// Every description id this crate binds. A seventeenth endpoint bound without a
 /// line here is held to a weaker standard than the sixteen; a listed id that binds
 /// nothing is a stale list.
-const ENDPOINTS: [&str; 16] = [
+const ENDPOINTS: [&str; 17] = [
     "annotation",
     "browse-annotations",
     "browse-explain",
     "browse-explain-versions",
     "browse-file",
     "browse-hash",
+    "browse-layout",
     "browse-pr",
     "browse-pr-explain",
     "browse-pr-review",
@@ -318,6 +319,13 @@ fn suite() -> Suite {
         )
         .namespace(OA)
         .cacheable("browse-style")
+        .cacheable("browse-layout")
+        // ★ The layout sheet is a BUILD CONSTANT — no configuration, no
+        // derivation, nothing in a running process can change it — so cacheable
+        // with an empty thread set is correct rather than a promise nothing
+        // keeps. `pure` is the declaration that says so; the theme sheet beside
+        // it is the opposite case and carries a thread per candidate config file.
+        .pure("browse-layout")
         // ★ ONE check, on ONE endpoint. `opt_out` would have been the wrong lever
         // here and this crate already knows why: it cost `browse-review` ENFORCED,
         // CACHEABLE and SKOLEM-RDF for a release cycle over a single legitimately
@@ -368,7 +376,7 @@ fn conforms() {
     assert!(report.is_clean(), "{report}");
 
     // The stub provider is walked as a module endpoint (conformance PENDING #17):
-    // fifteen of this crate's, one of the fixture's.
+    // this crate's, plus one of the fixture's.
     assert_eq!(
         report.endpoints,
         ENDPOINTS.len() + 1,
@@ -430,6 +438,7 @@ fn conforms() {
             // reported — so the waiver subtracts one rule, not the endpoint.
             "browse-file source text/markdown",
             "browse-hash source text/plain",
+            "browse-layout source text/css",
             "browse-review source text/plain",
             "browse-review source text/turtle",
             "browse-review-options source text/plain",
@@ -521,6 +530,7 @@ fn the_style_sheet_is_the_only_threaded_representation_and_the_watch_names_its_t
         "urn:repo:demo:explain-versions",
         "urn:iki:annotation:seed",
         "urn:repo:style",
+        "urn:repo:style:layout",
     ];
     let mut threaded: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     let mut cached_without_a_thread: Vec<&str> = Vec::new();
@@ -530,7 +540,13 @@ fn the_style_sheet_is_the_only_threaded_representation_and_the_watch_names_its_t
         let threads: Vec<String> = repr.threads().iter().map(|t| t.to_string()).collect();
         if !threads.is_empty() {
             threaded.insert(target, threads);
-        } else if repr.expiry != Expiry::Always {
+        } else if repr.expiry != Expiry::Always && target != LAYOUT_IRI {
+            // ★ `urn:repo:style:layout` is the deliberate exception and the
+            // ONLY one: a build constant is cacheable with nothing to cut
+            // because nothing in a running process can change it. The suite is
+            // told the same thing by `Suite::pure("browse-layout")`; naming it
+            // here rather than dropping it from the probe list keeps the fact
+            // checked instead of merely unobserved.
             cached_without_a_thread.push(target);
         }
     }
@@ -564,7 +580,7 @@ fn declared_outputs_are_the_media_types_served() {
     let scratch = Scratch::new();
     let (kernel, _watch) = seeded(&scratch);
     let root = Capability::root();
-    let calls: [(&str, &[(&str, &str)]); 26] = [
+    let calls: [(&str, &[(&str, &str)]); 27] = [
         ("urn:repo:demo:tree", &[]),
         ("urn:repo:demo:tree", &[("as", "text/html")]),
         ("urn:repo:demo:tree", &[("as", "text/turtle")]),
@@ -581,6 +597,7 @@ fn declared_outputs_are_the_media_types_served() {
         ("urn:repo:demo:hash", &[]),
         ("urn:repo:demo:hash", &[("as", "application/json")]),
         ("urn:repo:style", &[]),
+        ("urn:repo:style:layout", &[]),
         ("urn:repo:demo:annotations", &[]),
         ("urn:repo:demo:annotations", &[("as", "text/html")]),
         ("urn:repo:demo:annotations", &[("as", "text/turtle")]),
