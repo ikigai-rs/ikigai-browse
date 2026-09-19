@@ -64,6 +64,18 @@
 //!   Cacheable with a golden thread per candidate config file, and
 //!   [`Mount::space_watched`] hands the host the watch that cuts them, so an
 //!   edited `a11y.toml` lands on the next read instead of the next restart.
+//! - `urn:repo:style:layout` — the **layout stylesheet** for the `browse-*`
+//!   classes the HTML faces emit (`text/css`, root-independent, cacheable, a
+//!   build constant): crumbs, entry lists, the action strip, the explain and
+//!   review disclosure menus, annotation cards and the create form, the
+//!   pull-request listings. A door serving these faces links it BESIDE
+//!   `urn:repo:style` — that one is the syntax theme inside a file view, this
+//!   one is the page furniture. ★ It styles only what this crate emits (no bare
+//!   `body`/`button`/`pre` rules), so a host can link it inside its own chrome.
+//!   A door that knows the caller cannot write annotations sets
+//!   `data-browse-posture="read-only"` on any ancestor and the create form is
+//!   hidden — presentation only; the Sink is capability-gated regardless. See
+//!   the `layout` module docs for why it is a sibling rather than an extension.
 //! - `urn:repo:{repo}:prs:{path}` — the **contextual** listing: the PRs that
 //!   touched anything at or under a path, newest first — open PRs by
 //!   intersecting their changed files (`urn:repo:pr:files`), merged PRs mined
@@ -125,6 +137,10 @@ mod annotate;
 mod archive;
 mod explain;
 mod hash;
+/// The layout stylesheet for the `browse-*` classes the HTML faces emit —
+/// `urn:repo:style:layout`, the sibling of `urn:repo:style`. See the module
+/// docs for why it is a sibling and not an extension.
+mod layout;
 /// The one-shot that moves a pre-0.3.0 store's annotations into the
 /// `urn:iki:` namespace. Public because the `migrate-annotation-ns` binary
 /// (feature `migrate`) is a separate crate target and because the transform
@@ -142,6 +158,7 @@ use archive::Archive;
 
 pub use annotate::CAP_ANNOTATE;
 pub use explain::ExplainConfig;
+pub use layout::LAYOUT_IRI;
 pub use watch::{ConfigWatch, StyleWatch, WatchError};
 
 /// The wildcard capability every browse action declares: an agent is offered
@@ -539,6 +556,9 @@ fn base_space(
     let space = bind_family(space, roots, hash, Some("hash"), Some("hash:{path}"));
     // The theme stylesheet: one concrete row shared by all roots.
     let space = space.bind(StyleRow, style_endpoint(app, home));
+    // Its sibling, the LAYOUT sheet for the `browse-*` classes the faces emit
+    // — the same shape, and a build constant rather than a derived one.
+    let space = space.bind(layout::LayoutRow, layout::layout_endpoint());
     // The pull-request pages ride with every variant: they need no store and
     // no LLM — only ikigai-repo's pr facades resolved through the kernel at
     // runtime (unmounted facades answer a typed NotFound, not a panic).
@@ -2425,6 +2445,52 @@ mod tests {
         assert!(matches!(err, Error::Denied(_)), "{err:?}");
     }
 
+    /// The LAYOUT face beside it: one `text/css` representation of the
+    /// `browse-*` rules, cacheable, and behind the same grant every other
+    /// browse action is.
+    ///
+    /// ★ The rules it carries are pinned against the MARKUP by
+    /// `layout::tests::every_emitted_class_is_styled`; what is checked here is
+    /// that a door can actually GET them — the failure ledger #441 recorded was
+    /// not a missing rule but a missing resource.
+    #[test]
+    fn the_layout_face_serves_the_browse_rules_and_is_cacheable() {
+        let k = styled_kernel(None, None);
+        let cap = demo_cap();
+        let out = source(&k, layout::LAYOUT_IRI, &[], &cap).unwrap();
+        assert_eq!(out.repr_type.media_type, "text/css");
+        let css = body(&out);
+        // A sample of each region, so a sheet gutted to a stub fails here.
+        for rule in [
+            ".browse-entries{",
+            ".browse-crumbs{",
+            ".browse-actions{",
+            ".browse-annotate{",
+            ".browse-review-menu-panel",
+            ".browse-recent-prs{",
+        ] {
+            assert!(css.contains(rule), "the layout sheet lost `{rule}`: {css}");
+        }
+        // ★ It carries NO `hl-` rule: the syntax theme is the other resource,
+        // and a door links both. A sheet that started highlighting would make
+        // the two IRIs fight over one cascade.
+        assert!(
+            !css.contains(".hl-"),
+            "the layout sheet is not the theme: {css}"
+        );
+        // The one behavioural rule, keyed on what the DOOR states.
+        assert!(
+            css.contains("[data-browse-posture=\"read-only\"] .browse-annotate{display:none}"),
+            "{css}"
+        );
+        // Cacheable: the second resolution is a cache hit.
+        let request = Request::new(Verb::Source, Iri::parse(layout::LAYOUT_IRI).unwrap());
+        assert!(k.is_cached(&request, &cap), "the layout sheet should cache");
+        let unrelated = Capability::scoped(["urn:cap:unrelated"]);
+        let err = source(&k, layout::LAYOUT_IRI, &[], &unrelated).unwrap_err();
+        assert!(matches!(err, Error::Denied(_)), "{err:?}");
+    }
+
     /// A kernel whose mount STATES its config home — the only form a test that
     /// resolves [`STYLE_IRI`] may use. Resolving it over an ambient mount asserts
     /// against whatever `a11y.toml` the developer's machine happens to hold, and
@@ -3025,6 +3091,7 @@ mod tests {
             "urn:repo:demo:annotations:{path}",
             "urn:iki:annotation:{id}",
             "urn:repo:style",
+            "urn:repo:style:layout",
         ] {
             assert!(
                 offered.contains(row),
