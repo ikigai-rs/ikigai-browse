@@ -4,9 +4,10 @@
 //! ## Why it is a resource and not a host's business
 //!
 //! Every face here emits markup (`browse-crumbs`, `browse-entries`,
-//! `browse-review-menu`, `browse-annotate`, …) and, until 0.3.4, defined none
-//! of it. The rules lived as a `const &str` inside one particular server's
-//! binary (`ikigai-web/src/serve.rs`), which made the family's premise false:
+//! `browse-review-menu`, `browse-annotate`, …) and, until this resource
+//! existed, defined none of it. The rules lived as a `const &str` inside one
+//! particular server's binary (`ikigai-web/src/serve.rs`), which made the
+//! family's premise false:
 //! *browse emits the affordance, any host with a `/k/` route serves it* — but
 //! the affordance arrived unstyled everywhere except that one binary, and that
 //! binary is scheduled for retirement. A tree page on a second door rendered as

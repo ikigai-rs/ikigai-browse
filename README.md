@@ -161,8 +161,8 @@ handling (a host that shows kernel errors inline needs nothing extra).
 **Two stylesheets, and a door links both.** `urn:repo:style:layout` is the
 **layout** sheet for the `browse-*` classes every face here emits — crumbs,
 entry lists, the action strip, the explain and review disclosure menus,
-annotation cards and the create form, the pull-request listings. Before 0.3.4
-those rules lived as a `const &str` inside `ikigai-web`'s binary, which made
+annotation cards and the create form, the pull-request listings. Until it
+existed those rules lived as a `const &str` inside `ikigai-web`'s binary, which made
 this family's premise false: browse emits the affordance, any host with a `/k/`
 route serves it — but the affordance arrived unstyled on every door but that
 one, and that binary is being retired. A door links it exactly as it links the
