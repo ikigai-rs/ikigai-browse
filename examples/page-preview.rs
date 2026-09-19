@@ -8,7 +8,7 @@
 //! two stylesheets is that both schemes read.
 //!
 //! It mounts THIS checkout, resolves the real tree, file, annotations and
-//! review-menu faces through the kernel, and inlines the two stylesheets
+//! review-menu faces through the kernel, and inlines the two stylesheet
 //! resources — `urn:repo:style` (the syntax theme) and `urn:repo:style:layout`
 //! (the page furniture). Nothing here writes markup of its own beyond the page
 //! shell and the section headings, so what you see is what a door serves.
