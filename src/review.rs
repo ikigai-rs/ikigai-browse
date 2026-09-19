@@ -17,6 +17,24 @@
 //! annotations re-anchor or orphan exactly like human ones — that drift IS the
 //! review-history story.
 //!
+//! ## Choosing the backend per request
+//!
+//! `provider={iri}` derives THIS pass against a backend the caller names
+//! rather than the configured review tier, on the explain family's terms (see
+//! that module's header): the selectable set is the operator's — every
+//! configured tier plus [`crate::ExplainConfig::allow_provider`] — and
+//! anything else is `Denied` before any work, never a silent fall back.
+//!
+//! ★ IT IS A SECOND PASS, NOT A REPLACEMENT. The archive key folds the model
+//! identity, so a second backend serving a different model derives and mints
+//! its OWN pass over the same content, alongside the first: two reviewers'
+//! margins on one file, both queryable on the annotation axis. Two backends
+//! serving the SAME model share the key, so the second is an archive hit that
+//! asks nothing and mints nothing — the same rule the explain menu is built
+//! on, and the reason the operator's `review_model_label` applies only while
+//! `provider` IS the configured one (a label written for one model must never
+//! key another model's pass).
+//!
 //! ## Provenance — standard terms only, no vocab publish
 //!
 //! A machine annotation carries `dcterms:creator` (the model identity),
@@ -442,6 +460,32 @@ impl Endpoint for ReviewEndpoint {
         }
         let config = &self.config;
 
+        // The caller's backend choice, validated BEFORE any work — explain's
+        // rule, verbatim: an unknown or non-allowed provider is a refusal that
+        // names what was asked for and what is on offer, never a silent fall
+        // back to the configured one. A caller who asked for one model, got
+        // another, and had the pass archived (and annotations MINTED) under
+        // that other model's identity has been lied to durably — the entry and
+        // its findings are thereafter indistinguishable from legitimate ones.
+        //
+        // Review has no `version=`: nothing here addresses an archived pass
+        // without deriving one, so unlike explain's there is no argument for
+        // this one to be exclusive with.
+        let provider = match inv.inline_str("provider") {
+            Ok(requested) => {
+                let selectable = config.selectable();
+                if !selectable.contains(requested) {
+                    return Err(Error::Denied(format!(
+                        "browse: `{requested}` is not a provider this host offers to review \
+                         with; selectable here: {}",
+                        selectable.into_iter().collect::<Vec<_>>().join(", ")
+                    )));
+                }
+                requested.to_string()
+            }
+            Err(_) => config.review_provider.clone(),
+        };
+
         // The archive key's backbone, THROUGH the kernel (dependency-recorded)
         // — same construction as explain.
         let hash_repr = inv.source(&parse_iri(&hash_iri(repo, &rel))?).await?;
@@ -460,11 +504,22 @@ impl Endpoint for ReviewEndpoint {
 
         // The model identity for the tag: explicit config label → the
         // provider's resolved `:model` identity → the provider-IRI heuristic.
-        let model = match &config.review_model_label {
+        //
+        // ★ THE LABEL DESCRIBES THE OPERATOR'S BACKEND, so it is keyed to the
+        // provider and not to the pass: a request that selects a different
+        // backend resolves THAT backend's own identity instead of inheriting a
+        // label written for another model. Stamping `review_model_label` onto
+        // a model it does not describe would write a wrong identity into the
+        // archive KEY and onto every annotation's `dcterms:creator`.
+        let explicit = match provider == config.review_provider {
+            true => config.review_model_label.as_ref(),
+            false => None,
+        };
+        let model = match explicit {
             Some(label) => label.clone(),
-            None => resolve_model(inv, &config.review_provider)
+            None => resolve_model(inv, &provider)
                 .await
-                .unwrap_or_else(|| provider_label(&config.review_provider)),
+                .unwrap_or_else(|| provider_label(&provider)),
         };
         let tag = format!("{REVIEW_PROMPT_VERSION}@{model}");
 
@@ -498,7 +553,7 @@ impl Endpoint for ReviewEndpoint {
              {REVIEW_REMINDER}",
             truncate(&text, config.max_prompt_bytes),
         );
-        let request = Request::new(Verb::Source, parse_iri(&config.review_provider)?)
+        let request = Request::new(Verb::Source, parse_iri(&provider)?)
             .with_arg("prompt", ArgRef::Inline(prompt.into_bytes()))
             .with_arg(
                 "system",
@@ -528,7 +583,7 @@ impl Endpoint for ReviewEndpoint {
                 "browse: `{}` returned no parseable QUOTE:/NOTE: findings for `{rel}` \
                  (max_tokens {}); nothing archived. The answer began: \"{}\" — re-source \
                  with debug=raw for the full unparsed answer",
-                config.review_provider,
+                provider,
                 config.review_max_tokens,
                 answer_excerpt(&answer)
             )));
@@ -591,7 +646,7 @@ impl Endpoint for ReviewEndpoint {
     }
 
     fn describe(&self) -> Description {
-        review_description()
+        review_description(&self.config)
     }
 }
 
@@ -739,7 +794,12 @@ pub(crate) fn pass_turtle(entry: &PassEntry) -> String {
 
 /// `repo` is not an ArgSpec: every advertised row fixes the root in its
 /// pattern (see `crate::bind_family`); the binding is grammar-injected.
-fn review_description() -> Description {
+/// Takes the config because the `provider` argument's `one_of` IS this host's
+/// allowlist ([`ExplainConfig::selectable`]) — the manifold must state which
+/// backends a caller may actually name, not a hard-coded guess, so that
+/// `urn:kernel:validate` can reject a bad one before dispatch and a UI can
+/// build its "review with" menu from the description alone.
+fn review_description(config: &ExplainConfig) -> Description {
     Description::new("browse-review")
         .title("Machine review pass (annotations minted by a model)")
         .summary(
@@ -751,7 +811,10 @@ fn review_description() -> Description {
              content-hash, review-tag) — re-sourcing unchanged content is an archive hit \
              that mints nothing. Changed content is a fresh pass; earlier passes' \
              annotations re-anchor or orphan like human ones. Quotes that do not anchor \
-             are counted (orphaned_items), never fatal. text/plain (default) is the \
+             are counted (orphaned_items), never fatal. provider= derives this pass \
+             against a different (host-allowed) backend, keyed by that backend's own \
+             model identity, so a second model is a second coexisting pass rather than a \
+             replacement. text/plain (default) is the \
              margin-notes digest; as=application/json adds {minted, orphaned_items, \
              annotations}; as=text/html the card page; as=text/turtle the pass's \
              provenance graph.",
@@ -766,6 +829,27 @@ fn review_description() -> Description {
                 .binding()
                 .class(crate::XSD_STRING)
                 .summary("file path within the root, percent-encoded"),
+        )
+        .input(
+            ArgSpec::new("provider")
+                // The value is an endpoint IRI, not free text — the class says
+                // so, so type-based selection can offer it a resource rather
+                // than a string. Spelled exactly as explain's, deliberately:
+                // one argument name for one concept across the module.
+                .class("http://www.w3.org/2001/XMLSchema#anyURI")
+                .optional()
+                .summary(
+                    "the LLM provider IRI that derives THIS review pass, instead of the \
+                     configured review tier; one_of is what this host allows. That backend's \
+                     own model identity keys the archive entry, so a second model yields a \
+                     second pass COEXISTING with the first — its own findings, minted as its \
+                     own annotations, alongside rather than instead. A backend serving the \
+                     same model as an existing pass keys that same entry: an archive hit \
+                     that asks nothing and mints nothing. Unlike explain there is no \
+                     version= here — no argument addresses an archived pass — so this one \
+                     is exclusive with nothing.",
+                )
+                .one_of(config.selectable()),
         )
         .input(
             ArgSpec::new("as")
@@ -865,6 +949,53 @@ mod tests {
         Kernel::new(Arc::new(Fallback::new(vec![
             Arc::new(browse),
             Arc::new(llm_space(log, reply)),
+        ])))
+    }
+
+    /// A second bound backend, for the `provider=` tests. No `:model`
+    /// resource answers for it, so its tag label is the provider heuristic
+    /// (`alt`) — which is also the point: it is NOT `r1`, the label the
+    /// operator wrote for the configured backend.
+    const ALT_PROVIDER: &str = "urn:llm:alt:ask";
+    const ALT_FINDINGS: &str =
+        "QUOTE: fn gamma() {}\nNOTE: The third entry point has no caller in this file.\n";
+
+    fn alt_llm_space(log: &Arc<Log>, reply: &str) -> EndpointSpace {
+        let log = Arc::clone(log);
+        let reply = reply.to_string();
+        EndpointSpace::new().bind(
+            Exact::new(ALT_PROVIDER),
+            FnEndpoint::new("fake-alt-llm", move |inv: &Invocation<'_>| {
+                log.asks.lock().unwrap().push((
+                    inv.inline_str("prompt").unwrap_or("").to_string(),
+                    inv.inline_str("system").unwrap_or("").to_string(),
+                    inv.inline_str("max_tokens").unwrap_or("").to_string(),
+                ));
+                Ok(repr_utf8("text/plain", reply.clone()))
+            })
+            .with_description(
+                Description::new("fake-alt-llm")
+                    .verb(Verb::Source)
+                    .requires(CAP_NET),
+            ),
+        )
+    }
+
+    /// Both backends bound, with the host config in the test's hands — the
+    /// shape every `provider=` case needs.
+    fn kernel_with_alt(
+        root: &std::path::Path,
+        store: &Arc<Store>,
+        log: &Arc<Log>,
+        alt_log: &Arc<Log>,
+        config: impl FnOnce(ExplainConfig) -> ExplainConfig,
+    ) -> Kernel {
+        let cfg = config(ExplainConfig::new(Arc::clone(store)).review_model_label("r1"));
+        let browse = crate::space_with_explain(vec![("demo".to_string(), root.to_path_buf())], cfg);
+        Kernel::new(Arc::new(Fallback::new(vec![
+            Arc::new(browse),
+            Arc::new(llm_space(log, TWO_FINDINGS)),
+            Arc::new(alt_llm_space(alt_log, ALT_FINDINGS)),
         ])))
     }
 
@@ -1279,7 +1410,19 @@ mod tests {
         // No `repo` ArgSpec: rows fix the root; the binding is
         // grammar-injected.
         let names: Vec<&str> = description.inputs.iter().map(|i| i.name.as_str()).collect();
-        assert_eq!(names, ["path", "as", "debug"]);
+        assert_eq!(names, ["path", "provider", "as", "debug"]);
+
+        // The manifold publishes the allowlist: `provider`'s one_of IS what
+        // this host permits, so validate can reject before dispatch and a UI
+        // can build its "review with" menu from the description alone. On a
+        // default config every tier points at one of two backends, so the set
+        // is the same two explain offers — no new reach.
+        let provider_spec = description
+            .inputs
+            .iter()
+            .find(|i| i.name == "provider")
+            .unwrap();
+        assert_eq!(provider_spec.one_of, ["urn:llm:ask", "urn:llm:coder:ask"]);
     }
 
     #[test]
@@ -1399,5 +1542,149 @@ mod tests {
         assert_eq!(findings[0].note, "first line wrapped second line");
         assert_eq!(findings[1].note, "fine");
         assert_eq!(malformed, 2, "the stray NOTE and the noteless QUOTE");
+    }
+
+    #[test]
+    fn a_second_provider_derives_a_second_coexisting_pass() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let alt_log = Arc::new(Log::default());
+        let k = kernel_with_alt(&root, &store, &log, &alt_log, |c| {
+            c.allow_provider(ALT_PROVIDER)
+        });
+
+        // The configured backend first.
+        let first = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(first["derived"], true);
+        assert_eq!(first["version_tag"], "review-v2@r1");
+        assert_eq!(first["minted"].as_array().unwrap().len(), 2);
+        assert_eq!((log.count(), alt_log.count()), (1, 0));
+
+        // The second backend over the SAME content: a different model
+        // identity is a different key, so this derives rather than hitting —
+        // and the operator's `review_model_label` does not follow it.
+        let second = json(
+            &k,
+            "urn:repo:demo:review:a.rs",
+            &[("provider", ALT_PROVIDER)],
+        );
+        assert_eq!(second["derived"], true);
+        assert_eq!(second["version_tag"], "review-v2@alt");
+        assert_eq!(second["model"], "alt");
+        assert_eq!(second["minted"].as_array().unwrap().len(), 1);
+        assert_eq!((log.count(), alt_log.count()), (1, 1));
+        assert_ne!(first["minted"], second["minted"]);
+
+        // ★ COEXISTING, not replacing: the first pass is still there, still a
+        // hit, still its own findings — and the file's one annotation axis
+        // now carries both reviewers' margins.
+        let again = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(again["derived"], false, "the first pass was overwritten");
+        assert_eq!(again["version_tag"], "review-v2@r1");
+        assert_eq!(again["minted"], first["minted"]);
+        let alt_again = json(
+            &k,
+            "urn:repo:demo:review:a.rs",
+            &[("provider", ALT_PROVIDER)],
+        );
+        assert_eq!(alt_again["derived"], false);
+        assert_eq!(alt_again["minted"], second["minted"]);
+        assert_eq!(
+            (log.count(), alt_log.count()),
+            (1, 1),
+            "neither hit may re-ask"
+        );
+
+        let listing = json(&k, "urn:repo:demo:annotations:a.rs", &[]);
+        let rows = listing.as_array().unwrap();
+        assert_eq!(rows.len(), 3, "two passes' findings on one axis: {rows:?}");
+        let creators: Vec<&str> = rows
+            .iter()
+            .map(|r| r["creator"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            creators,
+            ["r1", "r1", "alt"],
+            "reading order: alpha, beta, gamma"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_provider_this_host_does_not_offer_is_refused_before_any_ask() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let alt_log = Arc::new(Log::default());
+        // Bound, but NOT in the operator's selectable set.
+        let k = kernel_with_alt(&root, &store, &log, &alt_log, |c| c);
+
+        let err = issue(
+            &k,
+            Verb::Source,
+            "urn:repo:demo:review:a.rs",
+            &[("provider", ALT_PROVIDER)],
+            &cap(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Denied(_)), "{err:?}");
+        let message = err.to_string();
+        assert!(message.contains(ALT_PROVIDER), "{message}");
+        assert!(
+            message.contains(PROVIDER),
+            "names what IS on offer: {message}"
+        );
+        assert_eq!(
+            (log.count(), alt_log.count()),
+            (0, 0),
+            "refused before any work"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_distinct_review_tier_is_selectable_as_itself() {
+        // ★ THE TRAP THIS ARC CLOSED. `selectable()` held the two explain
+        // tiers only, so on a host whose review tier is a DIFFERENT backend,
+        // `provider=<the review default>` — the manifold naming exactly what
+        // the server does when asked nothing — came back Denied. It never
+        // showed on our host because there the review tier equals the file
+        // tier.
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let alt_log = Arc::new(Log::default());
+        let k = kernel_with_alt(&root, &store, &log, &alt_log, |c| {
+            c.review_provider(ALT_PROVIDER)
+        });
+
+        let pass = json(
+            &k,
+            "urn:repo:demo:review:a.rs",
+            &[("provider", ALT_PROVIDER)],
+        );
+        assert_eq!(pass["derived"], true);
+        assert_eq!(
+            pass["version_tag"], "review-v2@r1",
+            "the configured tier keeps its label"
+        );
+        assert_eq!((log.count(), alt_log.count()), (0, 1));
+
+        // And the manifold says so: the one_of a UI builds its menu from.
+        let description = review_description(
+            &ExplainConfig::new(Arc::clone(&store)).review_provider(ALT_PROVIDER),
+        );
+        let provider = description
+            .inputs
+            .iter()
+            .find(|a| a.name == "provider")
+            .expect("review declares provider");
+        assert!(
+            provider.one_of.iter().any(|v| v == ALT_PROVIDER),
+            "{:?}",
+            provider.one_of
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 }
