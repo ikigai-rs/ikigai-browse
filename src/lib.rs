@@ -17,7 +17,8 @@
 //!   a UTF-8 sniff to `text/plain`); `as=text/html` renders a
 //!   syntax-highlighted, line-numbered view whose lines carry `id="L{n}"`
 //!   anchors (the surface S2's annotations target), inline markers at
-//!   annotated lines, and — explanations mounted — an explain link.
+//!   annotated lines, and — explanations mounted — an explain link and a
+//!   review link, each beside its own "… with" backend menu.
 //! - `urn:repo:{repo}:state` — the **freshness oracle**: the git HEAD sha plus
 //!   a short-status digest, one line; `as=application/json` yields
 //!   `{head, dirty: [paths]}`. Uncacheable by design — it exists to be the
@@ -35,12 +36,16 @@
 //!   that RE-ANCHOR when the target drifts and are orphan-flagged (never
 //!   dropped) when the quote is gone. The file HTML face gains an annotations
 //!   panel and marks annotated lines.
-//! - `urn:repo:{repo}:review:{path}` — the S4 **machine review pass**
-//!   ([`space_with_explain`]): region-grain LLM commentary minted as real
-//!   annotations (provenance-distinguished — `dcterms:creator`,
-//!   `oa:motivatedBy oa:assessing`, `prov:wasGeneratedBy`), the pass archived
-//!   by `(path, content-hash, review-tag)` so re-sourcing unchanged content
-//!   mints nothing.
+//! - `urn:repo:{repo}:review:{path}` + `:review-options:{path}` — the S4
+//!   **machine review pass** ([`space_with_explain`]): region-grain LLM
+//!   commentary minted as real annotations (provenance-distinguished —
+//!   `dcterms:creator`, `oa:motivatedBy oa:assessing`, `prov:wasGeneratedBy`),
+//!   the pass archived by `(path, content-hash, review-tag)` so re-sourcing
+//!   unchanged content mints nothing. `review-options` is the host's
+//!   `provider=` allowlist grouped by MODEL — what the file face's "review
+//!   with…" menu renders, derivation-free and needing only the browse grant.
+//!   ⚠ It is not a listing of archived passes: the annotations listing already
+//!   carries `creator` and `generated_by` on every finding.
 //! - `urn:repo:{repo}:prs` + `urn:repo:{repo}:pr:{n}` (and, explanations
 //!   mounted, `…:pr:{n}:explain` / `…:pr:{n}:review`) — the **pull-request
 //!   family**: ikigai-repo's pr facades resolved THROUGH THE KERNEL at
@@ -1050,11 +1055,18 @@ fn explain_button(repo: &str, rel: &str, label: &str, title: Option<&str>) -> St
     )
 }
 
-/// The header strip under the crumbs: face-level actions (today just the
-/// explain link, when that family is mounted; empty otherwise), followed by
-/// the explain option menu.
+/// The header strip under the crumbs on a FILE face: face-level actions (the
+/// explain and review links, when those families are mounted; empty
+/// otherwise), followed by their option menus.
 ///
-/// The menu is a SIBLING of the action row, not a member of it: the row is
+/// Explain and review ride the same `Mount::explain` config — they are bound
+/// together or not at all — so one flag gates both and neither link can dangle.
+/// ⚠ The tree face builds its own row instead of calling this: **the review
+/// pass is file-grain** (findings anchor in text, so a directory target is a
+/// typed `NotFound`), and a directory review button would be an affordance
+/// whose only possible answer is a refusal.
+///
+/// A menu is a SIBLING of the action row, not a member of it: the row is
 /// `display:flex` in every host that styles it, and a disclosure opened inside
 /// a flex row is sized to its content — on a phone that is a column of
 /// wrapped fragments. Block-level below the row, it lays out at any width with
@@ -1064,9 +1076,11 @@ fn actions_html(repo: &str, rel: &str, explain: bool) -> String {
         return String::new();
     }
     format!(
-        "<nav class=\"browse-actions\">{}</nav>{}",
+        "<nav class=\"browse-actions\">{}{}</nav>{}{}",
         explain_button(repo, rel, "explain", None),
+        review::review_button_html(repo, rel),
         explain::menu_html(repo, rel),
+        review::menu_html(repo, rel),
     )
 }
 
@@ -1312,7 +1326,10 @@ fn file_description(has_store: bool, explain: bool) -> Description {
     if explain {
         summary.push_str(
             " The html face links the file's explain resource \
-             (urn:repo:{repo}:explain:{path}).",
+             (urn:repo:{repo}:explain:{path}) and its review pass \
+             (urn:repo:{repo}:review:{path}), each beside a \"… with\" menu built from \
+             urn:repo:{repo}:explain-versions:{path} and \
+             urn:repo:{repo}:review-options:{path} and fetched only when opened.",
         );
     }
     let mut description = Description::new("browse-file")
@@ -2140,6 +2157,10 @@ mod tests {
             // explain-versions would answer nothing, so the disclosure that
             // fetches it must not render either.
             assert!(!html.contains("browse-explain-menu"), "{iri}: {html}");
+            // Review rides the same config, so it is absent for the same
+            // reason: `Mount::explain` binds both families or neither.
+            assert!(!html.contains("browse-review-link"), "{iri}: {html}");
+            assert!(!html.contains("browse-review-menu"), "{iri}: {html}");
         }
 
         // space_with_explain: the tree face links the directory's explain and
@@ -2169,6 +2190,11 @@ mod tests {
             assert!(html.contains(target), "missing {target}: {html}");
         }
         assert_eq!(html.matches("browse-explain-menu\"").count(), 1, "{html}");
+        // ⚠ And NO review affordance on a directory: the pass is file-grain
+        // (findings anchor in text), so a tree-level button would be an
+        // affordance whose only possible answer is a typed NotFound.
+        assert!(!html.contains("browse-review-link"), "{html}");
+        assert!(!html.contains("browse-review-menu"), "{html}");
         let html = body(
             &source(
                 &k,
@@ -2182,6 +2208,15 @@ mod tests {
             html.contains("hx-get=\"/k/source urn:repo:demo:explain:src/lib.rs as=text/html\""),
             "{html}"
         );
+        // The review button beside it, and its own closed menu — the file face
+        // is the only face that carries them.
+        for target in [
+            "hx-get=\"/k/source urn:repo:demo:review:src/lib.rs as=text/html\"",
+            "hx-get=\"/k/source urn:repo:demo:review-options:src/lib.rs as=text/html\"",
+        ] {
+            assert!(html.contains(target), "missing {target}: {html}");
+        }
+        assert_eq!(html.matches("browse-review-menu\"").count(), 1, "{html}");
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -2956,8 +2991,14 @@ mod tests {
             vec![("demo".to_string(), root.clone())],
             crate::ExplainConfig::new(store),
         )));
-        // browse grant + a net grant (explain declares urn:cap:net:* too).
-        let cap = Capability::scoped(["urn:cap:browse:read:demo", "urn:cap:net:localhost"]);
+        // browse grant + a net grant (explain declares urn:cap:net:* too) +
+        // annotate (the review pass mints, so it declares that as well; its
+        // MENU does not, and is offered on the browse grant alone).
+        let cap = Capability::scoped([
+            "urn:cap:browse:read:demo",
+            "urn:cap:net:localhost",
+            "urn:cap:annotate",
+        ]);
         let query = ActionQuery {
             capability: Some(&cap),
             ..Default::default()
@@ -2978,6 +3019,8 @@ mod tests {
             "urn:repo:demo:explain:{path}",
             "urn:repo:demo:explain-versions",
             "urn:repo:demo:explain-versions:{path}",
+            "urn:repo:demo:review:{path}",
+            "urn:repo:demo:review-options:{path}",
             "urn:repo:demo:annotations",
             "urn:repo:demo:annotations:{path}",
             "urn:iki:annotation:{id}",

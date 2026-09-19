@@ -129,10 +129,10 @@ const RAW_FACE_IS_A_PASS_THROUGH: &str =
      `the_raw_file_face_serves_the_extension_mapped_type`; remove this waiver when \
      `Description` grows a pass-through output marker (core PENDING §20)";
 
-/// Every description id this crate binds. A sixteenth endpoint bound without a
-/// line here is held to a weaker standard than the fifteen; a listed id that binds
+/// Every description id this crate binds. A seventeenth endpoint bound without a
+/// line here is held to a weaker standard than the sixteen; a listed id that binds
 /// nothing is a stale list.
-const ENDPOINTS: [&str; 15] = [
+const ENDPOINTS: [&str; 16] = [
     "annotation",
     "browse-annotations",
     "browse-explain",
@@ -145,6 +145,7 @@ const ENDPOINTS: [&str; 15] = [
     "browse-prs",
     "browse-prs-scoped",
     "browse-review",
+    "browse-review-options",
     "browse-state",
     "browse-style",
     "browse-tree",
@@ -300,6 +301,10 @@ fn suite() -> Suite {
         // The review's quote is in `src/lib.rs`, so the pass mints a finding
         // rather than reporting an unanchorable one.
         .fixture(Fixture::new("browse-review", Verb::Source).binding("path", "src/lib.rs"))
+        // The menu resource reads neither the tree nor the archive, so any
+        // path answers — named anyway, so the walk fires the face this crate
+        // means rather than whatever sample the suite would invent.
+        .fixture(Fixture::new("browse-review-options", Verb::Source).binding("path", "src/lib.rs"))
         // The annotation entry: the Source probe reads `walk`, and the pipeline
         // probe rewrites it (`content` is the body's piped form). `target` and
         // `exact` are per (id, verb), so the Sink gets a call that anchors —
@@ -427,6 +432,7 @@ fn conforms() {
             "browse-hash source text/plain",
             "browse-review source text/plain",
             "browse-review source text/turtle",
+            "browse-review-options source text/plain",
             "browse-state source text/plain",
             "browse-style source text/css",
             "browse-tree source text/plain",

@@ -35,6 +35,35 @@
 //! `provider` IS the configured one (a label written for one model must never
 //! key another model's pass).
 //!
+//! ## The affordance: a CALLER, never a second implementation
+//!
+//! The file HTML face carries a `review` button and a "review with…" menu
+//! ([`review_button_html`], [`menu_html`]), whose rows come from
+//! `urn:repo:{repo}:review-options:{path}` — this host's own `provider=`
+//! allowlist, grouped by model, never a hard-coded list.
+//!
+//! ★ BOTH EMIT EXACTLY `urn:repo:{repo}:review:{path}` (the menu adding
+//! `provider=`), which is precisely the call a git-event trigger makes: same
+//! resource, same arguments, same capability check, same archive key, same
+//! minted annotations. The markup chooses the FACE and nothing else. Nothing
+//! here assembles a prompt, post-processes a finding, or writes an annotation
+//! by another path — a UI that did any of those would produce results a
+//! trigger could never reproduce, and the two would then diverge silently.
+//! The only legitimate difference between a clicked review and a triggered one
+//! is what caused it.
+//!
+//! ⚠ The reverse reading is the useful one: whatever the button needs, a
+//! headless trigger needs too, WITHOUT a human present — the net grant, the
+//! annotate grant, the browse read, and an answer to what bounds the spend.
+//!
+//! ## Manual review is the human annotation affordance, unchanged
+//!
+//! There is no second path for a human note. The file face's annotations panel
+//! renders machine findings and human notes in one reading order, machine ones
+//! prefixed by their model, and ends with the create form that Sinks
+//! `urn:iki:annotation` — so a reviewer answers a finding beside it rather
+//! than in another view, over the resource that already existed.
+//!
 //! ## Provenance — standard terms only, no vocab publish
 //!
 //! A machine annotation carries `dcterms:creator` (the model identity),
@@ -72,7 +101,8 @@ use oxigraph::model::{Literal, NamedNode, Quad, Term};
 use crate::annotate::{self, Included, CAP_ANNOTATE, PROV};
 use crate::archive::Archive;
 use crate::explain::{
-    ik, iso8601, parse_iri, provider_label, resolve_model, truncate, truncated_len, CAP_NET, IK,
+    command_safe, ik, iso8601, menu_options, parse_iri, provider_label, resolve_model, truncate,
+    truncated_len, MenuTier, ModelOption, CAP_NET, IK,
 };
 use crate::hash::hash_iri;
 use crate::{
@@ -428,7 +458,61 @@ pub(crate) fn bind(
         roots: Arc::clone(roots),
         config: Arc::clone(config),
     });
-    crate::bind_family(space, roots, review, None, Some("review:{path}"))
+    let space = crate::bind_family(space, roots, review, None, Some("review:{path}"));
+    let options: Arc<dyn Endpoint> = Arc::new(OptionsEndpoint {
+        roots: Arc::clone(roots),
+        config: Arc::clone(config),
+    });
+    crate::bind_family(space, roots, options, None, Some("review-options:{path}"))
+}
+
+/// `urn:repo:{repo}:review:{path}` — the pass a Review button asks for, and
+/// the same IRI #261's git-event trigger will ask for.
+pub(crate) fn review_iri(repo: &str, rel: &str) -> String {
+    format!("urn:repo:{repo}:review:{}", iri_encode(rel))
+}
+
+/// `urn:repo:{repo}:review-options:{path}` — the menu's own resource.
+fn options_iri(repo: &str, rel: &str) -> String {
+    format!("urn:repo:{repo}:review-options:{}", iri_encode(rel))
+}
+
+/// The review affordance on a file face: a button that asks for the pass with
+/// the host's CONFIGURED backend — `urn:repo:{repo}:review:{path}` with no
+/// arguments at all beyond the face, which is exactly the call a headless
+/// trigger makes.
+///
+/// ★ IT ADDS NOTHING OF ITS OWN. No prompt, no post-processing, no second
+/// annotation path: the button is a caller of one resource, so a trigger can
+/// reuse this IRI verbatim with a different cause and get the same archive key
+/// and the same minted annotations. The only thing the markup decides is the
+/// FACE (`as=text/html`, because a browser is asking).
+pub(crate) fn review_button_html(repo: &str, rel: &str) -> String {
+    format!(
+        "<button class=\"browse-review-link\" title=\"review this file — one model call, \
+         findings minted as annotations\" hx-get=\"/k/source {iri} as=text/html\" \
+         hx-target=\"#browse\" hx-swap=\"innerHTML\">review</button>",
+        iri = review_iri(repo, rel),
+    )
+}
+
+/// The closed "review with…" disclosure: markup only, no resolution. Its body
+/// is a SEPARATE resolution of this path's `review-options … as=text/html`,
+/// fetched on the `toggle` event — so a file view costs nothing for the menu
+/// until a human opens it, and opening it costs ONE sub-request (the model
+/// inventory) however many backends the host has.
+///
+/// `<details>`/`<summary>` for the same reasons explain's menu gives: keyboard
+/// operable with no CSS and no JavaScript of ours, announced as a disclosure,
+/// never hover-only, and block-level so it lays out at any width.
+pub(crate) fn menu_html(repo: &str, rel: &str) -> String {
+    format!(
+        "<details class=\"browse-review-menu\"><summary>review with…</summary>\
+         <div class=\"browse-review-menu-body\" hx-get=\"/k/source {iri} as=text/html\" \
+         hx-trigger=\"toggle once from:closest details\" hx-target=\"this\" \
+         hx-swap=\"innerHTML\"><p>loading options…</p></div></details>",
+        iri = options_iri(repo, rel),
+    )
 }
 
 struct ReviewEndpoint {
@@ -873,6 +957,249 @@ fn review_description(config: &ExplainConfig) -> Description {
         .output("application/json")
         .output("text/html;charset=utf-8")
         .output("text/turtle")
+}
+
+// --- the "review with…" menu -------------------------------------------------
+
+/// `urn:repo:{repo}:review-options:{path}` — **which backends this host will
+/// review with**, grouped by the model each serves, and nothing else.
+///
+/// ## What it is not
+///
+/// ⚠ It is NOT a listing of archived passes, and there deliberately is none.
+/// `urn:repo:{repo}:annotations:{path} as=application/json` already carries
+/// `creator` (the model) and `generated_by` (the pass) on every row, so "which
+/// models have reviewed this file" is a group-by over a listing the file face
+/// already renders. A parallel listing would duplicate a join the data answers.
+/// This resource answers the other question — what COULD review it — which
+/// nothing else does in a form a menu can render.
+///
+/// ## Why it is its own resource rather than part of the file face
+///
+/// Two reasons, both about cost and authority:
+///
+/// * **Cost.** Grouping by model needs `urn:llm:models`. Folding that read
+///   into the file face would spend it on every file view, whether or not
+///   anyone wants a menu — and on a host with a DISCOVERING backend that read
+///   probes, so the file face would inherit a network round trip on the hot
+///   path. A separate resource fetched on the disclosure's `toggle` costs
+///   nothing at all until a human opens the menu.
+/// * **Authority.** It could not live on `browse-review`: that endpoint
+///   DECLARES `urn:cap:net:*` and `urn:cap:annotate` because it spends and
+///   mints, so a browse-only session would be refused its own menu. This one
+///   requires the browse grant alone — reading what is on offer is not
+///   spending — which is the same split `explain-versions` makes.
+struct OptionsEndpoint {
+    roots: Roots,
+    config: Arc<ExplainConfig>,
+}
+
+#[async_trait]
+impl Endpoint for OptionsEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        if inv.request.verb != Verb::Source {
+            return Err(Error::Endpoint(format!(
+                "browse-review-options does not support the {:?} verb",
+                inv.request.verb
+            )));
+        }
+        let (repo, _root) = repo_root(inv, &self.roots)?;
+        granted(inv, repo)?;
+        let rel = path_binding(inv)?;
+        if rel.is_empty() {
+            return Err(Error::MissingArgument("path".to_string()));
+        }
+        // No filesystem touch and no archive read: the choices are a property
+        // of the HOST, not of the path. The path only names what a chosen row
+        // would review, so this answers for a path that has since been
+        // deleted exactly as it answers for one that has not — and a menu that
+        // 404s the moment a file moves would be worse than one that does not.
+        //
+        // ★ THE ONE SUB-REQUEST. `menu_options` resolves `urn:llm:models`,
+        // once, best-effort: no llm module bound (or an unreachable one)
+        // degrades the menu to provider IRIs rather than failing it. It never
+        // asks a model anything — opening a menu must not cost what the menu
+        // exists to let you decide about.
+        let options = menu_options(inv, &self.config, &review_tiers(&self.config)).await;
+        match inv.inline_str("as").unwrap_or("text/plain") {
+            t if t.starts_with("application/json") => {
+                let rows: Vec<serde_json::Value> = options
+                    .iter()
+                    .map(|o| {
+                        serde_json::json!({
+                            "label": o.label(),
+                            "model": o.model(),
+                            "provider": o.provider(),
+                            "providers": o.providers(),
+                            "default_for": o.default_for(),
+                        })
+                    })
+                    .collect();
+                Ok(repr(
+                    "application/json",
+                    serde_json::Value::Array(rows).to_string(),
+                ))
+            }
+            t if t.starts_with("text/html") => Ok(repr_utf8(
+                "text/html",
+                options_panel_html(repo, &rel, &options),
+            )),
+            _ => {
+                let lines: Vec<String> = options
+                    .iter()
+                    .map(|o| {
+                        format!(
+                            "{}\t{}\t{}",
+                            o.label(),
+                            o.providers().join(","),
+                            o.default_for().unwrap_or("-")
+                        )
+                    })
+                    .collect();
+                Ok(repr_utf8("text/plain", lines.join("\n")))
+            }
+        }
+    }
+
+    fn name(&self) -> &str {
+        "browse-review-options"
+    }
+
+    fn describe(&self) -> Description {
+        options_description()
+    }
+}
+
+/// The tier a REVIEW menu marks against: the one configured `review_provider`.
+/// Explain has two grains and therefore two tiers; review is file-grain only,
+/// so exactly one row can ever be "what a plain review click already does".
+fn review_tiers(config: &ExplainConfig) -> [MenuTier<'_>; 1] {
+    [MenuTier {
+        provider: config.review_provider.as_str(),
+        label: "review",
+    }]
+}
+
+/// The menu panel: one row per MODEL, each button sending
+/// `provider={iri}` to the very resource the plain button asks for.
+///
+/// ★ ONE ROW PER MODEL, NOT PER BACKEND — the same rule the explain menu is
+/// built on, for the same reason: the archive tag folds model identity, so two
+/// backends serving one model key ONE pass. A menu of backends would offer a
+/// second review it cannot produce, and its no-op would read as a bug.
+fn options_panel_html(repo: &str, rel: &str, options: &[ModelOption]) -> String {
+    let review = review_iri(repo, rel);
+    let mut out = String::from("<div class=\"browse-review-menu-panel\">");
+    out.push_str(
+        "<p class=\"browse-review-menu-heading\">review with \
+         <span class=\"browse-size\">derives — one model call, findings minted as \
+         annotations</span></p>",
+    );
+    if options.is_empty() {
+        // Unreachable while `selectable()` always holds the configured tiers,
+        // but a menu that renders an empty list with no word for it is the
+        // kind of blank a reader blames on the fetch.
+        out.push_str(
+            "<p class=\"browse-review-menu-empty\">this host offers no review backend.</p>",
+        );
+    }
+    out.push_str("<ul class=\"browse-entries browse-review-choices\">");
+    for option in options {
+        let mut notes: Vec<String> = Vec::new();
+        if let Some(tier) = option.default_for() {
+            notes.push(format!("default for {tier}"));
+        }
+        if option.providers().len() > 1 {
+            notes.push(format!(
+                "served by {}",
+                option
+                    .providers()
+                    .iter()
+                    .map(|p| provider_label(p))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if option.model().is_none() {
+            notes.push("backend reports no model id".to_string());
+        }
+        let detail = if notes.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " <span class=\"browse-size\">{}</span>",
+                esc(&notes.join(" · "))
+            )
+        };
+        let label = option.label();
+        if command_safe(option.provider()) {
+            out.push_str(&format!(
+                "<li><button class=\"browse-review-link\" hx-get=\"/k/source {review} \
+                 as=text/html provider={provider}\" hx-target=\"#browse\" \
+                 hx-swap=\"innerHTML\">{label}</button>{detail}</li>",
+                provider = esc(option.provider()),
+                label = esc(&label),
+            ));
+        } else {
+            out.push_str(&format!(
+                "<li><span class=\"browse-review-inert\">{}</span>{detail}</li>",
+                esc(&label),
+            ));
+        }
+    }
+    out.push_str("</ul>");
+    out.push_str(
+        "<p class=\"browse-review-menu-note\"><span class=\"browse-size\">One row per model, \
+         not per backend: a pass is archived by the model and the prompt that made it, so two \
+         backends serving one model give one review — the second request is an archive hit \
+         that mints nothing. A second MODEL is a second pass alongside the first, not a \
+         replacement: both sets of findings stay on the file.</span></p>",
+    );
+    out.push_str("</div>");
+    out
+}
+
+/// `repo` is not an ArgSpec — see [`review_description`]'s note.
+fn options_description() -> Description {
+    Description::new("browse-review-options")
+        .title("Backends this host will review with")
+        .summary(
+            "Which providers a review of this path may name — \
+             urn:repo:{repo}:review-options:{path}: this host's `provider=` allowlist \
+             grouped by the MODEL each backend serves, because the review archive keys on \
+             the model and two backends serving one model key ONE pass. Derives nothing, \
+             asks no model, needs no network grant, and reads neither the working tree nor \
+             the archive: the rows are a property of the host, so a deleted path still \
+             answers. It is NOT a listing of archived passes — \
+             urn:repo:{repo}:annotations:{path} as=application/json already carries creator \
+             and generated_by per finding, which is the same question answered by data that \
+             already exists. text/plain (default) is label<TAB>providers<TAB>defaultFor \
+             lines; as=application/json the structured rows; as=text/html the option menu \
+             the file face opens beside its review button, each row sending provider= to \
+             urn:repo:{repo}:review:{path}. The html and json faces read urn:llm:models \
+             once, best-effort: without it the menu degrades to provider IRIs rather than \
+             failing.",
+        )
+        .verb(Verb::Source)
+        .verb(Verb::Meta)
+        .requires(CAP_WILDCARD)
+        .input(
+            ArgSpec::new("path")
+                .binding()
+                .class(crate::XSD_STRING)
+                .summary("file path within the root, percent-encoded"),
+        )
+        .input(
+            ArgSpec::new("as")
+                .optional()
+                .class(crate::XSD_STRING)
+                .summary("application/json for the structured rows, text/html for the option menu")
+                .one_of(["text/plain", "application/json", "text/html"])
+                .default_value("text/plain"),
+        )
+        .output("text/plain;charset=utf-8")
+        .output("application/json")
+        .output("text/html;charset=utf-8")
 }
 
 // --- tests -------------------------------------------------------------------
@@ -1685,6 +2012,361 @@ mod tests {
             "{:?}",
             provider.one_of
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // --- the review affordance and its "review with…" menu ------------------
+
+    /// Two backends on ONE model (`coder` — the configured review tier — and
+    /// `alt` both serve `same:1b`), a third on its own that the bare
+    /// `urn:llm:ask` facade routes to.
+    const INVENTORY: &str = r#"{
+        "default": "gp",
+        "models": {
+            "coder": {"backend": "urn:llm:coder:ask", "model": "same:1b"},
+            "alt":   {"backend": "urn:llm:alt:ask",   "model": "same:1b"},
+            "gp":    {"backend": "urn:llm:gp:ask",    "model": "big:70b"}
+        }
+    }"#;
+
+    /// A fake `urn:llm:models` over a literal inventory, COUNTING resolves —
+    /// the counter is how these tests observe that rendering a file costs no
+    /// inventory read and opening its menu costs exactly one.
+    fn fake_models_space(body: &str, calls: &Arc<AtomicU32>) -> EndpointSpace {
+        let text = body.to_string();
+        let counter = Arc::clone(calls);
+        EndpointSpace::new().bind(
+            Exact::new("urn:llm:models"),
+            FnEndpoint::new("fake-llm-models", move |_inv: &Invocation<'_>| {
+                counter.fetch_add(1, Ordering::Relaxed);
+                Ok(repr("application/json", text.clone()))
+            })
+            .with_description(Description::new("fake-llm-models").verb(Verb::Source)),
+        )
+    }
+
+    /// A counted backend at an arbitrary provider IRI — the menu may offer any
+    /// selectable one, and the "everything offered is accepted" test actually
+    /// clicks them.
+    fn fake_llm_at(iri: &str, log: &Arc<Log>, reply: &str) -> EndpointSpace {
+        let log = Arc::clone(log);
+        let reply = reply.to_string();
+        EndpointSpace::new().bind(
+            Exact::new(iri),
+            FnEndpoint::new("fake-any-llm", move |inv: &Invocation<'_>| {
+                log.asks.lock().unwrap().push((
+                    inv.inline_str("prompt").unwrap_or("").to_string(),
+                    inv.inline_str("system").unwrap_or("").to_string(),
+                    inv.inline_str("max_tokens").unwrap_or("").to_string(),
+                ));
+                Ok(repr_utf8("text/plain", reply.clone()))
+            })
+            .with_description(
+                Description::new("fake-any-llm")
+                    .verb(Verb::Source)
+                    .requires(CAP_NET),
+            ),
+        )
+    }
+
+    /// Browse, the inventory, and every backend the inventory names.
+    fn kernel_with_menu(
+        root: &std::path::Path,
+        store: &Arc<Store>,
+        log: &Arc<Log>,
+        calls: &Arc<AtomicU32>,
+        config: impl FnOnce(ExplainConfig) -> ExplainConfig,
+    ) -> Kernel {
+        let cfg = config(ExplainConfig::new(Arc::clone(store)));
+        let browse = crate::space_with_explain(vec![("demo".to_string(), root.to_path_buf())], cfg);
+        Kernel::new(Arc::new(Fallback::new(vec![
+            Arc::new(browse),
+            Arc::new(fake_models_space(INVENTORY, calls)),
+            Arc::new(fake_llm_at(PROVIDER, log, TWO_FINDINGS)),
+            Arc::new(fake_llm_at(ALT_PROVIDER, log, ALT_FINDINGS)),
+            Arc::new(fake_llm_at("urn:llm:ask", log, TWO_FINDINGS)),
+        ])))
+    }
+
+    fn html_face(kernel: &Kernel, iri: &str) -> String {
+        body(&issue(kernel, Verb::Source, iri, &[("as", "text/html")], &cap()).unwrap())
+    }
+
+    /// Every `provider=` a menu emits, in order.
+    fn offered_providers(html: &str) -> Vec<String> {
+        html.match_indices("provider=")
+            .map(|(i, _)| {
+                html[i + "provider=".len()..]
+                    .split(['"', ' '])
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// ★ THE COST DISCIPLINE, which is the good part of the explain menu and
+    /// is preserved here: a file view pays NOTHING for the menu, and opening
+    /// it pays one inventory read — never a probe per backend, and never an
+    /// inference call. Opening a menu must not cost what the menu exists to
+    /// let you decide about.
+    #[test]
+    fn opening_the_review_menu_costs_one_inventory_read_and_no_model_call() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let calls = Arc::new(AtomicU32::new(0));
+        let k = kernel_with_menu(&root, &store, &log, &calls, |c| {
+            c.allow_provider(ALT_PROVIDER)
+        });
+
+        // Rendering the file: the button and the closed disclosure, and not a
+        // single sub-request for either.
+        let page = html_face(&k, "urn:repo:demo:file:a.rs");
+        assert_eq!(page.matches("browse-review-link").count(), 1, "{page}");
+        assert_eq!(page.matches("browse-review-menu\"").count(), 1, "{page}");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "a file view must not fan out"
+        );
+        assert_eq!(log.count(), 0);
+
+        // Opening it: one inventory read, no ask.
+        let menu = html_face(&k, "urn:repo:demo:review-options:a.rs");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(log.count(), 0, "a menu never derives");
+        assert!(menu.contains("same:1b"), "{menu}");
+
+        // And a second open is a second read, not a fan-out: the count tracks
+        // opens, so the assertion above is about the menu and not about a
+        // cache that happens to be warm.
+        html_face(&k, "urn:repo:demo:review-options:a.rs");
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(log.count(), 0);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★ ONE ROW PER MODEL, because the review archive keys on the model: two
+    /// backends serving one model key ONE pass, so a second row would offer a
+    /// review it cannot produce and its no-op would read as a bug.
+    #[test]
+    fn two_backends_serving_one_model_are_one_review_row() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let calls = Arc::new(AtomicU32::new(0));
+        let k = kernel_with_menu(&root, &store, &log, &calls, |c| {
+            c.allow_provider(ALT_PROVIDER)
+        });
+
+        let menu = html_face(&k, "urn:repo:demo:review-options:a.rs");
+        // {coder, alt} serve same:1b; the bare facade serves big:70b. Three
+        // selectable providers, TWO rows.
+        assert_eq!(menu.matches("same:1b").count(), 1, "{menu}");
+        let offered = offered_providers(&menu);
+        assert_eq!(offered.len(), 2, "{menu}");
+        // The backends are named as a fact beside the row, never offered as a
+        // second button.
+        assert!(menu.contains("served by coder, alt"), "{menu}");
+        // The row's button names the CONFIGURED review tier, not the
+        // alphabetically first of the pair: which backend answers cannot
+        // change the archive key, but it does decide which machine spends the
+        // time on a miss.
+        assert!(offered.contains(&PROVIDER.to_string()), "{menu}");
+        assert!(!offered.contains(&ALT_PROVIDER.to_string()), "{menu}");
+        // The row a plain `review` click already takes is marked as such.
+        assert!(menu.contains("default for review"), "{menu}");
+        // And the panel says why there is one row, in the markup itself.
+        assert!(
+            menu.contains("One row per model, not per backend"),
+            "{menu}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The menu is the host's allowlist, never a hard-coded list — so it can
+    /// never render a click that comes back `Denied`, and never omits one the
+    /// operator allowed.
+    #[test]
+    fn the_menu_offers_exactly_what_review_accepts_and_never_more() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let calls = Arc::new(AtomicU32::new(0));
+        let k = kernel_with_menu(&root, &store, &log, &calls, |c| {
+            c.allow_provider(ALT_PROVIDER)
+        });
+
+        let menu = html_face(&k, "urn:repo:demo:review-options:a.rs");
+        for provider in offered_providers(&menu) {
+            assert!(
+                issue(
+                    &k,
+                    Verb::Source,
+                    "urn:repo:demo:review:a.rs",
+                    &[("provider", &provider)],
+                    &cap(),
+                )
+                .is_ok(),
+                "the menu offered `{provider}`, which review refused"
+            );
+        }
+        // A backend the inventory names and the operator did NOT allow is
+        // absent — the manifold's one_of and the menu are the same set.
+        assert!(!menu.contains("urn:llm:gp:ask"), "{menu}");
+        assert!(!menu.contains("big:70b\n"), "{menu}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Reading what is on offer is not spending, so the menu asks for the
+    /// browse grant alone. It could not have lived on `browse-review`, which
+    /// DECLARES net and annotate because it spends and mints — a browse-only
+    /// session would have been refused its own menu.
+    #[test]
+    fn the_menu_needs_neither_a_net_nor_an_annotate_grant() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let calls = Arc::new(AtomicU32::new(0));
+        let k = kernel_with_menu(&root, &store, &log, &calls, |c| c);
+        let browse_only = Capability::scoped(["urn:cap:browse:read:demo"]);
+
+        let menu = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:review-options:a.rs",
+                &[("as", "text/html")],
+                &browse_only,
+            )
+            .expect("a browse grant reads what is on offer"),
+        );
+        assert!(menu.contains("browse-review-menu-panel"), "{menu}");
+        // The pass itself stays refused under the same capability — the menu
+        // shows the door, it does not open it.
+        let denied = issue(
+            &k,
+            Verb::Source,
+            "urn:repo:demo:review:a.rs",
+            &[],
+            &browse_only,
+        );
+        assert!(matches!(denied, Err(Error::Denied(_))), "{denied:?}");
+        assert_eq!(log.count(), 0);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★ THE INVARIANT: the button is a CALLER, not a second implementation.
+    ///
+    /// Everything the affordance emits names `urn:repo:{repo}:review:{path}`
+    /// and adds nothing but a FACE (and, from a menu row, the `provider=` the
+    /// manifold already declares). So a git-event trigger firing the same IRI
+    /// with a different cause lands on the same archive key and serves the
+    /// same minted annotations — which is what the second half asserts: the
+    /// button's exact call derives, and the trigger's exact call is a HIT on
+    /// it, same tag, same minted set.
+    #[test]
+    fn the_button_and_a_trigger_are_one_call_with_two_causes() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let calls = Arc::new(AtomicU32::new(0));
+        let k = kernel_with_menu(&root, &store, &log, &calls, |c| {
+            c.allow_provider(ALT_PROVIDER)
+        });
+
+        // What the markup asks for, read off the page rather than from the
+        // helper that wrote it.
+        let page = html_face(&k, "urn:repo:demo:file:a.rs");
+        assert!(
+            page.contains(
+                "hx-get=\"/k/source urn:repo:demo:review:a.rs as=text/html\" \
+                 hx-target=\"#browse\""
+            ),
+            "the plain button must add nothing but the face: {page}"
+        );
+        let menu = html_face(&k, "urn:repo:demo:review-options:a.rs");
+        assert!(
+            menu.contains(&format!(
+                "hx-get=\"/k/source urn:repo:demo:review:a.rs as=text/html provider={PROVIDER}\""
+            )),
+            "a menu row must add nothing but the face and provider=: {menu}"
+        );
+        // Nothing else is reachable from either: no second annotation path, no
+        // prompt of the UI's own.
+        assert!(!page.contains("urn:iki:annotation:mint"), "{page}");
+
+        // The button's call, verbatim.
+        let clicked = issue(
+            &k,
+            Verb::Source,
+            "urn:repo:demo:review:a.rs",
+            &[("as", "text/html")],
+            &cap(),
+        )
+        .unwrap();
+        assert!(body(&clicked).contains("review by"), "{}", body(&clicked));
+        assert_eq!(log.count(), 1, "the click derived");
+
+        // A trigger's call, verbatim — same IRI, no provider, a machine's
+        // face. It is an archive HIT on what the click derived: same tag, and
+        // the same minted annotations, not a second pass.
+        let triggered = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(triggered["derived"], false, "a trigger must not re-derive");
+        // The tag folds `urn:llm:{p}:model`, which this fixture does not bind,
+        // so it falls back to the provider heuristic — the documented
+        // asymmetry between what a MENU can learn (the cheap inventory) and
+        // what a TAG resolves (the per-provider identity). What matters here
+        // is that both causes land on the ONE tag, whichever it is.
+        assert_eq!(triggered["version_tag"], "review-v2@coder");
+        assert_eq!(log.count(), 1, "the trigger paid nothing");
+        assert_eq!(
+            triggered["minted"].as_array().unwrap().len(),
+            2,
+            "the trigger serves the click's findings"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The menu renders on a host with no llm module bound at all: the
+    /// configured tier is still offered, labelled by the same provider
+    /// heuristic its version tag falls back to.
+    #[test]
+    fn the_review_menu_renders_with_no_inventory_bound() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let browse = crate::space_with_explain(
+            vec![("demo".to_string(), root.clone())],
+            ExplainConfig::new(Arc::clone(&store)),
+        );
+        let k = Kernel::new(Arc::new(browse));
+
+        let menu = html_face(&k, "urn:repo:demo:review-options:a.rs");
+        let offered = offered_providers(&menu);
+        assert!(offered.contains(&PROVIDER.to_string()), "{menu}");
+        assert!(menu.contains(">coder</button>"), "{menu}");
+        assert!(menu.contains("backend reports no model id"), "{menu}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A directory has no review affordance, because it has no review: the
+    /// pass is file-grain (findings anchor in text), so a tree-level button
+    /// would be an affordance whose only possible answer is a refusal.
+    #[test]
+    fn a_directory_offers_no_review_and_the_pass_refuses_one() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let calls = Arc::new(AtomicU32::new(0));
+        let k = kernel_with_menu(&root, &store, &log, &calls, |c| c);
+
+        let tree = html_face(&k, "urn:repo:demo:tree");
+        assert!(!tree.contains("browse-review-link"), "{tree}");
+        assert!(!tree.contains("browse-review-menu"), "{tree}");
+        // And the resource agrees, for the reason the markup encodes.
+        let refused = issue(&k, Verb::Source, "urn:repo:demo:review:", &[], &cap());
+        assert!(refused.is_err(), "{refused:?}");
         std::fs::remove_dir_all(&root).ok();
     }
 }

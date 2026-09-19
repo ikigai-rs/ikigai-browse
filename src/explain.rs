@@ -1435,8 +1435,26 @@ fn explain_description(config: &ExplainConfig) -> Description {
 }
 
 // --- the option menu --------------------------------------------------------
+//
+// ★ SHARED BY EVERY `provider=` MENU IN THE CRATE, not just explain's. The
+// rows below were written for "explain with…" and the model-axis rule they
+// encode was written down only in this module's prose; `review with…` needs
+// the same rule for the same reason (its archive key folds model identity
+// too), and a second hand-rolled grouping would be the rule restated in code
+// that can drift from it. So the grouping is one function taking the caller's
+// TIERS — the configured defaults it should mark — and the rendering of a row
+// stays with each menu, because what a row's button asks for differs.
 
-/// One row of the "explain with" menu: a MODEL, and every selectable provider
+/// A configured tier a MENU marks its rows against: the provider IRI the
+/// operator already points at some grain, and the name to show for it
+/// ("files", "directories", "review"). Order is significance order: the first
+/// tier serving a row's model is the backend that row's button names.
+pub(crate) struct MenuTier<'a> {
+    pub(crate) provider: &'a str,
+    pub(crate) label: &'static str,
+}
+
+/// One row of a "… with" menu: a MODEL, and every selectable provider
 /// that serves it.
 ///
 /// ★ THE MENU'S AXIS IS THE MODEL, because the ARCHIVE'S axis is. The version
@@ -1446,7 +1464,7 @@ fn explain_description(config: &ExplainConfig) -> Description {
 /// of BACKENDS would therefore promise a second explanation it cannot deliver,
 /// and its no-op would read as a bug. One model, one row — the serving
 /// backends are named beside it as a fact, never offered as a second choice.
-struct ModelOption {
+pub(crate) struct ModelOption {
     /// The model identity `urn:llm:models` attributes to these providers, or
     /// `None` when nothing reports one: no llm module bound, a selectable
     /// provider the inventory does not list, or — since ikigai-llm 0.12, where
@@ -1470,11 +1488,12 @@ struct ModelOption {
     /// The selectable provider IRIs serving it, sorted; the first is the one
     /// the row's button names. Longer than one only when `model` is `Some`.
     providers: Vec<String>,
-    /// Which configured tier already points at this model ("files",
-    /// "directories", "files and directories") — the row a plain `explain`
-    /// click would have taken, marked so the menu does not read as a set of
-    /// alternatives to something unnamed.
-    default_for: Option<&'static str>,
+    /// Which configured tier(s) already point at this model ("files",
+    /// "directories", "files and directories", "review") — the row a plain
+    /// `explain` (or `review`) click would have taken, marked so the menu does
+    /// not read as a set of alternatives to something unnamed. The names are
+    /// the caller's [`Tier`] labels, joined with " and " in the caller's order.
+    default_for: Option<String>,
 }
 
 impl ModelOption {
@@ -1482,11 +1501,30 @@ impl ModelOption {
     /// heuristic ([`provider_label`]) — which is exactly the label the version
     /// tag will carry if this row is clicked, so the menu and the archive
     /// agree even when neither knows the model.
-    fn label(&self) -> String {
+    pub(crate) fn label(&self) -> String {
         match &self.model {
             Some(model) => model.clone(),
             None => provider_label(&self.providers[0]),
         }
+    }
+
+    /// Whether this row is (one of) the configured default(s), and for what —
+    /// the caller's tier labels, already joined.
+    pub(crate) fn default_for(&self) -> Option<&str> {
+        self.default_for.as_deref()
+    }
+
+    /// The backends serving this row's model, in the order [`menu_options`]
+    /// settled — named as a FACT beside the row, never offered as a second
+    /// choice (they all key the one archive entry).
+    pub(crate) fn providers(&self) -> &[String] {
+        &self.providers
+    }
+
+    /// The model identity the inventory attributes to this row, or `None` when
+    /// the menu could not learn one.
+    pub(crate) fn model(&self) -> Option<&str> {
+        self.model.as_deref()
     }
 
     /// The provider IRI the row's `provider=` names.
@@ -1497,7 +1535,7 @@ impl ModelOption {
     /// (see [`menu_options`]) — a row that is the operator's default derives
     /// on the operator's backend, and only a row with no configured backend
     /// falls through to lexicographic order.
-    fn provider(&self) -> &str {
+    pub(crate) fn provider(&self) -> &str {
         &self.providers[0]
     }
 }
@@ -1516,9 +1554,17 @@ impl ModelOption {
 /// browse-only session still gets the declared inventory.
 ///
 /// The set of rows is drawn from [`ExplainConfig::selectable`] — the exact set
-/// `provider=` accepts — so the menu can never offer a click that would come
-/// back `Denied`.
-async fn menu_options(inv: &Invocation<'_>, config: &ExplainConfig) -> Vec<ModelOption> {
+/// `provider=` accepts, one host-level allowlist for every `provider=` in the
+/// module — so no menu built on this can offer a click that would come back
+/// `Denied`.
+///
+/// `tiers` is the caller's: which configured defaults to mark, and in what
+/// order. Explain passes its file and directory tiers; review passes its one.
+pub(crate) async fn menu_options(
+    inv: &Invocation<'_>,
+    config: &ExplainConfig,
+    tiers: &[MenuTier<'_>],
+) -> Vec<ModelOption> {
     let inventory = model_inventory(inv).await;
     let mut by_model: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
@@ -1543,22 +1589,16 @@ async fn menu_options(inv: &Invocation<'_>, config: &ExplainConfig) -> Vec<Model
             // silently routing the default row's first derivation through some
             // alphabetically-earlier backend would be a surprise nobody asked
             // for.
-            providers.sort_by_key(|p| {
-                (
-                    *p != config.file_provider,
-                    *p != config.dir_provider,
-                    p.clone(),
-                )
-            });
+            providers.sort_by_key(|p| (tier_rank(tiers, p), p.clone()));
             ModelOption {
-                default_for: default_for(config, &providers),
+                default_for: default_for(tiers, &providers),
                 model: Some(model),
                 providers,
             }
         })
         .collect();
     options.extend(unknown.into_iter().map(|provider| ModelOption {
-        default_for: default_for(config, std::slice::from_ref(&provider)),
+        default_for: default_for(tiers, std::slice::from_ref(&provider)),
         model: None,
         providers: vec![provider],
     }));
@@ -1568,16 +1608,45 @@ async fn menu_options(inv: &Invocation<'_>, config: &ExplainConfig) -> Vec<Model
     options
 }
 
-/// Which configured tier (if either) is served by one of these providers.
-fn default_for(config: &ExplainConfig, providers: &[String]) -> Option<&'static str> {
-    let file = providers.contains(&config.file_provider);
-    let dir = providers.contains(&config.dir_provider);
-    match (file, dir) {
-        (true, true) => Some("files and directories"),
-        (true, false) => Some("files"),
-        (false, true) => Some("directories"),
-        (false, false) => None,
-    }
+/// The tiers an EXPLAIN menu marks against, in significance order: the file
+/// grain first (the one a plain `explain` on a file takes), then the directory
+/// rollup. A host that points both at one backend gets one row marked
+/// "files and directories", not two.
+fn explain_tiers(config: &ExplainConfig) -> [MenuTier<'_>; 2] {
+    [
+        MenuTier {
+            provider: config.file_provider.as_str(),
+            label: "files",
+        },
+        MenuTier {
+            provider: config.dir_provider.as_str(),
+            label: "directories",
+        },
+    ]
+}
+
+/// How significant a provider is to the caller: the index of the first tier
+/// naming it, or past the end when no tier does. The sort key that puts the
+/// operator's own backend at the head of a row — which cannot change the
+/// archive KEY (that is the point of grouping by model) but does decide which
+/// machine spends the time on a miss.
+fn tier_rank(tiers: &[MenuTier<'_>], provider: &str) -> usize {
+    tiers
+        .iter()
+        .position(|t| t.provider == provider)
+        .unwrap_or(tiers.len())
+}
+
+/// Which configured tier(s) are served by one of these providers, joined in
+/// the caller's tier order: "files", "directories", "files and directories",
+/// "review". `None` when this row is nobody's default.
+fn default_for(tiers: &[MenuTier<'_>], providers: &[String]) -> Option<String> {
+    let hit: Vec<&str> = tiers
+        .iter()
+        .filter(|t| providers.iter().any(|p| p == t.provider))
+        .map(|t| t.label)
+        .collect();
+    (!hit.is_empty()).then(|| hit.join(" and "))
 }
 
 /// `urn:llm:models` as JSON, or `None` — no llm module, an older one, a
@@ -1632,7 +1701,7 @@ pub(crate) fn menu_html(repo: &str, rel: &str) -> String {
 /// argument there, so its row renders inert rather than emitting a request the
 /// host would mis-parse. Model ids and provider IRIs never contain whitespace
 /// in practice; a discovered one might.
-fn command_safe(value: &str) -> bool {
+pub(crate) fn command_safe(value: &str) -> bool {
     !value.is_empty() && !value.chars().any(char::is_whitespace)
 }
 
@@ -1729,7 +1798,7 @@ fn menu_panel_html(
     out.push_str("<ul class=\"browse-entries browse-explain-choices\">");
     for option in options {
         let mut notes: Vec<String> = Vec::new();
-        if let Some(tier) = option.default_for {
+        if let Some(tier) = option.default_for() {
             notes.push(format!("default for {tier}"));
         }
         if option.providers.len() > 1 {
@@ -1849,7 +1918,7 @@ impl Endpoint for VersionsEndpoint {
                 // still offers every selectable backend, labelled by the same
                 // heuristic the version tags fall back to.
                 let current = source_str(inv, &hash_iri(repo, &rel)).await;
-                let options = menu_options(inv, &self.config).await;
+                let options = menu_options(inv, &self.config, &explain_tiers(&self.config)).await;
                 Ok(repr_utf8(
                     "text/html",
                     menu_panel_html(repo, &rel, &options, &entries, current.as_deref()),

@@ -16,6 +16,7 @@ pairs), and each root answers these resource families:
 | `urn:iki:annotation[:{id}]` | a **W3C Web Annotation** (S2) on a file — Sink creates/updates (anchoring the quoted text; the bare `urn:iki:annotation` mints a uuid id), Source reads with drift **re-anchoring**, Delete removes; faces: `text/plain` (the body), `as=application/json`, `as=text/turtle` |
 | `urn:repo:{repo}:annotations[:{path}]` | every annotation on one file (or the whole repo, path omitted) in reading order, drift-reconciled on each read; faces: `application/json` (default), `as=text/html` (panel fragment), `as=text/turtle` |
 | `urn:repo:{repo}:review:{path}` | the **machine review pass** (S4) — region-grain LLM commentary minted as real annotations (provenance-distinguished), the pass archived by `(path, content-hash, review-tag)` so re-sourcing unchanged content mints nothing; faces: `text/plain` (the margin digest), `as=application/json` (`{minted, orphaned_items, reviewed_bytes, total_bytes, annotations, …}`), `as=text/html` (the card page), `as=text/turtle` (the pass's provenance graph); `debug=raw` derives and returns the model's **unparsed answer** (nothing minted or archived) — the parse-failure diagnosis face; `provider={iri}` derives against a host-allowed backend, keyed by its own model identity (a second model is a second coexisting pass) |
+| `urn:repo:{repo}:review-options:{path}` | **which backends this host will review with** — its `provider=` allowlist grouped by the MODEL each serves, because the review archive keys on the model and two backends serving one model key ONE pass; derives nothing, asks no model, needs no net grant, and reads neither the working tree nor the archive (the rows are a property of the host, so a deleted path still answers); `text/plain` (default) is `label`⇥`providers`⇥`defaultFor` lines, `as=application/json` the structured rows, `as=text/html` the **option menu** the file face opens beside its review button, each row sending `provider=` to `urn:repo:{repo}:review:{path}`. ⚠ It is NOT a listing of archived passes: `urn:repo:{repo}:annotations:{path} as=application/json` already carries `creator` and `generated_by` on every finding, which is the same question answered by data that already exists |
 | `urn:repo:style` | the **theme stylesheet** the classed highlight faces bind to — `text/css`, root-independent, cacheable: each theme inside its OWN `@media (prefers-color-scheme: …)` block, above an unconditional `.hl-code` floor, all targeting the `hl-` classes the HTML faces emit, with the themes and the contrast floor read from the layered `a11y.toml` (see the host contract below) |
 | `urn:repo:{repo}:prs` | the root's **pull requests** — ikigai-repo's `urn:repo:pr:list` facade resolved through the kernel with `dir=` the root's directory; `state=` (`open`/`closed`/`merged`/`all`) and `limit=` forward to the facade (ikigai-repo ≥ 0.1.4 — omitted, the facade's defaults apply); `text/plain` (default) is `number`⇥`title`⇥`branch`⇥`updated`⇥`state` per line (empty = no matching PRs), `as=application/json` the facade's structured rows, `as=text/html` the listing with each PR linking its page (`chrome=embed` for the rows-only fragment other faces fold in) |
 | `urn:repo:{repo}:prs:{path}` | the **contextual listing** — the PRs that touched anything at or under a path, newest first: open PRs from `urn:repo:pr:list` intersected per-PR with `urn:repo:pr:files` (ikigai-repo ≥ 0.1.5; bounded to the 20 most recently updated open PRs), merged PRs mined from the path-scoped log (`urn:repo:log path=`, last 100 path-touching commits) by the squash-merge **convention** that a subject ends `(#N)` — a merge-commit repo yields fewer rows, never wrong ones; the path is a *history* scope (a deleted directory still lists; no history = empty listing); open rows first, then merged, deduped by number; `state=` (`open`/`merged`/`all`, default `all`) and `limit=` cap the synthesized listing; faces mirror `prs` (`as=application/json` is the synthesized `{number, title, state, branch, updated}` rows; the html face labels its scope) |
@@ -268,7 +269,10 @@ the tree and file faces carry explain links (`browse-explain-link` — the
 tree face one per entry plus the directory's own under a
 `browse-actions` nav), and the explain face backlinks its target
 (`browse-view-link`) and folds the annotation cards in under
-`annotations=include`.
+`annotations=include`. The **file** face additionally carries a review link
+(`browse-review-link`) in the same nav; the tree face does not, because the
+review pass is file-grain (findings anchor in text), so a directory button
+would be an affordance whose only possible answer is a refusal.
 
 **The option menu.** Beside each face's explain button sits a
 `<details class="browse-explain-menu">` disclosure — native, so it is
@@ -295,6 +299,32 @@ since ikigai-llm 0.12, a provider that pins no model and discovers it from an
 unreachable backend — gets its OWN row, labelled by the same provider
 heuristic its version tag will fall back to and marked as unidentified: two
 unknowns are two rows, because they may well be two models.
+
+**The review button is a CALLER, not a second implementation.** The file
+face's `review` button `hx-get`s `urn:repo:{repo}:review:{path}` and adds
+nothing but the face; its `<details class="browse-review-menu">` twin fetches
+`review-options … as=text/html` on `toggle` and each row adds only the
+`provider=` the manifold already declares. That is exactly the call a
+git-event trigger makes — same resource, same arguments, same capability
+check, same archive key, same minted annotations — so the two cannot diverge;
+the only legitimate difference is the cause. Nothing in the UI path assembles
+a prompt, post-processes a finding, or writes an annotation another way.
+⚠ The reverse reading is the useful one: whatever a click needs (the net
+grant, the annotate grant, the browse read, and an answer to what bounds the
+spend) a headless trigger needs too, with no human present. The review menu
+follows the same model axis and the same cost discipline as explain's, minus
+the archive half — one `urn:llm:models` resolve when a human opens it, nothing
+before — and it requires the **browse grant alone**, because reading what is
+on offer is not spending. It could not have lived on `review` itself, which
+declares net and annotate, or a browse-only session would be refused its own
+menu.
+
+**Manual review is the existing human annotation affordance.** There is no
+second path and no new resource for it: the annotations panel under a file
+renders machine findings and human notes in one reading order (machine ones
+carrying their model identity) and ends with the create form that Sinks
+`urn:iki:annotation` — so a reviewer answers a finding beside it rather than
+in another view.
 
 ## Annotations (S2)
 
