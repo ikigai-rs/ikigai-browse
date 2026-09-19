@@ -118,7 +118,12 @@ pub(crate) const LAYOUT_CSS: &str = "\
 }}\n\
 \
 /* Navigation is buttons (every move is an hx-get), so the buttons must read as\n\
-   links. Scoped to this crate's classes: a door's own buttons are its own. */\n\
+   links. Scoped to this crate's classes: a door's own buttons are its own.\n\
+   The reset is deliberately WIDE (min-height, border-radius) because a door's\n\
+   bare `button {}` rule reaches these too and is only ONE specificity point\n\
+   below: gonk's is `min-height:2.5rem; border-radius:.375rem; background:accent`,\n\
+   which turned every tree entry into a chip. Anything that rule sets and this\n\
+   one does not, a door still decides. */\n\
 .browse-home-link,\
 .browse-crumb,\
 .browse-dir,\
@@ -130,8 +135,9 @@ pub(crate) const LAYOUT_CSS: &str = "\
 .browse-prs-link,\
 .browse-pr,\
 .browse-annotation-line{\
-background:none;border:0;padding:0;margin:0;font:inherit;text-align:left;\
-color:var(--browse-link);cursor:pointer;text-decoration:none\
+background:none;border:0;border-radius:0;padding:0;margin:0;min-height:0;\
+font:inherit;text-align:left;color:var(--browse-link);cursor:pointer;\
+text-decoration:none\
 }\n\
 .browse-home-link:hover,\
 .browse-crumb:hover,\
@@ -207,8 +213,9 @@ padding:.05em .5em;border:1px solid var(--browse-flag);border-radius:999px;\
 color:var(--browse-flag)}\n\
 .browse-annotate{display:grid;gap:.4rem;max-width:32rem;margin:1rem 0}\n\
 .browse-annotate input,.browse-annotate textarea{font:inherit;padding:.3rem}\n\
-.browse-annotate button{justify-self:start;font:inherit;padding:.25rem .8rem;\
-cursor:pointer}\n\
+/* The submit is a real button and reads as one — only its placement is ours, so\n\
+   a door that styles buttons keeps its own. */\n\
+.browse-annotate button{justify-self:start}\n\
 \
 /* The read-only posture the DOOR states; see this module's header. The Sink is\n\
    capability-gated regardless — this is honesty, not the boundary. */\n\
