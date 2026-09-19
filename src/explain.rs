@@ -44,8 +44,10 @@
 //! names rather than the tier's configured one. Three things about it:
 //!
 //! - **Authority is the operator's, not the caller's.** The selectable set is
-//!   the two configured tier providers plus whatever
-//!   [`ExplainConfig::allow_provider`] added; anything else is `Denied`,
+//!   every configured tier provider (file, directory, review, pull-request)
+//!   plus whatever [`ExplainConfig::allow_provider`] added — ONE host-level
+//!   allowlist shared by every `provider=` in the module, so a tier's own
+//!   default is always nameable. Anything else is `Denied`,
 //!   naming what was asked for and what is on offer. It never falls back
 //!   silently. The reason is that `explain`'s declared capability
 //!   (`urn:cap:net:*`) cannot vary by argument value — it means "may derive",
@@ -357,8 +359,9 @@ impl ExplainConfig {
     }
 
     /// Widen the set of provider IRIs a REQUEST may name with `provider=`,
-    /// beyond the two this endpoint already asks ([`Self::file_provider`] and
-    /// [`Self::dir_provider`] are always selectable — naming one of them
+    /// beyond the tiers this module already asks ([`Self::file_provider`],
+    /// [`Self::dir_provider`], [`Self::review_provider`] and
+    /// [`Self::pr_provider`] are always selectable — naming one of them
     /// points the host at a backend it already uses to explain, so it grants
     /// no reach the caller did not already have).
     ///
@@ -385,14 +388,30 @@ impl ExplainConfig {
         self
     }
 
-    /// Every provider IRI a `provider=` argument may name here: the two
-    /// configured tiers plus whatever [`Self::allow_provider`] added.
+    /// Every provider IRI a `provider=` argument may name here: every backend
+    /// this host has already configured to answer some tier — file explain,
+    /// directory rollup, the review pass, the pull-request pass — plus
+    /// whatever [`Self::allow_provider`] added.
+    ///
+    /// ★ A TIER'S OWN DEFAULT MUST BE NAMEABLE, and only construction can
+    /// guarantee that. The set held the two explain tiers alone, which was
+    /// right while `provider=` existed only on explain and silently wrong the
+    /// moment a second endpoint reused it: on a host configuring a distinct
+    /// `review_provider`, `provider=<the review default>` would come back
+    /// `Denied` — the manifold refusing exactly what the server does when
+    /// asked nothing. It never showed, because on our host the review tier
+    /// happens to equal the file tier. So this is ONE host-level allowlist for
+    /// every `provider=` in the module, not one per endpoint: a backend the
+    /// operator already spends on for some tier is one a caller may name.
+    ///
     /// Computed on demand rather than snapshotted, so builder order never
     /// matters and a later `file_provider(…)` stays selectable.
     pub(crate) fn selectable(&self) -> BTreeSet<String> {
         let mut set = self.selectable_providers.clone();
         set.insert(self.file_provider.clone());
         set.insert(self.dir_provider.clone());
+        set.insert(self.review_provider.clone());
+        set.insert(self.pr_provider.clone());
         set
     }
 

@@ -15,7 +15,7 @@ pairs), and each root answers these resource families:
 | `urn:repo:{repo}:explain-versions[:{path}]` | what the archive holds for a path — one row per entry (tag, hash, model, derived-at), across content versions and tags; derives nothing and needs no net capability; `as=text/html` is the **option menu** the faces open beside their explain button — the entries the current content can reopen (free) above the models this host will derive a new one with, one row per MODEL |
 | `urn:iki:annotation[:{id}]` | a **W3C Web Annotation** (S2) on a file — Sink creates/updates (anchoring the quoted text; the bare `urn:iki:annotation` mints a uuid id), Source reads with drift **re-anchoring**, Delete removes; faces: `text/plain` (the body), `as=application/json`, `as=text/turtle` |
 | `urn:repo:{repo}:annotations[:{path}]` | every annotation on one file (or the whole repo, path omitted) in reading order, drift-reconciled on each read; faces: `application/json` (default), `as=text/html` (panel fragment), `as=text/turtle` |
-| `urn:repo:{repo}:review:{path}` | the **machine review pass** (S4) — region-grain LLM commentary minted as real annotations (provenance-distinguished), the pass archived by `(path, content-hash, review-tag)` so re-sourcing unchanged content mints nothing; faces: `text/plain` (the margin digest), `as=application/json` (`{minted, orphaned_items, reviewed_bytes, total_bytes, annotations, …}`), `as=text/html` (the card page), `as=text/turtle` (the pass's provenance graph); `debug=raw` derives and returns the model's **unparsed answer** (nothing minted or archived) — the parse-failure diagnosis face |
+| `urn:repo:{repo}:review:{path}` | the **machine review pass** (S4) — region-grain LLM commentary minted as real annotations (provenance-distinguished), the pass archived by `(path, content-hash, review-tag)` so re-sourcing unchanged content mints nothing; faces: `text/plain` (the margin digest), `as=application/json` (`{minted, orphaned_items, reviewed_bytes, total_bytes, annotations, …}`), `as=text/html` (the card page), `as=text/turtle` (the pass's provenance graph); `debug=raw` derives and returns the model's **unparsed answer** (nothing minted or archived) — the parse-failure diagnosis face; `provider={iri}` derives against a host-allowed backend, keyed by its own model identity (a second model is a second coexisting pass) |
 | `urn:repo:style` | the **theme stylesheet** the classed highlight faces bind to — `text/css`, root-independent, cacheable: each theme inside its OWN `@media (prefers-color-scheme: …)` block, above an unconditional `.hl-code` floor, all targeting the `hl-` classes the HTML faces emit, with the themes and the contrast floor read from the layered `a11y.toml` (see the host contract below) |
 | `urn:repo:{repo}:prs` | the root's **pull requests** — ikigai-repo's `urn:repo:pr:list` facade resolved through the kernel with `dir=` the root's directory; `state=` (`open`/`closed`/`merged`/`all`) and `limit=` forward to the facade (ikigai-repo ≥ 0.1.4 — omitted, the facade's defaults apply); `text/plain` (default) is `number`⇥`title`⇥`branch`⇥`updated`⇥`state` per line (empty = no matching PRs), `as=application/json` the facade's structured rows, `as=text/html` the listing with each PR linking its page (`chrome=embed` for the rows-only fragment other faces fold in) |
 | `urn:repo:{repo}:prs:{path}` | the **contextual listing** — the PRs that touched anything at or under a path, newest first: open PRs from `urn:repo:pr:list` intersected per-PR with `urn:repo:pr:files` (ikigai-repo ≥ 0.1.5; bounded to the 20 most recently updated open PRs), merged PRs mined from the path-scoped log (`urn:repo:log path=`, last 100 path-touching commits) by the squash-merge **convention** that a subject ends `(#N)` — a merge-commit repo yields fewer rows, never wrong ones; the path is a *history* scope (a deleted directory still lists; no history = empty listing); open rows first, then merged, deduped by number; `state=` (`open`/`merged`/`all`, default `all`) and `limit=` cap the synthesized listing; faces mirror `prs` (`as=application/json` is the synthesized `{number, title, state, branch, updated}` rows; the html face labels its scope) |
@@ -72,8 +72,10 @@ lazily re-derives while old tags stay addressable via `version=`.
 
 **Choosing the backend per request.** `provider={iri}` derives THIS
 explanation against a backend the caller names instead of the tier default.
-The selectable set is the operator's: the two configured tier providers plus
-whatever `ExplainConfig::allow_provider` adds — anything else is `Denied`,
+The selectable set is the operator's, and it is ONE host-level allowlist for
+every `provider=` in the module: every configured tier provider (file,
+directory, review, pull-request) plus whatever `ExplainConfig::allow_provider`
+adds — anything else is `Denied`,
 naming what was asked for and what is on offer, never a silent fall back. The
 set is published as the `provider` ArgSpec's `one_of`, so `urn:kernel:validate`
 can reject a bad one before dispatch and a UI can build its menu from
@@ -570,6 +572,16 @@ The review action `requires` all three of `urn:cap:browse:read:*`,
 Knobs on `ExplainConfig`: `review_provider` (default `urn:llm:coder:ask`),
 `review_max_tokens` (default 800), `review_model_label` (the tag override,
 same precedence as the explain labels).
+
+`provider={iri}` picks the backend for THIS pass, on the same terms as
+explain's: validated against the host allowlist before any work, `Denied`
+otherwise, and the label never follows a backend it was not written for.
+Because the tag folds the MODEL, a second model is a **second coexisting
+pass** — its own findings, minted as its own annotations, alongside the first
+rather than instead of it, both on the one annotation axis. A backend serving
+a model some pass already used keys that same entry: an archive hit that asks
+nothing and mints nothing. Review has no `version=`, so unlike explain's the
+argument is exclusive with nothing.
 
 Because findings are ordinary annotations in the shared graph, one SPARQL axis
 answers review questions directly, e.g. every machine finding still anchored
