@@ -7,8 +7,8 @@
 //! in a browser, and again with the OS in dark mode: the whole point of the
 //! two stylesheets is that both schemes read.
 //!
-//! It mounts THIS checkout, resolves the real tree, file, annotations and
-//! review-menu faces through the kernel, and inlines the two stylesheet
+//! It mounts THIS checkout, resolves the real tree, file, annotations,
+//! review-menu and review-queue faces through the kernel, and inlines the two stylesheet
 //! resources — `urn:repo:style` (the syntax theme) and `urn:repo:style:layout`
 //! (the page furniture). Nothing here writes markup of its own beyond the page
 //! shell and the section headings, so what you see is what a door serves.
@@ -85,6 +85,22 @@ fn main() {
                 &kernel,
                 &cap,
                 "urn:repo:self:review-options:src/layout.rs",
+                &[("as", "text/html")],
+            ),
+        ),
+        // ⚠ EMPTY here, and honestly so: this preview mounts annotations
+        // WITHOUT the explain family, so no review pass can run and no
+        // finding can exist. What it does show is the queue's page shell —
+        // the state nav, the not-a-gate note and the empty message. The
+        // finding CARD (severity badges, the decision form) has no visual
+        // check yet; `every_emitted_class_is_styled` only proves each class
+        // has a rule, not that the rule looks right.
+        (
+            "review queue (empty) — urn:repo:self:findings",
+            source(
+                &kernel,
+                &cap,
+                "urn:repo:self:findings",
                 &[("as", "text/html")],
             ),
         ),

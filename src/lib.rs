@@ -38,14 +38,24 @@
 //!   panel and marks annotated lines.
 //! - `urn:repo:{repo}:review:{path}` + `:review-options:{path}` — the S4
 //!   **machine review pass** ([`space_with_explain`]): region-grain LLM
-//!   commentary minted as real annotations (provenance-distinguished —
-//!   `dcterms:creator`, `oa:motivatedBy oa:assessing`, `prov:wasGeneratedBy`),
-//!   the pass archived by `(path, content-hash, review-tag)` so re-sourcing
-//!   unchanged content mints nothing. `review-options` is the host's
-//!   `provider=` allowlist grouped by MODEL — what the file face's "review
-//!   with…" menu renders, derivation-free and needing only the browse grant.
-//!   ⚠ It is not a listing of archived passes: the annotations listing already
-//!   carries `creator` and `generated_by` on every finding.
+//!   commentary minted as PENDING FINDINGS (provenance-distinguished —
+//!   `dcterms:creator`, `sh:resultSeverity` = the model's proposal,
+//!   `prov:wasGeneratedBy`), the pass archived by `(path, content-hash,
+//!   review-tag)` so re-sourcing unchanged content mints nothing.
+//!   `review-options` is the host's `provider=` allowlist grouped by MODEL —
+//!   what the file face's "review with…" menu renders, derivation-free and
+//!   needing only the browse grant. ⚠ It is not a listing of archived passes:
+//!   the findings listing already carries `creator` and `generated_by` on
+//!   every finding.
+//! - `urn:iki:finding:{id}` + `urn:repo:{repo}:findings[:{path}]` — the
+//!   **pending review queue** ([`space_with_explain`]). ★ **Nothing a machine
+//!   produces reaches the annotation family on its own**: a review pass mints
+//!   findings, and `Sink urn:iki:finding:{id} decision=publish` — gated by
+//!   `urn:cap:annotate` — is the only promotion path. The model PROPOSES a
+//!   severity from a closed set; the human accepts or re-rates it and **both
+//!   ratings are kept**, on the finding and on its decision node. Declining
+//!   keeps the finding as a record rather than discarding it. ⚠ A queue, not
+//!   a gate: a pending finding blocks no commit, push or merge.
 //! - `urn:repo:{repo}:prs` + `urn:repo:{repo}:pr:{n}` (and, explanations
 //!   mounted, `…:pr:{n}:explain` / `…:pr:{n}:review`) — the **pull-request
 //!   family**: ikigai-repo's pr facades resolved THROUGH THE KERNEL at
@@ -136,6 +146,7 @@ use syntect::util::LinesWithEndings;
 mod annotate;
 mod archive;
 mod explain;
+mod finding;
 mod hash;
 /// The layout stylesheet for the `browse-*` classes the HTML faces emit —
 /// `urn:repo:style:layout`, the sibling of `urn:repo:style`. See the module
@@ -459,7 +470,9 @@ impl Mount {
             });
             let space = base_space(&roots, &ignore, archive.as_ref(), false, app, home);
             let space = match archive {
-                Some(archive) => annotate::bind(space, &roots, &archive),
+                Some(archive) => {
+                    finding::bind(annotate::bind(space, &roots, &archive), &roots, &archive)
+                }
                 None => space,
             };
             return (space, style);
@@ -484,7 +497,11 @@ impl Mount {
         let space = review::bind(space, &roots, &shared);
         // So do the pull-request derived layers (pr:{n}:explain / pr:{n}:review).
         let space = pr::bind_explain(space, &roots, &shared);
-        (annotate::bind(space, &roots, &archive), style)
+        // The pending-finding family rides with the annotation family: one
+        // store, one drift pass, and the promotion that is the only door
+        // between them (ledger #444).
+        let space = annotate::bind(space, &roots, &archive);
+        (finding::bind(space, &roots, &archive), style)
     }
 }
 
@@ -1096,9 +1113,13 @@ fn actions_html(repo: &str, rel: &str, explain: bool) -> String {
         return String::new();
     }
     format!(
-        "<nav class=\"browse-actions\">{}{}</nav>{}{}",
+        "<nav class=\"browse-actions\">{}{}{}</nav>{}{}",
         explain_button(repo, rel, "explain", None),
         review::review_button_html(repo, rel),
+        // ★ Without this link the interim between this arc and gonk's Queue
+        // page is a black hole: a click on `review` would appear to do nothing
+        // at all, because its findings exist and nothing can see them.
+        finding::findings_link_html(repo, rel),
         explain::menu_html(repo, rel),
         review::menu_html(repo, rel),
     )

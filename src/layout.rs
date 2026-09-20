@@ -212,6 +212,35 @@ border-left:2px solid var(--browse-rule);font-style:italic;opacity:.85}\n\
 .browse-annotation-flag{font-size:.72em;white-space:nowrap;margin-left:.35rem;\
 padding:.05em .5em;border:1px solid var(--browse-flag);border-radius:999px;\
 color:var(--browse-flag)}\n\
+\
+/* The pending review queue (ledger #444). A finding is a MACHINE CLAIM
+   AWAITING A HUMAN, and it must never read as a published note: the dashed
+   rule and the state class carry that at a glance. */\n\
+.browse-finding{border-left-style:dashed}\n\
+.browse-finding-pending{border-left-color:var(--browse-flag)}\n\
+.browse-finding-published{border-left-style:solid}\n\
+.browse-finding-declined{opacity:.6}\n\
+.browse-finding-severity{font-size:.72em;white-space:nowrap;margin-right:.35rem;\
+padding:.05em .5em;border:1px solid currentColor;border-radius:999px}\n\
+.browse-finding-severity-critical,.browse-finding-severity-major{\
+color:var(--browse-flag)}\n\
+.browse-finding-severity-minor,.browse-finding-severity-info,\
+.browse-finding-severity-praise,.browse-finding-severity-unrated{opacity:.7}\n\
+.browse-finding-rater{font-size:.72em;opacity:.6;margin-right:.75rem}\n\
+.browse-finding-decision,.browse-finding-reason{font-size:.85em;opacity:.75;\
+margin:.25rem 0}\n\
+.browse-finding-minted{color:inherit}\n\
+.browse-finding-decide{display:grid;gap:.4rem;max-width:32rem;margin:.5rem 0}\n\
+.browse-finding-decide textarea,.browse-finding-decide select{font:inherit;\
+padding:.3rem}\n\
+.browse-finding-decide button{justify-self:start}\n\
+.browse-finding-label{font-size:.85em;opacity:.8}\n\
+.browse-findings-note{font-size:.85em;opacity:.7;margin:.5rem 0}\n\
+.browse-findings-empty{opacity:.7;font-style:italic}\n\
+.browse-findings-states{display:flex;flex-wrap:wrap;gap:.4rem;margin:.5rem 0}\n\
+.browse-findings-state-current{font-weight:600;text-decoration:underline}\n\
+.browse-findings-link{font:inherit}\n\
+\
 .browse-annotate{display:grid;gap:.4rem;max-width:32rem;margin:1rem 0}\n\
 .browse-annotate input,.browse-annotate textarea{font:inherit;padding:.3rem}\n\
 /* The submit is a real button and reads as one — only its placement is ours, so\n\
@@ -312,6 +341,22 @@ mod tests {
         // `annotate.rs`: appended to `browse-annotation`.
         "browse-annotation-orphaned",
         "browse-annotation-machine",
+        // `annotate.rs`: `browse-finding-{state}`, state from
+        // `Annotation::state()`.
+        "browse-finding",
+        "browse-finding-pending",
+        "browse-finding-published",
+        "browse-finding-declined",
+        // `finding.rs`: `browse-finding-severity-{severity}`, one per
+        // `finding::SEVERITIES` plus the unrated case.
+        "browse-finding-severity-critical",
+        "browse-finding-severity-major",
+        "browse-finding-severity-minor",
+        "browse-finding-severity-info",
+        "browse-finding-severity-praise",
+        "browse-finding-severity-unrated",
+        // `finding.rs`: the current state button in the queue's state nav.
+        "browse-findings-state-current",
     ];
 
     /// Every `browse-*` class the faces emit has a rule in [`LAYOUT_CSS`].
@@ -333,6 +378,7 @@ mod tests {
             include_str!("explain.rs"),
             include_str!("review.rs"),
             include_str!("pr.rs"),
+            include_str!("finding.rs"),
         ];
         let mut emitted: BTreeSet<&str> = DYNAMIC_CLASSES.iter().copied().collect();
         for source in sources {

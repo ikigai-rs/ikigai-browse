@@ -49,7 +49,7 @@ use ikigai_core::{
     Iri, Representation, Request, Result, UriTemplate, Verb,
 };
 
-use crate::annotate::{self, Included, CAP_ANNOTATE};
+use crate::annotate::{self, Included};
 use crate::archive::Archive;
 use crate::explain::{
     entry_iri, explain_turtle, iso8601, load_entry, parse_iri, provider_label, resolve_model,
@@ -108,7 +108,10 @@ const PR_PROMPT: &str = "Explain this pull request from its diff: what does this
 /// quote-and-commentary prose: zero `QUOTE:`/`NOTE:` lines, nothing
 /// parseable, deterministically at temperature 0.2. The contract stated only
 /// above the diff loses to the diff; restated below it, 6/6 findings parse.
-const PR_REVIEW_PROMPT_VERSION: &str = "pr-review-v3";
+/// v4: every finding carries a `SEVERITY:` line (the file pass's set,
+/// verbatim — one vocabulary for both surfaces), and the findings are PENDING
+/// rather than minted annotations (ledger #444).
+const PR_REVIEW_PROMPT_VERSION: &str = "pr-review-v4";
 /// The PR reviewer persona (the file pass's, retargeted at a diff).
 const PR_REVIEW_SYSTEM_PROMPT: &str =
     "You are an experienced engineer reviewing a colleague's pull request. \
@@ -122,11 +125,17 @@ const PR_REVIEW_SYSTEM_PROMPT: &str =
 /// The per-PR instruction: the finding format is the machine contract (each
 /// finding anchors by its verbatim quote from the DIFF).
 const PR_REVIEW_PROMPT: &str = "Review this pull request's diff and give your 3 to 6 most useful \
-     findings. Format each finding as exactly two lines and nothing else:\n\
+     findings. Format each finding as exactly three lines and nothing else:\n\
      QUOTE: <one line copied character-for-character from the diff, INCLUDING \
      its leading '+', '-', or space column - under 80 characters, distinctive \
      enough to occur only once>\n\
+     SEVERITY: <exactly one of: critical, major, minor, info, praise>\n\
      NOTE: <one or two sentences of review commentary on that region>\n\
+     Use critical for something that will bite in production (data loss, a \
+     security hole, corruption), major for a real defect or design risk that \
+     should be fixed, minor for a small improvement where correctness is not \
+     at stake, info for an observation or a question, and praise for a genuine \
+     strength. Use no other word for SEVERITY.\n\
      Do not number the findings. Do not add headings, preamble, or closing \
      remarks. The QUOTE must appear verbatim in the diff, leading diff marker \
      and all, or the finding is discarded.";
@@ -136,10 +145,12 @@ const PR_REVIEW_PROMPT: &str = "Review this pull request's diff and give your 3 
 /// [`PR_REVIEW_PROMPT_VERSION`]).
 const PR_REVIEW_REMINDER: &str =
     "Now give the findings. Remember the format contract: each finding is \
-     exactly two lines - the first starts `QUOTE: ` followed by one line \
+     exactly three lines - the first starts `QUOTE: ` followed by one line \
      copied character-for-character from the diff above (leading '+', '-', \
      or space column included, under 80 characters), the second starts \
-     `NOTE: ` with your commentary. No headings, no numbering, nothing else.";
+     `SEVERITY: ` followed by exactly one of critical, major, minor, info or \
+     praise, the third starts `NOTE: ` with your commentary. No headings, no \
+     numbering, nothing else.";
 
 // --- IRIs ---------------------------------------------------------------------
 
@@ -1480,7 +1491,7 @@ impl Endpoint for PrReviewEndpoint {
         let mut minted = Vec::new();
         let mut orphaned_items = malformed;
         for finding in &findings {
-            match annotate::mint_review_annotation(
+            match annotate::mint_pending_finding(
                 &config.archive,
                 &target,
                 repo,
@@ -1489,12 +1500,13 @@ impl Endpoint for PrReviewEndpoint {
                 &diff_hash,
                 &finding.quote,
                 &finding.note,
+                finding.severity.as_deref(),
                 &model,
                 &iri,
                 created.clone(),
                 annotate::Surface::Diff,
             )? {
-                Some(annotation_iri) => minted.push(annotation_iri),
+                Some(finding_iri) => minted.push(finding_iri),
                 None => orphaned_items += 1,
             }
         }
@@ -1638,14 +1650,16 @@ fn pr_review_description() -> Description {
              ikigai-repo's pr facades run in the root's directory — they must be mounted \
              and enforce their own exec capability. text/plain (default) is the \
              margin-notes digest; as=application/json adds {minted, orphaned_items, \
-             annotations}; as=text/html the card page; as=text/turtle the pass's \
+             findings}; as=text/html the card page; as=text/turtle the pass's \
              provenance graph.",
         )
         .verb(Verb::Source)
         .verb(Verb::Meta)
         .requires(CAP_WILDCARD)
+        // ⚠ NO `urn:cap:annotate`: the PR pass mints PENDING FINDINGS, exactly
+        // like the file pass, and cannot reach the annotation family. See
+        // `crate::review`'s description for why the absence is the point.
         .requires(CAP_NET)
-        .requires(CAP_ANNOTATE)
         .input(
             ArgSpec::new("n")
                 .binding()
@@ -1681,6 +1695,7 @@ fn pr_review_description() -> Description {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::annotate::CAP_ANNOTATE;
     use futures::executor::block_on;
     use ikigai_core::{Capability, Exact, Fallback, FnEndpoint, Kernel};
     use oxigraph::store::Store;
@@ -2502,12 +2517,12 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    const TWO_FINDINGS: &str = "QUOTE: +fn beta() {}\nNOTE: The new function lands without a \
-         caller - is it wired anywhere?\nQUOTE: @@ -1,3 +1,4 @@\nNOTE: A tight, single-hunk \
-         change - easy to review.\n";
+    const TWO_FINDINGS: &str = "QUOTE: +fn beta() {}\nSEVERITY: major\nNOTE: The new function \
+         lands without a caller - is it wired anywhere?\nQUOTE: @@ -1,3 +1,4 @@\nSEVERITY: \
+         praise\nNOTE: A tight, single-hunk change - easy to review.\n";
 
     #[test]
-    fn the_review_pass_mints_machine_annotations_anchored_in_the_diff() {
+    fn the_review_pass_mints_pending_findings_anchored_in_the_diff() {
         let root = temp_dir();
         let store = Arc::new(Store::new().unwrap());
         let state = FakeRepo::new();
@@ -2516,7 +2531,7 @@ mod tests {
 
         let pass = json(&k, "urn:repo:demo:pr:3:review", &[]);
         assert_eq!(pass["derived"], true);
-        assert_eq!(pass["version_tag"], "pr-review-v3@r1");
+        assert_eq!(pass["version_tag"], "pr-review-v4@r1");
         assert_eq!(
             pass["content_hash"], OID,
             "the pass keys on the head commit"
@@ -2538,14 +2553,26 @@ mod tests {
         );
         assert!(system.contains("colleague's pull request"), "{system}");
 
-        // The findings ARE annotations targeting the PR IRI — machine-marked,
-        // provenance-linked, in the one shared family.
-        let rows = json(&k, "urn:repo:demo:annotations", &[]);
+        // ★ A PR pass publishes nothing either: the findings are PENDING,
+        // targeting the PR IRI, machine-marked and provenance-linked — and
+        // the annotation family is empty until a human answers them.
+        assert_eq!(
+            json(&k, "urn:repo:demo:annotations", &[])
+                .as_array()
+                .unwrap()
+                .len(),
+            0,
+            "a PR review pass must not publish"
+        );
+        let rows = json(&k, "urn:repo:demo:findings", &[]);
         assert_eq!(rows.as_array().unwrap().len(), 2);
+        // Triage order: major before praise.
+        assert_eq!(rows[0]["severity"], "major");
+        assert_eq!(rows[0]["state"], "pending");
         assert_eq!(rows[0]["annotates"], "urn:repo:demo:pr:3");
+        assert_eq!(rows[0]["pr"], 3);
         assert_eq!(rows[0]["machine"], true);
         assert_eq!(rows[0]["creator"], "r1");
-        assert_eq!(rows[0]["motivation"], "assessing");
         assert!(rows[0]["generated_by"]
             .as_str()
             .unwrap()
@@ -2557,23 +2584,29 @@ mod tests {
         assert_eq!(hit["minted"], pass["minted"]);
         assert_eq!(log.count(), 1);
         assert_eq!(
-            json(&k, "urn:repo:demo:annotations", &[])
+            json(&k, "urn:repo:demo:findings", &[])
                 .as_array()
                 .unwrap()
                 .len(),
             2
         );
 
-        // The page html shows the machine markers on the diff lines.
+        // Published, the machine marker appears on the diff line — and not
+        // before: the PR page renders the annotation family, so a pending
+        // finding is invisible there by construction.
+        let html = body(&source(&k, "urn:repo:demo:pr:3", &[("as", "text/html")]).unwrap());
+        assert!(!html.contains("browse-annotation-marker-machine"), "{html}");
+        let pending = pass["minted"][0].as_str().unwrap();
+        issue(&k, Verb::Sink, pending, &[("decision", "publish")], &cap()).unwrap();
         let html = body(&source(&k, "urn:repo:demo:pr:3", &[("as", "text/html")]).unwrap());
         assert!(html.contains("browse-annotation-marker-machine"), "{html}");
         assert!(html.contains("review by r1"), "{html}");
 
-        // The pass's turtle records the provenance chain.
+        // The pass's turtle records the provenance chain — onto the FINDINGS.
         let ttl = body(&source(&k, "urn:repo:demo:pr:3:review", &[("as", "text/turtle")]).unwrap());
         assert!(ttl.contains("a ik:Review"), "{ttl}");
         assert!(ttl.contains("prov:used <urn:repo:demo:pr:3>"), "{ttl}");
-        assert!(ttl.contains("prov:generated <urn:iki:annotation:"), "{ttl}");
+        assert!(ttl.contains("prov:generated <urn:iki:finding:"), "{ttl}");
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -2629,7 +2662,7 @@ index 3f9c2d1..8a41b77 100644
         // The stored exacts stay honest: a stripped match records the
         // ORIGINAL diff line (marker and indentation intact); exact matches
         // keep the model's own quote.
-        let rows = json(&k, "urn:repo:demo:annotations", &[]);
+        let rows = json(&k, "urn:repo:demo:findings", &[]);
         let exacts: Vec<&str> = rows
             .as_array()
             .unwrap()
@@ -2733,9 +2766,15 @@ index 3f9c2d1..8a41b77 100644
             assert!(explain_desc.requires.contains(&cap.to_string()), "{cap}");
         }
         let review_desc = pr_review_description();
-        for cap in [CAP_WILDCARD, CAP_NET, CAP_ANNOTATE] {
+        for cap in [CAP_WILDCARD, CAP_NET] {
             assert!(review_desc.requires.contains(&cap.to_string()), "{cap}");
         }
+        // ★ And NOT annotate: a PR pass produces pending findings, so the
+        // authority to publish is not the authority to review (ledger #444).
+        assert!(
+            !review_desc.requires.contains(&CAP_ANNOTATE.to_string()),
+            "a review pass must not declare the annotate capability it no longer uses"
+        );
         let names: Vec<&str> = review_desc.inputs.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, ["n", "as", "debug"]);
         // The scoped listing: pages-tier caps only, path the sole binding.

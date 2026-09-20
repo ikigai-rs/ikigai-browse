@@ -15,7 +15,9 @@ pairs), and each root answers these resource families:
 | `urn:repo:{repo}:explain-versions[:{path}]` | what the archive holds for a path — one row per entry (tag, hash, model, derived-at), across content versions and tags; derives nothing and needs no net capability; `as=text/html` is the **option menu** the faces open beside their explain button — the entries the current content can reopen (free) above the models this host will derive a new one with, one row per MODEL |
 | `urn:iki:annotation[:{id}]` | a **W3C Web Annotation** (S2) on a file — Sink creates/updates (anchoring the quoted text; the bare `urn:iki:annotation` mints a uuid id), Source reads with drift **re-anchoring**, Delete removes; faces: `text/plain` (the body), `as=application/json`, `as=text/turtle` |
 | `urn:repo:{repo}:annotations[:{path}]` | every annotation on one file (or the whole repo, path omitted) in reading order, drift-reconciled on each read; faces: `application/json` (default), `as=text/html` (panel fragment), `as=text/turtle` |
-| `urn:repo:{repo}:review:{path}` | the **machine review pass** (S4) — region-grain LLM commentary minted as real annotations (provenance-distinguished), the pass archived by `(path, content-hash, review-tag)` so re-sourcing unchanged content mints nothing; faces: `text/plain` (the margin digest), `as=application/json` (`{minted, orphaned_items, reviewed_bytes, total_bytes, annotations, …}`), `as=text/html` (the card page), `as=text/turtle` (the pass's provenance graph); `debug=raw` derives and returns the model's **unparsed answer** (nothing minted or archived) — the parse-failure diagnosis face; `provider={iri}` derives against a host-allowed backend, keyed by its own model identity (a second model is a second coexisting pass) |
+| `urn:iki:finding:{id}` | one **pending review finding** — a `prov:Entity`, **not** an `oa:Annotation`. Source reads it (drift-reconciled like an annotation); Sink is the human's answer: `decision=publish` mints the annotation (needs `urn:cap:annotate`) and `decision=decline` keeps the finding as a record that someone looked and said no. `severity=` is the human's FINAL rating from a closed `one_of`; the model's proposal is never overwritten, and a piped value is the human's reason. A recorded decision is not changed (an identical repeat is a no-op) |
+| `urn:repo:{repo}:findings[:{path}]` | the **review queue** — every finding on one file or the whole repo, in TRIAGE order (severity, then position), `state=` one of `pending` (default) / `published` / `declined` / `all`; faces: `application/json` (default), `as=text/html` (the queue page, each pending card carrying its publish/decline form), `as=text/plain`, `as=text/turtle`. ⚠ A queue, not a gate: nothing here blocks a commit, a push or a merge |
+| `urn:repo:{repo}:review:{path}` | the **machine review pass** (S4) — region-grain LLM commentary minted as **pending findings, never annotations** (each with the model's PROPOSED severity), the pass archived by `(path, content-hash, review-tag)` so re-sourcing unchanged content mints nothing; faces: `text/plain` (the margin digest), `as=application/json` (`{minted, orphaned_items, reviewed_bytes, total_bytes, annotations, …}`), `as=text/html` (the card page), `as=text/turtle` (the pass's provenance graph); `debug=raw` derives and returns the model's **unparsed answer** (nothing minted or archived) — the parse-failure diagnosis face; `provider={iri}` derives against a host-allowed backend, keyed by its own model identity (a second model is a second coexisting pass) |
 | `urn:repo:{repo}:review-options:{path}` | **which backends this host will review with** — its `provider=` allowlist grouped by the MODEL each serves, because the review archive keys on the model and two backends serving one model key ONE pass; derives nothing, asks no model, needs no net grant, and reads neither the working tree nor the archive (the rows are a property of the host, so a deleted path still answers); `text/plain` (default) is `label`⇥`providers`⇥`defaultFor` lines, `as=application/json` the structured rows, `as=text/html` the **option menu** the file face opens beside its review button, each row sending `provider=` to `urn:repo:{repo}:review:{path}`. ⚠ It is NOT a listing of archived passes: `urn:repo:{repo}:annotations:{path} as=application/json` already carries `creator` and `generated_by` on every finding, which is the same question answered by data that already exists |
 | `urn:repo:style` | the **theme stylesheet** the classed highlight faces bind to — `text/css`, root-independent, cacheable: each theme inside its OWN `@media (prefers-color-scheme: …)` block, above an unconditional `.hl-code` floor, all targeting the `hl-` classes the HTML faces emit, with the themes and the contrast floor read from the layered `a11y.toml` (see the host contract below) |
 | `urn:repo:style:layout` | the **layout stylesheet** for the `browse-*` classes the HTML faces emit — `text/css`, root-independent, cacheable, a build constant (no configuration, no golden thread): crumbs, entry lists, the action strip, the explain and review disclosure menus, annotation cards and the create form, the pull-request listings. A door links it BESIDE `urn:repo:style` — that one is the syntax theme inside a file view, this one is the page furniture. It styles **only what this crate emits** (no bare `body`/`button`/`pre` rules), so a host can link it inside its own chrome; `data-browse-posture="read-only"` on any ancestor hides the annotate form |
@@ -23,7 +25,7 @@ pairs), and each root answers these resource families:
 | `urn:repo:{repo}:prs:{path}` | the **contextual listing** — the PRs that touched anything at or under a path, newest first: open PRs from `urn:repo:pr:list` intersected per-PR with `urn:repo:pr:files` (ikigai-repo ≥ 0.1.5; bounded to the 20 most recently updated open PRs), merged PRs mined from the path-scoped log (`urn:repo:log path=`, last 100 path-touching commits) by the squash-merge **convention** that a subject ends `(#N)` — a merge-commit repo yields fewer rows, never wrong ones; the path is a *history* scope (a deleted directory still lists; no history = empty listing); open rows first, then merged, deduped by number; `state=` (`open`/`merged`/`all`, default `all`) and `limit=` cap the synthesized listing; faces mirror `prs` (`as=application/json` is the synthesized `{number, title, state, branch, updated}` rows; the html face labels its scope) |
 | `urn:repo:{repo}:pr:{n}` | the **PR page** — metadata (`urn:repo:pr:view` json: author object, `headRefOid`) + the unified diff (`urn:repo:pr:diff`); the DIFF TEXT is an annotation surface (annotations target the PR IRI and quote diff lines, drifting like file annotations); `as=text/html` renders the highlighted, line-anchored diff with markers and the annotations panel; `annotations=include` folds the margin into the plain/json faces |
 | `urn:repo:{repo}:pr:{n}:explain` | a **review-shaped PR explanation** — what the change does and what a reviewer would look at — archived by `(repo, pr, headRefOid, version-tag)`: new commits derive fresh, prior entries stay addressable (`version=`) |
-| `urn:repo:{repo}:pr:{n}:review` | the **machine review pass over the diff** — findings minted as machine annotations targeting the PR IRI, the pass archived by `(repo, pr, headRefOid, review-tag)` so an unchanged head mints nothing; `reviewed_bytes`/`total_bytes` on the json face say how much of a big diff the model actually saw, and `debug=raw` returns the unparsed answer |
+| `urn:repo:{repo}:pr:{n}:review` | the **machine review pass over the diff** — findings minted as PENDING findings targeting the PR IRI (published only by a human, exactly like the file pass), the pass archived by `(repo, pr, headRefOid, review-tag)` so an unchanged head mints nothing; `reviewed_bytes`/`total_bytes` on the json face say how much of a big diff the model actually saw, and `debug=raw` returns the unparsed answer |
 
 **Resolution is the access model.** A `{repo}` that is not a configured root is
 a clean resolution *miss* (the grammar refuses to match; other mounted spaces
@@ -351,18 +353,39 @@ nothing but the face; its `<details class="browse-review-menu">` twin fetches
 `review-options … as=text/html` on `toggle` and each row adds only the
 `provider=` the manifold already declares. That is exactly the call a
 git-event trigger makes — same resource, same arguments, same capability
-check, same archive key, same minted annotations — so the two cannot diverge;
+check, same archive key, same pending findings — so the two cannot diverge;
 the only legitimate difference is the cause. Nothing in the UI path assembles
 a prompt, post-processes a finding, or writes an annotation another way.
-⚠ The reverse reading is the useful one: whatever a click needs (the net
-grant, the annotate grant, the browse read, and an answer to what bounds the
-spend) a headless trigger needs too, with no human present. The review menu
-follows the same model axis and the same cost discipline as explain's, minus
-the archive half — one `urn:llm:models` resolve when a human opens it, nothing
-before — and it requires the **browse grant alone**, because reading what is
-on offer is not spending. It could not have lived on `review` itself, which
-declares net and annotate, or a browse-only session would be refused its own
+★ And since the pass now produces **pending findings under both causes**, the
+invariant holds by construction rather than by care: publication is a third
+act, and it is always a human's. ⚠ The reverse reading is still the useful
+one: whatever a click needs (the net grant, the browse read, and an answer to
+what bounds the spend) a headless trigger needs too, with no human present —
+but **not** `urn:cap:annotate`, which the pass no longer declares, so a
+trigger can run complete and deliberately unable to publish anything. The
+review menu follows the same model axis and the same cost discipline as
+explain's, minus the archive half — one `urn:llm:models` resolve when a human
+opens it, nothing before — and it requires the **browse grant alone**, because
+reading what is on offer is not spending. It could not have lived on `review`
+itself, which declares net, or a browse-only session would be refused its own
 menu.
+
+**Nothing gets published except by a human.** A review pass writes
+`urn:iki:finding:{id}` records — `prov:Entity`, never `oa:Annotation`, never
+under the `urn:iki:annotation:` prefix, and carrying no `oa:` term whose
+`rdfs:domain` would type them into that family under entailment
+(`oa:bodyValue` and `oa:motivatedBy` both would; the body is
+`dcterms:description` instead). The model proposes a severity from the closed
+set `critical · major · minor · info · praise`, declared as the Sink's
+`one_of` and handed to the model in the same words, so the menu and the
+prompt cannot drift apart. A human publishes (`decision=publish`, gated by
+`urn:cap:annotate`) or declines — and **both ratings survive**: the proposal
+stays on the finding, the final rating goes on
+`urn:iki:finding:{id}:decision`, so "is this reviewer calibrated?" is a query
+rather than an impression. A finding's id is derived from its POSITION
+(`sha256(pass ‖ anchor ‖ quote)`), so a re-derivation re-mints the same node
+and a decision survives it. Staleness is the annotation layer's answer, not a
+second one: findings re-anchor and orphan on every read.
 
 **Manual review is the existing human annotation affordance.** There is no
 second path and no new resource for it: the annotations panel under a file
