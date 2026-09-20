@@ -85,7 +85,15 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # `urn:iki:store:graph-update` (ikigai-store). The in-place moves are now
 # expressible as a query against a host binding one of those; the cross-store
 # one is not, and says why in one place rather than four.
-version = "0.4.1"
+# 0.4.2 is PURELY ADDITIVE and the number is chosen deliberately: `review` gained
+# `provider=` (#32), the file face gained a Review button and
+# `urn:repo:{repo}:review-options:{path}` (#33), and the layout CSS became
+# `urn:repo:style:layout` (#34). Nothing moved or changed shape.
+# ⚠ NOT 0.5.0. `ikigai-gonk` pins `ikigai-browse = "0.4.1"`, and under Cargo's 0.x
+# caret rules `^0.4.1` means `<0.5.0` — a minor bump would CEILING the one consumer
+# waiting for these out of them, with no diagnostic (rule 5's second half; the
+# ikigai-dev-server 0.10 pin is the precedent that cost two minor releases).
+version = "0.4.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
