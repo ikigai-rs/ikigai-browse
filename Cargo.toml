@@ -85,15 +85,27 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # `urn:iki:store:graph-update` (ikigai-store). The in-place moves are now
 # expressible as a query against a host binding one of those; the cross-store
 # one is not, and says why in one place rather than four.
-# 0.4.2 is PURELY ADDITIVE and the number is chosen deliberately: `review` gained
+# 0.4.2 was PURELY ADDITIVE and the number was chosen deliberately: `review` gained
 # `provider=` (#32), the file face gained a Review button and
 # `urn:repo:{repo}:review-options:{path}` (#33), and the layout CSS became
-# `urn:repo:style:layout` (#34). Nothing moved or changed shape.
-# ⚠ NOT 0.5.0. `ikigai-gonk` pins `ikigai-browse = "0.4.1"`, and under Cargo's 0.x
-# caret rules `^0.4.1` means `<0.5.0` — a minor bump would CEILING the one consumer
-# waiting for these out of them, with no diagnostic (rule 5's second half; the
-# ikigai-dev-server 0.10 pin is the precedent that cost two minor releases).
-version = "0.4.2"
+# `urn:repo:style:layout` (#34). Nothing moved or changed shape. That entry argued
+# AGAINST 0.5.0 on caret-ceiling grounds, and it was right for that release.
+#
+# 0.5.0 (#36, ledger #444) IS a break, so the same reasoning now points the other
+# way. `urn:repo:{repo}:review:{path}` no longer produces annotations — it produces
+# PENDING findings, and promotion by a human is the only path into the
+# `urn:iki:annotation:` family ("nothing gets published to Gonk except by the
+# human"). Its `requires` SHRANK with it: the review actions no longer declare
+# `urn:cap:annotate`, because they no longer write annotations, and declaring a cap
+# you do not enforce makes the manifold lie. A caller that expected annotations to
+# appear gets findings instead. That is a changed shape, and under 0.x it is a minor.
+#
+# ⚠ SO GONK'S PIN MOVES IN THE SAME WAVE, AND THIS IS NOT OPTIONAL. `ikigai-gonk`
+# pins `ikigai-browse = "0.4.2"`, and `^0.4.2` means `<0.5.0` — publishing this
+# without moving that pin ceilings gonk out of the exact change it is waiting for,
+# silently, with no diagnostic. Rule 5's second half; the ikigai-dev-server 0.10 pin
+# is the precedent that cost two minor releases before anyone noticed.
+version = "0.5.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
