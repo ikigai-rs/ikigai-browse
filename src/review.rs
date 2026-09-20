@@ -98,7 +98,7 @@ use ikigai_core::{
 };
 use oxigraph::model::{Literal, NamedNode, Quad, Term};
 
-use crate::annotate::{self, Included, CAP_ANNOTATE, PROV};
+use crate::annotate::{self, Included, PROV};
 use crate::archive::Archive;
 use crate::explain::{
     command_safe, ik, iso8601, menu_options, parse_iri, provider_label, resolve_model, truncate,
@@ -118,7 +118,13 @@ use crate::{
 /// input, a contract stated only up top loses to the content and the model
 /// answers label-free (the pr-review-v2 live failure: quote-and-commentary
 /// prose, zero `QUOTE:`/`NOTE:` lines, nothing parseable).
-const REVIEW_PROMPT_VERSION: &str = "review-v2";
+/// v3: every finding now carries a `SEVERITY:` line, constrained to
+/// [`crate::finding::SEVERITIES`] — and the findings are PENDING, so a pass's
+/// output is no longer what a v2 pass's output was. The tag change is what
+/// keeps a v2 archive entry (whose `prov:generated` names annotations) readable
+/// beside a v3 one (whose `prov:generated` names findings) instead of
+/// colliding on one key.
+const REVIEW_PROMPT_VERSION: &str = "review-v3";
 
 /// The reviewer persona. The centerpiece constraint: commentary a thoughtful
 /// colleague would leave — intent, tradeoffs, risks, and earned praise — not
@@ -135,10 +141,16 @@ const REVIEW_SYSTEM_PROMPT: &str =
 /// finding anchors by its verbatim quote), so it is spelled out rigidly.
 const REVIEW_PROMPT: &str =
     "Review this file and give your 3 to 6 most useful findings. Format each \
-     finding as exactly two lines and nothing else:\n\
+     finding as exactly three lines and nothing else:\n\
      QUOTE: <a short snippet copied character-for-character from one line of \
      the file - under 80 characters, distinctive enough to occur only once>\n\
+     SEVERITY: <exactly one of: critical, major, minor, info, praise>\n\
      NOTE: <one or two sentences of review commentary on that region>\n\
+     Use critical for something that will bite in production (data loss, a \
+     security hole, corruption), major for a real defect or design risk that \
+     should be fixed, minor for a small improvement where correctness is not \
+     at stake, info for an observation or a question, and praise for a genuine \
+     strength. Use no other word for SEVERITY.\n\
      Do not number the findings. Do not add headings, preamble, or closing \
      remarks. The QUOTE must appear verbatim in the file or the finding is \
      discarded.";
@@ -149,10 +161,11 @@ const REVIEW_PROMPT: &str =
 /// contract only up top yielded label-free findings; restated, 6/6 labeled).
 const REVIEW_REMINDER: &str =
     "Now give the findings. Remember the format contract: each finding is \
-     exactly two lines - the first starts `QUOTE: ` followed by a short \
+     exactly three lines - the first starts `QUOTE: ` followed by a short \
      snippet copied character-for-character from one line of the file above, \
-     the second starts `NOTE: ` with your commentary. No headings, no \
-     numbering, nothing else.";
+     the second starts `SEVERITY: ` followed by exactly one of critical, \
+     major, minor, info or praise, the third starts `NOTE: ` with your \
+     commentary. No headings, no numbering, nothing else.";
 
 // --- the archive entry (RDF in the shared store) ------------------------------
 
@@ -399,6 +412,16 @@ pub(crate) fn load_pass(archive: &Archive, iri: &str) -> Result<Option<PassEntry
 pub(crate) struct Finding {
     pub(crate) quote: String,
     pub(crate) note: String,
+    /// The model's proposed severity, constrained to
+    /// [`crate::finding::SEVERITIES`].
+    ///
+    /// ⚠ `None` means the model gave no `SEVERITY:` line or invented a word
+    /// outside the set — and the finding is KEPT unrated rather than dropped
+    /// or silently defaulted. The failure-containment rule applies to the
+    /// rating exactly as it applies to the quote: one bad item must not kill
+    /// the pass, and a fabricated `info` would be indistinguishable from a
+    /// rating the model actually made.
+    pub(crate) severity: Option<String>,
 }
 
 /// Parse `QUOTE:`/`NOTE:` pairs out of the model's answer. Returns the
@@ -411,12 +434,18 @@ pub(crate) fn parse_findings(answer: &str) -> (Vec<Finding>, u64) {
     let mut findings = Vec::new();
     let mut malformed = 0u64;
     let mut quote: Option<String> = None;
+    let mut severity: Option<String> = None;
     let mut note = String::new();
-    let mut flush = |quote: &mut Option<String>, note: &mut String, malformed: &mut u64| {
+    let mut flush = |quote: &mut Option<String>,
+                     severity: &mut Option<String>,
+                     note: &mut String,
+                     malformed: &mut u64| {
+        let severity = severity.take();
         match quote.take() {
             Some(q) if !q.is_empty() && !note.trim().is_empty() => findings.push(Finding {
                 quote: q,
                 note: note.trim().to_string(),
+                severity,
             }),
             Some(_) => *malformed += 1,
             None => {}
@@ -426,8 +455,15 @@ pub(crate) fn parse_findings(answer: &str) -> (Vec<Finding>, u64) {
     for line in answer.lines() {
         let trimmed = line.trim();
         if let Some(q) = trimmed.strip_prefix("QUOTE:") {
-            flush(&mut quote, &mut note, &mut malformed);
+            flush(&mut quote, &mut severity, &mut note, &mut malformed);
             quote = Some(q.trim().to_string());
+        } else if let Some(s) = trimmed.strip_prefix("SEVERITY:") {
+            // Lower-cased and trimmed, then checked against the ONE set. A
+            // word outside it is dropped, not mapped: the model and the menu
+            // must offer the same five words or the two disagree the first
+            // time it invents a sixth.
+            let word = s.trim().trim_end_matches('.').to_ascii_lowercase();
+            severity = crate::finding::is_severity(&word).then_some(word);
         } else if let Some(n) = trimmed.strip_prefix("NOTE:") {
             if quote.is_none() {
                 // A stray NOTE with no quote to anchor it.
@@ -443,7 +479,7 @@ pub(crate) fn parse_findings(answer: &str) -> (Vec<Finding>, u64) {
             note.push_str(trimmed);
         }
     }
-    flush(&mut quote, &mut note, &mut malformed);
+    flush(&mut quote, &mut severity, &mut note, &mut malformed);
     (findings, malformed)
 }
 
@@ -677,7 +713,7 @@ impl Endpoint for ReviewEndpoint {
         let mut minted = Vec::new();
         let mut orphaned_items = malformed;
         for finding in &findings {
-            match annotate::mint_review_annotation(
+            match annotate::mint_pending_finding(
                 &config.archive,
                 &file_iri(repo, &rel),
                 repo,
@@ -686,12 +722,13 @@ impl Endpoint for ReviewEndpoint {
                 &hash,
                 &finding.quote,
                 &finding.note,
+                finding.severity.as_deref(),
                 &model,
                 &iri,
                 created.clone(),
                 annotate::Surface::File,
             )? {
-                Some(annotation_iri) => minted.push(annotation_iri),
+                Some(finding_iri) => minted.push(finding_iri),
                 // The model misquoted: mint nothing for this item, count it.
                 None => orphaned_items += 1,
             }
@@ -888,26 +925,40 @@ fn review_description(config: &ExplainConfig) -> Description {
         .title("Machine review pass (annotations minted by a model)")
         .summary(
             "A region-grain machine review of one file — urn:repo:{repo}:review:{path}. \
-             Source asks the review model for findings (each an exact quote plus a \
-             reviewer's note), mints every anchored finding as a real urn:iki:annotation: \
-             (provenance: dcterms:creator = the model, oa:motivatedBy oa:assessing, \
-             prov:wasGeneratedBy = this pass) and ARCHIVES the pass by (path, \
-             content-hash, review-tag) — re-sourcing unchanged content is an archive hit \
-             that mints nothing. Changed content is a fresh pass; earlier passes' \
-             annotations re-anchor or orphan like human ones. Quotes that do not anchor \
-             are counted (orphaned_items), never fatal. provider= derives this pass \
+             Source asks the review model for findings (each an exact quote, a proposed \
+             severity and a reviewer's note) and mints every anchored finding as a PENDING \
+             urn:iki:finding: — NOT an annotation. ⚠ Nothing a pass produces reaches the \
+             urn:iki:annotation: family on its own: Sink urn:iki:finding:{id} \
+             decision=publish is the only path in, and it needs urn:cap:annotate, which \
+             this pass deliberately does not. Provenance on a finding: dcterms:creator = \
+             the model, sh:resultSeverity = its PROPOSED severity, prov:wasGeneratedBy = \
+             this pass. The pass is ARCHIVED by (path, content-hash, review-tag) — \
+             re-sourcing unchanged content is an archive hit that mints nothing, and a \
+             re-derivation re-mints the SAME finding IRIs, so a human decision survives \
+             it. Changed content is a fresh pass; earlier findings re-anchor or orphan \
+             like annotations. Quotes that do not anchor are counted (orphaned_items), \
+             never fatal; a missing or invented SEVERITY leaves the finding unrated \
+             rather than dropping it. provider= derives this pass \
              against a different (host-allowed) backend, keyed by that backend's own \
              model identity, so a second model is a second coexisting pass rather than a \
              replacement. text/plain (default) is the \
              margin-notes digest; as=application/json adds {minted, orphaned_items, \
-             annotations}; as=text/html the card page; as=text/turtle the pass's \
+             findings}; as=text/html the card page, each finding with its publish/decline \
+             affordance; as=text/turtle the pass's \
              provenance graph.",
         )
         .verb(Verb::Source)
         .verb(Verb::Meta)
         .requires(CAP_WILDCARD)
+        // ⚠ NO `urn:cap:annotate` — and its absence is the point, not an
+        // oversight. A pass writes PENDING FINDINGS and cannot reach the
+        // annotation family at all, so the authority it used to demand is
+        // required only by `Sink urn:iki:finding:{id} decision=publish`.
+        // ★ That is the safety interlock: a git-event trigger can run
+        // headlessly with browse+net and still publish nothing. Declared =
+        // enforced in both directions — declaring the annotate cap here would
+        // be an over-offer the pass no longer honours.
         .requires(CAP_NET)
-        .requires(CAP_ANNOTATE)
         .input(
             ArgSpec::new("path")
                 .binding()
@@ -1207,6 +1258,7 @@ fn options_description() -> Description {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::annotate::CAP_ANNOTATE;
     use futures::executor::block_on;
     use ikigai_core::{Capability, Exact, Fallback, FnEndpoint, Iri, Kernel};
     use oxigraph::store::Store;
@@ -1362,9 +1414,12 @@ mod tests {
     }
 
     const CONTENT: &str = "fn alpha() {}\nfn beta() {}\nfn gamma() {}\n";
-    const TWO_FINDINGS: &str = "QUOTE: fn alpha() {}\nNOTE: A clear entry point; the naming makes \
-         the call order obvious.\nQUOTE: fn beta() {}\nNOTE: Consider a doc comment - the role of \
-         this helper is not evident.\n";
+    /// Two well-formed v3 findings: one rated `praise`, one rated `minor` —
+    /// so every count below is also a check that the `SEVERITY:` line parsed
+    /// and reached the stored proposal.
+    const TWO_FINDINGS: &str = "QUOTE: fn alpha() {}\nSEVERITY: praise\nNOTE: A clear entry \
+         point; the naming makes the call order obvious.\nQUOTE: fn beta() {}\nSEVERITY: \
+         minor\nNOTE: Consider a doc comment - the role of this helper is not evident.\n";
 
     fn demo_root() -> PathBuf {
         let root = temp_dir();
@@ -1381,7 +1436,7 @@ mod tests {
 
         let first = json(&k, "urn:repo:demo:review:a.rs", &[]);
         assert_eq!(first["derived"], true);
-        assert_eq!(first["version_tag"], "review-v2@r1");
+        assert_eq!(first["version_tag"], "review-v3@r1");
         assert_eq!(first["model"], "r1");
         assert_eq!(first["orphaned_items"], 0);
         // Nothing was truncated, and the face says exactly what was seen.
@@ -1391,23 +1446,44 @@ mod tests {
         assert_eq!(first["annotations"].as_array().unwrap().len(), 2);
         assert_eq!(log.count(), 1);
 
-        // The findings ARE annotations — the one shared listing shows them.
-        let listing = json(&k, "urn:repo:demo:annotations:a.rs", &[]);
-        assert_eq!(listing.as_array().unwrap().len(), 2);
-        assert_eq!(listing[0]["machine"], true);
-        assert_eq!(listing[0]["creator"], "r1");
-        assert_eq!(listing[0]["motivation"], "assessing");
-        assert_eq!(listing[0]["exact"], "fn alpha() {}");
-        assert_eq!(listing[0]["line"], 1);
+        // ★★ THE PASS MINTS NOTHING INTO THE ANNOTATION FAMILY. This is the
+        // whole of ledger #444 in one assertion: the model produced two
+        // findings, they are addressable and rated, and the family every
+        // existing reader and query looks at is EMPTY until a human acts.
+        let annotations = json(&k, "urn:repo:demo:annotations:a.rs", &[]);
+        assert_eq!(
+            annotations.as_array().unwrap().len(),
+            0,
+            "a review pass must not publish anything: {annotations}"
+        );
+        for iri in first["minted"].as_array().unwrap() {
+            let iri = iri.as_str().unwrap();
+            assert!(iri.starts_with("urn:iki:finding:"), "{iri}");
+        }
+
+        // They are in the PENDING QUEUE instead, rated by the model, in
+        // triage order (minor before praise).
+        let queue = json(&k, "urn:repo:demo:findings:a.rs", &[]);
+        let rows = queue.as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["exact"], "fn beta() {}");
+        assert_eq!(rows[0]["severity"], "minor");
+        assert_eq!(rows[0]["state"], "pending");
+        assert_eq!(rows[0]["machine"], true);
+        assert_eq!(rows[0]["creator"], "r1");
+        assert_eq!(rows[0]["decision"], serde_json::Value::Null);
+        assert_eq!(rows[1]["exact"], "fn alpha() {}");
+        assert_eq!(rows[1]["severity"], "praise");
+        assert_eq!(rows[1]["line"], 1);
 
         // Re-source on unchanged content: an archive hit that MINTS NOTHING —
-        // no new ask, no new annotations, the same recorded set.
+        // no new ask, no new findings, the same recorded set.
         let second = json(&k, "urn:repo:demo:review:a.rs", &[]);
         assert_eq!(second["derived"], false);
         assert_eq!(second["minted"], first["minted"]);
         assert_eq!(log.count(), 1, "the hit must not re-ask");
-        let listing = json(&k, "urn:repo:demo:annotations:a.rs", &[]);
-        assert_eq!(listing.as_array().unwrap().len(), 2, "mint-once");
+        let queue = json(&k, "urn:repo:demo:findings:a.rs", &[]);
+        assert_eq!(queue.as_array().unwrap().len(), 2, "mint-once");
 
         // The prompt fed the model the file and the format contract — and the
         // contract is RESTATED after the content (long inputs crowd a
@@ -1444,24 +1520,50 @@ mod tests {
             &cap(),
         )
         .unwrap();
-        issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).unwrap();
+        let pass = json(&k, "urn:repo:demo:review:a.rs", &[]);
 
-        // JSON: one axis, two kinds, provenance on every row.
+        // Only the human note is in the annotation family: the machine's two
+        // are pending. A human PUBLISHES one of them — the only way in.
+        let pending: Vec<String> = pass["minted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i.as_str().unwrap().to_string())
+            .collect();
+        let published = issue(
+            &k,
+            Verb::Sink,
+            &pending[0],
+            &[("decision", "publish")],
+            &cap(),
+        )
+        .unwrap();
+        let published = body(&published);
+        assert!(
+            published.starts_with("urn:iki:annotation:"),
+            "publishing answers with the annotation it minted: {published}"
+        );
+
+        // JSON: one axis, two kinds, provenance on every row — and the
+        // machine row is there because a person put it there.
         let listing = json(&k, "urn:repo:demo:annotations:a.rs", &[]);
         let rows = listing.as_array().unwrap();
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 2, "one published finding, one human note");
         let machine: Vec<bool> = rows.iter().map(|r| r["machine"] == true).collect();
-        assert_eq!(
-            machine,
-            [true, true, false],
-            "reading order: alpha, beta, gamma"
-        );
-        assert_eq!(rows[2]["motivation"], "commenting");
-        assert_eq!(rows[2]["creator"], serde_json::Value::Null);
+        assert_eq!(machine, [true, false], "reading order: the quote, gamma");
+        assert_eq!(rows[1]["motivation"], "commenting");
+        assert_eq!(rows[1]["creator"], serde_json::Value::Null);
+        assert_eq!(rows[0]["motivation"], "assessing");
         assert!(rows[0]["generated_by"]
             .as_str()
             .unwrap()
             .starts_with("urn:ikigai:browse:review:demo:sha256:"));
+        // ★ The published annotation points back at the finding it was rated
+        // against, so the model's proposal is one hop from the published note.
+        assert_eq!(
+            rows[0]["derived_from"],
+            serde_json::Value::String(pending[0].clone())
+        );
 
         // The file HTML face: hollow machine markers, solid human dot, the
         // model identity on the machine cards.
@@ -1541,7 +1643,7 @@ mod tests {
         let err = issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).unwrap_err();
         assert!(format!("{err:?}").contains("no parseable"), "{err:?}");
         assert_eq!(log.count(), 2, "an unarchived pass re-derives");
-        let listing = json(&k, "urn:repo:demo:annotations:a.rs", &[]);
+        let listing = json(&k, "urn:repo:demo:findings:a.rs", &[]);
         assert_eq!(listing.as_array().unwrap().len(), 0, "nothing minted");
 
         // Every quote misquoted: likewise fatal, nothing minted or archived.
@@ -1554,7 +1656,7 @@ mod tests {
         );
         let err = issue(&k2, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).unwrap_err();
         assert!(format!("{err:?}").contains("anchored"), "{err:?}");
-        let listing = json(&k2, "urn:repo:demo:annotations:a.rs", &[]);
+        let listing = json(&k2, "urn:repo:demo:findings:a.rs", &[]);
         assert_eq!(listing.as_array().unwrap().len(), 0);
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1574,9 +1676,12 @@ mod tests {
         assert_eq!(fresh["derived"], true);
         assert_eq!(log.count(), 2);
 
-        // …while the FIRST pass's annotations re-anchor or orphan exactly
-        // like human ones — the drift is the review history, kept visible.
-        let listing = json(&k, "urn:repo:demo:annotations:a.rs", &[]);
+        // …while the FIRST pass's findings re-anchor or orphan exactly like
+        // annotations do — the drift is the review history, kept visible.
+        // ★ A pending finding gets THE drift story, not a second one: a
+        // finding whose file has since changed is stale by construction, and
+        // the answer to that already existed.
+        let listing = json(&k, "urn:repo:demo:findings:a.rs", &[]);
         let rows = listing.as_array().unwrap();
         assert_eq!(rows.len(), 3, "2 from pass one + 1 anchoring from pass two");
         let alpha_old: Vec<&serde_json::Value> = rows
@@ -1597,16 +1702,18 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// ★★ **The safety interlock, in one test.** A review pass needs browse
+    /// and net and nothing else — so a headless git-event trigger can run
+    /// without the authority to publish anything — and publishing needs
+    /// `urn:cap:annotate`, which is the authority nobody has by accident.
     #[test]
-    fn review_requires_browse_net_and_annotate() {
+    fn a_review_runs_unarmed_and_only_publishing_needs_annotate() {
         let root = demo_root();
         let store = Arc::new(Store::new().unwrap());
         let log = Arc::new(Log::default());
         let k = kernel_with(&root, &store, &log, TWO_FINDINGS);
 
         for missing in [
-            // No annotate: the pass writes annotations — denied at baseline.
-            Capability::scoped(["urn:cap:browse:read:demo", "urn:cap:net:localhost"]),
             // No net: the pass asks a model — denied at baseline.
             Capability::scoped(["urn:cap:browse:read:demo", CAP_ANNOTATE]),
             // No browse grant at all.
@@ -1626,6 +1733,40 @@ mod tests {
         let err = issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &wrong).unwrap_err();
         assert!(matches!(err, Error::Denied(_)), "{err:?}");
         assert_eq!(log.count(), 0, "no ask ever left");
+
+        // ★ THE TRIGGER'S GRANT: browse + net, no annotate. The pass runs,
+        // the findings land, and nothing is published.
+        let unarmed = Capability::scoped(["urn:cap:browse:read:demo", "urn:cap:net:localhost"]);
+        let pass = issue(
+            &k,
+            Verb::Source,
+            "urn:repo:demo:review:a.rs",
+            &[("as", "application/json")],
+            &unarmed,
+        )
+        .unwrap();
+        let pass: serde_json::Value = serde_json::from_str(&body(&pass)).unwrap();
+        let pending: Vec<String> = pass["minted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(log.count(), 1, "the unarmed pass really derived");
+
+        // …and that same grant cannot publish one of them.
+        let denied = issue(
+            &k,
+            Verb::Sink,
+            &pending[0],
+            &[("decision", "publish")],
+            &unarmed,
+        )
+        .unwrap_err();
+        assert!(matches!(denied, Error::Denied(_)), "{denied:?}");
+        let annotations = json(&k, "urn:repo:demo:annotations:a.rs", &[]);
+        assert_eq!(annotations.as_array().unwrap().len(), 0, "{annotations}");
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1656,8 +1797,11 @@ mod tests {
         let ttl = body(&out);
         assert!(ttl.contains("a ik:Review"), "{ttl}");
         assert!(ttl.contains("prov:used <urn:repo:demo:file:a.rs>"), "{ttl}");
-        assert!(ttl.contains("prov:generated <urn:iki:annotation:"), "{ttl}");
-        assert!(ttl.contains("ik:versionTag \"review-v2@r1\""), "{ttl}");
+        // ⚠ The pass generated FINDINGS, not annotations: the entry's
+        // `prov:generated` is the pending set a human has yet to answer.
+        assert!(ttl.contains("prov:generated <urn:iki:finding:"), "{ttl}");
+        assert!(!ttl.contains("urn:iki:annotation:"), "{ttl}");
+        assert!(ttl.contains("ik:versionTag \"review-v3@r1\""), "{ttl}");
         assert!(
             ttl.contains("ik:orphanedItems \"0\"^^xsd:nonNegativeInteger"),
             "{ttl}"
@@ -1670,19 +1814,28 @@ mod tests {
             "{ttl}"
         );
 
-        // The minted annotations' own turtle carries the standard provenance.
+        // The minted findings' own turtle carries the standard provenance —
+        // and NOT `oa:Annotation`, nor any `oa:` term whose domain would
+        // entail it.
         let ttl = body(
             &issue(
                 &k,
                 Verb::Source,
-                "urn:repo:demo:annotations:a.rs",
+                "urn:repo:demo:findings:a.rs",
                 &[("as", "text/turtle")],
                 &cap(),
             )
             .unwrap(),
         );
         assert!(ttl.contains("dcterms:creator \"r1\""), "{ttl}");
-        assert!(ttl.contains("oa:motivatedBy oa:assessing"), "{ttl}");
+        assert!(ttl.contains("a prov:Entity"), "{ttl}");
+        assert!(
+            ttl.contains("sh:resultSeverity <urn:iki:severity:"),
+            "{ttl}"
+        );
+        assert!(!ttl.contains("a oa:Annotation"), "{ttl}");
+        assert!(!ttl.contains("oa:bodyValue"), "{ttl}");
+        assert!(!ttl.contains("oa:motivatedBy"), "{ttl}");
         assert!(
             ttl.contains("prov:wasGeneratedBy <urn:ikigai:browse:review:"),
             "{ttl}"
@@ -1728,12 +1881,19 @@ mod tests {
         let config = Arc::new(ExplainConfig::new(Arc::new(Store::new().unwrap())));
         let endpoint = ReviewEndpoint { roots, config };
         let description = endpoint.describe();
-        for cap in [CAP_WILDCARD, CAP_NET, CAP_ANNOTATE] {
+        for cap in [CAP_WILDCARD, CAP_NET] {
             assert!(
                 description.requires.contains(&cap.to_string()),
                 "missing {cap}"
             );
         }
+        // ★ And NOT annotate. Declared = enforced in both directions: a pass
+        // that cannot reach the annotation family must not demand the
+        // authority to, or every trigger has to be armed to run at all.
+        assert!(
+            !description.requires.contains(&CAP_ANNOTATE.to_string()),
+            "the pass mints pending findings; publishing is the only annotate act"
+        );
         // No `repo` ArgSpec: rows fix the root; the binding is
         // grammar-injected.
         let names: Vec<&str> = description.inputs.iter().map(|i| i.name.as_str()).collect();
@@ -1775,7 +1935,7 @@ mod tests {
         assert_eq!(body(&raw), TWO_FINDINGS, "the answer verbatim, unparsed");
         assert_eq!(log.count(), 2, "a fresh ask, not the archive hit");
         // Nothing new minted by the probe.
-        let listing = json(&k, "urn:repo:demo:annotations:a.rs", &[]);
+        let listing = json(&k, "urn:repo:demo:findings:a.rs", &[]);
         assert_eq!(listing.as_array().unwrap().len(), 2);
 
         // The probe works where the normal pass FAILS — the whole point.
@@ -1791,7 +1951,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(body(&raw), "label-free musings about the file");
-        let listing = json(&k2, "urn:repo:demo:annotations:a.rs", &[]);
+        let listing = json(&k2, "urn:repo:demo:findings:a.rs", &[]);
         assert_eq!(listing.as_array().unwrap().len(), 0, "nothing minted");
 
         // An unknown debug face is a typed argument error, no ask spent.
@@ -1884,7 +2044,7 @@ mod tests {
         // The configured backend first.
         let first = json(&k, "urn:repo:demo:review:a.rs", &[]);
         assert_eq!(first["derived"], true);
-        assert_eq!(first["version_tag"], "review-v2@r1");
+        assert_eq!(first["version_tag"], "review-v3@r1");
         assert_eq!(first["minted"].as_array().unwrap().len(), 2);
         assert_eq!((log.count(), alt_log.count()), (1, 0));
 
@@ -1897,18 +2057,18 @@ mod tests {
             &[("provider", ALT_PROVIDER)],
         );
         assert_eq!(second["derived"], true);
-        assert_eq!(second["version_tag"], "review-v2@alt");
+        assert_eq!(second["version_tag"], "review-v3@alt");
         assert_eq!(second["model"], "alt");
         assert_eq!(second["minted"].as_array().unwrap().len(), 1);
         assert_eq!((log.count(), alt_log.count()), (1, 1));
         assert_ne!(first["minted"], second["minted"]);
 
         // ★ COEXISTING, not replacing: the first pass is still there, still a
-        // hit, still its own findings — and the file's one annotation axis
-        // now carries both reviewers' margins.
+        // hit, still its own findings — and the file's one QUEUE now carries
+        // both reviewers' margins, each awaiting the same human.
         let again = json(&k, "urn:repo:demo:review:a.rs", &[]);
         assert_eq!(again["derived"], false, "the first pass was overwritten");
-        assert_eq!(again["version_tag"], "review-v2@r1");
+        assert_eq!(again["version_tag"], "review-v3@r1");
         assert_eq!(again["minted"], first["minted"]);
         let alt_again = json(
             &k,
@@ -1923,17 +2083,26 @@ mod tests {
             "neither hit may re-ask"
         );
 
-        let listing = json(&k, "urn:repo:demo:annotations:a.rs", &[]);
+        let listing = json(&k, "urn:repo:demo:findings:a.rs", &[]);
         let rows = listing.as_array().unwrap();
         assert_eq!(rows.len(), 3, "two passes' findings on one axis: {rows:?}");
         let creators: Vec<&str> = rows
             .iter()
             .map(|r| r["creator"].as_str().unwrap())
             .collect();
+        // ⚠ TRIAGE order, not reading order — the queue's whole job. r1's
+        // beta is `minor`, alt gave no SEVERITY at all (so it sorts with
+        // `info`), r1's alpha is `praise`.
+        assert_eq!(creators, ["r1", "alt", "r1"], "{rows:?}");
+        let severities: Vec<&serde_json::Value> = rows.iter().map(|r| &r["severity"]).collect();
         assert_eq!(
-            creators,
-            ["r1", "r1", "alt"],
-            "reading order: alpha, beta, gamma"
+            severities,
+            [
+                &serde_json::Value::String("minor".into()),
+                &serde_json::Value::Null,
+                &serde_json::Value::String("praise".into())
+            ],
+            "an unrated finding is kept unrated, never defaulted: {rows:?}"
         );
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1993,7 +2162,7 @@ mod tests {
         );
         assert_eq!(pass["derived"], true);
         assert_eq!(
-            pass["version_tag"], "review-v2@r1",
+            pass["version_tag"], "review-v3@r1",
             "the configured tier keeps its label"
         );
         assert_eq!((log.count(), alt_log.count()), (0, 1));
@@ -2319,7 +2488,7 @@ mod tests {
         // asymmetry between what a MENU can learn (the cheap inventory) and
         // what a TAG resolves (the per-provider identity). What matters here
         // is that both causes land on the ONE tag, whichever it is.
-        assert_eq!(triggered["version_tag"], "review-v2@coder");
+        assert_eq!(triggered["version_tag"], "review-v3@coder");
         assert_eq!(log.count(), 1, "the trigger paid nothing");
         assert_eq!(
             triggered["minted"].as_array().unwrap().len(),

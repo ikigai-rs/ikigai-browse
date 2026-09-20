@@ -104,11 +104,50 @@ const DCTERMS_CREATED: &str = "http://purl.org/dc/terms/created";
 const DCTERMS_CREATOR: &str = "http://purl.org/dc/terms/creator";
 pub(crate) const PROV: &str = "http://www.w3.org/ns/prov#";
 const PROV_WAS_GENERATED_BY: &str = "http://www.w3.org/ns/prov#wasGeneratedBy";
+/// `prov:wasDerivedFrom` — a PUBLISHED annotation back to the pending finding
+/// a human promoted it from (entity to entity, which is what PROV's derivation
+/// is for). Absent on every annotation that was never a finding.
+pub(crate) const PROV_WAS_DERIVED_FROM: &str = "http://www.w3.org/ns/prov#wasDerivedFrom";
+pub(crate) const PROV_USED: &str = "http://www.w3.org/ns/prov#used";
+pub(crate) const PROV_GENERATED: &str = "http://www.w3.org/ns/prov#generated";
+
+/// The finding family's body predicate.
+///
+/// ⚠ **NOT `oa:bodyValue`, and the reason is entailment, not style.** The W3C
+/// Web Annotation vocabulary gives `oa:bodyValue` (and `oa:motivatedBy`)
+/// `rdfs:domain oa:Annotation`: writing either onto a pending finding would
+/// type it INTO the annotation family under any reasoner, which is precisely
+/// what [`Family::Finding`] exists to prevent. No code path would have shown
+/// it. `dcterms:description` is domain-free and says the same thing.
+pub(crate) const DCTERMS_DESCRIPTION: &str = "http://purl.org/dc/terms/description";
+/// `dcterms:type` — the decision node's outcome, one of
+/// [`Outcome::iri`]'s two values.
+pub(crate) const DCTERMS_TYPE: &str = "http://purl.org/dc/terms/type";
+
+/// `sh:resultSeverity` — the severity of an assessment result.
+///
+/// ★ A PUBLISHED term for exactly this concept, chosen over inventing
+/// `ik:severity` because the vocabulary lives in `ikigai-core` and a browse arc
+/// cannot add to it (the conformance walk's `VOCABULARY` check refuses an `ik:`
+/// term the published vocabulary does not define, and rightly). SHACL's own
+/// three severities are instances of `sh:Severity` and the spec allows more, so
+/// the `urn:iki:severity:*` values below sit legally beside `sh:Violation`.
+/// The `ik:severity` / `ik:Finding` vocabulary need is reported up.
+pub(crate) const SH_RESULT_SEVERITY: &str = "http://www.w3.org/ns/shacl#resultSeverity";
 
 /// The `oa:motivatedBy` value the human Sink stamps.
 const MOTIVATION_HUMAN: &str = "commenting";
-/// The `oa:motivatedBy` value the review pass stamps.
-const MOTIVATION_REVIEW: &str = "assessing";
+/// The `oa:motivatedBy` value a PUBLISHED review finding carries.
+///
+/// ★ Still `assessing` after a human publishes it, deliberately: a person
+/// vouched for the claim, they did not write it. Only [`MOTIVATION_HUMAN`]
+/// means "a human's own words".
+pub(crate) const MOTIVATION_REVIEW: &str = "assessing";
+
+/// The two decision words, one place: the Sink's `one_of`, the form buttons'
+/// values, and the match that reads them.
+pub(crate) const PUBLISH: &str = "publish";
+pub(crate) const DECLINE: &str = "decline";
 
 /// How much context the stored quote selector carries on each side of the
 /// exact quote (characters). Part of the re-anchoring contract.
@@ -118,18 +157,74 @@ fn oa(term: &str) -> NamedNode {
     NamedNode::new(format!("{OA}{term}")).expect("oa terms are valid IRIs")
 }
 
+// --- the two families -------------------------------------------------------
+
+/// Which FAMILY a stored anchored note belongs to.
+///
+/// ★ The two families share this record, this store, this anchoring and this
+/// drift pass — and **nothing else**. A machine review pass writes only
+/// [`Family::Finding`]; the only way into [`Family::Annotation`] is a human
+/// publishing a finding (`crate::finding`) or a human Sink of
+/// `urn:iki:annotation` (ledger #444: *"nothing gets published to Gonk except
+/// by the human"*).
+///
+/// ⚠ The separation is carried by BOTH discriminators every reader here keys
+/// on — the IRI prefix and `rdf:type` — so neither `list_annotations`
+/// (`a oa:Annotation`) nor `list_annotations_for_target` (the
+/// `urn:iki:annotation:` prefix) can see a finding even by accident.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Family {
+    /// `urn:iki:annotation:{id}`, `a oa:Annotation` — the published family
+    /// every existing reader and query already sees.
+    Annotation,
+    /// `urn:iki:finding:{id}`, `a prov:Entity` — a machine claim AWAITING a
+    /// human. Never typed `oa:Annotation`, never under the annotation prefix,
+    /// and never carrying an `oa:` term whose domain is `oa:Annotation`.
+    Finding,
+}
+
+impl Family {
+    pub(crate) fn prefix(self) -> &'static str {
+        match self {
+            Family::Annotation => "urn:iki:annotation:",
+            Family::Finding => "urn:iki:finding:",
+        }
+    }
+
+    /// The family an IRI belongs to, with its id — `None` for anything else.
+    /// Checked longest-prefix-free: the two prefixes share no prefix.
+    pub(crate) fn split(iri: &str) -> Option<(Family, &str)> {
+        for family in [Family::Annotation, Family::Finding] {
+            if let Some(id) = iri.strip_prefix(family.prefix()) {
+                return Some((family, id));
+            }
+        }
+        None
+    }
+}
+
 // --- IRIs -------------------------------------------------------------------
 
+pub(crate) fn record_iri(family: Family, id: &str) -> String {
+    format!("{}{id}", family.prefix())
+}
+
 pub(crate) fn annotation_iri(id: &str) -> String {
-    format!("urn:iki:annotation:{id}")
+    record_iri(Family::Annotation, id)
 }
 
-fn quote_iri(id: &str) -> String {
-    format!("urn:iki:annotation:{id}:selector:quote")
+fn quote_iri(family: Family, id: &str) -> String {
+    format!("{}:selector:quote", record_iri(family, id))
 }
 
-fn position_iri(id: &str) -> String {
-    format!("urn:iki:annotation:{id}:selector:position")
+fn position_iri(family: Family, id: &str) -> String {
+    format!("{}:selector:position", record_iri(family, id))
+}
+
+/// The human act on a pending finding — its own node, so the model's proposal
+/// on the finding is never overwritten by it.
+pub(crate) fn decision_iri(id: &str) -> String {
+    format!("{}:decision", record_iri(Family::Finding, id))
 }
 
 /// Caller-supplied slugs must embed cleanly in the URN (and must not collide
@@ -205,48 +300,139 @@ fn parse_target(target: &str, roots: &BTreeMap<String, std::path::PathBuf>) -> R
 
 // --- the annotation record --------------------------------------------------
 
-/// One annotation, as stored (and as served). `start`/`end` are character
+/// What a human decided about a pending finding.
+///
+/// ★ Its own node (`urn:iki:finding:{id}:decision`), and that is the whole
+/// point: the model's proposal lives on the FINDING and the human's final
+/// rating lives HERE, so the two coexist and "is this reviewer calibrated?"
+/// stays a query rather than an impression (ledger #444, comment 2). One
+/// field that the human overwrote would destroy the only signal that could
+/// ever answer it, unrecoverably, on the first write.
+#[derive(Clone, Debug)]
+pub(crate) struct Decision {
+    pub(crate) outcome: Outcome,
+    /// The FINAL severity — the human's re-rating, or the model's proposal
+    /// accepted unchanged. Always present: a decision states a rating.
+    pub(crate) severity: String,
+    pub(crate) at: Option<String>,
+    /// The human's reason, if they gave one (the Sink's piped `content`).
+    /// ★ A declined finding with a reason is the beginning of a feedback
+    /// signal; a discarded one is churn.
+    pub(crate) note: Option<String>,
+    /// The annotation minted on publish — `None` for a decline, which is
+    /// exactly what makes a decline a RECORD rather than a deletion.
+    pub(crate) minted: Option<String>,
+}
+
+/// The two ways a human can answer a pending finding.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Outcome {
+    Published,
+    Declined,
+}
+
+impl Outcome {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Outcome::Published => "published",
+            Outcome::Declined => "declined",
+        }
+    }
+
+    pub(crate) fn iri(self) -> String {
+        format!("urn:iki:finding:outcome:{}", self.label())
+    }
+
+    pub(crate) fn from_iri(iri: &str) -> Option<Outcome> {
+        match iri.strip_prefix("urn:iki:finding:outcome:")? {
+            "published" => Some(Outcome::Published),
+            "declined" => Some(Outcome::Declined),
+            _ => None,
+        }
+    }
+}
+
+/// One anchored note, as stored (and as served) — an annotation or a pending
+/// finding, told apart by [`Annotation::family`]. `start`/`end` are character
 /// offsets into the target's text at `hash`.
 #[derive(Clone, Debug)]
-struct Annotation {
-    id: String,
-    body: String,
-    target_iri: String,
-    repo: String,
-    rel: String,
-    hash: String,
-    prefix: String,
-    exact: String,
-    suffix: String,
-    start: u64,
-    end: u64,
-    created: Option<String>,
-    reanchored: bool,
-    orphaned: bool,
+pub(crate) struct Annotation {
+    /// Which family this record is in. ⚠ Every IRI it owns derives from this;
+    /// a record loaded from one family and stored into the other would MOVE
+    /// it, which is what promotion does deliberately and nothing else may.
+    pub(crate) family: Family,
+    pub(crate) id: String,
+    pub(crate) body: String,
+    pub(crate) target_iri: String,
+    pub(crate) repo: String,
+    pub(crate) rel: String,
+    pub(crate) hash: String,
+    pub(crate) prefix: String,
+    pub(crate) exact: String,
+    pub(crate) suffix: String,
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+    pub(crate) created: Option<String>,
+    pub(crate) reanchored: bool,
+    pub(crate) orphaned: bool,
     /// `dcterms:creator` — the model identity on machine-minted annotations.
     /// `Some` IS the machine/human discriminator: human annotations never
     /// carry a creator (v1 is single-user; the passkey→workspace arc will add
     /// human authorship on a different axis).
-    creator: Option<String>,
+    pub(crate) creator: Option<String>,
     /// `oa:motivatedBy` (the short term: `commenting` / `assessing`). Absent
     /// on pre-S4 stores — read compatibility, never a discriminator.
-    motivation: Option<String>,
+    pub(crate) motivation: Option<String>,
     /// `prov:wasGeneratedBy` — the review pass entry that minted this
     /// annotation (machine annotations only).
-    generated_by: Option<String>,
+    pub(crate) generated_by: Option<String>,
+    /// `sh:resultSeverity`, as a bare severity name (`critical` … `praise`).
+    ///
+    /// ★ It means a DIFFERENT thing per family, and that is the design: on a
+    /// [`Family::Finding`] it is the MODEL'S PROPOSAL and is never rewritten;
+    /// on a [`Family::Annotation`] it is the HUMAN'S FINAL rating, copied in
+    /// at promotion. Both survive, one hop apart along
+    /// `prov:wasDerivedFrom`.
+    pub(crate) severity: Option<String>,
+    /// `prov:wasDerivedFrom` — the pending finding a published annotation was
+    /// promoted from. Annotation family only.
+    pub(crate) derived_from: Option<String>,
+    /// The human act. Finding family only; `None` IS the pending state.
+    pub(crate) decision: Option<Decision>,
 }
 
 /// What an annotation's recorded target IS — derived from the stored
 /// `ik:annotates` IRI, never a separate triple: a file's content, or a pull
 /// request's diff.
-enum TargetRef<'a> {
+pub(crate) enum TargetRef<'a> {
     File(&'a str),
     Pr(u64),
 }
 
 impl Annotation {
-    fn iri(&self) -> String {
-        annotation_iri(&self.id)
+    pub(crate) fn iri(&self) -> String {
+        record_iri(self.family, &self.id)
+    }
+
+    /// Where a finding is in the human pipeline: `pending` until someone
+    /// answers it, then the decision's outcome. `None` for an annotation —
+    /// an annotation IS the published state, it does not have one.
+    pub(crate) fn state(&self) -> Option<&'static str> {
+        match self.family {
+            Family::Annotation => None,
+            Family::Finding => Some(match &self.decision {
+                None => "pending",
+                Some(d) => d.outcome.label(),
+            }),
+        }
+    }
+
+    /// The rating that governs: the human's, once there is one.
+    pub(crate) fn effective_severity(&self) -> Option<&str> {
+        match &self.decision {
+            Some(d) => Some(d.severity.as_str()),
+            None => self.severity.as_deref(),
+        }
     }
 
     fn machine(&self) -> bool {
@@ -256,7 +442,7 @@ impl Annotation {
     /// Parse the recorded target IRI. Anything that is not this repo's
     /// `pr:{n}` page reads as a file target at the recorded path — including
     /// legacy records, whose `ik:annotates` always named a file.
-    fn target_ref(&self) -> TargetRef<'_> {
+    pub(crate) fn target_ref(&self) -> TargetRef<'_> {
         if let Some(number) = self
             .target_iri
             .strip_prefix("urn:repo:")
@@ -292,18 +478,29 @@ fn store_err(e: impl std::fmt::Display) -> Error {
 
 /// Insert the annotation's quads (the annotation node plus both selector
 /// nodes). Flags are stored only when true — absence means false.
-fn store_annotation(archive: &Archive, ann: &Annotation) -> Result<()> {
+pub(crate) fn store_annotation(archive: &Archive, ann: &Annotation) -> Result<()> {
     use oxigraph::model::vocab::{rdf, xsd};
     let subject = NamedNode::new(ann.iri()).map_err(store_err)?;
-    let quote = NamedNode::new(quote_iri(&ann.id)).map_err(store_err)?;
-    let position = NamedNode::new(position_iri(&ann.id)).map_err(store_err)?;
+    let quote = NamedNode::new(quote_iri(ann.family, &ann.id)).map_err(store_err)?;
+    let position = NamedNode::new(position_iri(ann.family, &ann.id)).map_err(store_err)?;
     let target = NamedNode::new(&ann.target_iri).map_err(store_err)?;
     let g = archive.graph().clone();
+    // ⚠ The class and the body predicate are the whole family boundary. A
+    // finding is `prov:Entity` + `dcterms:description`; `oa:Annotation` +
+    // `oa:bodyValue` would put an unapproved machine claim where every
+    // existing reader and query already looks.
+    let (class, body_predicate) = match ann.family {
+        Family::Annotation => (oa("Annotation"), oa("bodyValue")),
+        Family::Finding => (
+            NamedNode::new(format!("{PROV}Entity")).map_err(store_err)?,
+            NamedNode::new(DCTERMS_DESCRIPTION).map_err(store_err)?,
+        ),
+    };
     let mut quads: Vec<Quad> = vec![
-        Quad::new(subject.clone(), rdf::TYPE, oa("Annotation"), g.clone()),
+        Quad::new(subject.clone(), rdf::TYPE, class, g.clone()),
         Quad::new(
             subject.clone(),
-            oa("bodyValue"),
+            body_predicate,
             Literal::new_simple_literal(&ann.body),
             g.clone(),
         ),
@@ -403,7 +600,13 @@ fn store_annotation(archive: &Archive, ann: &Annotation) -> Result<()> {
             g.clone(),
         ));
     }
-    if let Some(motivation) = &ann.motivation {
+    // ⚠ ANNOTATION FAMILY ONLY. `oa:motivatedBy` carries `rdfs:domain
+    // oa:Annotation` in the W3C vocabulary, so stamping it on a finding would
+    // type the finding into the annotation family under entailment — no code
+    // path here would ever have shown it. A finding is machine by
+    // construction (it carries the model as `dcterms:creator`) and needs no
+    // motivation triple to say so.
+    if let (Family::Annotation, Some(motivation)) = (ann.family, &ann.motivation) {
         quads.push(Quad::new(
             subject.clone(),
             oa("motivatedBy"),
@@ -421,11 +624,80 @@ fn store_annotation(archive: &Archive, ann: &Annotation) -> Result<()> {
     }
     if let Some(pass) = &ann.generated_by {
         quads.push(Quad::new(
-            subject,
+            subject.clone(),
             NamedNode::new(PROV_WAS_GENERATED_BY).map_err(store_err)?,
             NamedNode::new(pass).map_err(store_err)?,
-            g,
+            g.clone(),
         ));
+    }
+    if let Some(severity) = &ann.severity {
+        quads.push(Quad::new(
+            subject.clone(),
+            NamedNode::new(SH_RESULT_SEVERITY).map_err(store_err)?,
+            NamedNode::new(severity_iri(severity)).map_err(store_err)?,
+            g.clone(),
+        ));
+    }
+    if let Some(from) = &ann.derived_from {
+        quads.push(Quad::new(
+            subject.clone(),
+            NamedNode::new(PROV_WAS_DERIVED_FROM).map_err(store_err)?,
+            NamedNode::new(from).map_err(store_err)?,
+            g.clone(),
+        ));
+    }
+    // The human act, on its own node — never folded into the finding, whose
+    // triples are the MODEL's and stay the model's.
+    if let (Family::Finding, Some(decision)) = (ann.family, &ann.decision) {
+        let node = NamedNode::new(decision_iri(&ann.id)).map_err(store_err)?;
+        quads.push(Quad::new(
+            node.clone(),
+            rdf::TYPE,
+            NamedNode::new(format!("{PROV}Activity")).map_err(store_err)?,
+            g.clone(),
+        ));
+        quads.push(Quad::new(
+            node.clone(),
+            NamedNode::new(PROV_USED).map_err(store_err)?,
+            subject,
+            g.clone(),
+        ));
+        quads.push(Quad::new(
+            node.clone(),
+            NamedNode::new(DCTERMS_TYPE).map_err(store_err)?,
+            NamedNode::new(decision.outcome.iri()).map_err(store_err)?,
+            g.clone(),
+        ));
+        quads.push(Quad::new(
+            node.clone(),
+            NamedNode::new(SH_RESULT_SEVERITY).map_err(store_err)?,
+            NamedNode::new(severity_iri(&decision.severity)).map_err(store_err)?,
+            g.clone(),
+        ));
+        if let Some(at) = &decision.at {
+            quads.push(Quad::new(
+                node.clone(),
+                NamedNode::new(DCTERMS_CREATED).map_err(store_err)?,
+                Literal::new_typed_literal(at, xsd::DATE_TIME),
+                g.clone(),
+            ));
+        }
+        if let Some(note) = &decision.note {
+            quads.push(Quad::new(
+                node.clone(),
+                NamedNode::new(DCTERMS_DESCRIPTION).map_err(store_err)?,
+                Literal::new_simple_literal(note),
+                g.clone(),
+            ));
+        }
+        if let Some(minted) = &decision.minted {
+            quads.push(Quad::new(
+                node,
+                NamedNode::new(PROV_GENERATED).map_err(store_err)?,
+                NamedNode::new(minted).map_err(store_err)?,
+                g,
+            ));
+        }
     }
     for quad in &quads {
         archive.insert(quad).map_err(store_err)?;
@@ -433,9 +705,25 @@ fn store_annotation(archive: &Archive, ann: &Annotation) -> Result<()> {
     Ok(())
 }
 
-/// Remove every quad under the annotation's three subjects.
-fn remove_annotation(archive: &Archive, id: &str) -> Result<()> {
-    for iri in [annotation_iri(id), quote_iri(id), position_iri(id)] {
+/// The IRI of a severity value. ⚠ An OBJECT, not a vocabulary term: the
+/// conformance walk checks predicates and `rdf:type` objects, and a severity
+/// is data. See [`SH_RESULT_SEVERITY`] for why the predicate is SHACL's.
+pub(crate) fn severity_iri(name: &str) -> String {
+    format!("urn:iki:severity:{name}")
+}
+
+/// Remove every quad under the record's subjects — the record, both
+/// selectors, and (finding family) its decision node.
+pub(crate) fn remove_annotation(archive: &Archive, family: Family, id: &str) -> Result<()> {
+    let mut subjects = vec![
+        record_iri(family, id),
+        quote_iri(family, id),
+        position_iri(family, id),
+    ];
+    if family == Family::Finding {
+        subjects.push(decision_iri(id));
+    }
+    for iri in subjects {
         let subject = NamedNode::new(&iri).map_err(store_err)?;
         let quads: Vec<Quad> = archive
             .quads_for_pattern(Some(subject.as_ref().into()), None, None)
@@ -450,15 +738,26 @@ fn remove_annotation(archive: &Archive, id: &str) -> Result<()> {
 
 /// Replace the annotation's stored state (the update path and the
 /// re-anchor/orphan persistence path).
-fn rewrite_annotation(archive: &Archive, ann: &Annotation) -> Result<()> {
-    remove_annotation(archive, &ann.id)?;
+pub(crate) fn rewrite_annotation(archive: &Archive, ann: &Annotation) -> Result<()> {
+    remove_annotation(archive, ann.family, &ann.id)?;
     store_annotation(archive, ann)
 }
 
 /// Load one annotation by id — `None` when the store holds no `oa:bodyValue`
 /// for it.
-fn load_annotation(archive: &Archive, id: &str) -> Result<Option<Annotation>> {
+pub(crate) fn load_annotation(archive: &Archive, id: &str) -> Result<Option<Annotation>> {
+    load_record(archive, Family::Annotation, id)
+}
+
+/// Load one record of either family by id — `None` when the store holds no
+/// body for it (`oa:bodyValue` / `dcterms:description`, per family).
+pub(crate) fn load_record(
+    archive: &Archive,
+    family: Family,
+    id: &str,
+) -> Result<Option<Annotation>> {
     let mut ann = Annotation {
+        family,
         id: id.to_string(),
         body: String::new(),
         target_iri: String::new(),
@@ -476,22 +775,39 @@ fn load_annotation(archive: &Archive, id: &str) -> Result<Option<Annotation>> {
         creator: None,
         motivation: None,
         generated_by: None,
+        severity: None,
+        derived_from: None,
+        decision: None,
     };
     let literal = |term: &Term| match term {
         Term::Literal(l) => l.value().to_string(),
         other => other.to_string(),
     };
     let mut found = false;
-    let subject = match NamedNode::new(annotation_iri(id)) {
+    let subject = match NamedNode::new(record_iri(family, id)) {
         Ok(node) => node,
         Err(_) => return Ok(None),
     };
     for quad in archive.quads_for_pattern(Some(subject.as_ref().into()), None, None) {
         let quad = quad.map_err(store_err)?;
         let predicate = quad.predicate.as_str();
-        if let Some(term) = predicate.strip_prefix(OA) {
+        if predicate == DCTERMS_DESCRIPTION && family == Family::Finding {
+            ann.body = literal(&quad.object);
+            found = true;
+        } else if predicate == SH_RESULT_SEVERITY {
+            if let Term::NamedNode(node) = &quad.object {
+                ann.severity = node
+                    .as_str()
+                    .strip_prefix("urn:iki:severity:")
+                    .map(str::to_string);
+            }
+        } else if predicate == PROV_WAS_DERIVED_FROM {
+            if let Term::NamedNode(node) = &quad.object {
+                ann.derived_from = Some(node.as_str().to_string());
+            }
+        } else if let Some(term) = predicate.strip_prefix(OA) {
             match term {
-                "bodyValue" => {
+                "bodyValue" if family == Family::Annotation => {
                     ann.body = literal(&quad.object);
                     found = true;
                 }
@@ -540,7 +856,13 @@ fn load_annotation(archive: &Archive, id: &str) -> Result<Option<Annotation>> {
     if !found {
         return Ok(None);
     }
-    for (iri, is_quote) in [(quote_iri(id), true), (position_iri(id), false)] {
+    if family == Family::Finding {
+        ann.decision = load_decision(archive, id)?;
+    }
+    for (iri, is_quote) in [
+        (quote_iri(family, id), true),
+        (position_iri(family, id), false),
+    ] {
         let subject = NamedNode::new(&iri).map_err(store_err)?;
         for quad in archive.quads_for_pattern(Some(subject.as_ref().into()), None, None) {
             let quad = quad.map_err(store_err)?;
@@ -555,6 +877,61 @@ fn load_annotation(archive: &Archive, id: &str) -> Result<Option<Annotation>> {
         }
     }
     Ok(Some(ann))
+}
+
+/// The human act on a finding, if there has been one. `None` IS "pending" —
+/// the absence of a decision node, not a flag on the finding.
+fn load_decision(archive: &Archive, id: &str) -> Result<Option<Decision>> {
+    let subject = match NamedNode::new(decision_iri(id)) {
+        Ok(node) => node,
+        Err(_) => return Ok(None),
+    };
+    let mut outcome = None;
+    let mut severity = None;
+    let mut at = None;
+    let mut note = None;
+    let mut minted = None;
+    for quad in archive.quads_for_pattern(Some(subject.as_ref().into()), None, None) {
+        let quad = quad.map_err(store_err)?;
+        let value = match &quad.object {
+            Term::Literal(l) => l.value().to_string(),
+            other => other.to_string(),
+        };
+        match quad.predicate.as_str() {
+            DCTERMS_TYPE => {
+                if let Term::NamedNode(node) = &quad.object {
+                    outcome = Outcome::from_iri(node.as_str());
+                }
+            }
+            SH_RESULT_SEVERITY => {
+                if let Term::NamedNode(node) = &quad.object {
+                    severity = node
+                        .as_str()
+                        .strip_prefix("urn:iki:severity:")
+                        .map(str::to_string);
+                }
+            }
+            DCTERMS_CREATED => at = Some(value),
+            DCTERMS_DESCRIPTION => note = Some(value),
+            PROV_GENERATED => {
+                if let Term::NamedNode(node) = &quad.object {
+                    minted = Some(node.as_str().to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    // The outcome is the discriminator: a node without one is not a decision.
+    let Some(outcome) = outcome else {
+        return Ok(None);
+    };
+    Ok(Some(Decision {
+        outcome,
+        severity: severity.unwrap_or_else(|| "info".to_string()),
+        at,
+        note,
+        minted,
+    }))
 }
 
 /// Every annotation in the store for one repo — optionally narrowed to one
@@ -586,16 +963,88 @@ fn list_annotations(archive: &Archive, repo: &str, rel: Option<&str>) -> Result<
     Ok(out)
 }
 
+/// Every PENDING-FINDING record for one repo, optionally narrowed to a path.
+///
+/// Filtered on BOTH discriminators — `rdf:type prov:Entity` and the
+/// `urn:iki:finding:` prefix — for the same reason [`list_annotations`] filters
+/// on type: one shared store holds explanation entries, review passes,
+/// annotations and findings, and a listing that keyed on only one of them
+/// would eventually pick up something else's node.
+///
+/// Order is TRIAGE order, not reading order: severity rank first (critical
+/// before praise), then path and position. ★ Severity stopped being a gate
+/// when nothing auto-publishes; what it is now is "what to look at first", and
+/// a queue that did not sort by it would not be offering that.
+pub(crate) fn list_findings(
+    archive: &Archive,
+    repo: &str,
+    rel: Option<&str>,
+) -> Result<Vec<Annotation>> {
+    use oxigraph::model::vocab::rdf;
+    let entity = NamedNode::new(format!("{PROV}Entity")).map_err(store_err)?;
+    let mut out = Vec::new();
+    for quad in archive.quads_for_pattern(None, Some(rdf::TYPE), Some(entity.as_ref().into())) {
+        let quad = quad.map_err(store_err)?;
+        let subject = quad.subject.to_string();
+        let iri = subject.trim_start_matches('<').trim_end_matches('>');
+        let Some(id) = iri.strip_prefix(Family::Finding.prefix()) else {
+            continue;
+        };
+        let Some(finding) = load_record(archive, Family::Finding, id)? else {
+            continue;
+        };
+        if finding.repo == repo && rel.is_none_or(|rel| finding.rel == rel) {
+            out.push(finding);
+        }
+    }
+    sort_findings(&mut out);
+    Ok(out)
+}
+
+/// Triage order for a slice of findings (and the same comparison the row
+/// listings re-apply after the drift pass has moved positions).
+pub(crate) fn sort_findings(findings: &mut [Annotation]) {
+    findings.sort_by(|a, b| {
+        (
+            severity_rank(a.effective_severity()),
+            &a.rel,
+            a.start,
+            &a.id,
+        )
+            .cmp(&(
+                severity_rank(b.effective_severity()),
+                &b.rel,
+                b.start,
+                &b.id,
+            ))
+    });
+}
+
+/// Where a severity sorts. An unrated finding sorts with `info` rather than
+/// first or last: the model declining to rate is not evidence either way, and
+/// burying it would hide exactly the findings whose format the model got wrong.
+pub(crate) fn severity_rank(severity: Option<&str>) -> usize {
+    crate::finding::SEVERITIES
+        .iter()
+        .position(|s| Some(*s) == severity)
+        .unwrap_or_else(|| {
+            crate::finding::SEVERITIES
+                .iter()
+                .position(|s| *s == "info")
+                .expect("`info` is a declared severity")
+        })
+}
+
 // --- anchoring --------------------------------------------------------------
 
 /// Where a quote sits in a text: byte and character coordinates plus the
 /// 1-based line its first character is on (the `#L{n}` anchor).
-struct Anchor {
+pub(crate) struct Anchor {
     byte_start: usize,
     byte_end: usize,
-    char_start: u64,
-    char_end: u64,
-    line: u64,
+    pub(crate) char_start: u64,
+    pub(crate) char_end: u64,
+    pub(crate) line: u64,
 }
 
 /// Find `exact` in `content`, deterministically: every occurrence is scored by
@@ -642,9 +1091,9 @@ fn strip_marker(line: &str) -> &str {
 /// only landed after marker-stripping — the ORIGINAL diff line to store as
 /// the exact quote (drift must keep comparing real diff content, never the
 /// stripped fiction the match was found through).
-struct DiffAnchor {
-    anchor: Anchor,
-    stored_exact: Option<String>,
+pub(crate) struct DiffAnchor {
+    pub(crate) anchor: Anchor,
+    pub(crate) stored_exact: Option<String>,
 }
 
 /// Anchoring against a unified diff — the PR targets' surface. Models (and
@@ -736,7 +1185,7 @@ pub(crate) enum Surface {
 
 /// Anchor on the right surface, normalizing both disciplines to a
 /// [`DiffAnchor`] (file hits never carry a stored-exact override).
-fn find_anchor_on(
+pub(crate) fn find_anchor_on(
     surface: Surface,
     content: &str,
     exact: &str,
@@ -755,7 +1204,7 @@ fn find_anchor_on(
 /// The stored context around an anchored quote: up to [`CONTEXT_CHARS`]
 /// characters each side. Always derived from the anchored occurrence (never
 /// the caller's raw arguments) so re-anchoring matches real neighbors.
-fn context_around(content: &str, anchor: &Anchor) -> (String, String) {
+pub(crate) fn context_around(content: &str, anchor: &Anchor) -> (String, String) {
     let before = &content[..anchor.byte_start];
     let prefix_start = before
         .char_indices()
@@ -773,7 +1222,7 @@ fn context_around(content: &str, anchor: &Anchor) -> (String, String) {
 /// The 1-based line a character offset falls on — clamped to the last line
 /// when the offset outruns the text (an orphan's recorded position rendered
 /// against shorter current content).
-fn line_of(content: &str, char_offset: u64) -> u64 {
+pub(crate) fn line_of(content: &str, char_offset: u64) -> u64 {
     let mut line = 1;
     for (i, ch) in content.chars().enumerate() {
         if i as u64 >= char_offset {
@@ -787,7 +1236,7 @@ fn line_of(content: &str, char_offset: u64) -> u64 {
 }
 
 /// The target's current text, when it is reachable and textual.
-enum CurrentContent {
+pub(crate) enum CurrentContent {
     /// UTF-8 text plus its `sha256:{hex}` content hash.
     Text(String, String),
     /// The target is gone or binary — nothing to anchor against.
@@ -810,7 +1259,7 @@ pub(crate) fn content_hash(bytes: &[u8]) -> String {
 /// Returns the line its anchor renders at (`None` when no content is in
 /// hand). Persists to the store ONLY when something changed — repeat reads of
 /// an unchanged (or already-orphaned) annotation touch nothing.
-fn refresh(
+pub(crate) fn refresh(
     archive: &Archive,
     ann: &mut Annotation,
     current: &CurrentContent,
@@ -904,6 +1353,38 @@ async fn reconcile(
     // Re-anchoring may have moved positions — restore reading order.
     rows.sort_by(|(a, _), (b, _)| (&a.rel, a.start, &a.id).cmp(&(&b.rel, b.start, &b.id)));
     Ok(rows)
+}
+
+/// The drift pass over a set of findings — the queue listing's middle, and
+/// the same `reconcile` the annotation listing runs: one content fetch per
+/// distinct target, then re-anchor or orphan each. ★ Findings do not get a
+/// drift story of their own; they get THE drift story.
+pub(crate) async fn reconcile_findings(
+    inv: &Invocation<'_>,
+    archive: &Archive,
+    roots: &BTreeMap<String, std::path::PathBuf>,
+    repo: &str,
+    findings: Vec<Annotation>,
+) -> Result<Vec<(Annotation, Option<u64>)>> {
+    reconcile(inv, archive, roots, repo, findings).await
+}
+
+/// Restore triage order after the drift pass has moved positions.
+pub(crate) fn sort_finding_rows(rows: &mut [(Annotation, Option<u64>)]) {
+    rows.sort_by(|(a, _), (b, _)| {
+        (
+            severity_rank(a.effective_severity()),
+            &a.rel,
+            a.start,
+            &a.id,
+        )
+            .cmp(&(
+                severity_rank(b.effective_severity()),
+                &b.rel,
+                b.start,
+                &b.id,
+            ))
+    });
 }
 
 /// The drift pass against content already in hand (the file face's path — no
@@ -1098,7 +1579,7 @@ async fn current_content(inv: &Invocation<'_>, repo: &str, rel: &str) -> Result<
 /// failure there (facades unmounted, gh error) is `Unknown`, never an error
 /// and never an orphaning: one broken PR fetch must not kill (or rewrite) a
 /// listing.
-async fn current_content_for(
+pub(crate) async fn current_content_for(
     inv: &Invocation<'_>,
     roots: &BTreeMap<String, std::path::PathBuf>,
     repo: &str,
@@ -1328,6 +1809,7 @@ impl AnnotationEndpoint {
             _ => inv.now().map(|t| iso8601(t.as_millis())),
         };
         let ann = Annotation {
+            family: Family::Annotation,
             id: id.clone(),
             body,
             target_iri,
@@ -1349,6 +1831,12 @@ impl AnnotationEndpoint {
             creator: None,
             motivation: Some(MOTIVATION_HUMAN.to_string()),
             generated_by: None,
+            // A human's own note carries no severity: severity is the review
+            // pipeline's triage axis, and inventing one here would put a
+            // rating on a claim nobody rated.
+            severity: None,
+            derived_from: None,
+            decision: None,
         };
         rewrite_annotation(&self.archive, &ann)?;
         match inv.inline_str("as").unwrap_or("text/plain") {
@@ -1366,7 +1854,7 @@ impl AnnotationEndpoint {
     fn delete(&self, inv: &Invocation<'_>) -> Result<Representation> {
         let id = Self::id_binding(inv)?;
         let ann = self.load_required(&id)?;
-        remove_annotation(&self.archive, &id)?;
+        remove_annotation(&self.archive, Family::Annotation, &id)?;
         Ok(repr_utf8("text/plain", format!("deleted {}", ann.iri())))
     }
 }
@@ -1587,7 +2075,7 @@ fn annotations_description() -> Description {
 
 // --- faces ------------------------------------------------------------------
 
-fn annotation_json(ann: &Annotation, line: Option<u64>) -> serde_json::Value {
+pub(crate) fn annotation_json(ann: &Annotation, line: Option<u64>) -> serde_json::Value {
     serde_json::json!({
         "id": ann.id,
         "iri": ann.iri(),
@@ -1610,23 +2098,42 @@ fn annotation_json(ann: &Annotation, line: Option<u64>) -> serde_json::Value {
         "creator": ann.creator,
         "motivation": ann.motivation,
         "generated_by": ann.generated_by,
+        // ★ Both ratings, always, on every row: `severity` is the MODEL'S
+        // PROPOSAL on a finding (and the human's final on a published
+        // annotation), `decision.severity` is what the human settled on.
+        // A consumer that wants one number takes `effective_severity`.
+        "severity": ann.severity,
+        "effective_severity": ann.effective_severity(),
+        "state": ann.state(),
+        "derived_from": ann.derived_from,
+        "decision": ann.decision.as_ref().map(|d| serde_json::json!({
+            "outcome": d.outcome.label(),
+            "severity": d.severity,
+            "decided_at": d.at,
+            "note": d.note,
+            "minted": d.minted,
+        })),
     })
 }
 
 /// One annotation's graph as Turtle (the same skolemized shape the store
 /// holds).
 fn annotation_turtle(ann: &Annotation) -> String {
+    let (class, body_predicate) = match ann.family {
+        Family::Annotation => ("oa:Annotation", "oa:bodyValue"),
+        Family::Finding => ("prov:Entity", "dcterms:description"),
+    };
     let mut props = vec![
-        "a oa:Annotation".to_string(),
-        format!("oa:bodyValue {}", ttl_str(&ann.body)),
+        format!("a {class}"),
+        format!("{body_predicate} {}", ttl_str(&ann.body)),
         format!("ik:annotates <{}>", ann.target_iri),
         format!("ik:repo {}", ttl_str(&ann.repo)),
         format!("ik:path {}", ttl_str(&ann.rel)),
         format!("ik:contentHash {}", ttl_str(&ann.hash)),
         format!(
             "oa:hasSelector <{}>, <{}>",
-            quote_iri(&ann.id),
-            position_iri(&ann.id)
+            quote_iri(ann.family, &ann.id),
+            position_iri(ann.family, &ann.id)
         ),
     ];
     if let Some(at) = &ann.created {
@@ -1638,7 +2145,9 @@ fn annotation_turtle(ann: &Annotation) -> String {
     if ann.orphaned {
         props.push("ik:orphaned true".to_string());
     }
-    if let Some(motivation) = &ann.motivation {
+    // Annotation family only — `oa:motivatedBy`'s domain would type a
+    // finding into the annotation family (see `store_annotation`).
+    if let (Family::Annotation, Some(motivation)) = (ann.family, &ann.motivation) {
         props.push(format!("oa:motivatedBy oa:{motivation}"));
     }
     if let Some(creator) = &ann.creator {
@@ -1647,7 +2156,35 @@ fn annotation_turtle(ann: &Annotation) -> String {
     if let Some(pass) = &ann.generated_by {
         props.push(format!("prov:wasGeneratedBy <{pass}>"));
     }
+    if let Some(severity) = &ann.severity {
+        props.push(format!("sh:resultSeverity <{}>", severity_iri(severity)));
+    }
+    if let Some(from) = &ann.derived_from {
+        props.push(format!("prov:wasDerivedFrom <{from}>"));
+    }
     let mut out = format!("<{}> {} .\n", ann.iri(), props.join(" ;\n    "));
+    if let (Family::Finding, Some(decision)) = (ann.family, &ann.decision) {
+        let mut act = vec![
+            "a prov:Activity".to_string(),
+            format!("prov:used <{}>", ann.iri()),
+            format!("dcterms:type <{}>", decision.outcome.iri()),
+            format!("sh:resultSeverity <{}>", severity_iri(&decision.severity)),
+        ];
+        if let Some(at) = &decision.at {
+            act.push(format!("dcterms:created \"{at}\"^^xsd:dateTime"));
+        }
+        if let Some(note) = &decision.note {
+            act.push(format!("dcterms:description {}", ttl_str(note)));
+        }
+        if let Some(minted) = &decision.minted {
+            act.push(format!("prov:generated <{minted}>"));
+        }
+        out.push_str(&format!(
+            "\n<{}> {} .\n",
+            decision_iri(&ann.id),
+            act.join(" ;\n    ")
+        ));
+    }
 
     let mut quote = vec![
         "a oa:TextQuoteSelector".to_string(),
@@ -1661,23 +2198,24 @@ fn annotation_turtle(ann: &Annotation) -> String {
     }
     out.push_str(&format!(
         "\n<{}> {} .\n",
-        quote_iri(&ann.id),
+        quote_iri(ann.family, &ann.id),
         quote.join(" ;\n    ")
     ));
     out.push_str(&format!(
         "\n<{}> a oa:TextPositionSelector ;\n    oa:start \"{}\"^^xsd:nonNegativeInteger ;\n    \
          oa:end \"{}\"^^xsd:nonNegativeInteger .\n",
-        position_iri(&ann.id),
+        position_iri(ann.family, &ann.id),
         ann.start,
         ann.end
     ));
     out
 }
 
-fn annotation_turtle_document(anns: &[Annotation]) -> String {
+pub(crate) fn annotation_turtle_document(anns: &[Annotation]) -> String {
     let mut out = format!(
         "@prefix oa: <{OA}> .\n@prefix ik: <{IK}> .\n@prefix dcterms: <http://purl.org/dc/terms/> \
-         .\n@prefix prov: <{PROV}> .\n@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n"
+         .\n@prefix prov: <{PROV}> .\n@prefix sh: <http://www.w3.org/ns/shacl#> .\n@prefix xsd: \
+         <http://www.w3.org/2001/XMLSchema#> .\n"
     );
     for ann in anns {
         out.push('\n');
@@ -1690,7 +2228,7 @@ fn annotation_turtle_document(anns: &[Annotation]) -> String {
 /// any drift flags. Orphans keep their (approximate) anchor but are visually
 /// flagged. `show_path` labels the card with its file (subtree folds span
 /// many files).
-fn annotation_card_html(ann: &Annotation, line: Option<u64>, show_path: bool) -> String {
+pub(crate) fn annotation_card_html(ann: &Annotation, line: Option<u64>, show_path: bool) -> String {
     let orphan_class = if ann.orphaned {
         " browse-annotation-orphaned"
     } else {
@@ -1734,11 +2272,27 @@ fn annotation_card_html(ann: &Annotation, line: Option<u64>, show_path: bool) ->
     } else if ann.reanchored {
         flags.push_str("<span class=\"browse-annotation-flag\">re-anchored</span>");
     }
+    // The finding family's extra furniture: the model's proposed severity, the
+    // pipeline state, and — while it is pending — the human's decision form.
+    // ⚠ A finding card NEVER renders as a plain annotation card: a reader who
+    // cannot tell a published note from a machine claim awaiting approval is
+    // looking at the failure this whole family exists to prevent.
+    let (state_class, severity_html, decision_html) = match ann.family {
+        Family::Annotation => (String::new(), String::new(), String::new()),
+        Family::Finding => (
+            format!(
+                " browse-finding browse-finding-{}",
+                ann.state().unwrap_or("pending")
+            ),
+            crate::finding::severity_badge_html(ann.severity.as_deref(), ann.decision.as_ref()),
+            crate::finding::decision_html(&ann.id, ann.severity.as_deref(), ann.decision.as_ref()),
+        ),
+    };
     format!(
-        "<div class=\"browse-annotation{orphan_class}{machine_class}\" \
-         id=\"annotation-{id}\">{path}{anchor}{model}\
+        "<div class=\"browse-annotation{orphan_class}{machine_class}{state_class}\" \
+         id=\"annotation-{id}\">{path}{anchor}{model}{severity_html}\
          <blockquote class=\"browse-annotation-quote\">{exact}</blockquote>\
-         <p class=\"browse-annotation-body\">{body}</p>{flags}</div>",
+         <p class=\"browse-annotation-body\">{body}</p>{flags}{decision_html}</div>",
         id = esc(&ann.id),
         exact = esc(&ann.exact),
         body = esc(&ann.body),
@@ -1831,23 +2385,46 @@ pub(crate) fn file_overlay(
     Ok((marked, panel))
 }
 
-// --- the review layer's mint (S4) -------------------------------------------
+// --- the review layer's mint (S4): a PENDING FINDING, never an annotation ---
 
-/// Mint one MACHINE annotation — the review pass's finding, stored through the
-/// same machinery as a human note and distinguished only by provenance:
-/// `dcterms:creator` (the model identity), `oa:motivatedBy oa:assessing`, and
-/// `prov:wasGeneratedBy` (the pass entry). Anchors `exact` in `text` (already
-/// in hand — the pass sourced it) with no context hints: the model was told to
-/// pick distinctive quotes, and the deterministic first-occurrence rule covers
-/// the rest. `surface` selects the anchoring discipline — [`Surface::Diff`]
+/// Mint one **pending finding** — a machine review claim in
+/// [`Family::Finding`], awaiting a human.
+///
+/// ★ This used to mint an `oa:Annotation` directly, and that was the terminal
+/// step of every review pass. It is not any more (ledger #444): *"nothing gets
+/// published to Gonk except by the human"*, so a pass produces findings and
+/// **promotion on publish is the only path into the annotation family**. Both
+/// causes of a pass — the Review button and a git-event trigger — land here,
+/// which is what makes the "a clicked review and a triggered one are the same
+/// thing" invariant hold by CONSTRUCTION rather than by care: publication is a
+/// third act and it is always human.
+///
+/// The provenance is the same shape a machine annotation carried:
+/// `dcterms:creator` (the model), `prov:wasGeneratedBy` (the pass entry), plus
+/// `sh:resultSeverity` — the MODEL'S PROPOSAL, which a human may later
+/// override without ever overwriting. (No `oa:motivatedBy`: see
+/// [`store_annotation`] — its domain would type the finding into the
+/// annotation family.)
+///
+/// ## The id is derived from the POSITION, not minted fresh
+///
+/// `sha256(pass ‖ char_start ‖ exact)`, truncated — so a re-derivation of the
+/// same pass over the same content re-mints the SAME finding IRI and an
+/// existing decision survives it. That matters because the review archive is a
+/// cache, not a ledger: compaction (ledger #437) or a cleared store would
+/// otherwise turn every re-run into a fresh queue of findings a human has
+/// already answered. A uuid would have made re-runs cost a second triage pass
+/// each time.
+///
+/// Anchors `exact` in `text` (already in hand — the pass sourced it) with no
+/// context hints. `surface` selects the anchoring discipline — [`Surface::Diff`]
 /// for a PR pass tolerates dropped/wrong leading diff markers and stores the
-/// original diff line as the exact. Returns the minted IRI, or `None` when
+/// original diff line as the exact. Returns the finding's IRI, or `None` when
 /// the quote does not anchor — the caller counts it and moves on (one bad
-/// item must not kill the pass). `target_iri` names the annotated surface (a
-/// file, or a PR page whose diff is `text`); `rel` is its path, empty for a
-/// PR.
+/// item must not kill the pass). `target_iri` names the reviewed surface (a
+/// file, or a PR page whose diff is `text`); `rel` is its path, empty for a PR.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn mint_review_annotation(
+pub(crate) fn mint_pending_finding(
     archive: &Archive,
     target_iri: &str,
     repo: &str,
@@ -1856,6 +2433,7 @@ pub(crate) fn mint_review_annotation(
     hash: &str,
     exact: &str,
     note: &str,
+    severity: Option<&str>,
     model: &str,
     pass_iri: &str,
     created: Option<String>,
@@ -1870,8 +2448,15 @@ pub(crate) fn mint_review_annotation(
     };
     let exact = stored_exact.as_deref().unwrap_or(exact);
     let (prefix, suffix) = context_around(text, &anchor);
+    let id = finding_id(pass_iri, anchor.char_start, exact);
+    // Re-minting an already-answered finding must not erase the answer, and
+    // must not resurrect a decided one as pending.
+    if let Some(existing) = load_record(archive, Family::Finding, &id)? {
+        return Ok(Some(existing.iri()));
+    }
     let ann = Annotation {
-        id: uuid::Uuid::new_v4().to_string(),
+        family: Family::Finding,
+        id,
         body: note.to_string(),
         target_iri: target_iri.to_string(),
         repo: repo.to_string(),
@@ -1886,11 +2471,26 @@ pub(crate) fn mint_review_annotation(
         reanchored: false,
         orphaned: false,
         creator: Some(model.to_string()),
+        // Carried for the promotion: the annotation this becomes is a machine
+        // claim a human published, so it is still `oa:assessing`. Never
+        // STORED on the finding itself.
         motivation: Some(MOTIVATION_REVIEW.to_string()),
         generated_by: Some(pass_iri.to_string()),
+        severity: severity.map(str::to_string),
+        derived_from: None,
+        decision: None,
     };
     store_annotation(archive, &ann)?;
     Ok(Some(ann.iri()))
+}
+
+/// The deterministic finding id — see [`mint_pending_finding`]. 24 hex
+/// characters of sha256 over the three things that fix a finding's POSITION:
+/// which pass produced it, where in the content it anchored, and what it
+/// quoted.
+pub(crate) fn finding_id(pass_iri: &str, char_start: u64, exact: &str) -> String {
+    let digest = Sha256::digest(format!("{pass_iri}\n{char_start}\n{exact}").as_bytes());
+    format!("{digest:x}").chars().take(24).collect()
 }
 
 /// The named annotations (a review pass's minted set), drift-reconciled
@@ -1902,10 +2502,12 @@ pub(crate) fn included_for_ids(archive: &Archive, iris: &[String], text: &str) -
     let current = CurrentContent::Text(text.to_string(), content_hash(text.as_bytes()));
     let mut rows: Vec<(Annotation, Option<u64>)> = Vec::with_capacity(iris.len());
     for iri in iris {
-        let Some(id) = iri.strip_prefix("urn:iki:annotation:") else {
+        // Either family: a pass entry records finding IRIs now, and entries
+        // archived before ledger #444 record annotation IRIs. Both still read.
+        let Some((family, id)) = Family::split(iri) else {
             continue;
         };
-        let Some(mut ann) = load_annotation(archive, id)? else {
+        let Some(mut ann) = load_record(archive, family, id)? else {
             continue;
         };
         let line = refresh(archive, &mut ann, &current)?;

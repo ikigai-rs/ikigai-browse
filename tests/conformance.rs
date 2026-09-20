@@ -129,15 +129,16 @@ const RAW_FACE_IS_A_PASS_THROUGH: &str =
      `the_raw_file_face_serves_the_extension_mapped_type`; remove this waiver when \
      `Description` grows a pass-through output marker (core PENDING §20)";
 
-/// Every description id this crate binds. A seventeenth endpoint bound without a
-/// line here is held to a weaker standard than the sixteen; a listed id that binds
+/// Every description id this crate binds. A twentieth endpoint bound without a
+/// line here is held to a weaker standard than the nineteen; a listed id that binds
 /// nothing is a stale list.
-const ENDPOINTS: [&str; 17] = [
+const ENDPOINTS: [&str; 19] = [
     "annotation",
     "browse-annotations",
     "browse-explain",
     "browse-explain-versions",
     "browse-file",
+    "browse-findings",
     "browse-hash",
     "browse-layout",
     "browse-pr",
@@ -150,6 +151,7 @@ const ENDPOINTS: [&str; 17] = [
     "browse-state",
     "browse-style",
     "browse-tree",
+    "finding",
 ];
 
 // ---------------------------------------------------------------------------
@@ -183,7 +185,16 @@ impl Scratch {
         let tree = scratch("tree");
         std::fs::write(tree.join("README.md"), "# demo\n\nA fixture tree.\n").expect("README.md");
         std::fs::create_dir_all(tree.join("src")).expect("src/");
-        std::fs::write(tree.join("src/lib.rs"), "pub fn demo() {}\n").expect("src/lib.rs");
+        // TWO anchorable lines, because the stub answer carries TWO findings:
+        // the `finding` entry's Source and Sink fixtures must bind DIFFERENT
+        // findings (a decided one is decided), and the queue must still have a
+        // PENDING row left after the Sink probe fires — a face over an empty
+        // store passes SKOLEM-RDF and VOCABULARY without seeing a triple.
+        std::fs::write(
+            tree.join("src/lib.rs"),
+            "pub fn demo() {}\npub fn other() {}\n",
+        )
+        .expect("src/lib.rs");
         let git = |args: &[&str]| {
             let out = Command::new("git")
                 .args(["-C", tree.to_str().expect("UTF-8 path")])
@@ -212,12 +223,15 @@ impl Drop for Scratch {
 
 /// A deterministic stand-in for `urn:llm:*:ask`.
 ///
-/// Its one answer is in the review pass's `QUOTE:` / `NOTE:` grammar, so the same
-/// stub drives both derivations: an explanation is whatever text came back, and a
-/// review of `src/lib.rs` mints exactly one machine annotation from it. It declares
+/// Its one answer is in the review pass's `QUOTE:` / `SEVERITY:` / `NOTE:` grammar,
+/// so the same stub drives both derivations: an explanation is whatever text came
+/// back, and a review of `src/lib.rs` mints exactly two PENDING FINDINGS from it —
+/// never an annotation, which is the point of the family (ledger #444). It declares
 /// the same net capability the real module declares, so `ENFORCED` sees the same
 /// floor the real composition would.
-const STUB_ANSWER: &str = "QUOTE: pub fn demo() {}\nNOTE: the fixture model's one note.\n";
+const STUB_ANSWER: &str = "QUOTE: pub fn demo() {}\nSEVERITY: minor\nNOTE: the fixture \
+     model's one note.\nQUOTE: pub fn other() {}\nSEVERITY: info\nNOTE: the fixture model's \
+     other note.\n";
 
 fn stub_llm() -> EndpointSpace {
     let mut space = EndpointSpace::new();
@@ -289,7 +303,48 @@ fn seeded(scratch: &Scratch) -> (Kernel, StyleWatch) {
 // The suite
 // ---------------------------------------------------------------------------
 
-fn suite() -> Suite {
+/// The pending findings the review fixture's pass produced, by id.
+///
+/// ⚠ The `finding` entry cannot be seeded the way the annotation entry is:
+/// **nothing but a review pass mints a finding, deliberately** (there is no
+/// creating Sink), and the ids are derived from the pass, the anchor and the
+/// quote rather than chosen. So the fixture fires the pass first and reads its
+/// own ids back off the queue — which is also a small proof that the queue face
+/// serves what the pass wrote.
+fn pending_findings(kernel: &Kernel) -> Vec<String> {
+    issue(
+        kernel,
+        request(Verb::Source, "urn:repo:demo:review:src/lib.rs", &[]),
+        &Capability::root(),
+    )
+    .expect("the review pass over the stub model");
+    let rows = issue(
+        kernel,
+        request(
+            Verb::Source,
+            "urn:repo:demo:findings",
+            &[("as", "application/json")],
+        ),
+        &Capability::root(),
+    )
+    .expect("the queue face");
+    let rows: serde_json::Value =
+        serde_json::from_slice(&rows.bytes).expect("the queue's json face parses");
+    let ids: Vec<String> = rows
+        .as_array()
+        .expect("an array of rows")
+        .iter()
+        .map(|r| r["id"].as_str().expect("every row has an id").to_string())
+        .collect();
+    assert_eq!(
+        ids.len(),
+        2,
+        "the stub pass mints two findings, so the Source and Sink fixtures differ: {ids:?}"
+    );
+    ids
+}
+
+fn suite(findings: &[String]) -> Suite {
     let mut suite = Suite::new()
         // Bindings are per ENTRY and the verb on a binding-only fixture is
         // ignored (conformance PENDING #2): one binding per template variable.
@@ -316,6 +371,17 @@ fn suite() -> Suite {
             Fixture::new("annotation", Verb::Sink)
                 .arg("target", TARGET)
                 .arg("exact", QUOTE),
+        )
+        // The `finding` entry: the Source probe reads one pending finding, and
+        // the pipeline probe DECIDES one (its `content` is the human's
+        // reason). ⚠ They bind DIFFERENT findings on purpose — a decided
+        // finding is decided, and a probe that read one the other had just
+        // answered would be walking a state nobody meant to test.
+        .fixture(Fixture::new("finding", Verb::Source).binding("id", &findings[0]))
+        .fixture(
+            Fixture::new("finding", Verb::Sink)
+                .binding("id", findings.last().expect("two findings"))
+                .arg("decision", "decline"),
         )
         .namespace(OA)
         .cacheable("browse-style")
@@ -370,7 +436,8 @@ fn issue(
 fn conforms() {
     let scratch = Scratch::new();
     let (kernel, _watch) = seeded(&scratch);
-    let report = suite().run_blocking(&kernel);
+    let findings = pending_findings(&kernel);
+    let report = suite(&findings).run_blocking(&kernel);
     // Printed even when clean (`--nocapture`): the report is the record.
     eprintln!("{report}");
     assert!(report.is_clean(), "{report}");
@@ -437,6 +504,8 @@ fn conforms() {
             // ★ The waived endpoint IS reached, under the very type OUTPUTS
             // reported — so the waiver subtracts one rule, not the endpoint.
             "browse-file source text/markdown",
+            "browse-findings source application/json",
+            "browse-findings source text/turtle",
             "browse-hash source text/plain",
             "browse-layout source text/css",
             "browse-review source text/plain",
@@ -446,6 +515,9 @@ fn conforms() {
             "browse-style source text/css",
             "browse-tree source text/plain",
             "browse-tree source text/turtle",
+            "finding sink text/plain",
+            "finding source text/plain",
+            "finding source text/turtle",
             "stub-llm source text/plain",
         ]
         .into_iter()
