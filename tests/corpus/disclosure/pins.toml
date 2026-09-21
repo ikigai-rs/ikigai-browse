@@ -1,0 +1,51 @@
+# The manifest for the review host. Every pin here states the TRUE minimum API
+# the host uses, with the reason written beside it — a pin with no reason is a
+# pin nobody can move.
+#
+# ⚠ A loose pin can resolve stale from CI's cached registry index and break only
+# on CI, where the failure is furthest from the person who caused it. That is why
+# each of these names a version rather than a range, and why the reason is here
+# rather than in a commit message nobody will find.
+
+[package]
+name = "review-host"
+version = "0.3.1"
+edition = "2021"
+
+[dependencies]
+# The kernel. 0.1.56 is the true minimum: `config::config_home` and
+# `layered_paths_in` arrived in it and the style layer calls both.
+ikigai-core = "0.1.56"
+
+# The model face. 0.12 is the true minimum on two counts the option menu is
+# written against: `urn:llm:models` reports an unpinned provider as a null model
+# rather than omitting it, and the inventory is cacheable while no provider is
+# discovering.
+#
+# ★ This pin states a FLOOR and nothing else — it is deliberately written so
+# that every later minor release of ikigai-llm is picked up without an edit
+# here, because the host uses no API that a 0.13 or a 0.14 could take away.
+# A floor that also froze the ceiling would leave this host serving an
+# abandoned line of the model face with no diagnostic at all.
+ikigai-llm = "0.12"
+
+# The browse module the review pass lives in. 0.6.0 because a pass can now be
+# archived with zero findings and a statement saying so; a caller reading
+# `minted.is_empty()` as failure was correct before it and is wrong after.
+ikigai-browse = "0.6.0"
+
+# The persistent store. 0.2.2 because the tenancy tokens
+# (`urn:cap:store:{read,write}:graph:<iri>`) are enforced exactly there, and the
+# host grants the narrow ones.
+#
+# ⚠ 0.1.70 is YANKED (the in-memory placeholder). A yanked version still
+# resolves from an existing lockfile, so a machine that has not run
+# `cargo update` since can still be building it — check the lock, not the
+# manifest, when a store bug looks impossible.
+ikigai-store = "0.2.2"
+
+[dev-dependencies]
+# A FLOOR DECLARATION, not a code dependency: no line in this crate calls it.
+# The conformance suite reads the vocabulary as its oracle and the review face
+# uses four terms that landed in 0.1.69.
+ikigai-vocab = "0.1.69"
