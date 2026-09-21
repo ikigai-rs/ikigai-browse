@@ -1175,7 +1175,14 @@ impl Endpoint for ReviewEndpoint {
             }
         }
         if debug_raw {
-            return Ok(repr_utf8("text/plain", raw_answers.join("\n\n")));
+            // ⚠ A probe that answered NOTHING must not read as an empty answer.
+            // Every region failing leaves `raw_answers` empty, and returning
+            // that would show a diagnosis face reporting a blank model reply
+            // — which is one of the very collapses it exists to tell apart.
+            match (raw_answers.is_empty(), first_error) {
+                (true, Some(e)) => return Err(e),
+                _ => return Ok(repr_utf8("text/plain", raw_answers.join("\n\n"))),
+            }
         }
         // ⚠ Every region failing is the old whole-pass failure and stays one:
         // nothing was reviewed, so there is nothing honest to archive and the
@@ -2601,6 +2608,29 @@ mod tests {
             assert!(raw.contains(answer), "{raw}");
         }
         assert!(store.is_empty().unwrap(), "a probe archives nothing");
+
+        // ⚠ And a probe that answered nothing reports the FAILURE, never an
+        // empty answer — an empty diagnosis face is one of the collapses this
+        // face exists to tell apart.
+        let root2 = six_line_root();
+        let log2 = Arc::new(Log::default());
+        let k2 = scripted_kernel(
+            &root2,
+            &store,
+            &log2,
+            REGION_BYTES,
+            16,
+            &["ERROR", "ERROR", "ERROR"],
+        );
+        assert!(issue(
+            &k2,
+            Verb::Source,
+            "urn:repo:demo:review:a.rs",
+            &[("debug", "raw")],
+            &cap()
+        )
+        .is_err());
+        std::fs::remove_dir_all(&root2).ok();
         std::fs::remove_dir_all(&root).ok();
     }
 
