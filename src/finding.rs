@@ -129,14 +129,14 @@ use crate::{
 /// happened to emit, and the model is constrained to exactly this list — two
 /// lists disagree the first time a model invents a word.
 ///
-/// * `critical` — will bite in production: data loss, a security hole, corruption.
-/// * `major` — a real defect or design risk that should be fixed.
-/// * `minor` — a small improvement; correctness is not at stake.
-/// * `info` — an observation, a question, context worth recording.
-/// * `praise` — an earned strength. ★ Not a severity in the usual sense, and
-///   deliberately here anyway: praise is ALLOWED (review-v4 stopped asking for
-///   it), and a set with no bucket for it forces the model to file a
-///   compliment as `info`, after which triage cannot tell one from a note.
+/// What each word MEANS is [`SEVERITY_MEANINGS`], not a list here: a prose
+/// gloss in this comment is a second copy that no test can check, and it would
+/// drift from the definitions the model is actually rating against.
+///
+/// ★ `praise` is the one that needs a note beyond its definition. It is not a
+/// severity in the usual sense and is deliberately in the set anyway: review-v4
+/// stopped ASKING for it, but a set with no bucket for a compliment forces the
+/// model to file one as `info`, after which triage cannot tell them apart.
 pub(crate) const SEVERITIES: [&str; 5] = ["critical", "major", "minor", "info", "praise"];
 
 /// What each of [`SEVERITIES`] MEANS, in the same order — the definitions the
@@ -144,9 +144,9 @@ pub(crate) const SEVERITIES: [&str; 5] = ["critical", "major", "minor", "info", 
 ///
 /// ★ They live beside the words rather than inside the prompt string because a
 /// severity whose meaning is stated in one place and enforced from another is
-/// the same defect as a closed set named only in an error message: the model
-/// is rating against this text, and a human triaging its output is reading the
-/// doc comment above. One source, both readers.
+/// the same defect as a closed set named only in an error message. One source:
+/// the model rates against this text, a human triaging reads it here, and the
+/// prompt is built from it.
 pub(crate) const SEVERITY_MEANINGS: [&str; 5] = [
     "something that will bite in production (data loss, a security hole, corruption)",
     "a real defect or design risk that should be fixed",
