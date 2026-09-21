@@ -104,6 +104,9 @@ use crate::explain::{
     command_safe, ik, iso8601, menu_options, parse_iri, provider_label, resolve_model, truncate,
     truncated_len, MenuTier, ModelOption, CAP_NET, IK,
 };
+use crate::finding::{
+    join_words, PRAISE_SEVERITY, SERIOUS_SEVERITIES, SEVERITIES, SEVERITY_MEANINGS,
+};
 use crate::hash::hash_iri;
 use crate::{
     crumbs_html, esc, file_iri, granted, iri_encode, path_binding, repo_root, repr, repr_utf8,
@@ -124,48 +127,192 @@ use crate::{
 /// keeps a v2 archive entry (whose `prov:generated` names annotations) readable
 /// beside a v3 one (whose `prov:generated` names findings) instead of
 /// colliding on one key.
-const REVIEW_PROMPT_VERSION: &str = "review-v3";
+/// v4: the QUOTA became a THRESHOLD. "your 3 to 6 most useful findings" was one
+/// rule over two classes with opposite loss functions — it CAPPED serious
+/// findings at six and FLOORED suggestions at three, so a file with one real
+/// defect still had to yield two more of something. v4 drops the floor, leaves
+/// the serious half explicitly uncapped, bounds the suggestions below it at
+/// [`SUGGESTION_LIMIT`], stops ASKING for praise, forbids decorating the quote,
+/// and adds the [`NOTHING_ABOVE_THRESHOLD`] answer so a clean file is a
+/// statement rather than an empty result. A v4 pass is therefore a different
+/// population from a v3 one, and the tag keeps the 53-finding v3 corpus
+/// readable beside it on identical inputs instead of being overwritten.
+///
+/// ⚠⚠ THE ONE THING v4 DELIBERATELY DOES NOT SAY, and why. The obvious wording
+/// for a threshold is "report every problem you would rate critical or major" —
+/// and it was measured, on qwen3-coder:30b at temperature 0.2, 24 passes over
+/// the same four files per variant:
+///
+/// | prompt                                   | serious/pass | serious share |
+/// |------------------------------------------|--------------|---------------|
+/// | v3 (the 3–6 quota)                       |          1.2 |           27% |
+/// | "report EVERY problem you would rate …"  |          3.8 |           62% |
+/// | the same, plus prose telling it to hold the bar high | 6.4 |      91% |
+/// | v4 as shipped (severity is not the gate) |          1.1 |           18% |
+///
+/// Nothing about the CODE changed between those runs. Of the findings the
+/// severity-keyed wording called serious, 43% were findings v3 also produced
+/// and rated `minor` or `info` — so the rate rose by RE-LABELLING, not by
+/// finding more. ★ The rule underneath: a self-reported severity cannot be both
+/// the triage signal and the reporting gate. Tell a model that rating something
+/// `major` is how a finding gets reported and `major` is what it writes. v4
+/// therefore gates on "worth a colleague's attention", states that the serious
+/// half is never capped, and leaves the rating purely descriptive — which is
+/// also what [`crate::finding::SEVERITIES`] is for.
+const REVIEW_PROMPT_VERSION: &str = "review-v4";
 
-/// The reviewer persona. The centerpiece constraint: commentary a thoughtful
-/// colleague would leave — intent, tradeoffs, risks, and earned praise — not
-/// mechanical lint.
+/// How many SUGGESTIONS — the tier between [`crate::finding::SERIOUS_SEVERITIES`]
+/// and [`crate::finding::PRAISE_SEVERITY`] — a pass is asked to carry at most.
+///
+/// ★ The asymmetry is the design, and it is deliberate that only this half has
+/// a number. A missed serious problem is expensive and silent, so recall is
+/// what matters there and nothing caps it; a rejected suggestion costs one
+/// click, so precision and VOLUME matter and a bound is the right tool. One
+/// number covering both classes optimizes neither.
+///
+/// ⚠ It is a REQUEST, not a bound: measured at ~5 suggestions per pass against
+/// this limit of 3. A bound the prompt merely asks for is not a bound, and the
+/// honest fix is to enforce it after parsing — which needs somewhere to record
+/// what was dropped, the way `orphaned_items` records what did not anchor, or
+/// the discarded text is destroyed at the moment it is generated.
+const SUGGESTION_LIMIT: usize = 3;
+
+/// The whole answer a model returns when nothing in the file met the
+/// threshold — and it is a REQUIRED utterance, not an optional courtesy.
+///
+/// ⚠ Dropping the floor makes a clean file a normal outcome, and a normal
+/// outcome that arrives as an empty answer is indistinguishable from a denied
+/// capability, a collapsed format, or a model that failed. The sentinel is what
+/// lets the endpoint tell "reviewed, nothing to say" from "this pass broke":
+/// the first archives as a pass that happened, the second is still an error
+/// that archives nothing and re-derives.
+const NOTHING_ABOVE_THRESHOLD: &str = "NOTHING ABOVE THRESHOLD";
+
+/// The reviewer persona: a defect-finder first, a commentator second.
+///
+/// ★ v3 asked for "the kind of margin notes a thoughtful human reviewer
+/// leaves" and spent a slot on "one genuine strength when you see it", which
+/// put praise in COMPETITION with findings for a fixed quota. v4 keeps the
+/// judgment and drops the solicitation: `praise` stays in the severity set so
+/// triage can tell a compliment from a note, but the prompt no longer asks for
+/// one. The last sentence is the other half of the threshold — a model that is
+/// never told an empty answer is acceptable will find something to say.
 const REVIEW_SYSTEM_PROMPT: &str =
-    "You are an experienced engineer reviewing a colleague's file. You write \
-     the kind of margin notes a thoughtful human reviewer leaves: you name the \
-     design's intent and its tradeoffs, point at subtle risks and edge cases, \
-     question misleading names or comments, and call out one genuine strength \
-     when you see it. You never restate what the code plainly does, never \
-     nitpick formatting, and never invent problems to fill space.";
+    "You are an experienced engineer reviewing a colleague's file. Your first \
+     duty is to find real problems: defects that will bite in production, risks \
+     the author has not seen, design decisions that will not hold, and names or \
+     comments that no longer tell the truth. You argue a serious finding rather \
+     than asserting it, and you rate honestly — calling something serious when \
+     it is not costs the reader as much as missing it. You never restate what \
+     the code plainly does, never nitpick formatting, and never invent problems \
+     to fill space: a file with nothing wrong in it is an ordinary outcome, and \
+     you say so plainly instead of manufacturing observations.";
 
-/// The per-file instruction: the finding format is the machine contract (each
-/// finding anchors by its verbatim quote), so it is spelled out rigidly.
-const REVIEW_PROMPT: &str =
-    "Review this file and give your 3 to 6 most useful findings. Format each \
-     finding as exactly three lines and nothing else:\n\
-     QUOTE: <a short snippet copied character-for-character from one line of \
-     the file - under 80 characters, distinctive enough to occur only once>\n\
-     SEVERITY: <exactly one of: critical, major, minor, info, praise>\n\
-     NOTE: <one or two sentences of review commentary on that region>\n\
-     Use critical for something that will bite in production (data loss, a \
-     security hole, corruption), major for a real defect or design risk that \
-     should be fixed, minor for a small improvement where correctness is not \
-     at stake, info for an observation or a question, and praise for a genuine \
-     strength. Use no other word for SEVERITY.\n\
-     Do not number the findings. Do not add headings, preamble, or closing \
-     remarks. The QUOTE must appear verbatim in the file or the finding is \
-     discarded.";
+/// The per-file instruction. Two things are rigid here and for different
+/// reasons: the three-line finding format is the MACHINE CONTRACT (each finding
+/// anchors by its verbatim quote, and a finding that does not anchor mints
+/// nothing), and the threshold is the REPORTING RULE.
+///
+/// ★ It is built rather than written down: every severity word, every
+/// definition and the tier split come from [`crate::finding::SEVERITIES`],
+/// [`crate::finding::SEVERITY_MEANINGS`] and the two partition indices, so the
+/// prompt, the Sink's `one_of` and the triage menu cannot drift apart. There is
+/// no fourth copy of the list to forget.
+///
+/// ⚠ "Copy the characters and nothing else: no backticks…" earns its place with
+/// a number. Asked to argue its findings, the model reaches for markdown and
+/// wraps the quote in backticks — which cannot anchor, so the finding mints
+/// nothing and is counted as an orphan. Measured on the same four files: 12% of
+/// everything produced orphaned without that clause, 1–5% with it, and one file
+/// of dense CSS-in-Rust went from a 100% anchoring collapse (0 findings minted
+/// across 6 passes) to normal. It is the cheapest line in this prompt.
+fn review_prompt() -> String {
+    let serious = join_words(&SEVERITIES[..SERIOUS_SEVERITIES], "or");
+    let suggestions = join_words(&SEVERITIES[SERIOUS_SEVERITIES..PRAISE_SEVERITY], "or");
+    let praise = join_words(&SEVERITIES[PRAISE_SEVERITY..], "or");
+    let ladder: Vec<String> = SEVERITIES
+        .iter()
+        .zip(SEVERITY_MEANINGS)
+        .map(|(word, meaning)| format!("{word} for {meaning}"))
+        .collect();
+    let ladder = join_words(
+        &ladder.iter().map(String::as_str).collect::<Vec<_>>(),
+        "and",
+    );
+    format!(
+        "Review this file. Read all of it before you answer.\n\
+         Report only what is worth a colleague's attention. There is no minimum and no \
+         quota to fill: a typical review of one file is one or two findings, and a file \
+         with nothing worth reporting is a complete review.\n\
+         Never leave a real problem out because you have already reported others: a \
+         defect is worth reporting however many findings you already have. Keep the \
+         {suggestions} ones to {SUGGESTION_LIMIT} at most, and add at most one rated \
+         {praise}, and only if they would earn the reader's time.\n\
+         Rate each finding honestly. The rating is a triage signal for a human reader, \
+         not the reason a finding is reported: calling a style preference or a doc \
+         comment {serious} costs that reader exactly as much as missing a real defect \
+         does.\n\
+         If nothing in this file is worth reporting, answer with exactly this one line and \
+         nothing else:\n\
+         {NOTHING_ABOVE_THRESHOLD}\n\
+         Otherwise format each finding as exactly three lines and nothing else:\n\
+         QUOTE: <a short snippet copied character-for-character from one line of \
+         the file - under 80 characters, distinctive enough to occur only once. Copy the \
+         characters and nothing else: no backticks, no quotation marks, no markdown, no \
+         ellipsis>\n\
+         SEVERITY: <exactly one of: {}>\n\
+         NOTE: <one to four sentences of review commentary on that region, arguing the \
+         finding rather than asserting it>\n\
+         Use {ladder}. Use no other word for SEVERITY.\n\
+         Do not number the findings. Do not add headings, preamble, or closing \
+         remarks. The QUOTE must appear verbatim in the file or the finding is \
+         discarded.",
+        SEVERITIES.join(", "),
+    )
+}
 
 /// The format contract again, appended AFTER the content: the last words the
 /// model reads must be the format, or a long file crowds the contract out of
 /// its answer (measured on qwen3-coder:30b — a 16 KiB prompt with the
 /// contract only up top yielded label-free findings; restated, 6/6 labeled).
-const REVIEW_REMINDER: &str =
-    "Now give the findings. Remember the format contract: each finding is \
-     exactly three lines - the first starts `QUOTE: ` followed by a short \
-     snippet copied character-for-character from one line of the file above, \
-     the second starts `SEVERITY: ` followed by exactly one of critical, \
-     major, minor, info or praise, the third starts `NOTE: ` with your \
-     commentary. No headings, no numbering, nothing else.";
+///
+/// ⚠ v4 restates the THRESHOLD here too, for the same reason and with the same
+/// evidence behind it: the stopping rule is as easy for a long file to crowd
+/// out as the format is, and a model that has forgotten it falls back on the
+/// habit the quota trained.
+fn review_reminder() -> String {
+    let serious = join_words(&SEVERITIES[..SERIOUS_SEVERITIES], "or");
+    let suggestions = join_words(&SEVERITIES[SERIOUS_SEVERITIES..PRAISE_SEVERITY], "or");
+    format!(
+        "Now give the findings. Remember the format contract: each finding is \
+         exactly three lines - the first starts `QUOTE: ` followed by a short \
+         snippet copied character-for-character from one line of the file above, \
+         the second starts `SEVERITY: ` followed by exactly one of {}, the third \
+         starts `NOTE: ` with your commentary. No headings, no numbering, nothing \
+         else, and nothing around the quote - no backticks and no quotation marks, \
+         or it will not match the file and the finding is discarded. Report every \
+         {serious} problem you found, however many that is, but only what truly \
+         meets that bar; keep the {suggestions} ones to {SUGGESTION_LIMIT} at most. \
+         If nothing met the bar, the entire answer is the single line \
+         {NOTHING_ABOVE_THRESHOLD}.",
+        join_words(&SEVERITIES, "or"),
+    )
+}
+
+/// Whether the model made the affirmative clean-file statement.
+///
+/// ⚠ Tolerant of a model that emphasizes or punctuates the line (`**NOTHING
+/// ABOVE THRESHOLD**`, a trailing period) because they all do, but it must be
+/// a LINE OF ITS OWN: a `contains` over the whole answer would read a model
+/// musing about the threshold as a clean bill of health, and a false all-clear
+/// is worse than no report because it is trusted.
+fn says_nothing_above_threshold(answer: &str) -> bool {
+    answer.lines().any(|line| {
+        line.trim()
+            .trim_matches(|c: char| c == '*' || c == '`' || c == '#' || c == '.' || c == ' ')
+            .eq_ignore_ascii_case(NOTHING_ABOVE_THRESHOLD)
+    })
+}
 
 // --- the archive entry (RDF in the shared store) ------------------------------
 
@@ -219,6 +366,35 @@ impl PassEntry {
                 " · reviewed {reviewed} of {total} bytes (input truncated)"
             )),
             _ => None,
+        }
+    }
+
+    /// What this pass FOUND and over how much of the input — the headline of
+    /// the plain and html faces.
+    ///
+    /// ★ Zero findings is a STATEMENT here, never an absence a reader has to
+    /// interpret. With the quota gone a clean file is an ordinary outcome, and
+    /// "0 finding(s)" reads exactly like a denied capability, a collapsed
+    /// answer or an outage — the failure mode is that the first quiet week is
+    /// indistinguishable from a broken pipeline.
+    ///
+    /// ⚠ And COVERAGE is the second half of the claim, not a footnote. "Nothing
+    /// above threshold" over the whole file and the same words over 15% of it
+    /// are different assertions, and the weaker one is a FALSE ALL-CLEAR if it
+    /// renders like the stronger. `reviewed_bytes`/`total_bytes` already carry
+    /// the difference; this is where it reaches a reader.
+    pub(crate) fn statement(&self) -> String {
+        let head = match self.minted.len() {
+            0 => "nothing above threshold".to_string(),
+            1 => "1 finding".to_string(),
+            n => format!("{n} findings"),
+        };
+        match self.truncation_note() {
+            Some(note) => format!("{head}{note}"),
+            None => match self.total_bytes {
+                Some(total) => format!("{head} · reviewed the whole file ({total} bytes)"),
+                None => head,
+            },
         }
     }
 }
@@ -669,9 +845,10 @@ impl Endpoint for ReviewEndpoint {
 
         // Miss: derive one pass. Ask, parse, anchor, mint, archive.
         let prompt = format!(
-            "{REVIEW_PROMPT}\n\nRepository: {repo}\nPath: {rel}\n\n```\n{}\n```\n\n\
-             {REVIEW_REMINDER}",
+            "{}\n\nRepository: {repo}\nPath: {rel}\n\n```\n{}\n```\n\n{}",
+            review_prompt(),
             truncate(&text, config.max_prompt_bytes),
+            review_reminder(),
         );
         let request = Request::new(Verb::Source, parse_iri(&provider)?)
             .with_arg("prompt", ArgRef::Inline(prompt.into_bytes()))
@@ -693,23 +870,56 @@ impl Endpoint for ReviewEndpoint {
             return Ok(repr_utf8("text/plain", answer));
         }
         let (findings, malformed) = parse_findings(&answer);
+        let created = inv.now().map(|t| iso8601(t.as_millis()));
         if findings.is_empty() {
-            // Nothing parseable at all IS a failure — erroring (and archiving
-            // nothing) keeps the key re-derivable instead of poisoning it
-            // with an empty pass. The error carries the answer's opening so
-            // the collapse is diagnosable (a label-free format, a refusal, an
-            // empty ceiling-starved reply all read differently).
+            // ★ THE CLEAN PASS. The model said in words that nothing met the
+            // threshold, so this is a pass that HAPPENED: archived, dated,
+            // attributed to the model, with its coverage — and an archive hit
+            // the next time, so a quiet file costs one call ever rather than
+            // one per commit.
+            //
+            // ⚠ The sentinel alone is not sufficient, and `malformed == 0` is
+            // the other half. `malformed` counts a QUOTE the model never
+            // finished or a NOTE with nothing to anchor it: an answer carrying
+            // both the sentinel and that wreckage is a COLLAPSE wearing a clean
+            // answer's clothes, and archiving it would record a false
+            // all-clear under a key that never re-derives.
+            if malformed == 0 && says_nothing_above_threshold(&answer) {
+                let entry = PassEntry {
+                    iri,
+                    repo: repo.to_string(),
+                    rel: rel.clone(),
+                    target_iri: file_iri(repo, &rel),
+                    hash,
+                    tag,
+                    model,
+                    minted: Vec::new(),
+                    orphaned_items: 0,
+                    reviewed_bytes: Some(truncated_len(&text, config.max_prompt_bytes) as u64),
+                    total_bytes: Some(text.len() as u64),
+                    derived_at: created,
+                };
+                store_pass(&config.archive, &entry)?;
+                let included = annotate::included_for_ids(&config.archive, &[], &text)?;
+                return face(inv, repo, &rel, &entry, true, &included);
+            }
+            // Nothing parseable and no clean statement either IS a failure —
+            // erroring (and archiving nothing) keeps the key re-derivable
+            // instead of poisoning it with an empty pass. The error carries the
+            // answer's opening so the collapse is diagnosable (a label-free
+            // format, a refusal, an empty ceiling-starved reply all read
+            // differently).
             return Err(Error::Endpoint(format!(
-                "browse: `{}` returned no parseable QUOTE:/NOTE: findings for `{rel}` \
-                 (max_tokens {}); nothing archived. The answer began: \"{}\" — re-source \
-                 with debug=raw for the full unparsed answer",
+                "browse: `{}` returned no parseable QUOTE:/NOTE: findings for `{rel}`, and \
+                 did not report `{NOTHING_ABOVE_THRESHOLD}` either (max_tokens {}); nothing \
+                 archived. The answer began: \"{}\" — re-source with debug=raw for the full \
+                 unparsed answer",
                 provider,
                 config.review_max_tokens,
                 answer_excerpt(&answer)
             )));
         }
 
-        let created = inv.now().map(|t| iso8601(t.as_millis()));
         let mut minted = Vec::new();
         let mut orphaned_items = malformed;
         for finding in &findings {
@@ -789,6 +999,10 @@ fn face(
                 "version_tag": entry.tag,
                 "model": entry.model,
                 "derived": derived,
+                // The affirmative statement, for a machine consumer that would
+                // otherwise have to infer a clean pass from an empty array —
+                // the same inference a broken pipeline invites.
+                "statement": entry.statement(),
                 "minted": entry.minted,
                 "orphaned_items": entry.orphaned_items,
                 "reviewed_bytes": entry.reviewed_bytes,
@@ -805,19 +1019,16 @@ fn face(
         t if t.starts_with("text/turtle") => Ok(repr("text/turtle", pass_turtle(entry))),
         _ => {
             let mut out = format!(
-                "review by {} · {} · {} finding(s)",
+                "review by {} · {} · {}",
                 entry.model,
                 entry.tag,
-                entry.minted.len()
+                entry.statement()
             );
             if entry.orphaned_items > 0 {
                 out.push_str(&format!(
                     " · {} item(s) did not anchor",
                     entry.orphaned_items
                 ));
-            }
-            if let Some(note) = entry.truncation_note() {
-                out.push_str(&note);
             }
             out.push('\n');
             out.push_str(&included.margin_text());
@@ -845,10 +1056,20 @@ fn review_html(
          hx-swap=\"innerHTML\">view file</button></nav>",
         entry.target_iri,
     ));
+    // ⚠ A clean pass renders an EMPTY annotation panel, and an empty panel is
+    // the shape of every other way this page can fail. The statement goes
+    // above it, in the page body rather than the provenance footnote, because
+    // it is the page's content when there are no cards.
+    if entry.minted.is_empty() {
+        out.push_str(&format!(
+            "<p class=\"browse-review-clean\">This file was reviewed: {}.</p>",
+            esc(&entry.statement()),
+        ));
+    }
     out.push_str(&included.panel_html(None));
     let hash_short: String = entry.hash.chars().take(19).collect(); // "sha256:" + 12 hex
     let mut provenance = format!(
-        "reviewed by {} · {} · {}… · {}",
+        "reviewed by {} · {} · {}… · {} · {}",
         esc(&entry.model),
         esc(&entry.tag),
         esc(&hash_short),
@@ -857,15 +1078,13 @@ fn review_html(
         } else {
             "from the archive"
         },
+        esc(&entry.statement()),
     );
     if entry.orphaned_items > 0 {
         provenance.push_str(&format!(
             " · {} item(s) did not anchor",
             entry.orphaned_items
         ));
-    }
-    if let Some(note) = entry.truncation_note() {
-        provenance.push_str(&esc(&note));
     }
     out.push_str(&format!(
         "<p class=\"browse-provenance\">{provenance}</p></div>"
@@ -938,7 +1157,13 @@ fn review_description(config: &ExplainConfig) -> Description {
              it. Changed content is a fresh pass; earlier findings re-anchor or orphan \
              like annotations. Quotes that do not anchor are counted (orphaned_items), \
              never fatal; a missing or invented SEVERITY leaves the finding unrated \
-             rather than dropping it. provider= derives this pass \
+             rather than dropping it. ★ The pass reports against a THRESHOLD, not a \
+             quota: every problem the model rates critical or major, however many or \
+             few, plus at most three minor/info suggestions and at most one praise. A \
+             file with nothing above the bar is an ARCHIVED PASS with zero findings \
+             whose every face says so affirmatively, together with how much of the \
+             input was actually read — an empty answer with no such statement is still \
+             an error that archives nothing. provider= derives this pass \
              against a different (host-allowed) backend, keyed by that backend's own \
              model identity, so a second model is a second coexisting pass rather than a \
              replacement. text/plain (default) is the \
@@ -1436,7 +1661,7 @@ mod tests {
 
         let first = json(&k, "urn:repo:demo:review:a.rs", &[]);
         assert_eq!(first["derived"], true);
-        assert_eq!(first["version_tag"], "review-v3@r1");
+        assert_eq!(first["version_tag"], "review-v4@r1");
         assert_eq!(first["model"], "r1");
         assert_eq!(first["orphaned_items"], 0);
         // Nothing was truncated, and the face says exactly what was seen.
@@ -1497,6 +1722,177 @@ mod tests {
         );
         assert!(system.contains("reviewing a colleague's file"), "{system}");
         assert_eq!(max_tokens, "800");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★ The v4 instruction is a THRESHOLD, and the threshold's words are
+    /// SLICES of the declared severity list rather than a fourth copy of it.
+    /// A quota and a threshold are one word apart in the prompt and a different
+    /// population in the archive, so the halves are pinned here: the counting
+    /// language is gone, the serious class is stated to be uncapped, and every
+    /// severity word the model is handed traces back to `finding::SEVERITIES`.
+    ///
+    /// ⚠ The negative assertion is the load-bearing one. "Report every problem
+    /// you would rate {serious}" is the obvious phrasing, it is what the design
+    /// note asked for, and it MEASURED as a 2.6× rise in the serious rate with
+    /// no change to the code — the model relabels rather than reports more. See
+    /// [`REVIEW_PROMPT_VERSION`] for the table. Anyone restoring that sentence
+    /// is undoing an experiment, so this fails first.
+    #[test]
+    fn the_prompt_asks_for_a_threshold_rather_than_a_quota() {
+        let prompt = review_prompt();
+        let reminder = review_reminder();
+
+        // The quota is gone from both halves — including the reminder, which
+        // is the last thing a long file lets the model read.
+        for text in [&prompt, &reminder] {
+            assert!(!text.contains("3 to 6"), "{text}");
+            assert!(!text.contains("most useful findings"), "{text}");
+        }
+        assert!(
+            prompt.contains("no minimum and no quota to fill"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Never leave a real problem out because you have already reported"),
+            "the serious half is explicitly uncapped: {prompt}"
+        );
+        assert!(
+            prompt.contains("not the reason a finding is reported"),
+            "the rating must not be the reporting gate: {prompt}"
+        );
+        for text in [&prompt, &reminder] {
+            assert!(
+                !text.contains("rate critical or major,"),
+                "severity-as-gate phrasing inflates the rating 2.6x - see \
+                 REVIEW_PROMPT_VERSION: {text}"
+            );
+        }
+        assert!(
+            prompt.contains(&format!(
+                "Keep the minor or info ones to {SUGGESTION_LIMIT} at most"
+            )),
+            "{prompt}"
+        );
+        assert!(prompt.contains("at most one rated praise"), "{prompt}");
+
+        // The anchor rule that took orphaned findings from 12% to 1-5%.
+        assert!(prompt.contains("no backticks"), "{prompt}");
+        assert!(reminder.contains("no backticks"), "{reminder}");
+
+        // Every declared severity is offered to the model, with its declared
+        // meaning, in both halves of the contract.
+        for (word, meaning) in SEVERITIES.iter().zip(SEVERITY_MEANINGS) {
+            assert!(
+                prompt.contains(&format!("{word} for {meaning}")),
+                "{prompt}"
+            );
+            assert!(reminder.contains(word), "{reminder}");
+        }
+
+        // And the clean answer is spelled out where the model will read it.
+        assert!(prompt.contains(NOTHING_ABOVE_THRESHOLD), "{prompt}");
+        assert!(reminder.contains(NOTHING_ABOVE_THRESHOLD), "{reminder}");
+
+        // The persona stopped SOLICITING praise; the severity keeps its bucket
+        // so triage can still tell a compliment from a note.
+        assert!(
+            !REVIEW_SYSTEM_PROMPT.contains("one genuine strength"),
+            "{REVIEW_SYSTEM_PROMPT}"
+        );
+        assert!(SEVERITIES.contains(&"praise"));
+    }
+
+    /// ⚠ A clean file is now an ORDINARY outcome, and it must not look like an
+    /// outage. The pass is archived, dated, attributed and re-served from the
+    /// archive like any other, every face states it in words, and the
+    /// statement carries the COVERAGE — "nothing above threshold" over a
+    /// truncated input is a weaker claim than over a whole file and must not
+    /// render the same way.
+    #[test]
+    fn a_clean_file_is_an_archived_pass_that_says_so() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, "NOTHING ABOVE THRESHOLD\n");
+
+        let first = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(first["derived"], true);
+        assert_eq!(first["minted"].as_array().unwrap().len(), 0);
+        assert_eq!(first["orphaned_items"], 0);
+        assert_eq!(first["total_bytes"], CONTENT.len());
+        assert_eq!(first["version_tag"], "review-v4@r1");
+        assert_eq!(
+            first["statement"],
+            format!(
+                "nothing above threshold · reviewed the whole file ({} bytes)",
+                CONTENT.len()
+            )
+        );
+
+        // It is a PASS, so it is in the archive: the second source is a hit
+        // and asks nothing. A quiet file costs one call ever, not one a commit.
+        let second = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(second["derived"], false);
+        assert_eq!(second["statement"], first["statement"]);
+        assert_eq!(log.count(), 1, "the hit must not re-ask");
+
+        // Every face SAYS it rather than rendering an absence.
+        let text =
+            body(&issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).unwrap());
+        assert!(text.contains("nothing above threshold"), "{text}");
+        assert!(text.contains("reviewed the whole file"), "{text}");
+        let html = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:review:a.rs",
+                &[("as", "text/html")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert!(html.contains("browse-review-clean"), "{html}");
+        assert!(html.contains("This file was reviewed"), "{html}");
+
+        // Nothing was minted: the finding queue is empty, not merely quiet.
+        let queue = json(&k, "urn:repo:demo:findings:a.rs", &[]);
+        assert_eq!(queue.as_array().unwrap().len(), 0);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The coverage half, on its own: the same clean answer over a TRUNCATED
+    /// input must not make the same claim. This is the false all-clear the
+    /// threshold would otherwise introduce — and it is the majority case, not
+    /// an edge case, while `max_prompt_bytes` truncates most files.
+    #[test]
+    fn a_clean_pass_over_a_truncated_input_says_how_much_it_saw() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let cfg = ExplainConfig::new(Arc::clone(&store))
+            .review_model_label("r1")
+            .max_prompt_bytes(20);
+        let browse = crate::space_with_explain(vec![("demo".to_string(), root.clone())], cfg);
+        let k = Kernel::new(Arc::new(Fallback::new(vec![
+            Arc::new(browse),
+            Arc::new(llm_space(&log, "NOTHING ABOVE THRESHOLD")),
+        ])));
+
+        let pass = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(pass["reviewed_bytes"], 20);
+        assert_eq!(pass["total_bytes"], CONTENT.len());
+        assert_eq!(
+            pass["statement"],
+            format!(
+                "nothing above threshold · reviewed 20 of {} bytes (input truncated)",
+                CONTENT.len()
+            )
+        );
+        let text =
+            body(&issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).unwrap());
+        assert!(text.contains("(input truncated)"), "{text}");
+        assert!(!text.contains("the whole file"), "{text}");
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1658,6 +2054,42 @@ mod tests {
         assert!(format!("{err:?}").contains("anchored"), "{err:?}");
         let listing = json(&k2, "urn:repo:demo:findings:a.rs", &[]);
         assert_eq!(listing.as_array().unwrap().len(), 0);
+
+        // ⚠ A COLLAPSE WEARING A CLEAN ANSWER'S CLOTHES. The sentinel is here,
+        // but so is the wreckage of a finding the model started and never
+        // finished — so the answer is evidence that it had something to say,
+        // not that it had nothing. Archiving it would record a false all-clear
+        // under a key that never re-derives, which is the worst outcome
+        // available: wrong, durable, and trusted.
+        let store3 = Arc::new(Store::new().unwrap());
+        let k3 = kernel_with(
+            &root,
+            &store3,
+            &log,
+            "QUOTE: fn alpha() {}\nNOTHING ABOVE THRESHOLD\n",
+        );
+        let err = issue(&k3, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).unwrap_err();
+        assert!(format!("{err:?}").contains("no parseable"), "{err:?}");
+        assert!(
+            format!("{err:?}").contains(NOTHING_ABOVE_THRESHOLD),
+            "the error names the statement the answer failed to make: {err:?}"
+        );
+        assert!(
+            issue(&k3, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).is_err(),
+            "an unarchived pass re-derives"
+        );
+
+        // And a mere MENTION of the threshold in prose is not the statement:
+        // a lax match would read a model musing about the bar as a clean bill
+        // of health, and a false all-clear is worse than no report.
+        let store4 = Arc::new(Store::new().unwrap());
+        let k4 = kernel_with(
+            &root,
+            &store4,
+            &log,
+            "I considered whether anything here is NOTHING ABOVE THRESHOLD worthy.\n",
+        );
+        assert!(issue(&k4, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).is_err());
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1801,7 +2233,7 @@ mod tests {
         // `prov:generated` is the pending set a human has yet to answer.
         assert!(ttl.contains("prov:generated <urn:iki:finding:"), "{ttl}");
         assert!(!ttl.contains("urn:iki:annotation:"), "{ttl}");
-        assert!(ttl.contains("ik:versionTag \"review-v3@r1\""), "{ttl}");
+        assert!(ttl.contains("ik:versionTag \"review-v4@r1\""), "{ttl}");
         assert!(
             ttl.contains("ik:orphanedItems \"0\"^^xsd:nonNegativeInteger"),
             "{ttl}"
@@ -2044,7 +2476,7 @@ mod tests {
         // The configured backend first.
         let first = json(&k, "urn:repo:demo:review:a.rs", &[]);
         assert_eq!(first["derived"], true);
-        assert_eq!(first["version_tag"], "review-v3@r1");
+        assert_eq!(first["version_tag"], "review-v4@r1");
         assert_eq!(first["minted"].as_array().unwrap().len(), 2);
         assert_eq!((log.count(), alt_log.count()), (1, 0));
 
@@ -2057,7 +2489,7 @@ mod tests {
             &[("provider", ALT_PROVIDER)],
         );
         assert_eq!(second["derived"], true);
-        assert_eq!(second["version_tag"], "review-v3@alt");
+        assert_eq!(second["version_tag"], "review-v4@alt");
         assert_eq!(second["model"], "alt");
         assert_eq!(second["minted"].as_array().unwrap().len(), 1);
         assert_eq!((log.count(), alt_log.count()), (1, 1));
@@ -2068,7 +2500,7 @@ mod tests {
         // both reviewers' margins, each awaiting the same human.
         let again = json(&k, "urn:repo:demo:review:a.rs", &[]);
         assert_eq!(again["derived"], false, "the first pass was overwritten");
-        assert_eq!(again["version_tag"], "review-v3@r1");
+        assert_eq!(again["version_tag"], "review-v4@r1");
         assert_eq!(again["minted"], first["minted"]);
         let alt_again = json(
             &k,
@@ -2162,7 +2594,7 @@ mod tests {
         );
         assert_eq!(pass["derived"], true);
         assert_eq!(
-            pass["version_tag"], "review-v3@r1",
+            pass["version_tag"], "review-v4@r1",
             "the configured tier keeps its label"
         );
         assert_eq!((log.count(), alt_log.count()), (0, 1));
@@ -2488,7 +2920,7 @@ mod tests {
         // asymmetry between what a MENU can learn (the cheap inventory) and
         // what a TAG resolves (the per-provider identity). What matters here
         // is that both causes land on the ONE tag, whichever it is.
-        assert_eq!(triggered["version_tag"], "review-v3@coder");
+        assert_eq!(triggered["version_tag"], "review-v4@coder");
         assert_eq!(log.count(), 1, "the trigger paid nothing");
         assert_eq!(
             triggered["minted"].as_array().unwrap().len(),

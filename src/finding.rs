@@ -134,15 +134,58 @@ use crate::{
 /// * `minor` — a small improvement; correctness is not at stake.
 /// * `info` — an observation, a question, context worth recording.
 /// * `praise` — an earned strength. ★ Not a severity in the usual sense, and
-///   deliberately here anyway: the reviewer prompt explicitly asks for one
-///   genuine strength, and a set with no bucket for it forces the model to
-///   file praise as `info`, after which triage cannot tell a compliment from a
-///   note.
+///   deliberately here anyway: praise is ALLOWED (review-v4 stopped asking for
+///   it), and a set with no bucket for it forces the model to file a
+///   compliment as `info`, after which triage cannot tell one from a note.
 pub(crate) const SEVERITIES: [&str; 5] = ["critical", "major", "minor", "info", "praise"];
+
+/// What each of [`SEVERITIES`] MEANS, in the same order — the definitions the
+/// review prompt spells out for the model, reading as `"{word} for {meaning}"`.
+///
+/// ★ They live beside the words rather than inside the prompt string because a
+/// severity whose meaning is stated in one place and enforced from another is
+/// the same defect as a closed set named only in an error message: the model
+/// is rating against this text, and a human triaging its output is reading the
+/// doc comment above. One source, both readers.
+pub(crate) const SEVERITY_MEANINGS: [&str; 5] = [
+    "something that will bite in production (data loss, a security hole, corruption)",
+    "a real defect or design risk that should be fixed",
+    "a small improvement where correctness is not at stake",
+    "an observation or a question",
+    "a genuine strength",
+];
+
+/// How many of [`SEVERITIES`], counted from the front, are SERIOUS — the class
+/// the review prompt reports without limit.
+///
+/// ★ The list is ordered worst-first, so the reporting threshold is a PREFIX
+/// LENGTH over it and not a fourth copy of the words. The Sink's `one_of`, the
+/// menu, the prompt and this split therefore move together: adding a severity
+/// or reordering the list changes what the prompt asks for in the same edit,
+/// and [`the_reporting_threshold_partitions_the_severity_list`] fails if the
+/// order stops matching the tiers.
+pub(crate) const SERIOUS_SEVERITIES: usize = 2;
+
+/// Where the compliment bucket begins — everything between
+/// [`SERIOUS_SEVERITIES`] and here is a SUGGESTION: welcome, optional, and
+/// bounded, because a rejected suggestion costs one click while a missed
+/// serious problem is silent.
+pub(crate) const PRAISE_SEVERITY: usize = 4;
 
 /// Whether `word` is one of [`SEVERITIES`] — the one place the set is checked.
 pub(crate) fn is_severity(word: &str) -> bool {
     SEVERITIES.contains(&word)
+}
+
+/// Severity words as prose for the prompt — `join_words(&["minor", "info"],
+/// "or")` reads `minor or info`. The prompt hands the model the SAME words the
+/// contract declares rather than a retyped list.
+pub(crate) fn join_words(words: &[&str], conjunction: &str) -> String {
+    match words {
+        [] => String::new(),
+        [one] => one.to_string(),
+        [head @ .., last] => format!("{} {conjunction} {last}", head.join(", ")),
+    }
 }
 
 /// `urn:iki:finding:{id}` — one pending finding.
@@ -1123,6 +1166,33 @@ mod tests {
             assert!(err.to_string().contains("already published"), "{err}");
         }
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★ The review threshold is a PREFIX of [`SEVERITIES`], so the prompt's
+    /// three classes are slices of the one declared list. The list's ORDER is
+    /// therefore load-bearing in a way a reader of `["critical", …]` would not
+    /// guess — reorder it, or insert a word, and the prompt silently starts
+    /// asking for a different thing. This is the test that refuses to let that
+    /// happen quietly.
+    #[test]
+    fn the_reporting_threshold_partitions_the_severity_list() {
+        assert_eq!(&SEVERITIES[..SERIOUS_SEVERITIES], ["critical", "major"]);
+        assert_eq!(
+            &SEVERITIES[SERIOUS_SEVERITIES..PRAISE_SEVERITY],
+            ["minor", "info"]
+        );
+        assert_eq!(&SEVERITIES[PRAISE_SEVERITY..], ["praise"]);
+        assert_eq!(SEVERITY_MEANINGS.len(), SEVERITIES.len());
+        assert_eq!(
+            join_words(&SEVERITIES[..SERIOUS_SEVERITIES], "or"),
+            "critical or major"
+        );
+        assert_eq!(
+            join_words(&SEVERITIES[..PRAISE_SEVERITY], "and"),
+            "critical, major, minor and info"
+        );
+        assert_eq!(join_words(&SEVERITIES[PRAISE_SEVERITY..], "or"), "praise");
+        assert_eq!(join_words(&[], "or"), "");
     }
 
     /// The severity set is CLOSED, it is in the CONTRACT, and the menu is
