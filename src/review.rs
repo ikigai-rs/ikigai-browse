@@ -210,6 +210,78 @@ use crate::{
 /// something as missing when it may live elsewhere (which removes the loudest
 /// false positive of chunking, not the blind spot), and the designed answer is
 /// a structural outline pass over the whole file, which is a separate arc.
+///
+/// ⚠⚠ THERE IS NO v6, AND THAT IS A RESULT RATHER THAN AN OMISSION — the
+/// defect it would have answered is real, measured, and still here.
+///
+/// THE DEFECT (ledger #483, measured 2026-09-21 on `ikigai-devtools`'s
+/// `claude/CLAUDE.md`, a 44 KB document that is almost entirely a catalogue of
+/// traps): every critical and major a v5 pass produced was the reviewer
+/// RESTATING A HAZARD THE DOCUMENT EXISTS TO WARN ABOUT. The `critical` was the
+/// `launchctl bootout` trap, whose own text explains that the pair fails
+/// silently. Stated generally: a reviewer holding the file but not the file's
+/// PURPOSE cannot tell "this text DESCRIBES a hazard" from "this text IS one",
+/// so the severity scales with how honest the document is. The better the
+/// disclosure, the worse the review.
+///
+/// TWO PROMPT LINES WERE MEASURED AGAINST IT AND BOTH FAILED. Six `debug=raw`
+/// passes per arm over that file (the archive-bypass arm — a repeat run through
+/// the ordinary path is an archive hit and answers 100% agreement to any
+/// question), `qwen3-coder:30b` at the configured temperature, findings counted
+/// after the anchor check so they are the ones a pass would mint:
+///
+/// | prompt                                          | findings/pass | serious/pass | critical/pass |
+/// |-------------------------------------------------|---------------|--------------|---------------|
+/// | v5 as shipped                                   |  11.5 (±3.8)  |  6.0 (±2.5)  |  1.5 (±0.55)  |
+/// | + "if the anchored text already states the problem, or warns against it, that is not a finding" | 13.2 (±1.7) | 8.5 (±1.1) | 2.2 (±0.75) |
+/// | + a four-sentence CONTRAST (a documented hazard is not the hazard; a claim the code contradicts is) | 10.3 (±2.3) | 6.0 (±1.7) | 0.5 (±0.84) |
+///
+/// ★ The one-sentence form — the obvious one, and the one the ledger item
+/// proposed — made it WORSE on every axis: naming "the problem the text states"
+/// gives the model a place to look for problems, and it found more of them.
+///
+/// ★ The contrast form did not fix it either, and the way it fails is the
+/// useful part. The serious rate is EXACTLY FLAT (6.0 per pass, both arms);
+/// only the `critical` count moved. That is relabelling rather than
+/// discrimination, and the control says so: the same downward shift landed on
+/// nine fixtures carrying planted comment-vs-code contradictions
+/// (`tests/corpus/disclosure/`, whose README states each plant and these rates).
+/// Detections barely moved — 24 of 54 → 26 of 54 — while the ratings on the
+/// REAL defects fell with everything else: `critical` on the path-traversal
+/// fixture 6 → 2, on the panicking-accessor fixture 6 → 2, on the
+/// forged-digest fixture 9 → 2. A rule that lowers severity everywhere is not
+/// telling disclosure from defect; it is turning the volume down, and the loss
+/// function here is asymmetric.
+///
+/// ⚠ AND THE CONTRAST FORM'S REMAINING SERIOUS FINDINGS CHANGED KIND RATHER
+/// THAN GOING AWAY. Told that a claim the file does not keep IS worth
+/// reporting, the model dressed the same restatements as self-contradiction —
+/// "the text states X but then contradicts this by saying Y", where X and Y are
+/// two halves of one warning — plus a new genre, "this rule is not enforced by
+/// any automated check", which several of those passages say about themselves.
+/// That is #452's finding in a new place: explaining a bar to this model gives
+/// it better vocabulary for clearing the bar.
+///
+/// ⚠ The one thing it bought, recorded because it says where a real fix might
+/// live: the pin fixture — a comment arguing a version FLOOR beside a `^0.12`
+/// that is also a ceiling — went 0/6 to 4/6. Naming the class made ONE
+/// contradiction reportable that the baseline never saw. It did not make the
+/// other four (a promised capability check that is absent, a "five scopes"
+/// list of six, a documented 1-based line number returned 0-based, a header
+/// forbidding the pipe the code below it writes) reportable at all: the
+/// baseline and both variants find a contradiction only when the contradicting
+/// behaviour is EXECUTABLE CODE THEY CAN QUOTE. #449's "absence has no anchor",
+/// narrowed to this class.
+///
+/// ★ So the shape of the fix is NOT a sentence in this prompt. What the reviewer
+/// is missing is the file's PURPOSE, which is not in the file — and the two
+/// candidates that remain both cost more than a prompt line: a role the caller
+/// declares (an operator's claim, not the model's guess), or a second pass that
+/// judges a finding against the passage it anchors in rather than the model
+/// judging its own output. Whoever tries again should re-measure the two rows
+/// above before assuming a third wording is different; the corpus and the
+/// archive-bypass harness (`examples/review-probe.rs`) are committed so that
+/// costs an afternoon rather than a week.
 const REVIEW_PROMPT_VERSION: &str = "review-v5";
 
 /// How many SUGGESTIONS — the tier between [`crate::finding::SERIOUS_SEVERITIES`]
@@ -2709,6 +2781,42 @@ mod tests {
             "{REVIEW_SYSTEM_PROMPT}"
         );
         assert!(SEVERITIES.contains(&"praise"));
+    }
+
+    /// ⚠⚠ THE SECOND SENTENCE THIS PROMPT IS NOT ALLOWED TO GROW BACK, and for
+    /// the same reason as the first: it was measured, it failed, and a variant
+    /// that quietly restores it undoes the experiment rather than repeating it.
+    ///
+    /// The defect is real — a reviewer cannot tell a DISCLOSED hazard from a
+    /// PRESENT one, so a document full of ⚠ produces a queue full of criticals
+    /// (ledger #483). The two obvious answers both make it worse or move
+    /// nothing; [`REVIEW_PROMPT_VERSION`] carries the table and the arms.
+    /// Briefly: the one-line suppression ("if the anchored text already states
+    /// the problem … that is not a finding") took the serious rate from 6.0 to
+    /// 8.5 findings per pass on the file it was written for, and the
+    /// four-sentence contrast held it flat while deflating `critical` on a
+    /// control corpus of real comment-vs-code contradictions.
+    ///
+    /// ★ So this asserts ABSENCE, and it is deliberately blunt: any prompt
+    /// carrying either shape fails here, including a reworded one that happens
+    /// to reuse these words. The fix for a red here is to read the table, not
+    /// to reword around the assertion.
+    #[test]
+    fn the_prompt_does_not_tell_the_model_that_a_disclosed_hazard_is_not_a_finding() {
+        let prompt = review_prompt(SUGGESTION_LIMIT, true);
+        let reminder = review_reminder(SUGGESTION_LIMIT);
+        for text in [&prompt, &reminder] {
+            assert!(
+                !text.contains("that is not a finding"),
+                "the suppression line raised the serious rate 6.0 -> 8.5 per pass \
+                 (ledger #483) - see REVIEW_PROMPT_VERSION: {text}"
+            );
+            assert!(
+                !text.contains("not the hazard"),
+                "the contrast line only deflated severity, on real defects too \
+                 (ledger #483) - see REVIEW_PROMPT_VERSION: {text}"
+            );
+        }
     }
 
     /// ⚠ A clean file is now an ORDINARY outcome, and it must not look like an
