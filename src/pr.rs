@@ -1600,7 +1600,7 @@ fn pr_review_face(
                     entry.orphaned_items
                 ));
             }
-            if let Some(note) = entry.truncation_note() {
+            if let Some(note) = entry.coverage_note() {
                 provenance.push_str(&esc(&note));
             }
             out.push_str(&format!(
@@ -1622,7 +1622,7 @@ fn pr_review_face(
                     entry.orphaned_items
                 ));
             }
-            if let Some(note) = entry.truncation_note() {
+            if let Some(note) = entry.coverage_note() {
                 out.push_str(&note);
             }
             out.push('\n');
@@ -2850,13 +2850,21 @@ index 3f9c2d1..8a41b77 100644
         assert!(prompt.contains("… (content truncated)"), "{prompt}");
 
         // The archive hit serves the same numbers; the plain face names it.
+        //
+        // ⚠ The WORDS are the file review's now, not this face's. `PassEntry` is
+        // shared, and the file review stopped truncating in review-v5 — it
+        // chunks — so a short reading there means a region that did not come
+        // back rather than a deliberate prefix. The diff review still truncates
+        // by policy, so "coverage incomplete" understates what is known here:
+        // it is the cost of one entry type serving both, and the fix is the
+        // same chunking on this side, which is its own arc.
         let hit = json(&k, "urn:repo:demo:pr:3:review", &[]);
         assert_eq!(hit["derived"], false);
         assert_eq!(hit["reviewed_bytes"], 40);
         let text = body(&source(&k, "urn:repo:demo:pr:3:review", &[]).unwrap());
         assert!(
             text.contains(&format!(
-                "reviewed 40 of {} bytes (input truncated)",
+                "reviewed 40 of {} bytes (coverage incomplete)",
                 DIFF.len()
             )),
             "{text}"
