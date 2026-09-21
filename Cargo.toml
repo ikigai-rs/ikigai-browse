@@ -101,11 +101,39 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # appear gets findings instead. That is a changed shape, and under 0.x it is a minor.
 #
 # ⚠ SO GONK'S PIN MOVES IN THE SAME WAVE, AND THIS IS NOT OPTIONAL. `ikigai-gonk`
-# pins `ikigai-browse = "0.4.2"`, and `^0.4.2` means `<0.5.0` — publishing this
-# without moving that pin ceilings gonk out of the exact change it is waiting for,
-# silently, with no diagnostic. Rule 5's second half; the ikigai-dev-server 0.10 pin
-# is the precedent that cost two minor releases before anyone noticed.
-version = "0.5.0"
+# pinned `ikigai-browse = "0.4.2"`, and `^0.4.2` means `<0.5.0` — publishing that
+# without moving the pin would have ceilinged gonk out of the exact change it was
+# waiting for, silently, with no diagnostic. Rule 5's second half; the
+# ikigai-dev-server 0.10 pin is the precedent that cost two minor releases before
+# anyone noticed. The pin moved with the publish (gonk #24), and ⚠ IT HAS TO AGAIN
+# FOR 0.6.0: gonk now pins "0.5.0", and `^0.5.0` means `<0.6.0`. The same trap,
+# one release later, for the same reason.
+#
+# 0.6.0 carries TWO arcs that both changed the review's observable shape.
+#
+# review-v4 (#38, ledger #449) replaced the 3-to-6 QUOTA with a threshold. ⚠ The
+# consumer-visible part is that a pass can now be archived with ZERO findings and
+# a statement saying so — `nothing above threshold · reviewed the whole file
+# (4812 bytes)`. **A caller reading `minted.is_empty()` as failure was correct
+# before this and is wrong after it**, which is the break that makes this a minor
+# rather than a patch. The json face gains `statement`; the plain and html faces
+# change shape.
+# ★ And the thing worth remembering from that arc: the threshold is deliberately
+# NOT keyed on self-reported severity. Measured, the phrasing "report what you
+# would rate major or worse" moved the serious share 27% → 62% (→ 91% with
+# calibration prose) by RE-LABELLING — 43% of the new "serious" were findings the
+# old prompt rated minor or info. A self-reported severity cannot be both the
+# triage signal and the reporting gate. A test fails if that sentence returns.
+#
+# review-v5 (#39, ledger #450) removed TRUNCATION. A file is split into
+# line-aligned regions that TILE it — concat reproduces the file byte for byte —
+# so `ik:reviewedBytes == ik:totalBytes` stops being a disclosure and becomes an
+# invariant a test pins. `PassEntry::truncation_note` became `coverage_note`, and
+# the words `(input truncated)` became `(coverage incomplete)`: a short reading now
+# means a region that did not come back, not a ceiling. ⚠ `pr.rs` shares that entry
+# type and still truncates its diff by policy, so its face understates what it
+# knows until the diff review gets the same treatment (ledger #472).
+version = "0.6.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
