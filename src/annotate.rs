@@ -52,6 +52,13 @@
 //! re-anchoring matches against; caller-supplied `prefix`/`suffix` serve only
 //! to disambiguate the initial anchor.
 //!
+//! ⚠ One concession, and only one: a quote that misses is retried ONCE with a
+//! leading run of non-alphanumeric characters stripped (the marker a model
+//! decorates a quote with — ledger #488), and the text then RECORDED is the
+//! target's own characters, not the caller's. Everything after that leading
+//! run must still match character-for-character; the anchor is the proof the
+//! quote came off the file.
+//!
 //! On every Source/list, when the target's current hash differs from the
 //! annotation's recorded `ik:contentHash`, the quote is re-searched in the new
 //! content (same scoring). Found → BOTH selectors and the recorded hash are
@@ -1174,7 +1181,66 @@ fn find_anchor_in_diff(
     None
 }
 
-/// Which anchoring discipline a target's text demands: plain quote search
+/// The quote with a leading run of non-alphanumeric characters removed —
+/// `Some` only when there WAS such a run and something survives it.
+///
+/// This is the whole concession [`find_anchor_on_file`] makes, and its
+/// narrowness is the point: the run is LEADING, the rest must still match
+/// character-for-character, and the retry happens once. A general fuzzy match
+/// would destroy the property the anchor exists for — that it is proof the
+/// model read the file.
+fn strip_leading_decoration(exact: &str) -> Option<&str> {
+    let rest = exact.trim_start_matches(|c: char| !c.is_alphanumeric());
+    (rest.len() < exact.len() && !rest.is_empty()).then_some(rest)
+}
+
+/// Anchoring against file content: the quote as given, and — once, only when
+/// that missed — the quote with a leading run of non-alphanumeric characters
+/// stripped.
+///
+/// ⚠ The retry exists because the model DECORATES the quote with the marker
+/// the document is written in rather than the characters the line carries
+/// (ledger #488). Measured on a warning-dense Markdown file, it prefixed
+/// quotes with a `⚠` the line does not have —
+///
+///   quoted: `⚠ **A per-repo cron CANNOT be the ecosystem's clock`
+///   file:   `9e. **A per-repo cron CANNOT be the ecosystem's clock`
+///
+/// — and every other character matched. It is the same reflex the prompt's
+/// backtick clause already fights, with characters that clause does not name;
+/// on that file 28-48% of findings orphaned against the 1-5% the prompt
+/// advertises, and the orphans were not random lines but exactly the marked
+/// rules. ★ Fixing it HERE rather than with a sixth prompt clause is
+/// deliberate: five phrasings were measured (ledger #483) and one made things
+/// worse, a clause competes for attention a long file can crowd out, and this
+/// is testable without a model.
+///
+/// ★ The stored exact is read back out of `content`, never handed through
+/// from the caller's string: `exact` is the anchor, the dedupe key and part of
+/// the finding id (`sha256(pass ‖ char_start ‖ exact)`), so storing the
+/// model's decorated form would make the same finding a different id on every
+/// pass.
+fn find_anchor_on_file(
+    content: &str,
+    exact: &str,
+    prefix: &str,
+    suffix: &str,
+) -> Option<DiffAnchor> {
+    if let Some(anchor) = find_anchor(content, exact, prefix, suffix) {
+        return Some(DiffAnchor {
+            anchor,
+            stored_exact: None,
+        });
+    }
+    let anchor = find_anchor(content, strip_leading_decoration(exact)?, prefix, suffix)?;
+    let stored_exact = content[anchor.byte_start..anchor.byte_end].to_string();
+    Some(DiffAnchor {
+        anchor,
+        stored_exact: Some(stored_exact),
+    })
+}
+
+/// Which anchoring discipline a target's text demands: [`find_anchor_on_file`]
 /// for file content, the marker-tolerant [`find_anchor_in_diff`] for a pull
 /// request's unified diff.
 #[derive(Clone, Copy, PartialEq)]
@@ -1184,7 +1250,9 @@ pub(crate) enum Surface {
 }
 
 /// Anchor on the right surface, normalizing both disciplines to a
-/// [`DiffAnchor`] (file hits never carry a stored-exact override).
+/// [`DiffAnchor`]. Either surface may report a stored-exact override — the
+/// text to record is always the FILE's (or diff's) characters, never the
+/// caller's.
 pub(crate) fn find_anchor_on(
     surface: Surface,
     content: &str,
@@ -1194,10 +1262,7 @@ pub(crate) fn find_anchor_on(
 ) -> Option<DiffAnchor> {
     match surface {
         Surface::Diff => find_anchor_in_diff(content, exact, prefix, suffix),
-        Surface::File => find_anchor(content, exact, prefix, suffix).map(|anchor| DiffAnchor {
-            anchor,
-            stored_exact: None,
-        }),
+        Surface::File => find_anchor_on_file(content, exact, prefix, suffix),
     }
 }
 
@@ -3479,6 +3544,60 @@ mod tests {
 
         // Still a miss when the code is simply not there.
         assert!(find_anchor_in_diff(diff, "vanished()", "", "").is_none());
+    }
+
+    /// Ledger #488: the model prefixes a quote with the marker the document
+    /// is written in (`⚠`, `★`, a bullet, a number) rather than the
+    /// characters the line carries. One leading strip, retried once, and the
+    /// recorded exact is the FILE's characters.
+    #[test]
+    fn a_decorated_quote_anchors_once_stripped_and_stores_the_files_characters() {
+        // The measured shape, verbatim from #488: the file numbers the rule,
+        // the model marks it.
+        let file = "9d. **`cargo install` IGNORES `Cargo.lock`**\n\
+                    9e. **A per-repo cron CANNOT be the ecosystem's clock**\n";
+        let quoted = "⚠ **A per-repo cron CANNOT be the ecosystem's clock**";
+
+        let hit = find_anchor_on(Surface::File, file, quoted, "", "").unwrap();
+        assert_eq!(hit.anchor.line, 2);
+        // ★ What is stored is the file's text, never the model's: the `⚠`
+        // AND the `**` the strip took with it are gone.
+        let stored = hit.stored_exact.as_deref().unwrap();
+        assert_eq!(stored, "A per-repo cron CANNOT be the ecosystem's clock**");
+        assert!(file.contains(stored), "stored exact must be file text");
+        assert!(!stored.starts_with('⚠'));
+
+        // ★ And the id is the id the undecorated quote would have minted —
+        // the whole reason `exact` may not be the model's characters.
+        let clean = find_anchor_on(Surface::File, file, stored, "", "").unwrap();
+        assert_eq!(clean.stored_exact, None, "an exact quote needs no retry");
+        assert_eq!(
+            finding_id("urn:pass", hit.anchor.char_start, stored),
+            finding_id("urn:pass", clean.anchor.char_start, stored),
+        );
+
+        // The side of the same rule that keeps it honest: ONE LEADING run.
+        // An interior decoration still orphans...
+        assert!(
+            find_anchor_on(Surface::File, file, "⚠ **A per-repo ⚠ cron", "", "").is_none(),
+            "the retry strips a prefix, it does not fuzzy-match"
+        );
+        // ...a quote that is simply not in the file still orphans, decorated
+        // or not (the anchor is the proof the model read the file)...
+        assert!(find_anchor_on(Surface::File, file, "⚠ a cron job may never", "", "").is_none());
+        // ...and a quote that is ALL decoration anchors nothing rather than
+        // matching the empty string everywhere.
+        assert!(find_anchor_on(Surface::File, file, "⚠ ** ", "", "").is_none());
+    }
+
+    /// The same rule catches the other decoration a model adds for free:
+    /// indentation it did not read off the line.
+    #[test]
+    fn a_reindented_quote_anchors_to_the_files_own_indentation() {
+        let file = "fn f() {\n    let x = 1;\n}\n";
+        let hit = find_anchor_on(Surface::File, file, "        let x = 1;", "", "").unwrap();
+        assert_eq!(hit.stored_exact.as_deref(), Some("let x = 1;"));
+        assert_eq!(hit.anchor.line, 2);
     }
 
     #[test]
