@@ -1038,6 +1038,18 @@ impl Endpoint for ReviewEndpoint {
                 detail: format!("`{rel}` is binary — there is nothing to review"),
             });
         };
+        // ⚠ An EMPTY file has no regions, and since v5 that is a real branch
+        // rather than a curiosity: the walk below would make zero calls and then
+        // report that no region produced findings, which reads like a model
+        // failure. It is refused here for the same reason a directory is — and
+        // NOT archived as a clean pass, because "nothing above threshold" would
+        // attribute to the model a judgment it was never asked to make.
+        if text.is_empty() {
+            return Err(Error::InvalidArgument {
+                name: "path".to_string(),
+                detail: format!("`{rel}` is empty — there is nothing to review"),
+            });
+        }
 
         // The model identity for the tag: explicit config label → the
         // provider's resolved `:model` identity → the provider-IRI heuristic.
@@ -3181,6 +3193,28 @@ mod tests {
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap_or_else(|e| panic!("annotation turtle must parse: {e}\n{ttl}"));
         assert!(!triples.is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_empty_file_is_refused_rather_than_reported_clean() {
+        let root = temp_dir();
+        std::fs::write(root.join("empty.rs"), "").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, TWO_FINDINGS);
+
+        let err = issue(
+            &k,
+            Verb::Source,
+            "urn:repo:demo:review:empty.rs",
+            &[],
+            &cap(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument { .. }), "{err:?}");
+        assert_eq!(log.count(), 0, "an empty file costs no model call");
+        assert!(store.is_empty().unwrap(), "and archives no clean pass");
         std::fs::remove_dir_all(&root).ok();
     }
 
