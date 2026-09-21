@@ -17,6 +17,31 @@
 //! annotations re-anchor or orphan exactly like human ones — that drift IS the
 //! review-history story.
 //!
+//! ## The whole file, one region at a time
+//!
+//! ★ A pass covers EVERY byte of the file. Anything larger than one prompt
+//! (`max_prompt_bytes`) is split into line-aligned regions and each is reviewed
+//! by its own model call, the findings unioned into one pass — because the
+//! alternative, feeding a 16 KiB prefix, reported in exactly the shape of a
+//! complete review and made 62% of this ecosystem's source files silent false
+//! all-clears. `ik:reviewedBytes == ik:totalBytes` is an INVARIANT here, not a
+//! disclosure: either the pass covered the file or every face says it did not.
+//!
+//! Three consequences worth stating where they cannot be missed:
+//!
+//! * **Clean is a UNION, not a per-region property.** A pass is clean only when
+//!   EVERY region said so; one region's findings make the file not clean, and a
+//!   region whose answer collapsed is not counted as reviewed at all.
+//! * **A failed region leaves the pass incomplete but RECORDED.** Six good
+//!   regions are not thrown away because the seventh timed out; the entry
+//!   carries the coverage it earned.
+//! * **⚠ A defect that SPANS two regions is invisible to both.** Two sources of
+//!   truth, an invariant set in one region and violated in another, an error
+//!   path nothing calls — the cross-region class is the serious class, and
+//!   chunking trades a coverage hole for a severity hole. The prompt stops a
+//!   region from reporting an absence it cannot check; the real answer is a
+//!   structural outline pass over the whole file, which is its own arc.
+//!
 //! ## Choosing the backend per request
 //!
 //! `provider={iri}` derives THIS pass against a backend the caller names
@@ -101,9 +126,13 @@ use oxigraph::model::{Literal, NamedNode, Quad, Term};
 use crate::annotate::{self, Included, PROV};
 use crate::archive::Archive;
 use crate::explain::{
-    command_safe, ik, iso8601, menu_options, parse_iri, provider_label, resolve_model, truncate,
-    truncated_len, MenuTier, ModelOption, CAP_NET, IK,
+    command_safe, ik, iso8601, menu_options, parse_iri, provider_label, resolve_model, MenuTier,
+    ModelOption, CAP_NET, IK,
 };
+// ★ `truncate`/`truncated_len` are deliberately NOT imported here any more. The
+// review pass no longer truncates anything: it chunks. The explain family still
+// imports them, because an explanation of a file's first 16 KiB is a weaker but
+// coherent answer, while a REVIEW of the first 16 KiB is a false all-clear.
 use crate::finding::{
     join_words, PRAISE_SEVERITY, SERIOUS_SEVERITIES, SEVERITIES, SEVERITY_MEANINGS,
 };
@@ -159,7 +188,29 @@ use crate::{
 /// therefore gates on "worth a colleague's attention", states that the serious
 /// half is never capped, and leaves the rating purely descriptive — which is
 /// also what [`crate::finding::SEVERITIES`] is for.
-const REVIEW_PROMPT_VERSION: &str = "review-v4";
+/// v5: the pass reviews the WHOLE FILE. v4 and every version before it fed
+/// `truncate(&text, max_prompt_bytes)` — 16 KiB by default — and then reported
+/// in exactly the shape of a complete review. Measured 2026-09-19 over 140
+/// `*/src/*.rs` files: 88 of them (62%) exceed that ceiling, median 23 KiB, p90
+/// 90 KiB, ~3.1 MB of source no pass has ever seen; this very file is 129 KiB,
+/// so a review of the reviewer saw about 15% of it and said nothing about the
+/// other 85%. ★ Truncation is therefore replaced by CHUNKING: the file is split
+/// into line-aligned regions of at most `max_prompt_bytes` and each is reviewed
+/// by its own call, the findings unioned into one pass. `ik:reviewedBytes ==
+/// ik:totalBytes` stops being a disclosure and becomes an INVARIANT a test can
+/// pin — either the pass covered the file or it says it did not.
+/// A v5 pass is a different population from a v4 one on every file over the
+/// chunk size, and the tag keeps the v4 corpus readable beside it.
+///
+/// ⚠⚠ THE BLIND SPOT v5 BUYS WITH THAT COVERAGE, stated plainly because the
+/// report cannot: a defect that SPANS two regions is invisible to both. Two
+/// sources of truth, an invariant established in one region and violated in
+/// another, an error path nothing calls — the cross-region class is precisely
+/// the class most worth reporting. The prompt tells each region not to report
+/// something as missing when it may live elsewhere (which removes the loudest
+/// false positive of chunking, not the blind spot), and the designed answer is
+/// a structural outline pass over the whole file, which is a separate arc.
+const REVIEW_PROMPT_VERSION: &str = "review-v5";
 
 /// How many SUGGESTIONS — the tier between [`crate::finding::SERIOUS_SEVERITIES`]
 /// and [`crate::finding::PRAISE_SEVERITY`] — a pass is asked to carry at most.
@@ -175,7 +226,27 @@ const REVIEW_PROMPT_VERSION: &str = "review-v4";
 /// honest fix is to enforce it after parsing — which needs somewhere to record
 /// what was dropped, the way `orphaned_items` records what did not anchor, or
 /// the discarded text is destroyed at the moment it is generated.
+///
+/// ⚠⚠ AND CHUNKING MULTIPLIES A REQUEST BY N. A per-call limit of 3 over the
+/// seven regions of a 109 KiB file asks for 21 suggestions, which is the v4
+/// volume problem (6.4 findings per pass, 53% `info`) made seven times worse.
+/// Until there is somewhere to record a drop, v5 does the one thing it can do
+/// without destroying evidence: it DIVIDES this number across the regions
+/// ([`region_suggestion_budget`]), so the whole-file ask is bounded by
+/// `max(SUGGESTION_LIMIT, regions)` rather than by their product — 9 instead of
+/// 27 for this file. That is still a request. Enforcing it needs an
+/// `ik:droppedItems` the vocabulary does not have.
 const SUGGESTION_LIMIT: usize = 3;
+
+/// How many suggestions ONE region is asked for, given how many regions the
+/// file was split into — [`SUGGESTION_LIMIT`] shared out, never below one.
+///
+/// A single-region file gets exactly [`SUGGESTION_LIMIT`], which is what makes
+/// a small file's v5 prompt byte-identical to its v4 prompt: the only thing
+/// that changed for files under the chunk size is the tag.
+fn region_suggestion_budget(regions: usize) -> usize {
+    SUGGESTION_LIMIT.div_ceil(regions.max(1)).max(1)
+}
 
 /// The whole answer a model returns when nothing in the file met the
 /// threshold — and it is a REQUIRED utterance, not an optional courtesy.
@@ -226,10 +297,17 @@ const REVIEW_SYSTEM_PROMPT: &str =
 /// everything produced orphaned without that clause, 1–5% with it, and one file
 /// of dense CSS-in-Rust went from a 100% anchoring collapse (0 findings minted
 /// across 6 passes) to normal. It is the cheapest line in this prompt.
-fn review_prompt() -> String {
+fn review_prompt(suggestion_budget: usize, ask_for_praise: bool) -> String {
     let serious = join_words(&SEVERITIES[..SERIOUS_SEVERITIES], "or");
     let suggestions = join_words(&SEVERITIES[SERIOUS_SEVERITIES..PRAISE_SEVERITY], "or");
     let praise = join_words(&SEVERITIES[PRAISE_SEVERITY..], "or");
+    // ⚠ One praise per REGION would be one per call, so a seven-region file
+    // would ask for seven compliments on a prompt that stopped soliciting them.
+    // Only the first region is asked.
+    let praise_clause = match ask_for_praise {
+        true => format!(", and add at most one rated {praise},"),
+        false => String::from(","),
+    };
     let ladder: Vec<String> = SEVERITIES
         .iter()
         .zip(SEVERITY_MEANINGS)
@@ -246,8 +324,8 @@ fn review_prompt() -> String {
          with nothing worth reporting is a complete review.\n\
          Never leave a real problem out because you have already reported others: a \
          defect is worth reporting however many findings you already have. Keep the \
-         {suggestions} ones to {SUGGESTION_LIMIT} at most, and add at most one rated \
-         {praise}, and only if they would earn the reader's time.\n\
+         {suggestions} ones to {suggestion_budget} at most{praise_clause} and only if \
+         they would earn the reader's time.\n\
          Rate each finding honestly. The rating is a triage signal for a human reader, \
          not the reason a finding is reported: calling a style preference or a doc \
          comment {serious} costs that reader exactly as much as missing a real defect \
@@ -280,7 +358,7 @@ fn review_prompt() -> String {
 /// evidence behind it: the stopping rule is as easy for a long file to crowd
 /// out as the format is, and a model that has forgotten it falls back on the
 /// habit the quota trained.
-fn review_reminder() -> String {
+fn review_reminder(suggestion_budget: usize) -> String {
     let serious = join_words(&SEVERITIES[..SERIOUS_SEVERITIES], "or");
     let suggestions = join_words(&SEVERITIES[SERIOUS_SEVERITIES..PRAISE_SEVERITY], "or");
     format!(
@@ -292,7 +370,7 @@ fn review_reminder() -> String {
          else, and nothing around the quote - no backticks and no quotation marks, \
          or it will not match the file and the finding is discarded. Report every \
          {serious} problem you found, however many that is, but only what truly \
-         meets that bar; keep the {suggestions} ones to {SUGGESTION_LIMIT} at most. \
+         meets that bar; keep the {suggestions} ones to {suggestion_budget} at most. \
          If nothing met the bar, the entire answer is the single line \
          {NOTHING_ABOVE_THRESHOLD}.",
         join_words(&SEVERITIES, "or"),
@@ -312,6 +390,152 @@ fn says_nothing_above_threshold(answer: &str) -> bool {
             .trim_matches(|c: char| c == '*' || c == '`' || c == '#' || c == '.' || c == ' ')
             .eq_ignore_ascii_case(NOTHING_ABOVE_THRESHOLD)
     })
+}
+
+// --- chunking: the whole file, one region at a time ---------------------------
+
+/// One region of a file offered to ONE model call: a byte range into the full
+/// text plus the 1-based line it starts on.
+///
+/// ★ The range indexes the FULL text and never a copy, which is what keeps the
+/// anchor check untouched: quotes have always been anchored against the whole
+/// file regardless of what was fed, so a finding from region 3 validates exactly
+/// as one from region 1 does. Chunking is cheap precisely because it changes
+/// only what the model SEES, never what a quote is checked against.
+#[derive(Debug, PartialEq, Eq)]
+struct Region {
+    start: usize,
+    end: usize,
+    first_line: usize,
+}
+
+impl Region {
+    fn len(&self) -> usize {
+        self.end - self.start
+    }
+
+    /// The last line this region carries — for the header that tells the model
+    /// where in the file it is standing.
+    fn last_line(&self, text: &str) -> usize {
+        let newlines = text[self.start..self.end].matches('\n').count();
+        // A region ending exactly on a newline ends the line before it.
+        match text[self.start..self.end].ends_with('\n') {
+            true => self.first_line + newlines.saturating_sub(1),
+            false => self.first_line + newlines,
+        }
+    }
+}
+
+/// Split `text` into at most `max_regions` consecutive regions of at most
+/// `chunk_bytes` each, cut at line boundaries.
+///
+/// ## Where the cut falls, and why not at item boundaries
+///
+/// A byte offset cuts through the middle of a function; an item boundary
+/// (`fn`/`impl`/`class`/`def`) is the right review unit but needs a parser, and
+/// this module is language-agnostic on purpose — it reviews Markdown and TOML
+/// with the same code path. The cheap middle, and what this does: inside the
+/// last quarter of each window, prefer a BLANK LINE, else a COLUMN-0 line start
+/// (in every language this module sees, an unindented line opens a top-level
+/// item), else any line boundary, else a character-safe byte cut for a file with
+/// no newline in a whole window.
+///
+/// ★ The invariant a test pins: the regions TILE the text — contiguous, in
+/// order, no gap and no overlap — so concatenating them reproduces the file
+/// exactly. `reviewed_bytes` is then a sum of region lengths rather than an
+/// estimate, and `reviewed_bytes == total_bytes` means what it says.
+///
+/// ⚠ The regions do NOT overlap. Overlap was the other candidate countermeasure
+/// for the cross-region blind spot, and it is not free: it re-reads the overlap
+/// on every pass and produces duplicate findings. It also does not fix the
+/// class — a defect relating byte 900 to byte 90000 spans no boundary a small
+/// overlap would bridge. The outline pass is the answer to that, and it is a
+/// separate arc.
+fn split_into_regions(text: &str, chunk_bytes: usize, max_regions: usize) -> Vec<Region> {
+    let chunk_bytes = chunk_bytes.max(1);
+    let max_regions = max_regions.max(1);
+    let mut regions = Vec::new();
+    let mut start = 0usize;
+    let mut line = 1usize;
+    while start < text.len() && regions.len() < max_regions {
+        let end = region_end(text, start, chunk_bytes);
+        debug_assert!(end > start, "a region must make progress");
+        regions.push(Region {
+            start,
+            end,
+            first_line: line,
+        });
+        line += text[start..end].matches('\n').count();
+        start = end;
+    }
+    regions
+}
+
+/// Where the region starting at `start` ends: the best boundary at or below
+/// `start + chunk_bytes`, preferring a blank line, then a column-0 line start,
+/// then any line start — all within the last quarter of the window so a lucky
+/// early blank line cannot produce a tiny region.
+fn region_end(text: &str, start: usize, chunk_bytes: usize) -> usize {
+    if text.len() - start <= chunk_bytes {
+        return text.len();
+    }
+    let mut hard = start + chunk_bytes;
+    while hard > start && !text.is_char_boundary(hard) {
+        hard -= 1;
+    }
+    if hard <= start {
+        // One character wider than the budget: a single char larger than
+        // `chunk_bytes` still has to make progress or the walk never ends.
+        let mut end = start + 1;
+        while end < text.len() && !text.is_char_boundary(end) {
+            end += 1;
+        }
+        return end;
+    }
+    let floor = start + (chunk_bytes - chunk_bytes / 4);
+    let bytes = text.as_bytes();
+    let (mut blank, mut column0, mut any) = (None, None, None);
+    for (offset, byte) in text[start..hard].bytes().enumerate() {
+        if byte != b'\n' {
+            continue;
+        }
+        let boundary = start + offset + 1;
+        if boundary <= floor {
+            continue;
+        }
+        any = Some(boundary);
+        match bytes.get(boundary) {
+            Some(b' ' | b'\t') | None => {}
+            Some(_) => column0 = Some(boundary),
+        }
+        if boundary >= 2 && bytes[boundary - 2] == b'\n' {
+            blank = Some(boundary);
+        }
+    }
+    blank.or(column0).or(any).unwrap_or(hard)
+}
+
+/// What a region's prompt says about where it is — empty for a file that fits
+/// in one call, so a small file's v5 prompt is byte-identical to its v4 one.
+///
+/// ⚠ The second sentence is not politeness. A model shown region 2 of 7 will
+/// report "this file never validates its input" about validation that lives in
+/// region 5 — the loudest and most confident false positive chunking creates,
+/// and the one that would train a reader to distrust the whole pass. It does
+/// NOT fix the cross-region blind spot; nothing in a per-region prompt can.
+fn region_header(region: &Region, index: usize, total: usize, text: &str) -> String {
+    if total == 1 {
+        return String::new();
+    }
+    format!(
+        "\nRegion: part {} of {total}, lines {} to {} of this file\n\
+         You are reviewing THIS REGION ONLY. The other parts are reviewed separately and \
+         the findings are merged, so report only what is visible here, and never report \
+         something as missing from the file when it may appear in another region.",
+        index + 1,
+        region.first_line,
+        region.last_line(text),
+    )
 }
 
 // --- the archive entry (RDF in the shared store) ------------------------------
@@ -348,22 +572,36 @@ pub(crate) struct PassEntry {
     pub(crate) model: String,
     pub(crate) minted: Vec<String>,
     pub(crate) orphaned_items: u64,
-    /// How much of the input the model actually saw vs. its full size —
-    /// honest reporting for big inputs (`max_prompt_bytes` truncates what is
-    /// fed; quotes still anchor against everything). `None` on entries
-    /// archived before these fields existed.
+    /// How much of the input the model actually saw vs. its full size.
+    ///
+    /// ★ Since v5 these are an INVARIANT rather than a disclosure: the pass
+    /// chunks the file and reviews every region, so `reviewed_bytes ==
+    /// total_bytes` unless the pass SAYS otherwise — a region whose answer
+    /// collapsed, or a file past [`crate::ExplainConfig::review_max_chunks`].
+    /// Before v5 the gap was the ordinary case (62% of this ecosystem's source
+    /// files), which is why prose about honest reporting was not enough and a
+    /// test now pins the equality.
+    ///
+    /// `None` on entries archived before these fields existed.
     pub(crate) reviewed_bytes: Option<u64>,
     pub(crate) total_bytes: Option<u64>,
     pub(crate) derived_at: Option<String>,
 }
 
 impl PassEntry {
-    /// The truncation notice the plain and html faces append when the model
-    /// saw less than the whole input — silence would misrepresent the pass.
-    pub(crate) fn truncation_note(&self) -> Option<String> {
+    /// The notice the plain and html faces append when the pass saw less than
+    /// the whole input — silence would misrepresent it.
+    ///
+    /// ⚠ The words changed in v5 and the change is the point. Before v5 a short
+    /// reading meant TRUNCATION, which was policy: the majority of files were
+    /// fed a 16 KiB prefix on purpose. v5 reviews every region, so a short
+    /// reading now means a region that did not come back — a collapsed answer
+    /// or a file past the region cap. The entry carries two numbers and cannot
+    /// tell those two apart after a reload, so it claims only what it knows.
+    pub(crate) fn coverage_note(&self) -> Option<String> {
         match (self.reviewed_bytes, self.total_bytes) {
             (Some(reviewed), Some(total)) if reviewed < total => Some(format!(
-                " · reviewed {reviewed} of {total} bytes (input truncated)"
+                " · reviewed {reviewed} of {total} bytes (coverage incomplete)"
             )),
             _ => None,
         }
@@ -382,14 +620,16 @@ impl PassEntry {
     /// above threshold" over the whole file and the same words over 15% of it
     /// are different assertions, and the weaker one is a FALSE ALL-CLEAR if it
     /// renders like the stronger. `reviewed_bytes`/`total_bytes` already carry
-    /// the difference; this is where it reaches a reader.
+    /// the difference; this is where it reaches a reader. Since v5 the whole-file
+    /// form is the ordinary one and the short form is the exception — the
+    /// reverse of every version before it.
     pub(crate) fn statement(&self) -> String {
         let head = match self.minted.len() {
             0 => "nothing above threshold".to_string(),
             1 => "1 finding".to_string(),
             n => format!("{n} findings"),
         };
-        match self.truncation_note() {
+        match self.coverage_note() {
             Some(note) => format!("{head}{note}"),
             None => match self.total_bytes {
                 Some(total) => format!("{head} · reviewed the whole file ({total} bytes)"),
@@ -787,9 +1027,10 @@ impl Endpoint for ReviewEndpoint {
         let hash_repr = inv.source(&parse_iri(&hash_iri(repo, &rel))?).await?;
         let hash = String::from_utf8_lossy(&hash_repr.bytes).trim().to_string();
 
-        // The content, also through the kernel: the anchor surface (full text
-        // — the model sees at most max_prompt_bytes, but quotes anchor
-        // against everything).
+        // The content, also through the kernel: the anchor surface, and since
+        // v5 also the whole of what the model is shown — one region per call.
+        // Quotes have always anchored against everything here, which is what
+        // lets a region's finding validate exactly like a whole file's.
         let content = inv.source(&parse_iri(&file_iri(repo, &rel))?).await?;
         let Ok(text) = String::from_utf8(content.bytes.clone()) else {
             return Err(Error::InvalidArgument {
@@ -797,6 +1038,18 @@ impl Endpoint for ReviewEndpoint {
                 detail: format!("`{rel}` is binary — there is nothing to review"),
             });
         };
+        // ⚠ An EMPTY file has no regions, and since v5 that is a real branch
+        // rather than a curiosity: the walk below would make zero calls and then
+        // report that no region produced findings, which reads like a model
+        // failure. It is refused here for the same reason a directory is — and
+        // NOT archived as a clean pass, because "nothing above threshold" would
+        // attribute to the model a judgment it was never asked to make.
+        if text.is_empty() {
+            return Err(Error::InvalidArgument {
+                name: "path".to_string(),
+                detail: format!("`{rel}` is empty — there is nothing to review"),
+            });
+        }
 
         // The model identity for the tag: explicit config label → the
         // provider's resolved `:model` identity → the provider-IRI heuristic.
@@ -843,81 +1096,171 @@ impl Endpoint for ReviewEndpoint {
             }
         }
 
-        // Miss: derive one pass. Ask, parse, anchor, mint, archive.
-        let prompt = format!(
-            "{}\n\nRepository: {repo}\nPath: {rel}\n\n```\n{}\n```\n\n{}",
-            review_prompt(),
-            truncate(&text, config.max_prompt_bytes),
-            review_reminder(),
-        );
-        let request = Request::new(Verb::Source, parse_iri(&provider)?)
-            .with_arg("prompt", ArgRef::Inline(prompt.into_bytes()))
-            .with_arg(
-                "system",
-                ArgRef::Inline(REVIEW_SYSTEM_PROMPT.as_bytes().to_vec()),
-            )
-            .with_arg(
-                "temperature",
-                ArgRef::Inline(config.temperature.clone().into_bytes()),
-            )
-            .with_arg(
-                "max_tokens",
-                ArgRef::Inline(config.review_max_tokens.to_string().into_bytes()),
+        // Miss: derive one pass over EVERY region of the file. Ask, parse,
+        // anchor, mint, archive — the same five steps as v4, N times, unioned.
+        let regions = split_into_regions(&text, config.max_prompt_bytes, config.review_max_chunks);
+        let budget = region_suggestion_budget(regions.len());
+        let offered: usize = regions.iter().map(Region::len).sum();
+        let mut raw_answers = Vec::new();
+        let mut findings = Vec::new();
+        let mut malformed = 0u64;
+        let mut reviewed = 0usize;
+        let mut collapsed: Vec<String> = Vec::new();
+        let mut first_error: Option<Error> = None;
+        for (index, region) in regions.iter().enumerate() {
+            let prompt = format!(
+                "{}\n\nRepository: {repo}\nPath: {rel}{}\n\n```\n{}\n```\n\n{}",
+                review_prompt(budget, index == 0),
+                region_header(region, index, regions.len(), &text),
+                &text[region.start..region.end],
+                review_reminder(budget),
             );
-        let answer = inv.issue(request).await?;
-        let answer = String::from_utf8_lossy(&answer.bytes).to_string();
-        if debug_raw {
-            return Ok(repr_utf8("text/plain", answer));
-        }
-        let (findings, malformed) = parse_findings(&answer);
-        let created = inv.now().map(|t| iso8601(t.as_millis()));
-        if findings.is_empty() {
-            // ★ THE CLEAN PASS. The model said in words that nothing met the
-            // threshold, so this is a pass that HAPPENED: archived, dated,
-            // attributed to the model, with its coverage — and an archive hit
-            // the next time, so a quiet file costs one call ever rather than
-            // one per commit.
+            let request = Request::new(Verb::Source, parse_iri(&provider)?)
+                .with_arg("prompt", ArgRef::Inline(prompt.into_bytes()))
+                .with_arg(
+                    "system",
+                    ArgRef::Inline(REVIEW_SYSTEM_PROMPT.as_bytes().to_vec()),
+                )
+                .with_arg(
+                    "temperature",
+                    ArgRef::Inline(config.temperature.clone().into_bytes()),
+                )
+                .with_arg(
+                    "max_tokens",
+                    ArgRef::Inline(config.review_max_tokens.to_string().into_bytes()),
+                );
+            // ★ PARTIAL FAILURE IS RECORDED, NOT DISCARDED. Region 4 of 7 failing
+            // must not throw away six regions of real work: the pass keeps what
+            // it has and declares its coverage, which is exactly the invariant
+            // `reviewed_bytes`/`total_bytes` now carry. Discarding would also
+            // re-spend all seven calls on the next ask.
             //
-            // ⚠ The sentinel alone is not sufficient, and `malformed == 0` is
-            // the other half. `malformed` counts a QUOTE the model never
-            // finished or a NOTE with nothing to anchor it: an answer carrying
-            // both the sentinel and that wreckage is a COLLAPSE wearing a clean
-            // answer's clothes, and archiving it would record a false
-            // all-clear under a key that never re-derives.
-            if malformed == 0 && says_nothing_above_threshold(&answer) {
-                let entry = PassEntry {
-                    iri,
-                    repo: repo.to_string(),
-                    rel: rel.clone(),
-                    target_iri: file_iri(repo, &rel),
-                    hash,
-                    tag,
-                    model,
-                    minted: Vec::new(),
-                    orphaned_items: 0,
-                    reviewed_bytes: Some(truncated_len(&text, config.max_prompt_bytes) as u64),
-                    total_bytes: Some(text.len() as u64),
-                    derived_at: created,
-                };
-                store_pass(&config.archive, &entry)?;
-                let included = annotate::included_for_ids(&config.archive, &[], &text)?;
-                return face(inv, repo, &rel, &entry, true, &included);
+            // ⚠ A DENIAL is the one error that short-circuits. It is a property
+            // of the caller's capability, identical for every region, so
+            // grinding through sixteen of them would turn one refusal into
+            // sixteen and bury the reason.
+            let answer = match inv.issue(request).await {
+                Ok(answer) => String::from_utf8_lossy(&answer.bytes).to_string(),
+                Err(e @ Error::Denied(_)) => return Err(e),
+                Err(e) => {
+                    collapsed.push(format!("region {}: {e}", index + 1));
+                    first_error.get_or_insert(e);
+                    continue;
+                }
+            };
+            if debug_raw {
+                raw_answers.push(match regions.len() {
+                    1 => answer,
+                    n => format!(
+                        "--- region {} of {n} (bytes {}–{}) ---\n{answer}",
+                        index + 1,
+                        region.start,
+                        region.end
+                    ),
+                });
+                continue;
+            }
+            let (mut region_findings, region_malformed) = parse_findings(&answer);
+            match region_findings.is_empty() {
+                // ★ A REGION IS CLEAN ONLY ON ITS OWN SAY-SO, and the pass is
+                // clean only if every region was. The naive union — "no findings
+                // anywhere, so the file is clean" — would let one collapsed
+                // answer produce a FALSE ALL-CLEAR under a key that never
+                // re-derives. A region that neither found anything nor said so
+                // is a region that was not reviewed, and its bytes are not
+                // counted.
+                true if region_malformed == 0 && says_nothing_above_threshold(&answer) => {
+                    reviewed += region.len();
+                }
+                true => {
+                    collapsed.push(format!(
+                        "region {}: \"{}\"",
+                        index + 1,
+                        answer_excerpt(&answer)
+                    ));
+                }
+                false => {
+                    reviewed += region.len();
+                    malformed += region_malformed;
+                    findings.append(&mut region_findings);
+                }
+            }
+        }
+        if debug_raw {
+            // ⚠ A probe that answered NOTHING must not read as an empty answer.
+            // Every region failing leaves `raw_answers` empty, and returning
+            // that would show a diagnosis face reporting a blank model reply
+            // — which is one of the very collapses it exists to tell apart.
+            match (raw_answers.is_empty(), first_error) {
+                (true, Some(e)) => return Err(e),
+                _ => return Ok(repr_utf8("text/plain", raw_answers.join("\n\n"))),
+            }
+        }
+        // ⚠ Every region failing is the old whole-pass failure and stays one:
+        // nothing was reviewed, so there is nothing honest to archive and the
+        // key must stay re-derivable. A transport error is reported as itself.
+        if reviewed == 0 {
+            if let Some(e) = first_error {
+                return Err(e);
             }
             // Nothing parseable and no clean statement either IS a failure —
             // erroring (and archiving nothing) keeps the key re-derivable
-            // instead of poisoning it with an empty pass. The error carries the
+            // instead of poisoning it with an empty pass. The error carries each
             // answer's opening so the collapse is diagnosable (a label-free
             // format, a refusal, an empty ceiling-starved reply all read
             // differently).
+            let scope = match regions.len() {
+                1 => String::new(),
+                n => format!(" in any of its {n} regions"),
+            };
             return Err(Error::Endpoint(format!(
-                "browse: `{}` returned no parseable QUOTE:/NOTE: findings for `{rel}`, and \
-                 did not report `{NOTHING_ABOVE_THRESHOLD}` either (max_tokens {}); nothing \
-                 archived. The answer began: \"{}\" — re-source with debug=raw for the full \
-                 unparsed answer",
-                provider,
+                "browse: `{provider}` returned no parseable QUOTE:/NOTE: findings for \
+                 `{rel}`{scope}, and did not report `{NOTHING_ABOVE_THRESHOLD}` either \
+                 (max_tokens {}); nothing archived. The answer began: {} — re-source with \
+                 debug=raw for the full unparsed answer",
                 config.review_max_tokens,
-                answer_excerpt(&answer)
+                collapsed.join("; "),
             )));
+        }
+        let created = inv.now().map(|t| iso8601(t.as_millis()));
+        // ★ The regions TILE the file, so this is a sum and not an estimate, and
+        // `reviewed == text.len()` is the invariant rather than a hope. Exactly
+        // two things can break the equality, and both are the pass saying so: a
+        // region whose answer collapsed, and a file past `review_max_chunks`
+        // whose tail was never offered to any call.
+        let reviewed_bytes = Some(reviewed as u64);
+        let total_bytes = Some(text.len() as u64);
+        debug_assert!(
+            reviewed <= offered && offered <= text.len(),
+            "regions must tile a prefix of the file"
+        );
+        if findings.is_empty() {
+            // ★ THE CLEAN PASS — and with regions it is a UNION, which is the
+            // one place the naive implementation is wrong. Reaching here means
+            // every region that was reviewed said in words that nothing met the
+            // threshold: a region with findings never lands here, and a region
+            // that collapsed never counted its bytes, so a clean statement is
+            // always paired with the coverage that earned it. This is a pass
+            // that HAPPENED: archived, dated, attributed to the model, and an
+            // archive hit the next time, so a quiet file costs its calls once
+            // rather than once per commit.
+            let entry = PassEntry {
+                iri,
+                repo: repo.to_string(),
+                rel: rel.clone(),
+                target_iri: file_iri(repo, &rel),
+                hash,
+                tag,
+                model,
+                minted: Vec::new(),
+                orphaned_items: 0,
+                reviewed_bytes,
+                total_bytes,
+                derived_at: created,
+            };
+            store_pass(&config.archive, &entry)?;
+            let included = annotate::included_for_ids(&config.archive, &[], &text)?;
+            return face(inv, repo, &rel, &entry, true, &included);
         }
 
         let mut minted = Vec::new();
@@ -945,7 +1288,14 @@ impl Endpoint for ReviewEndpoint {
         }
         // The same stable order a later load reconstructs (the store keeps no
         // insertion order); the face rows re-sort by anchor position anyway.
+        //
+        // ⚠ And DEDUPED, which regions made necessary. A finding id is
+        // `sha256(pass ‖ char_start ‖ exact)`, so two regions quoting the same
+        // line mint ONE finding and `mint_pending_finding` hands back the same
+        // IRI twice — without this the pass would claim `prov:generated` of a
+        // set with a repeat in it and every face would count the finding twice.
         minted.sort();
+        minted.dedup();
         if minted.is_empty() {
             return Err(Error::Endpoint(format!(
                 "browse: none of the {} finding(s) for `{rel}` anchored (every quote was \
@@ -963,8 +1313,8 @@ impl Endpoint for ReviewEndpoint {
             model,
             minted,
             orphaned_items,
-            reviewed_bytes: Some(truncated_len(&text, config.max_prompt_bytes) as u64),
-            total_bytes: Some(text.len() as u64),
+            reviewed_bytes,
+            total_bytes,
             derived_at: created,
         };
         store_pass(&config.archive, &entry)?;
@@ -1159,7 +1509,15 @@ fn review_description(config: &ExplainConfig) -> Description {
              never fatal; a missing or invented SEVERITY leaves the finding unrated \
              rather than dropping it. ★ The pass reports against a THRESHOLD, not a \
              quota: every problem the model rates critical or major, however many or \
-             few, plus at most three minor/info suggestions and at most one praise. A \
+             few, plus a few minor/info suggestions and at most one praise. ★ And it \
+             covers the WHOLE FILE: a file larger than one prompt is split into \
+             line-aligned regions, each reviewed by its own call, the findings unioned \
+             — so reviewed_bytes == total_bytes unless the pass says otherwise, and a \
+             clean report means every region was clean and not that one of them \
+             collapsed. A region that fails leaves the pass INCOMPLETE BUT RECORDED, \
+             declaring its coverage, rather than discarding the regions that \
+             succeeded. ⚠ A defect spanning two regions is visible to neither; \
+             per-region findings are not one reviewer's reading of the whole file. A \
              file with nothing above the bar is an ARCHIVED PASS with zero findings \
              whose every face says so affirmatively, together with how much of the \
              input was actually read — an empty answer with no such statement is still \
@@ -1225,7 +1583,10 @@ fn review_description(config: &ExplainConfig) -> Description {
                 .class(crate::XSD_STRING)
                 .summary(
                     "raw: derive and return the model's unparsed answer (text/plain) — \
-                     nothing parsed, minted, or archived; the parse-failure diagnosis face",
+                     nothing parsed, minted, or archived; the parse-failure diagnosis \
+                     face. ⚠ It derives EVERY region, so on a large file it costs the \
+                     whole pass's calls and returns them concatenated under region \
+                     headers",
                 )
                 .one_of(["raw"]),
         )
@@ -1603,6 +1964,61 @@ mod tests {
         ])))
     }
 
+    /// A fake review model whose answers are SCRIPTED, one per call in order —
+    /// the shape every region test needs (a clean region beside a region with
+    /// a finding beside a region whose answer collapses). A reply of `ERROR`
+    /// fails that call instead of answering it; `DENIED` refuses it.
+    fn scripted_llm_space(log: &Arc<Log>, replies: &[&str]) -> EndpointSpace {
+        let log = Arc::clone(log);
+        let replies: Vec<String> = replies.iter().map(|r| (*r).to_string()).collect();
+        EndpointSpace::new().bind(
+            Exact::new(PROVIDER),
+            FnEndpoint::new("scripted-review-llm", move |inv: &Invocation<'_>| {
+                let mut asks = log.asks.lock().unwrap();
+                asks.push((
+                    inv.inline_str("prompt").unwrap_or("").to_string(),
+                    inv.inline_str("system").unwrap_or("").to_string(),
+                    inv.inline_str("max_tokens").unwrap_or("").to_string(),
+                ));
+                let reply = replies
+                    .get(asks.len() - 1)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("the model was asked {} times", asks.len()));
+                match reply.as_str() {
+                    "ERROR" => Err(Error::Endpoint("the backend dropped the call".to_string())),
+                    "DENIED" => Err(Error::Denied("no net grant".to_string())),
+                    _ => Ok(repr_utf8("text/plain", reply)),
+                }
+            })
+            .with_description(
+                Description::new("scripted-review-llm")
+                    .verb(Verb::Source)
+                    .requires(CAP_NET),
+            ),
+        )
+    }
+
+    /// A kernel over `SIX_LINES` whose model answers the scripted replies, at
+    /// `bytes` of content per call.
+    fn scripted_kernel(
+        root: &std::path::Path,
+        store: &Arc<Store>,
+        log: &Arc<Log>,
+        bytes: usize,
+        chunks: usize,
+        replies: &[&str],
+    ) -> Kernel {
+        let cfg = ExplainConfig::new(Arc::clone(store))
+            .review_model_label("r1")
+            .max_prompt_bytes(bytes)
+            .review_max_chunks(chunks);
+        let browse = crate::space_with_explain(vec![("demo".to_string(), root.to_path_buf())], cfg);
+        Kernel::new(Arc::new(Fallback::new(vec![
+            Arc::new(browse),
+            Arc::new(scripted_llm_space(log, replies)),
+        ])))
+    }
+
     fn cap() -> Capability {
         Capability::scoped([
             "urn:cap:browse:read:demo",
@@ -1652,6 +2068,25 @@ mod tests {
         root
     }
 
+    /// Six lines of exactly 14 bytes each — 84 bytes, so a region size in
+    /// bytes is a region size in lines and every count below is readable.
+    /// At 28 bytes a call that is three regions of two lines.
+    const SIX_LINES: &str = "fn one__() {}\nfn two__() {}\nfn three() {}\nfn four_() {}\n\
+                             fn five_() {}\nfn six__() {}\n";
+    const REGION_BYTES: usize = 28;
+
+    fn six_line_root() -> PathBuf {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), SIX_LINES).unwrap();
+        root
+    }
+
+    fn finding_on(line: &str) -> String {
+        format!("QUOTE: {line}\nSEVERITY: minor\nNOTE: This one deserves a second look.\n")
+    }
+
+    const CLEAN: &str = NOTHING_ABOVE_THRESHOLD;
+
     #[test]
     fn a_review_derives_once_and_mints_once() {
         let root = demo_root();
@@ -1661,7 +2096,7 @@ mod tests {
 
         let first = json(&k, "urn:repo:demo:review:a.rs", &[]);
         assert_eq!(first["derived"], true);
-        assert_eq!(first["version_tag"], "review-v4@r1");
+        assert_eq!(first["version_tag"], "review-v5@r1");
         assert_eq!(first["model"], "r1");
         assert_eq!(first["orphaned_items"], 0);
         // Nothing was truncated, and the face says exactly what was seen.
@@ -1738,10 +2173,483 @@ mod tests {
     /// no change to the code — the model relabels rather than reports more. See
     /// [`REVIEW_PROMPT_VERSION`] for the table. Anyone restoring that sentence
     /// is undoing an experiment, so this fails first.
+    /// ★ THE PROPERTY EVERYTHING ELSE RESTS ON: the regions TILE the file.
+    /// Contiguous, in order, no gap and no overlap — so `reviewed_bytes` is a
+    /// sum of region lengths rather than an estimate, and `reviewed_bytes ==
+    /// total_bytes` means every byte was offered to some call. A splitter that
+    /// dropped a byte between two regions would make the invariant a lie that
+    /// still passed every face.
+    #[test]
+    fn the_regions_tile_the_file_and_cut_at_line_boundaries() {
+        for (text, bytes) in [
+            (SIX_LINES, REGION_BYTES),
+            (SIX_LINES, 1),
+            (SIX_LINES, 10_000),
+            (CONTENT, 20),
+            ("no trailing newline at all, and one long line", 12),
+            ("", 16),
+            ("\n\n\n\n", 2),
+        ] {
+            let regions = split_into_regions(text, bytes, 1_000);
+            let mut at = 0;
+            for region in &regions {
+                assert_eq!(region.start, at, "a gap or an overlap in {text:?}");
+                assert!(region.end > region.start, "an empty region in {text:?}");
+                at = region.end;
+            }
+            assert_eq!(at, text.len(), "the regions must reach the end of {text:?}");
+            let rejoined: String = regions
+                .iter()
+                .map(|r| &text[r.start..r.end])
+                .collect::<Vec<_>>()
+                .concat();
+            assert_eq!(rejoined, text);
+        }
+
+        // Six 14-byte lines at 28 bytes a call: three regions of two lines,
+        // each cut at a line boundary and each knowing where it starts.
+        let regions = split_into_regions(SIX_LINES, REGION_BYTES, 1_000);
+        assert_eq!(regions.len(), 3);
+        assert_eq!(
+            regions.iter().map(|r| r.first_line).collect::<Vec<_>>(),
+            vec![1, 3, 5]
+        );
+        for region in &regions {
+            assert!(
+                SIX_LINES[region.start..region.end].ends_with('\n'),
+                "region {region:?} cut mid-line"
+            );
+        }
+        assert_eq!(regions[0].last_line(SIX_LINES), 2);
+        assert_eq!(regions[2].last_line(SIX_LINES), 6);
+    }
+
+    /// The cap is what bounds a pass's spend. A file past it is reviewed up to
+    /// the cap and the entry SAYS its coverage is short — the one case left
+    /// where a review does not see the whole file.
+    #[test]
+    fn the_region_cap_bounds_what_one_pass_offers() {
+        let regions = split_into_regions(SIX_LINES, REGION_BYTES, 2);
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions.iter().map(Region::len).sum::<usize>(), 56);
+        assert!(regions.last().unwrap().end < SIX_LINES.len());
+    }
+
+    /// The suggestion budget is DIVIDED across the regions, not repeated in
+    /// each of them: a per-call limit of three over seven regions asks for 21.
+    /// A one-region file keeps the whole limit, which is what makes a small
+    /// file's v5 prompt byte-identical to its v4 one.
+    #[test]
+    fn the_suggestion_budget_is_shared_out_across_the_regions() {
+        assert_eq!(region_suggestion_budget(1), SUGGESTION_LIMIT);
+        assert_eq!(region_suggestion_budget(2), 2);
+        assert_eq!(region_suggestion_budget(3), 1);
+        assert_eq!(region_suggestion_budget(7), 1);
+
+        // Only the first region is asked for praise; seven regions asking for
+        // "at most one" each would ask for seven.
+        let first = review_prompt(region_suggestion_budget(7), true);
+        let later = review_prompt(region_suggestion_budget(7), false);
+        assert!(first.contains("at most one rated praise"), "{first}");
+        assert!(!later.contains("at most one rated praise"), "{later}");
+        for text in [&first, &later] {
+            assert!(text.contains("info ones to 1 at most"), "{text}");
+        }
+    }
+
+    /// ★ THE HEADLINE INVARIANT. A file larger than one prompt is reviewed in
+    /// several calls and the pass covers ALL of it — `reviewed_bytes ==
+    /// total_bytes`, every face saying so in words. Before v5 this file would
+    /// have been a 28-byte review reported in the shape of a complete one.
+    #[test]
+    fn a_file_larger_than_one_prompt_is_reviewed_whole() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &[
+                &finding_on("fn one__() {}"),
+                &finding_on("fn three() {}"),
+                &finding_on("fn six__() {}"),
+            ],
+        );
+
+        let pass = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 3, "one call per region");
+        assert_eq!(pass["minted"].as_array().unwrap().len(), 3);
+        assert_eq!(pass["reviewed_bytes"], SIX_LINES.len());
+        assert_eq!(pass["total_bytes"], SIX_LINES.len());
+        assert_eq!(
+            pass["statement"],
+            format!(
+                "3 findings · reviewed the whole file ({} bytes)",
+                SIX_LINES.len()
+            )
+        );
+        assert_eq!(pass["version_tag"], "review-v5@r1");
+
+        // ★ The anchor surface never changed: a quote from the LAST region
+        // anchors against the whole file exactly as one from the first does.
+        let quotes: Vec<String> = pass["annotations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["exact"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(quotes.iter().any(|q| q == "fn six__() {}"), "{quotes:?}");
+
+        // Every region was told where it stands, and told not to report an
+        // absence it cannot check.
+        let prompts = log.asks.lock().unwrap().clone();
+        assert!(prompts[0].0.contains("Region: part 1 of 3, lines 1 to 2"));
+        assert!(prompts[2].0.contains("Region: part 3 of 3, lines 5 to 6"));
+        for (prompt, _, _) in &prompts {
+            assert!(
+                prompt.contains("never report something as missing from the file"),
+                "{prompt}"
+            );
+            assert!(!prompt.contains("(content truncated)"), "{prompt}");
+        }
+
+        // And it is one archived pass, so the next ask spends nothing.
+        let hit = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(hit["derived"], false);
+        assert_eq!(log.count(), 3);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A single-region file asks exactly once and its prompt carries no region
+    /// header at all — so the only thing that changed for a file under the
+    /// chunk size is the version tag.
+    #[test]
+    fn a_small_file_is_one_call_with_no_region_header() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, TWO_FINDINGS);
+
+        let pass = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 1);
+        let (prompt, _, _) = log.last();
+        assert!(!prompt.contains("Region:"), "{prompt}");
+        assert!(
+            prompt.contains(CONTENT),
+            "the whole file is in one call: {prompt}"
+        );
+        assert_eq!(pass["reviewed_bytes"], CONTENT.len());
+        assert_eq!(pass["total_bytes"], CONTENT.len());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ⚠ THE UNION RULE, AND THE NAIVE IMPLEMENTATION GETS IT WRONG. One region
+    /// saying `NOTHING ABOVE THRESHOLD` while another reports a finding is NOT
+    /// a clean file. Reporting it as one would be a false all-clear under a key
+    /// that never re-derives — the worst outcome available here, because it is
+    /// trusted and it is permanent.
+    #[test]
+    fn a_clean_pass_needs_every_region_to_be_clean() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &[CLEAN, &finding_on("fn four_() {}"), CLEAN],
+        );
+
+        let pass = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 3);
+        assert_eq!(pass["minted"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            pass["statement"],
+            format!(
+                "1 finding · reviewed the whole file ({} bytes)",
+                SIX_LINES.len()
+            )
+        );
+        assert!(
+            !pass["statement"]
+                .as_str()
+                .unwrap()
+                .contains("nothing above threshold"),
+            "two clean regions and one finding is not a clean file: {pass}"
+        );
+        // Coverage is still complete: the clean regions were reviewed too.
+        assert_eq!(pass["reviewed_bytes"], SIX_LINES.len());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Every region clean IS a clean file — an archived pass that says so, with
+    /// the coverage that earned the claim.
+    #[test]
+    fn a_file_clean_in_every_region_is_a_clean_pass_over_the_whole_file() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &[CLEAN, CLEAN, CLEAN],
+        );
+
+        let pass = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 3);
+        assert!(pass["minted"].as_array().unwrap().is_empty());
+        assert_eq!(
+            pass["statement"],
+            format!(
+                "nothing above threshold · reviewed the whole file ({} bytes)",
+                SIX_LINES.len()
+            )
+        );
+        let hit = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(
+            hit["derived"], false,
+            "a clean pass is archived like any other"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★ PARTIAL FAILURE IS RECORDED, NOT DISCARDED. Region 2 of 3 collapsing
+    /// must not throw away the two regions that worked — and the entry declares
+    /// exactly how much it covered, which is what makes the shortfall legible
+    /// instead of silent.
+    #[test]
+    fn a_collapsed_region_leaves_the_pass_incomplete_but_recorded() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &[
+                &finding_on("fn one__() {}"),
+                "I am afraid I cannot help with that.",
+                &finding_on("fn six__() {}"),
+            ],
+        );
+
+        let pass = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 3, "a failed region does not stop the walk");
+        assert_eq!(pass["minted"].as_array().unwrap().len(), 2);
+        assert_eq!(pass["reviewed_bytes"], 56);
+        assert_eq!(pass["total_bytes"], SIX_LINES.len());
+        assert_eq!(
+            pass["statement"],
+            format!(
+                "2 findings · reviewed 56 of {} bytes (coverage incomplete)",
+                SIX_LINES.len()
+            )
+        );
+        // Recorded means ARCHIVED: the two good regions are not re-spent.
+        let hit = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(hit["derived"], false);
+        assert_eq!(log.count(), 3);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ⚠⚠ THE SHARPEST CASE. Two regions say the file is clean and the third
+    /// collapses. The pass is clean — and it is ONLY clean about 56 of 84 bytes.
+    /// A collapsed region must never be counted as a quiet one, or "nothing
+    /// above threshold" would cover a region nobody read.
+    #[test]
+    fn a_collapsed_region_is_never_counted_as_a_clean_one() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(&root, &store, &log, REGION_BYTES, 16, &[CLEAN, "", CLEAN]);
+
+        let pass = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert!(pass["minted"].as_array().unwrap().is_empty());
+        assert_eq!(pass["reviewed_bytes"], 56);
+        assert_eq!(
+            pass["statement"],
+            format!(
+                "nothing above threshold · reviewed 56 of {} bytes (coverage incomplete)",
+                SIX_LINES.len()
+            )
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A transport failure mid-walk is the same story as a collapsed answer:
+    /// keep what was reviewed, declare the shortfall.
+    #[test]
+    fn a_region_the_backend_dropped_is_the_same_story() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &[&finding_on("fn one__() {}"), "ERROR", CLEAN],
+        );
+
+        let pass = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 3);
+        assert_eq!(pass["minted"].as_array().unwrap().len(), 1);
+        assert_eq!(pass["reviewed_bytes"], 56);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Every region failing is the OLD whole-pass failure and stays one:
+    /// nothing was reviewed, so there is nothing honest to archive and the key
+    /// must stay re-derivable rather than serve an empty pass forever.
+    #[test]
+    fn every_region_failing_is_an_error_and_archives_nothing() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &["nope", "nope", "nope", "nope", "nope", "nope"],
+        );
+
+        let err = issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("in any of its 3 regions"), "{text}");
+        assert!(text.contains(NOTHING_ABOVE_THRESHOLD), "{text}");
+        // Nothing archived: the next ask derives again rather than serving a
+        // poisoned key.
+        assert!(issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).is_err());
+        assert_eq!(log.count(), 6);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ⚠ A DENIAL short-circuits. It is a property of the caller's capability,
+    /// identical for every region, so grinding through sixteen of them would
+    /// turn one refusal into sixteen and bury the reason.
+    #[test]
+    fn a_denial_stops_at_the_first_region() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &["DENIED", "DENIED", "DENIED"],
+        );
+
+        assert!(issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).is_err());
+        assert_eq!(log.count(), 1, "one refusal, not one per region");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Two regions quoting the same line mint ONE finding: the id is
+    /// `sha256(pass ‖ char_start ‖ exact)`, so the second mint returns the
+    /// first's IRI and an undeduped `minted` would count it twice.
+    #[test]
+    fn the_same_quote_from_two_regions_mints_one_finding() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let quote = finding_on("fn one__() {}");
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &[&quote, &quote, &quote],
+        );
+
+        let pass = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 3);
+        assert_eq!(pass["minted"].as_array().unwrap().len(), 1, "{pass}");
+        assert_eq!(pass["annotations"].as_array().unwrap().len(), 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `debug=raw` diagnoses the WHOLE pass, so on a chunked file it returns
+    /// every region's unparsed answer under a header naming the region — and
+    /// still archives nothing.
+    #[test]
+    fn debug_raw_returns_every_region_unparsed() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &["first answer", "second answer", "third answer"],
+        );
+
+        let raw = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:review:a.rs",
+                &[("debug", "raw")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(log.count(), 3);
+        for (n, answer) in ["first answer", "second answer", "third answer"]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(raw.contains(&format!("--- region {} of 3", n + 1)), "{raw}");
+            assert!(raw.contains(answer), "{raw}");
+        }
+        assert!(store.is_empty().unwrap(), "a probe archives nothing");
+
+        // ⚠ And a probe that answered nothing reports the FAILURE, never an
+        // empty answer — an empty diagnosis face is one of the collapses this
+        // face exists to tell apart.
+        let root2 = six_line_root();
+        let log2 = Arc::new(Log::default());
+        let k2 = scripted_kernel(
+            &root2,
+            &store,
+            &log2,
+            REGION_BYTES,
+            16,
+            &["ERROR", "ERROR", "ERROR"],
+        );
+        assert!(issue(
+            &k2,
+            Verb::Source,
+            "urn:repo:demo:review:a.rs",
+            &[("debug", "raw")],
+            &cap()
+        )
+        .is_err());
+        std::fs::remove_dir_all(&root2).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn the_prompt_asks_for_a_threshold_rather_than_a_quota() {
-        let prompt = review_prompt();
-        let reminder = review_reminder();
+        let prompt = review_prompt(SUGGESTION_LIMIT, true);
+        let reminder = review_reminder(SUGGESTION_LIMIT);
 
         // The quota is gone from both halves — including the reminder, which
         // is the last thing a long file lets the model read.
@@ -1821,7 +2729,7 @@ mod tests {
         assert_eq!(first["minted"].as_array().unwrap().len(), 0);
         assert_eq!(first["orphaned_items"], 0);
         assert_eq!(first["total_bytes"], CONTENT.len());
-        assert_eq!(first["version_tag"], "review-v4@r1");
+        assert_eq!(first["version_tag"], "review-v5@r1");
         assert_eq!(
             first["statement"],
             format!(
@@ -1861,38 +2769,46 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// The coverage half, on its own: the same clean answer over a TRUNCATED
-    /// input must not make the same claim. This is the false all-clear the
-    /// threshold would otherwise introduce — and it is the majority case, not
-    /// an edge case, while `max_prompt_bytes` truncates most files.
+    /// The coverage half, on its own. ★ THE CLAIM FLIPPED IN v5: this used to
+    /// pin that a clean answer over a TRUNCATED input must not make the same
+    /// claim as a clean answer over a whole file — and that was the MAJORITY
+    /// case, because `max_prompt_bytes` truncated 62% of this ecosystem's
+    /// source. Now a small chunk size means more CALLS, not less file, and the
+    /// clean statement covers all of it. The weaker claim still exists and is
+    /// still distinguishable (see the collapsed-region tests); it is now the
+    /// exception it always pretended to be.
     #[test]
-    fn a_clean_pass_over_a_truncated_input_says_how_much_it_saw() {
+    fn a_clean_pass_covers_the_whole_file_however_small_the_chunk() {
         let root = demo_root();
         let store = Arc::new(Store::new().unwrap());
         let log = Arc::new(Log::default());
-        let cfg = ExplainConfig::new(Arc::clone(&store))
-            .review_model_label("r1")
-            .max_prompt_bytes(20);
-        let browse = crate::space_with_explain(vec![("demo".to_string(), root.clone())], cfg);
-        let k = Kernel::new(Arc::new(Fallback::new(vec![
-            Arc::new(browse),
-            Arc::new(llm_space(&log, "NOTHING ABOVE THRESHOLD")),
-        ])));
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            20,
+            16,
+            &[CLEAN, CLEAN, CLEAN, CLEAN, CLEAN],
+        );
 
         let pass = json(&k, "urn:repo:demo:review:a.rs", &[]);
-        assert_eq!(pass["reviewed_bytes"], 20);
+        assert!(
+            log.count() > 1,
+            "a 20-byte budget over 41 bytes is several calls"
+        );
+        assert_eq!(pass["reviewed_bytes"], CONTENT.len());
         assert_eq!(pass["total_bytes"], CONTENT.len());
         assert_eq!(
             pass["statement"],
             format!(
-                "nothing above threshold · reviewed 20 of {} bytes (input truncated)",
+                "nothing above threshold · reviewed the whole file ({} bytes)",
                 CONTENT.len()
             )
         );
         let text =
             body(&issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).unwrap());
-        assert!(text.contains("(input truncated)"), "{text}");
-        assert!(!text.contains("the whole file"), "{text}");
+        assert!(text.contains("the whole file"), "{text}");
+        assert!(!text.contains("coverage incomplete"), "{text}");
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -2233,7 +3149,7 @@ mod tests {
         // `prov:generated` is the pending set a human has yet to answer.
         assert!(ttl.contains("prov:generated <urn:iki:finding:"), "{ttl}");
         assert!(!ttl.contains("urn:iki:annotation:"), "{ttl}");
-        assert!(ttl.contains("ik:versionTag \"review-v4@r1\""), "{ttl}");
+        assert!(ttl.contains("ik:versionTag \"review-v5@r1\""), "{ttl}");
         assert!(
             ttl.contains("ik:orphanedItems \"0\"^^xsd:nonNegativeInteger"),
             "{ttl}"
@@ -2277,6 +3193,28 @@ mod tests {
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap_or_else(|e| panic!("annotation turtle must parse: {e}\n{ttl}"));
         assert!(!triples.is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_empty_file_is_refused_rather_than_reported_clean() {
+        let root = temp_dir();
+        std::fs::write(root.join("empty.rs"), "").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, TWO_FINDINGS);
+
+        let err = issue(
+            &k,
+            Verb::Source,
+            "urn:repo:demo:review:empty.rs",
+            &[],
+            &cap(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument { .. }), "{err:?}");
+        assert_eq!(log.count(), 0, "an empty file costs no model call");
+        assert!(store.is_empty().unwrap(), "and archives no clean pass");
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -2400,42 +3338,49 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// ★ WHAT THIS TEST USED TO PIN IS NOW THE DEFECT. It was
+    /// `a_truncated_input_is_reported_honestly`: a 20-byte ceiling over a
+    /// 41-byte file, the model shown a prefix, the faces honest about it. v5
+    /// keeps the honesty and removes the need for it — the same ceiling is now
+    /// a region size, every line reaches some call, and the pass covers the
+    /// file. The property that made truncation survivable is the property that
+    /// makes chunking cheap, and it is asserted here: a quote is anchored
+    /// against the WHOLE text, never against what one call was shown.
     #[test]
-    fn a_truncated_input_is_reported_honestly() {
+    fn a_file_split_across_regions_anchors_against_the_whole_text() {
         let root = demo_root();
         let store = Arc::new(Store::new().unwrap());
         let log = Arc::new(Log::default());
-        // A ceiling below the file size: the model sees a prefix, the quotes
-        // still anchor against the WHOLE file, and every face says how much
-        // was actually reviewed.
-        let cfg = ExplainConfig::new(Arc::clone(&store))
-            .review_model_label("r1")
-            .max_prompt_bytes(20);
-        let browse = crate::space_with_explain(vec![("demo".to_string(), root.clone())], cfg);
-        let k = Kernel::new(Arc::new(Fallback::new(vec![
-            Arc::new(browse),
-            Arc::new(llm_space(&log, TWO_FINDINGS)),
-        ])));
+        // Every region answers with the SAME two findings, one of which quotes
+        // a line no region but the first can see. All of them anchor, and the
+        // repeats collapse to two findings rather than 2× the region count.
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            20,
+            16,
+            &[TWO_FINDINGS, TWO_FINDINGS, TWO_FINDINGS, TWO_FINDINGS],
+        );
 
         let pass = json(&k, "urn:repo:demo:review:a.rs", &[]);
-        assert_eq!(pass["reviewed_bytes"], 20);
+        assert_eq!(pass["reviewed_bytes"], CONTENT.len());
         assert_eq!(pass["total_bytes"], CONTENT.len());
-        // `fn beta() {}` lies past the 20-byte window yet anchors: the anchor
-        // surface is the full text, only the prompt is truncated.
-        assert_eq!(pass["minted"].as_array().unwrap().len(), 2);
-        let (prompt, _, _) = log.last();
-        assert!(prompt.contains("… (content truncated)"), "{prompt}");
+        assert_eq!(pass["minted"].as_array().unwrap().len(), 2, "{pass}");
+        // No call was ever handed a truncation marker: there is no truncation.
+        for (prompt, _, _) in log.asks.lock().unwrap().iter() {
+            assert!(!prompt.contains("(content truncated)"), "{prompt}");
+        }
 
-        // The archive hit serves the same honest numbers, and the plain face
-        // names the truncation.
+        let calls = log.count();
         let hit = json(&k, "urn:repo:demo:review:a.rs", &[]);
         assert_eq!(hit["derived"], false);
-        assert_eq!(hit["reviewed_bytes"], 20);
+        assert_eq!(log.count(), calls, "the hit spends nothing");
         let text =
             body(&issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).unwrap());
         assert!(
             text.contains(&format!(
-                "reviewed 20 of {} bytes (input truncated)",
+                "reviewed the whole file ({} bytes)",
                 CONTENT.len()
             )),
             "{text}"
@@ -2476,7 +3421,7 @@ mod tests {
         // The configured backend first.
         let first = json(&k, "urn:repo:demo:review:a.rs", &[]);
         assert_eq!(first["derived"], true);
-        assert_eq!(first["version_tag"], "review-v4@r1");
+        assert_eq!(first["version_tag"], "review-v5@r1");
         assert_eq!(first["minted"].as_array().unwrap().len(), 2);
         assert_eq!((log.count(), alt_log.count()), (1, 0));
 
@@ -2489,7 +3434,7 @@ mod tests {
             &[("provider", ALT_PROVIDER)],
         );
         assert_eq!(second["derived"], true);
-        assert_eq!(second["version_tag"], "review-v4@alt");
+        assert_eq!(second["version_tag"], "review-v5@alt");
         assert_eq!(second["model"], "alt");
         assert_eq!(second["minted"].as_array().unwrap().len(), 1);
         assert_eq!((log.count(), alt_log.count()), (1, 1));
@@ -2500,7 +3445,7 @@ mod tests {
         // both reviewers' margins, each awaiting the same human.
         let again = json(&k, "urn:repo:demo:review:a.rs", &[]);
         assert_eq!(again["derived"], false, "the first pass was overwritten");
-        assert_eq!(again["version_tag"], "review-v4@r1");
+        assert_eq!(again["version_tag"], "review-v5@r1");
         assert_eq!(again["minted"], first["minted"]);
         let alt_again = json(
             &k,
@@ -2594,7 +3539,7 @@ mod tests {
         );
         assert_eq!(pass["derived"], true);
         assert_eq!(
-            pass["version_tag"], "review-v4@r1",
+            pass["version_tag"], "review-v5@r1",
             "the configured tier keeps its label"
         );
         assert_eq!((log.count(), alt_log.count()), (0, 1));
@@ -2920,7 +3865,7 @@ mod tests {
         // asymmetry between what a MENU can learn (the cheap inventory) and
         // what a TAG resolves (the per-provider identity). What matters here
         // is that both causes land on the ONE tag, whichever it is.
-        assert_eq!(triggered["version_tag"], "review-v4@coder");
+        assert_eq!(triggered["version_tag"], "review-v5@coder");
         assert_eq!(log.count(), 1, "the trigger paid nothing");
         assert_eq!(
             triggered["minted"].as_array().unwrap().len(),

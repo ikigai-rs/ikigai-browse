@@ -211,6 +211,7 @@ pub struct ExplainConfig {
     selectable_providers: BTreeSet<String>,
     pub(crate) ignore: BTreeSet<String>,
     pub(crate) max_prompt_bytes: usize,
+    pub(crate) review_max_chunks: usize,
 }
 
 impl ExplainConfig {
@@ -220,7 +221,9 @@ impl ExplainConfig {
     /// 800 (findings carry quotes — they need headroom), the pull-request
     /// explain → `urn:llm:coder:ask` at 600 (a diff walk reads like code but
     /// summarizes like a rollup), `temperature=0.2`, the standard ignore set,
-    /// prompts fed at most 16 KiB of content.
+    /// one model call fed at most 16 KiB of content, and a review pass spending
+    /// at most 16 of them — so whole-file coverage by chunking is bounded at
+    /// 256 KiB per file.
     pub fn new(store: Arc<Store>) -> Self {
         ExplainConfig {
             archive: Arc::new(Archive::new(store, GraphName::DefaultGraph)),
@@ -241,6 +244,7 @@ impl ExplainConfig {
             selectable_providers: BTreeSet::new(),
             ignore: crate::hash::default_ignore(),
             max_prompt_bytes: 16 * 1024,
+            review_max_chunks: 16,
         }
     }
 
@@ -423,11 +427,33 @@ impl ExplainConfig {
         self
     }
 
-    /// How much of a file's content (or a rollup's material) is fed to the
-    /// model before truncation (default 16 KiB). Part of prompt shape: bump
-    /// the prompt versions if you change truncation policy semantics.
+    /// How much of a file's content (or a rollup's material) reaches ONE model
+    /// call (default 16 KiB). Part of prompt shape: bump the prompt versions if
+    /// you change the policy semantics.
+    ///
+    /// ★ It means two different things on the two sides of this module, and the
+    /// difference is the point. The EXPLAIN passes still truncate at it — an
+    /// explanation of a file's first 16 KiB is a weaker but coherent answer.
+    /// The REVIEW pass CHUNKS at it instead (see
+    /// [`ExplainConfig::review_max_chunks`]): a review that silently stops at
+    /// byte 16384 reports in exactly the shape of a complete one, which made 62%
+    /// of this ecosystem's source files false all-clears.
     pub fn max_prompt_bytes(mut self, bytes: usize) -> Self {
         self.max_prompt_bytes = bytes;
+        self
+    }
+
+    /// The most model calls ONE review pass will spend, and therefore the hard
+    /// bound on what whole-file coverage costs (default 16, so 256 KiB at the
+    /// default [`ExplainConfig::max_prompt_bytes`]).
+    ///
+    /// ⚠ A file needing more regions than this is reviewed up to the cap and
+    /// the pass RECORDS that its coverage is incomplete — `ik:reviewedBytes` <
+    /// `ik:totalBytes`, and every face says so. That is the one remaining case
+    /// where a review does not see the whole file, and it is now the exception
+    /// rather than the majority.
+    pub fn review_max_chunks(mut self, chunks: usize) -> Self {
+        self.review_max_chunks = chunks;
         self
     }
 }
