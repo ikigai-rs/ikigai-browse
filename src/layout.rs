@@ -200,6 +200,12 @@ color:inherit;opacity:.4;text-decoration:none;user-select:none;\
 text-decoration:none}\n\
 .browse-binary{opacity:.7;font-style:italic}\n\
 \
+/* A review pass that found nothing: the statement IS the page body, so it\n\
+   carries the page's weight rather than the provenance line's whisper — an\n\
+   empty page is what a broken pass looks like. */\n\
+.browse-review-clean{border-left:3px solid var(--browse-machine);\
+padding-left:.6rem;margin-top:1.25rem}\n\
+\
 /* Annotations: cards in reading order, then the create form. */\n\
 .browse-annotations{display:grid;gap:.75rem;margin-top:1.25rem}\n\
 .browse-annotation{border-left:3px solid var(--browse-rule);padding-left:.6rem}\n\
