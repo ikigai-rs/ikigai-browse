@@ -105,9 +105,36 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # without moving the pin would have ceilinged gonk out of the exact change it was
 # waiting for, silently, with no diagnostic. Rule 5's second half; the
 # ikigai-dev-server 0.10 pin is the precedent that cost two minor releases before
-# anyone noticed. The pin moved with the publish (gonk #24), and ⚠ IT HAS TO AGAIN
-# FOR 0.6.0: gonk now pins "0.5.0", and `^0.5.0` means `<0.6.0`. The same trap,
-# one release later, for the same reason.
+# anyone noticed. The pin moved with the publish (gonk #24), and had to AGAIN for
+# 0.6.0, because `^0.5.0` means `<0.6.0` — the same trap, one release later. gonk
+# now pins "0.6.0", and `^0.6.0` admits every 0.6.x, which is exactly why 0.6.1 is
+# a PATCH: calling it a minor would drag gonk's pin into the wave for a change gonk
+# cannot otherwise observe. ⚠ Two consumers ARE ceilinged out and this bump does not
+# fix them: ikigai-cli pins "0.5.0" (`<0.6.0`) and ikigai-dev-server pins "0.3.0"
+# (`<0.4.0`). Neither will see this anchor fix until its pin moves.
+#
+# 0.6.1 carries ONE behavioural change and two things that are not API.
+#
+# #42 (ledger #488): a quote the model DECORATED with the document's own marker —
+# a leading `⚠` or `**` the line does not carry — now anchors, by ONE retry with
+# the leading run of non-alphanumerics stripped (`annotate::strip_leading_decoration`,
+# `find_anchor_on_file`). Measured on the field guide: orphan rate 32.2% → 17.2%,
+# as two anchoring functions over ONE set of raw answers, so model variance is
+# excluded. ★ Why this is a patch and not a minor: no resource name, capability,
+# face or signature moves, and NOTHING STORED CHANGES — an orphaned quote minted
+# nothing, so there is no existing finding whose id (`sha256(pass ‖ char_start ‖
+# exact)`) could move. What changes is that findings which used to be silently
+# dropped now exist. The stored `exact` is the STRIPPED form, read back out of the
+# file, never the model's decorated string — so the same finding is the same id on
+# every pass. Deliberately NOT wrap tolerance: 9 of the 15 residual orphans are a
+# hard-line-wrap shape and would anchor under a looser match, but that is a bigger
+# concession than a leading strip and the kind of loosening that erodes what the
+# anchor proves. The 6 genuine misquotations SHOULD orphan.
+# #41 (ledger #483) added no code the pass runs: two prompt lines were measured and
+# both failed, so the prompt is unchanged and `review-v5` stands — the pass tag does
+# not move. It added a test that asserts the ABSENCE of the losing sentence, and the
+# disclosure corpus under tests/corpus/. #43 (ledger #491) gave the probe example a
+# `--model` flag. Neither is API.
 #
 # 0.6.0 carries TWO arcs that both changed the review's observable shape.
 #
@@ -133,7 +160,7 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # means a region that did not come back, not a ceiling. ⚠ `pr.rs` shares that entry
 # type and still truncates its diff by policy, so its face understates what it
 # knows until the diff review gets the same treatment (ledger #472).
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
