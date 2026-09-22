@@ -1453,14 +1453,15 @@ pub(crate) fn sort_finding_rows(rows: &mut [(Annotation, Option<u64>)]) {
 }
 
 /// The drift pass against content already in hand (the file face's path — no
-/// kernel fetch), rows in reading order.
+/// kernel fetch), rows in reading order. Either family: the file face runs it
+/// over the file's annotations, and over its pending findings when asked to
+/// draw proposals — ONE drift story, so a proposal re-anchors and orphans by
+/// exactly the rule an annotation does.
 fn reconcile_against_text(
     archive: &Archive,
-    repo: &str,
-    rel: &str,
+    mut anns: Vec<Annotation>,
     text: &str,
 ) -> Result<Vec<(Annotation, Option<u64>)>> {
-    let mut anns = list_annotations(archive, repo, Some(rel))?;
     let current = CurrentContent::Text(text.to_string(), content_hash(text.as_bytes()));
     let mut rows: Vec<(Annotation, Option<u64>)> = Vec::with_capacity(anns.len());
     for mut ann in anns.drain(..) {
@@ -1617,7 +1618,7 @@ pub(crate) fn included_for_text(
     text: &str,
 ) -> Result<Included> {
     Ok(Included {
-        rows: reconcile_against_text(archive, repo, rel, text)?,
+        rows: reconcile_against_text(archive, list_annotations(archive, repo, Some(rel))?, text)?,
         with_paths: false,
     })
 }
@@ -2416,9 +2417,24 @@ fn annotations_listing_html(repo: &str, rel: &str, rows: &[(Annotation, Option<u
 pub(crate) struct Marker {
     pub(crate) id: String,
     pub(crate) note: String,
-    /// Machine-minted (review) markers render hollow (`○`) against the solid
-    /// human dot (`●`) — the two kinds are distinguishable at the line.
-    pub(crate) machine: bool,
+    pub(crate) kind: MarkerKind,
+}
+
+/// What a line marker stands for — the three kinds are distinguishable at the
+/// line, and the third is distinguishable from the first two BY LAW: a
+/// proposal is a pending finding nobody has published, and drawing it with an
+/// annotation's glyph would have the page assert a publication that never
+/// happened.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum MarkerKind {
+    /// A human's annotation — the solid dot (`●`).
+    Human,
+    /// A machine-minted annotation a human PUBLISHED — the hollow dot (`○`).
+    Machine,
+    /// A pending finding drawn as a proposal (`proposals=`), carrying the
+    /// model's proposed severity word — the hollow diamond (`◇`), classed by
+    /// severity so the stylesheet can colour it.
+    Proposal(String),
 }
 
 /// The file face's overlay (called from the S0 HTML view when a store is
@@ -2433,9 +2449,24 @@ pub(crate) fn file_overlay(
     rel: &str,
     text: &str,
 ) -> Result<(BTreeMap<u64, Vec<Marker>>, String)> {
-    let rows = reconcile_against_text(archive, repo, rel, text)?;
+    let rows = reconcile_against_text(archive, list_annotations(archive, repo, Some(rel))?, text)?;
+    let marked = markers_of(&rows, |ann| match ann.machine() {
+        true => MarkerKind::Machine,
+        false => MarkerKind::Human,
+    });
+    let panel = annotations_panel_html(&file_iri(repo, rel), &rows);
+    Ok((marked, panel))
+}
+
+/// The per-line markers of a reconciled row set: one per LIVE anchor, none
+/// for an orphan (its quote is at no current line). `kind` classifies each
+/// row's marker.
+fn markers_of(
+    rows: &[(Annotation, Option<u64>)],
+    kind: impl Fn(&Annotation) -> MarkerKind,
+) -> BTreeMap<u64, Vec<Marker>> {
     let mut marked: BTreeMap<u64, Vec<Marker>> = BTreeMap::new();
-    for (ann, line) in &rows {
+    for (ann, line) in rows {
         if ann.orphaned {
             continue;
         }
@@ -2443,11 +2474,193 @@ pub(crate) fn file_overlay(
         marked.entry(*line).or_default().push(Marker {
             id: ann.id.clone(),
             note: clip_to(&collapse(&ann.body), 160),
-            machine: ann.machine(),
+            kind: kind(ann),
         });
     }
-    let panel = annotations_panel_html(&file_iri(repo, rel), &rows);
-    Ok((marked, panel))
+    marked
+}
+
+// --- proposals=: pending findings drawn beside the code (ledger #496) --------
+
+/// The file's PENDING findings of the severities a caller named, drift-
+/// reconciled against the very content being served — what `proposals=`
+/// draws.
+///
+/// ★ **A proposal is not an annotation and the page must not say it is.**
+/// Nothing here is published: the host is narrowing its triage queue to the
+/// serious severities, and the rest — minted, stored, anchored — must stay
+/// visible where the code is rather than in a backlog. So the marks and the
+/// cards say *proposal*, carry the model that proposed them, and link the
+/// finding IRI; the decision (publish, decline) is NOT offered here. Browse
+/// does not know the host's decide route and must not learn it — the link is
+/// the affordance, and the finding's own page is where a human answers.
+///
+/// Anchoring is the annotation layer's drift pass, not a second one: a
+/// proposal whose quote moved re-anchors, one whose quote is gone orphans —
+/// and an orphan is COUNTED (the panel header, the margin header) and listed
+/// flagged, but drawn at no line, exactly as an orphaned annotation is.
+pub(crate) struct Proposals {
+    rows: Vec<(Annotation, Option<u64>)>,
+    /// The severity words the caller asked for, in the order asked — the
+    /// panel names them so a reader knows what the page is NOT showing.
+    requested: Vec<String>,
+}
+
+impl Proposals {
+    /// Select and reconcile: pending (undecided) findings on `rel` whose
+    /// proposed severity is one of `severities`. An unrated finding (the
+    /// model invented a word or said nothing) matches no word and is never
+    /// drawn — it is in the queue, where a human can rate it.
+    pub(crate) fn for_text(
+        archive: &Archive,
+        repo: &str,
+        rel: &str,
+        text: &str,
+        severities: &[String],
+    ) -> Result<Proposals> {
+        let pending: Vec<Annotation> = list_findings(archive, repo, Some(rel))?
+            .into_iter()
+            .filter(|f| f.decision.is_none())
+            .filter(|f| {
+                f.severity
+                    .as_deref()
+                    .is_some_and(|s| severities.iter().any(|w| w == s))
+            })
+            .collect();
+        Ok(Proposals {
+            rows: reconcile_against_text(archive, pending, text)?,
+            requested: severities.to_vec(),
+        })
+    }
+
+    /// Per-line proposal markers: live anchors only, each carrying its
+    /// severity word.
+    pub(crate) fn marks(&self) -> BTreeMap<u64, Vec<Marker>> {
+        markers_of(&self.rows, |f| {
+            MarkerKind::Proposal(f.severity.clone().unwrap_or_default())
+        })
+    }
+
+    /// How many of the selected proposals no longer anchor in the served
+    /// content.
+    pub(crate) fn orphaned(&self) -> usize {
+        self.rows.iter().filter(|(f, _)| f.orphaned).count()
+    }
+
+    /// The counted header both faces open with: `proposals (3, 1 orphaned)`
+    /// — or `proposals (0)`, so a page that draws nothing says it looked.
+    fn header(&self) -> String {
+        match self.orphaned() {
+            0 => format!("proposals ({})", self.rows.len()),
+            n => format!("proposals ({}, {n} orphaned)", self.rows.len()),
+        }
+    }
+
+    /// The proposals panel under the file view: a note stating what these
+    /// are and are not, then one card per proposal in reading order.
+    pub(crate) fn panel_html(&self) -> String {
+        let mut out = format!(
+            "<div class=\"browse-proposals\"><p class=\"browse-proposals-note\">\
+             {header} — pending review findings rated {words}, drawn here as proposals. \
+             Nothing in this section is published; a human decides at each finding's \
+             own page.</p>",
+            header = esc(&self.header()),
+            words = esc(&self.requested.join(", ")),
+        );
+        for (finding, line) in &self.rows {
+            out.push_str(&proposal_card_html(finding, *line));
+        }
+        out.push_str("</div>");
+        out
+    }
+
+    /// The compact section the text face appends: the counted header, then
+    /// one line per proposal — anchor line, severity, drift flag, the model,
+    /// clipped quote, collapsed note, and the finding IRI.
+    pub(crate) fn margin_text(&self) -> String {
+        let mut out = format!("--- {} ---", self.header());
+        for (finding, line) in &self.rows {
+            out.push('\n');
+            if let Some(n) = line {
+                out.push_str(&format!("L{n} "));
+            }
+            out.push_str(&format!(
+                "[{}] ",
+                finding.severity.as_deref().unwrap_or("unrated")
+            ));
+            if finding.orphaned {
+                out.push_str("[orphaned] ");
+            } else if finding.reanchored {
+                out.push_str("[re-anchored] ");
+            }
+            if let Some(model) = &finding.creator {
+                out.push_str(&format!("[proposed by {model}] "));
+            }
+            out.push_str(&format!(
+                "\"{}\" -- {} -- {}",
+                clip(&finding.exact),
+                collapse(&finding.body),
+                finding.iri()
+            ));
+        }
+        out
+    }
+}
+
+/// One proposal card. Deliberately NOT [`annotation_card_html`]: that card
+/// says "review by", offers the decision form on a pending finding, and
+/// carries the annotation family's classes — three things this card must not
+/// do. What it carries: the anchor line, the severity word (as a class), the
+/// word *proposal*, the model, the quote, the note, and the finding IRI as a
+/// link to the finding's own page (`urn:iki:finding:{id} as=text/html`, the
+/// same `/k/` shape every other face links through).
+fn proposal_card_html(finding: &Annotation, line: Option<u64>) -> String {
+    let severity = finding.severity.as_deref().unwrap_or("unrated");
+    let orphan_class = match finding.orphaned {
+        true => " browse-proposal-orphaned",
+        false => "",
+    };
+    let anchor = match line {
+        Some(n) if !finding.orphaned => {
+            format!("<a class=\"browse-proposal-line\" href=\"#L{n}\">L{n}</a> ")
+        }
+        _ => String::new(),
+    };
+    let model = finding
+        .creator
+        .as_deref()
+        .map(|m| {
+            format!(
+                "<span class=\"browse-proposal-model\">by {}</span> ",
+                esc(m)
+            )
+        })
+        .unwrap_or_default();
+    let mut flags = String::new();
+    if finding.orphaned {
+        flags.push_str(
+            "<span class=\"browse-proposal-flag\">orphaned — quote no longer in the current \
+             content</span>",
+        );
+    } else if finding.reanchored {
+        flags.push_str("<span class=\"browse-proposal-flag\">re-anchored</span>");
+    }
+    let iri = finding.iri();
+    format!(
+        "<div class=\"browse-proposal browse-proposal-{severity}{orphan_class}\" \
+         id=\"proposal-{id}\">{anchor}\
+         <span class=\"browse-proposal-severity browse-proposal-severity-{severity}\">\
+         {severity}</span> <span class=\"browse-proposal-label\">proposal</span> {model}\
+         <blockquote class=\"browse-proposal-quote\">{exact}</blockquote>\
+         <p class=\"browse-proposal-body\">{body}</p>{flags}\
+         <a class=\"browse-proposal-link\" href=\"#\" hx-get=\"/k/source {iri} as=text/html\" \
+         hx-target=\"#browse\" hx-swap=\"innerHTML\">{iri}</a></div>",
+        severity = esc(severity),
+        id = esc(&finding.id),
+        exact = esc(&finding.exact),
+        body = esc(&finding.body),
+        iri = esc(&iri),
+    )
 }
 
 // --- the review layer's mint (S4): a PENDING FINDING, never an annotation ---
@@ -2644,18 +2857,10 @@ pub(crate) fn target_overlay(
     text: &str,
 ) -> Result<(BTreeMap<u64, Vec<Marker>>, String)> {
     let rows = reconcile_target_against_text(archive, target_iri, text)?;
-    let mut marked: BTreeMap<u64, Vec<Marker>> = BTreeMap::new();
-    for (ann, line) in &rows {
-        if ann.orphaned {
-            continue;
-        }
-        let Some(line) = line else { continue };
-        marked.entry(*line).or_default().push(Marker {
-            id: ann.id.clone(),
-            note: clip_to(&collapse(&ann.body), 160),
-            machine: ann.machine(),
-        });
-    }
+    let marked = markers_of(&rows, |ann| match ann.machine() {
+        true => MarkerKind::Machine,
+        false => MarkerKind::Human,
+    });
     let panel = annotations_panel_html(target_iri, &rows);
     Ok((marked, panel))
 }

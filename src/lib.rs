@@ -18,7 +18,11 @@
 //!   syntax-highlighted, line-numbered view whose lines carry `id="L{n}"`
 //!   anchors (the surface S2's annotations target), inline markers at
 //!   annotated lines, and — explanations mounted — an explain link and a
-//!   review link, each beside its own "… with" backend menu.
+//!   review link, each beside its own "… with" backend menu. `proposals=`
+//!   (store mounted; a list of the finding contract's severity words) draws
+//!   the file's PENDING review findings of those severities beside their
+//!   lines as proposal marks — labelled proposals, never annotations, nothing
+//!   published — and the default draws nothing.
 //! - `urn:repo:{repo}:state` — the **freshness oracle**: the git HEAD sha plus
 //!   a short-status digest, one line; `as=application/json` yields
 //!   `{head, dirty: [paths]}`. Uncacheable by design — it exists to be the
@@ -165,6 +169,7 @@ mod review;
 /// The watch that keeps `urn:repo:style` fresh — see [`Mount::space_watched`].
 mod watch;
 
+use annotate::MarkerKind;
 use archive::Archive;
 
 pub use annotate::CAP_ANNOTATE;
@@ -790,6 +795,41 @@ pub(crate) fn include_annotations(inv: &Invocation<'_>) -> Result<bool> {
     }
 }
 
+/// The `proposals` arg of the file face: a comma-separated list of severity
+/// words, each validated against the finding contract's closed set
+/// (`finding::is_severity` — the one place the words live). Absent or empty
+/// draws nothing, which is the default: every consumer that does not ask
+/// gets the page it always got. Order is kept and duplicates dropped, so the
+/// panel names the words as the caller wrote them.
+///
+/// ★ The caller does not know the words either. gonk passes the complement of
+/// its serious set, read from the finding Sink's `one_of` — so this face
+/// accepts ANY subset the contract declares rather than a spelling of its own.
+pub(crate) fn proposal_severities(inv: &Invocation<'_>) -> Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for word in inv
+        .inline_str("proposals")
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+    {
+        if !finding::is_severity(word) {
+            return Err(Error::InvalidArgument {
+                name: "proposals".to_string(),
+                detail: format!(
+                    "`{word}` is not a severity — a comma-separated list of: {}",
+                    finding::SEVERITIES.join(", ")
+                ),
+            });
+        }
+        if !out.iter().any(|w| w == word) {
+            out.push(word.to_string());
+        }
+    }
+    Ok(out)
+}
+
 /// Minimal HTML escaping for names and paths embedded in attributes and text.
 pub(crate) fn esc(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -1309,20 +1349,40 @@ fn file_endpoint(roots: &Roots, archive: Option<&Arc<Archive>>, explain: bool) -
         let bytes = std::fs::read(&target)
             .map_err(|e| Error::Endpoint(format!("browse: read `{rel}`: {e}")))?;
         let include = include_annotations(inv)?;
+        let proposals = proposal_severities(inv)?;
+        // Both folds need a mounted store. Checked before the face is chosen
+        // so an unmounted `proposals=` fails loud on the html face too — an
+        // opt-in that silently drew nothing would be indistinguishable from
+        // "no proposals", which is the black hole the queue link's comment in
+        // `finding.rs` describes.
+        if !proposals.is_empty() && archive.is_none() {
+            return Err(Error::InvalidArgument {
+                name: "proposals".to_string(),
+                detail: "no annotation store is mounted (space_with_annotations / \
+                         space_with_explain)"
+                    .to_string(),
+            });
+        }
         match inv.inline_str("as").unwrap_or("") {
             // The HTML face already renders the annotations panel when the
             // store is mounted — `annotations=include` changes nothing there.
             t if t.starts_with("text/html") => Ok(repr_utf8(
                 "text/html",
-                file_html(repo, &rel, &bytes, archive.as_deref(), explain)?,
+                file_html(repo, &rel, &bytes, archive.as_deref(), explain, &proposals)?,
             )),
-            _ if include => {
+            _ if include || !proposals.is_empty() => {
                 // One resolution = content + human margin notes (the
-                // agent-grounding face). Only a mounted store and textual
-                // content can honor it — anything else fails loud.
+                // agent-grounding face), and — `proposals=` — the pending
+                // findings a human has not yet answered, marked as such. Only
+                // a mounted store and textual content can honor either —
+                // anything else fails loud.
+                let which = match include {
+                    true => "annotations",
+                    false => "proposals",
+                };
                 let Some(archive) = archive.as_deref() else {
                     return Err(Error::InvalidArgument {
-                        name: "annotations".to_string(),
+                        name: which.to_string(),
                         detail: "no annotation store is mounted (space_with_annotations / \
                                  space_with_explain)"
                             .to_string(),
@@ -1330,19 +1390,30 @@ fn file_endpoint(roots: &Roots, archive: Option<&Arc<Archive>>, explain: bool) -
                 };
                 let Ok(text) = std::str::from_utf8(&bytes) else {
                     return Err(Error::InvalidArgument {
-                        name: "annotations".to_string(),
+                        name: which.to_string(),
                         detail: format!(
-                            "`{rel}` is binary — there is no text face to fold annotations into"
+                            "`{rel}` is binary — there is no text face to fold {which} into"
                         ),
                     });
                 };
-                let included = annotate::included_for_text(archive, repo, &rel, text)?;
                 let mut out = text.to_string();
                 if !out.ends_with('\n') {
                     out.push('\n');
                 }
-                out.push('\n');
-                out.push_str(&included.margin_text());
+                if include {
+                    let included = annotate::included_for_text(archive, repo, &rel, text)?;
+                    out.push('\n');
+                    out.push_str(&included.margin_text());
+                }
+                if !proposals.is_empty() {
+                    let drawn =
+                        annotate::Proposals::for_text(archive, repo, &rel, text, &proposals)?;
+                    if include {
+                        out.push('\n');
+                    }
+                    out.push('\n');
+                    out.push_str(&drawn.margin_text());
+                }
                 Ok(repr_utf8("text/plain", out))
             }
             _ => Ok(Representation::new(media_type_for(&target, &bytes), bytes)),
@@ -1362,7 +1433,12 @@ fn file_description(has_store: bool, explain: bool) -> Description {
          annotated lines with inline markers anchored to their cards and appends the \
          annotations panel with its create form. annotations=include (store mounted, \
          textual content) serves the text plus a compact margin-notes section — \
-         content and human annotations in one resolution. Live and uncacheable.",
+         content and human annotations in one resolution. proposals=minor,info (store \
+         mounted) additionally draws the file's PENDING review findings of the named \
+         severities as proposal marks — labelled proposals, never annotations, nothing \
+         published, each linking its urn:iki:finding:{id} — with a proposals panel on the \
+         html face and a proposals section on the text face; the default draws nothing. \
+         Live and uncacheable.",
     );
     if explain {
         summary.push_str(
@@ -1399,6 +1475,26 @@ fn file_description(has_store: bool, explain: bool) -> Description {
                 )
                 .one_of(["include", "true", "false"])
                 .default_value("false"),
+        );
+        // Not a `one_of`: the value is a LIST of the finding contract's
+        // severity words (`urn:iki:finding:{id}`'s `severity` declares them),
+        // and a one_of would validate the whole comma-joined string as one
+        // word. Each word is checked against that set on the way in.
+        description = description.input(
+            ArgSpec::new("proposals")
+                .optional()
+                .class(XSD_STRING)
+                .summary(
+                    "a comma-separated list of severity words (the closed set \
+                     urn:iki:finding:{id}'s severity declares: critical, major, minor, info, \
+                     praise): draws this file's PENDING review findings of those severities \
+                     beside the lines they anchor to as proposal marks — visibly not \
+                     annotations, nothing drawn is published, each linking its \
+                     urn:iki:finding:{id}. The html face marks lines and appends a proposals \
+                     panel; the text face appends a proposals section. Default (absent or \
+                     empty) draws nothing.",
+                )
+                .default_value(""),
         );
     }
     description
@@ -1641,6 +1737,7 @@ fn file_html(
     bytes: &[u8],
     archive: Option<&Archive>,
     explain: bool,
+    proposals: &[String],
 ) -> Result<String> {
     let mut out = String::from("<div class=\"browse\">");
     out.push_str(&crumbs_html(repo, rel));
@@ -1659,9 +1756,29 @@ fn file_html(
             let overlay = archive
                 .map(|archive| annotate::file_overlay(archive, repo, rel, text))
                 .transpose()?;
-            let (marked, panel) = overlay.unwrap_or_default();
+            let (mut marked, panel) = overlay.unwrap_or_default();
+            // The `proposals=` overlay (ledger #496): the file's pending
+            // findings of the named severities, through the SAME drift pass,
+            // as proposal marks after the line's annotation markers, plus
+            // their own panel after the annotations panel. Opt-in: with no
+            // severities named this block runs nothing and the page is the
+            // page it always was.
+            let drawn = match (archive, proposals.is_empty()) {
+                (Some(archive), false) => Some(annotate::Proposals::for_text(
+                    archive, repo, rel, text, proposals,
+                )?),
+                _ => None,
+            };
+            if let Some(drawn) = &drawn {
+                for (line, marks) in drawn.marks() {
+                    marked.entry(line).or_default().extend(marks);
+                }
+            }
             out.push_str(&highlight_html(rel, text, &marked));
             out.push_str(&panel);
+            if let Some(drawn) = &drawn {
+                out.push_str(&drawn.panel_html());
+            }
         }
     }
     out.push_str("</div>");
@@ -1731,30 +1848,56 @@ fn highlight_html(
             })
             .unwrap_or_else(|| esc(line));
         let markers = annotated.get(&(n as u64));
-        let class = if markers.is_some() {
-            "browse-line browse-line-annotated"
-        } else {
-            "browse-line"
-        };
+        // A line is `annotated` when a published annotation anchors on it
+        // and `proposed` when a pending finding does; both when both. The
+        // two classes are distinct so a proposal never lights a line the way
+        // an annotation does — a reader must be able to tell at the gutter.
+        let mut class = String::from("browse-line");
+        if let Some(markers) = markers {
+            let (mut annotated, mut proposed) = (false, false);
+            for m in markers {
+                match m.kind {
+                    MarkerKind::Proposal(_) => proposed = true,
+                    MarkerKind::Human | MarkerKind::Machine => annotated = true,
+                }
+            }
+            if annotated {
+                class.push_str(" browse-line-annotated");
+            }
+            if proposed {
+                class.push_str(" browse-line-proposed");
+            }
+        }
         let marks = markers.map_or_else(String::new, |markers| {
             markers
                 .iter()
                 .map(|m| {
-                    // Hollow for machine (review) annotations, solid for
-                    // human — the two kinds are distinguishable at the line.
-                    let (class, dot) = if m.machine {
-                        (
-                            "browse-annotation-marker browse-annotation-marker-machine",
-                            "○",
-                        )
-                    } else {
-                        ("browse-annotation-marker", "●")
-                    };
-                    format!(
-                        "<a class=\"{class}\" href=\"#annotation-{}\" title=\"{}\">{dot}</a>",
-                        esc(&m.id),
-                        esc(&m.note)
-                    )
+                    // Solid for a human annotation, hollow for a machine
+                    // (review) annotation, a hollow diamond for a proposal —
+                    // three kinds, distinguishable at the line, and the
+                    // proposal anchored to ITS card (`#proposal-`), never an
+                    // annotation's.
+                    match &m.kind {
+                        MarkerKind::Human => format!(
+                            "<a class=\"browse-annotation-marker\" href=\"#annotation-{}\" \
+                             title=\"{}\">●</a>",
+                            esc(&m.id),
+                            esc(&m.note)
+                        ),
+                        MarkerKind::Machine => format!(
+                            "<a class=\"browse-annotation-marker browse-annotation-marker-machine\" \
+                             href=\"#annotation-{}\" title=\"{}\">○</a>",
+                            esc(&m.id),
+                            esc(&m.note)
+                        ),
+                        MarkerKind::Proposal(severity) => format!(
+                            "<a class=\"browse-proposal-marker browse-proposal-marker-{severity}\" \
+                             href=\"#proposal-{}\" title=\"proposal ({severity}): {}\">◇</a>",
+                            esc(&m.id),
+                            esc(&m.note),
+                            severity = esc(severity),
+                        ),
+                    }
                 })
                 .collect()
         });
@@ -2309,6 +2452,267 @@ mod tests {
         )
         .unwrap();
         assert!(body(&out).contains("binary file"), "{}", body(&out));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // --- proposals= (ledger #496) -------------------------------------------
+
+    /// The four-line first version of `src/lib.rs`: three findings anchor on
+    /// lines that survive the edit below and one on a line that does not.
+    const PROPOSED_V1: &str = "fn main() {\n    ()\n}\ngone\n";
+    /// What the file is by the time the page is drawn — `gone` is gone, so
+    /// its finding orphans and the other three re-anchor.
+    const PROPOSED_V2: &str = "fn main() {\n    ()\n}\n";
+
+    /// A demo root whose `src/lib.rs` carries one pending finding per
+    /// severity of interest, minted against [`PROPOSED_V1`] and then served
+    /// from [`PROPOSED_V2`]. Returns the kernel and the finding ids keyed by
+    /// severity word — `orphan` for the second `minor`, whose quote is gone.
+    fn proposed_root() -> (PathBuf, Kernel, BTreeMap<&'static str, String>) {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let archive = Archive::new(Arc::clone(&store), GraphName::DefaultGraph);
+        let hash = annotate::content_hash(PROPOSED_V1.as_bytes());
+        let mut ids = BTreeMap::new();
+        for (key, severity, quote, note) in [
+            ("major", "major", "fn main() {", "no caller anywhere."),
+            ("minor", "minor", "    ()", "the unit is implicit."),
+            ("info", "info", "}", "closes main."),
+            ("orphan", "minor", "gone", "this line will not survive."),
+        ] {
+            let iri = annotate::mint_pending_finding(
+                &archive,
+                &file_iri("demo", "src/lib.rs"),
+                "demo",
+                "src/lib.rs",
+                PROPOSED_V1,
+                &hash,
+                quote,
+                note,
+                Some(severity),
+                "m1",
+                "urn:ikigai:browse:review:test",
+                None,
+                annotate::Surface::File,
+            )
+            .unwrap()
+            .expect("the quote anchors in v1");
+            ids.insert(
+                key,
+                iri.strip_prefix("urn:iki:finding:").unwrap().to_string(),
+            );
+        }
+        std::fs::write(root.join("src/lib.rs"), PROPOSED_V2).unwrap();
+        let k = Kernel::new(Arc::new(space_with_annotations(
+            vec![("demo".to_string(), root.clone())],
+            store,
+        )));
+        (root, k, ids)
+    }
+
+    fn html_of(k: &Kernel, args: &[(&str, &str)]) -> String {
+        let mut args = args.to_vec();
+        args.push(("as", "text/html"));
+        body(&source(k, "urn:repo:demo:file:src/lib.rs", &args, &demo_cap()).unwrap())
+    }
+
+    /// ★ `proposals=minor,info` draws exactly those severities and not the
+    /// `major`; the default draws none and is byte-identical; an orphan is
+    /// counted and listed flagged but drawn at no line; and nothing drawn
+    /// claims to be an annotation or offers a decision.
+    #[test]
+    fn proposals_draws_the_named_severities_and_the_default_draws_none() {
+        let (root, k, ids) = proposed_root();
+        // Default: not a trace. And the empty list IS the default, byte for
+        // byte — a consumer that never heard of the argument and one that
+        // passes it empty get the same page.
+        let plain = html_of(&k, &[]);
+        assert!(!plain.contains("proposal"), "{plain}");
+        assert_eq!(plain, html_of(&k, &[("proposals", "")]));
+        // The findings ARE in the store — and the default page draws no card
+        // for them, as it never did.
+        assert!(!plain.contains("browse-finding"), "{plain}");
+
+        let html = html_of(&k, &[("proposals", "minor,info")]);
+        let marker = |key: &str| format!("href=\"#proposal-{}\"", ids[key]);
+        let card = |key: &str| format!("id=\"proposal-{}\"", ids[key]);
+        // Drawn: the minor and the info, at their (re-anchored) lines.
+        assert!(html.contains(&marker("minor")), "{html}");
+        assert!(html.contains(&marker("info")), "{html}");
+        assert!(html.contains(&card("minor")), "{html}");
+        assert!(
+            html.contains("browse-proposal-marker browse-proposal-marker-minor"),
+            "{html}"
+        );
+        assert!(
+            html.contains("browse-proposal-marker browse-proposal-marker-info"),
+            "{html}"
+        );
+        assert!(html.contains("browse-line browse-line-proposed"), "{html}");
+        // Not drawn: the major — not asked for, in any form.
+        assert!(!html.contains(&marker("major")), "{html}");
+        assert!(!html.contains(&card("major")), "{html}");
+        assert!(!html.contains("browse-proposal-marker-major"), "{html}");
+        // The orphan: counted in the header, listed flagged, no marker.
+        assert!(html.contains("proposals (3, 1 orphaned)"), "{html}");
+        assert!(!html.contains(&marker("orphan")), "{html}");
+        assert!(html.contains(&card("orphan")), "{html}");
+        assert!(
+            html.contains(&format!(
+                "browse-proposal browse-proposal-minor browse-proposal-orphaned\" {}",
+                card("orphan")
+            )),
+            "{html}"
+        );
+        // What a card carries: the word, the model, the note, the IRI as a
+        // link to the finding's own page.
+        assert!(
+            html.contains("<span class=\"browse-proposal-label\">proposal</span>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<span class=\"browse-proposal-model\">by m1</span>"),
+            "{html}"
+        );
+        assert!(html.contains("the unit is implicit."), "{html}");
+        assert!(
+            html.contains(&format!(
+                "hx-get=\"/k/source urn:iki:finding:{} as=text/html\"",
+                ids["minor"]
+            )),
+            "{html}"
+        );
+        assert!(
+            html.contains("Nothing in this section is published"),
+            "{html}"
+        );
+        // What it must NOT carry: an annotation's class, an annotation's
+        // "review by", or the decision form — a proposal is not an
+        // annotation and the page decides nothing.
+        let proposals = html
+            .split("<div class=\"browse-proposals\">")
+            .nth(1)
+            .unwrap();
+        assert!(!proposals.contains("browse-annotation"), "{proposals}");
+        assert!(!proposals.contains("review by"), "{proposals}");
+        assert!(!proposals.contains("browse-finding"), "{proposals}");
+        assert!(!proposals.contains("<form"), "{proposals}");
+        assert!(!html.contains("decision="), "{html}");
+        // The annotations panel is untouched by the fold: still there, still
+        // with its create form, still before the proposals.
+        let annotations_at = html.find("<div class=\"browse-annotations\">").unwrap();
+        let proposals_at = html.find("<div class=\"browse-proposals\">").unwrap();
+        assert!(annotations_at < proposals_at, "{html}");
+        // Order and repetition of the words are the caller's: the panel names
+        // them as asked, once each.
+        let html = html_of(&k, &[("proposals", "info, minor,info")]);
+        assert!(html.contains("rated info, minor,"), "{html}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A word outside the finding contract's set is a typed argument error
+    /// naming the set; a store-less mount refuses the argument on every face
+    /// rather than drawing nothing.
+    #[test]
+    fn proposals_rejects_an_unknown_word_and_an_unmounted_store() {
+        let (root, k, _) = proposed_root();
+        let err = source(
+            &k,
+            "urn:repo:demo:file:src/lib.rs",
+            &[("proposals", "minor,urgent"), ("as", "text/html")],
+            &demo_cap(),
+        )
+        .unwrap_err();
+        match err {
+            Error::InvalidArgument { name, detail } => {
+                assert_eq!(name, "proposals");
+                assert!(detail.contains("`urgent`"), "{detail}");
+                assert!(
+                    detail.contains("critical, major, minor, info, praise"),
+                    "{detail}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        std::fs::remove_dir_all(&root).ok();
+
+        let root = demo_root();
+        let bare = kernel(vec![("demo".to_string(), root.clone())]);
+        for args in [
+            vec![("proposals", "minor"), ("as", "text/html")],
+            vec![("proposals", "minor")],
+        ] {
+            let err =
+                source(&bare, "urn:repo:demo:file:src/lib.rs", &args, &demo_cap()).unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidArgument { name, .. } if name == "proposals"),
+                "{err:?}"
+            );
+        }
+        // And the empty list on a bare mount is still the default: nothing
+        // asked, nothing refused.
+        source(
+            &bare,
+            "urn:repo:demo:file:src/lib.rs",
+            &[("proposals", "")],
+            &demo_cap(),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The text face: `proposals=` appends a proposals section (after the
+    /// margin notes when `annotations=include` is also asked), with the same
+    /// counting and the same drift flags the margin notes carry.
+    #[test]
+    fn proposals_on_the_text_face_append_a_counted_section() {
+        let (root, k, ids) = proposed_root();
+        let out = source(
+            &k,
+            "urn:repo:demo:file:src/lib.rs",
+            &[("proposals", "minor")],
+            &demo_cap(),
+        )
+        .unwrap();
+        assert_eq!(out.repr_type.media_type, "text/plain");
+        let text = body(&out);
+        assert!(text.starts_with(PROPOSED_V2), "{text}");
+        assert!(
+            text.contains("\n--- proposals (2, 1 orphaned) ---\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "L2 [minor] [re-anchored] [proposed by m1] \"    ()\" -- the unit is \
+                 implicit. -- urn:iki:finding:{}",
+                ids["minor"]
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains("[minor] [orphaned] [proposed by m1] \"gone\""),
+            "{text}"
+        );
+        assert!(!text.contains(&ids["info"]), "{text}");
+        assert!(!text.contains("--- annotations"), "{text}");
+        // Both folds: annotations first, then proposals, blank-line separated.
+        let both = body(
+            &source(
+                &k,
+                "urn:repo:demo:file:src/lib.rs",
+                &[("annotations", "include"), ("proposals", "info")],
+                &demo_cap(),
+            )
+            .unwrap(),
+        );
+        assert!(
+            both.contains("--- annotations (0) ---\n\n--- proposals (1) ---\n"),
+            "{both}"
+        );
+        // And the raw face without the argument is still the raw face.
+        let raw = source(&k, "urn:repo:demo:file:src/lib.rs", &[], &demo_cap()).unwrap();
+        assert_eq!(raw.repr_type.media_type, "text/x-rust");
+        assert_eq!(raw.bytes, PROPOSED_V2.as_bytes());
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -3057,6 +3461,27 @@ mod tests {
                 .find(|i| i.name == "annotations")
                 .expect("declared when the store is mounted");
             assert_eq!(ann.one_of, vec!["include", "true", "false"]);
+            // `proposals` rides the same rule: declared only with a store,
+            // a LIST (so no one_of — each word is checked against
+            // `finding::SEVERITIES` on the way in), and a default that
+            // draws nothing, said in the summary in as many words.
+            assert!(!bare.inputs.iter().any(|i| i.name == "proposals"));
+            let proposals = with_store
+                .inputs
+                .iter()
+                .find(|i| i.name == "proposals")
+                .expect("declared when the store is mounted");
+            assert!(!proposals.required);
+            assert!(proposals.one_of.is_empty());
+            assert_eq!(proposals.default.as_deref(), Some(""));
+            assert!(
+                proposals.summary.contains("draws nothing"),
+                "{}",
+                proposals.summary
+            );
+            for word in finding::SEVERITIES {
+                assert!(proposals.summary.contains(word), "{}", proposals.summary);
+            }
         }
         std::fs::remove_dir_all(&root).ok();
     }

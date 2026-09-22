@@ -108,14 +108,18 @@ pub(crate) const LAYOUT_CSS: &str = "\
 --browse-rule:#d0d7de;\
 --browse-flag:#8a6100;\
 --browse-machine:#6639ba;\
---browse-mark:rgba(255,212,0,.22)\
+--browse-praise:#1a7f37;\
+--browse-mark:rgba(255,212,0,.22);\
+--browse-propose:rgba(102,57,186,.10)\
 }\n\
 @media (prefers-color-scheme:dark){:root{\
 --browse-link:#8ab4f8;\
 --browse-rule:#3d444d;\
 --browse-flag:#d4a72c;\
 --browse-machine:#b78af8;\
---browse-mark:rgba(255,212,0,.14)\
+--browse-praise:#57ab5a;\
+--browse-mark:rgba(255,212,0,.14);\
+--browse-propose:rgba(183,138,248,.12)\
 }}\n\
 \
 /* Navigation is buttons (every move is an hx-get), so the buttons must read as\n\
@@ -198,6 +202,47 @@ color:inherit;opacity:.4;text-decoration:none;user-select:none;\
 .browse-line-annotated,.browse-line:target{background:var(--browse-mark)}\n\
 .browse-annotation-marker{margin-right:.35ch;opacity:.8;color:inherit;\
 text-decoration:none}\n\
+.browse-annotation-marker-machine{color:var(--browse-machine)}\n\
+/* Proposals (ledger #496): a PENDING finding drawn beside its line under\n\
+   `proposals=`. A different tint than an annotated line and a different glyph\n\
+   than either annotation marker, because nothing here is published and the\n\
+   page must not read as if it were. The severity classes colour the mark and\n\
+   the badge; every colour is a palette property above and sits over the\n\
+   contrast floor (`the_palette_clears_the_contrast_floor`). */\n\
+.browse-line-proposed{background:var(--browse-propose)}\n\
+.browse-proposal-marker{margin-right:.35ch;color:inherit;text-decoration:none}\n\
+.browse-proposal-marker-critical,.browse-proposal-marker-major,\
+.browse-proposal-severity-critical,.browse-proposal-severity-major{\
+color:var(--browse-flag)}\n\
+.browse-proposal-marker-minor,.browse-proposal-marker-info,\
+.browse-proposal-severity-minor,.browse-proposal-severity-info{\
+color:var(--browse-machine)}\n\
+.browse-proposal-marker-praise,.browse-proposal-severity-praise{\
+color:var(--browse-praise)}\n\
+.browse-proposals{display:grid;gap:.75rem;margin-top:1.25rem}\n\
+.browse-proposals-note{font-size:.85em;opacity:.7;margin:0}\n\
+.browse-proposal{border-left:3px dotted var(--browse-machine);padding-left:.6rem}\n\
+.browse-proposal-critical,.browse-proposal-major{border-left-color:var(--browse-flag)}\n\
+.browse-proposal-minor,.browse-proposal-info{border-left-color:var(--browse-machine)}\n\
+.browse-proposal-praise{border-left-color:var(--browse-praise)}\n\
+.browse-proposal-orphaned{opacity:.75}\n\
+.browse-proposal-line{background:none;border:0;padding:0;margin:0;font:inherit;\
+color:var(--browse-link);text-decoration:none}\n\
+.browse-proposal-line:hover{text-decoration:underline}\n\
+.browse-proposal-severity{font-size:.72em;white-space:nowrap;margin-right:.35rem;\
+padding:.05em .5em;border:1px solid currentColor;border-radius:999px}\n\
+.browse-proposal-label{font-size:.72em;text-transform:uppercase;letter-spacing:.06em;\
+opacity:.7;margin-right:.35rem}\n\
+.browse-proposal-model{opacity:.65;font-size:.85em}\n\
+.browse-proposal-quote{margin:.15rem 0;padding-left:.5rem;\
+border-left:2px solid var(--browse-rule);font-style:italic;opacity:.85}\n\
+.browse-proposal-body{margin:.25rem 0}\n\
+.browse-proposal-flag{font-size:.72em;white-space:nowrap;margin-left:.35rem;\
+padding:.05em .5em;border:1px solid var(--browse-flag);border-radius:999px;\
+color:var(--browse-flag)}\n\
+.browse-proposal-link{font-size:.85em;color:var(--browse-link);text-decoration:none;\
+word-break:break-all}\n\
+.browse-proposal-link:hover{text-decoration:underline}\n\
 .browse-binary{opacity:.7;font-style:italic}\n\
 \
 /* A review pass that found nothing: the statement IS the page body, so it\n\
@@ -363,7 +408,94 @@ mod tests {
         "browse-finding-severity-unrated",
         // `finding.rs`: the current state button in the queue's state nav.
         "browse-findings-state-current",
+        // `lib.rs` / `annotate.rs`: `proposals=` — the line wrapper's class,
+        // and `browse-proposal-marker-{severity}`, `browse-proposal-{severity}`,
+        // `browse-proposal-severity-{severity}`, one per `finding::SEVERITIES`
+        // (an unrated finding matches no requested word and is never drawn).
+        "browse-line-proposed",
+        "browse-proposal-marker-critical",
+        "browse-proposal-marker-major",
+        "browse-proposal-marker-minor",
+        "browse-proposal-marker-info",
+        "browse-proposal-marker-praise",
+        "browse-proposal-critical",
+        "browse-proposal-major",
+        "browse-proposal-minor",
+        "browse-proposal-info",
+        "browse-proposal-praise",
+        "browse-proposal-severity-critical",
+        "browse-proposal-severity-major",
+        "browse-proposal-severity-minor",
+        "browse-proposal-severity-info",
+        "browse-proposal-severity-praise",
+        "browse-proposal-orphaned",
     ];
+
+    /// Every severity word the finding contract declares has a proposal
+    /// rule for each of its three classed sites — so a NEW severity cannot
+    /// ship with a mark that renders in the page's default colour. Reads the
+    /// list from `finding::SEVERITIES` rather than retyping it.
+    #[test]
+    fn every_severity_word_has_its_proposal_rules() {
+        for severity in crate::finding::SEVERITIES {
+            for site in ["proposal-marker", "proposal", "proposal-severity"] {
+                let class = format!(".browse-{site}-{severity}");
+                assert!(
+                    LAYOUT_CSS.contains(&class),
+                    "{class} has no rule — a `{severity}` proposal would draw uncoloured"
+                );
+            }
+        }
+    }
+
+    /// ★ The palette's FOREGROUND properties clear `ikigai-a11y`'s contrast
+    /// floor against the page grounds a door is likeliest to use — white, and
+    /// the near-black most dark schemes sit on. The sheet paints no ground of
+    /// its own (a door decides), so the two grounds are an assumption stated
+    /// here rather than a fact read from anywhere; what the test pins is that
+    /// a severity colour added for `proposals=` does not slip under the floor
+    /// a door cannot see past. The `--browse-mark` / `--browse-propose` tints
+    /// are backgrounds behind inherited text and are not foregrounds.
+    #[test]
+    fn the_palette_clears_the_contrast_floor() {
+        use ikigai_a11y::{ratio, Rgba};
+        const FLOOR: f64 = 4.5;
+        let light = Rgba::parse("#ffffff").unwrap();
+        let dark = Rgba::parse("#0d1117").unwrap();
+        let mut checked = 0;
+        for (scheme, ground) in [("light", light), ("dark", dark)] {
+            // The first `:root{…}` block is the light palette; the one inside
+            // the media query is the dark one.
+            let block = LAYOUT_CSS
+                .split(":root{")
+                .nth(match scheme {
+                    "light" => 1,
+                    _ => 2,
+                })
+                .and_then(|rest| rest.split('}').next())
+                .expect("both palette blocks are present");
+            for declaration in block.split(';') {
+                let Some((name, value)) = declaration.split_once(':') else {
+                    continue;
+                };
+                // `--browse-rule` is a hairline border, never text — a rule
+                // held to a text floor would have to be near-black.
+                if !value.starts_with('#') || name == "--browse-rule" {
+                    continue;
+                }
+                let colour = Rgba::parse(value.trim()).unwrap();
+                let contrast = ratio(colour, ground);
+                assert!(
+                    contrast >= FLOOR,
+                    "{scheme} {name}:{value} is {contrast:.2}:1 against {ground}, under the \
+                     {FLOOR}:1 floor"
+                );
+                checked += 1;
+            }
+        }
+        // Four foreground properties per scheme: link, flag, machine, praise.
+        assert_eq!(checked, 8, "the palette scan stopped seeing the properties");
+    }
 
     /// Every `browse-*` class the faces emit has a rule in [`LAYOUT_CSS`].
     ///

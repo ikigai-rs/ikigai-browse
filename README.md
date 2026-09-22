@@ -8,7 +8,7 @@ pairs), and each root answers these resource families:
 | resource | what it is |
 |----------|------------|
 | `urn:repo:{repo}:tree` / `urn:repo:{repo}:tree:{path}` | a directory listing — `text/plain` (default; `name`⇥`kind`⇥`size` per line), `as=text/html` (htmx-navigable; with the explanation family mounted, an explain link for the directory and one per entry), `as=text/turtle` (the skolemized graph) |
-| `urn:repo:{repo}:file:{path}` | file content — raw bytes under an extension-mapped media type; `as=text/html` for a syntax-highlighted, line-numbered view with `#L{n}` anchors, inline markers at annotated lines, and (explanations mounted) an explain link; `annotations=include` (store mounted) serves the text plus a compact, drift-reconciled margin-notes section — content and human annotations in one resolution |
+| `urn:repo:{repo}:file:{path}` | file content — raw bytes under an extension-mapped media type; `as=text/html` for a syntax-highlighted, line-numbered view with `#L{n}` anchors, inline markers at annotated lines, and (explanations mounted) an explain link; `annotations=include` (store mounted) serves the text plus a compact, drift-reconciled margin-notes section — content and human annotations in one resolution; `proposals=minor,info` (store mounted; any subset of the finding contract's severity words) draws the file's PENDING review findings of those severities beside their lines as **proposal marks** — labelled proposals, never annotations, nothing published, each linking its `urn:iki:finding:{id}` — with a proposals panel on the html face and a proposals section on the text face; the default draws nothing |
 | `urn:repo:{repo}:state` | the **freshness oracle** — HEAD sha + `clean`/`dirty:{n}` on one line; `as=application/json` for `{head, dirty: [paths]}` |
 | `urn:repo:{repo}:hash[:{path}]` | the **content hash** (S1) — `sha256:{hex}` of a file's bytes, or the **merkle** construction over a directory's entries (ignore-filtered), so one edit re-keys exactly the path to the root |
 | `urn:repo:{repo}:explain[:{path}]` | an **LLM-derived orientation explanation** (S1), archived by `(path, content-hash, version-tag)` — derived once per content version, reused forever; `as=application/json` adds `{content_hash, version_tag, derived}`, `as=text/html` the page face with provenance and a backlink to the explained resource, `as=text/turtle` the archive entry's graph; `version=` addresses an older tag; `provider=` derives this one against a different host-allowed backend (keyed by that backend's own model identity, so two models coexist); `annotations=include` (S3) folds the target's annotations in — the json face gains an `annotations` array, the text face appends margin notes, the html face renders the annotation cards, and a directory rollup folds its subtree's |
@@ -311,7 +311,27 @@ the note; hosts may style it as a margin dot), and appends an annotations
 panel: one card per annotation at its `#L{n}` anchor (orphans visually
 flagged, listed without a marker) plus a create form that `hx-post`s a Sink
 of `urn:iki:annotation` through the host's `/k/` adapter (form fields become
-sink args — htmx only, no scripts). With the explanation family mounted,
+sink args — htmx only, no scripts).
+
+**Proposals on the file page** (`proposals=`, ledger #496). A host narrowing
+its triage queue to the serious severities still wants the rest — minted,
+stored, anchored — visible where the code is. `proposals=minor,info,praise`
+(any subset of the finding contract's words, validated on the way in) draws
+the file's PENDING findings of those severities through the SAME drift pass
+the annotations run: a hollow-diamond marker per live anchor
+(`browse-proposal-marker browse-proposal-marker-{severity}`, the line classed
+`browse-line-proposed`, a different tint than an annotated line) and a
+`browse-proposals` panel after the annotations panel, one
+`browse-proposal-{severity}` card each carrying the severity word, the word
+*proposal*, the model that proposed it, the quote, the note, and the finding
+IRI as a link to the finding's own page. Nothing drawn is published and the
+markup never says otherwise: no `browse-annotation` class, no "review by",
+and **no publish/decline form** — browse does not know the host's decide
+route, so the finding link is the affordance and the finding's page is where
+a human answers. An orphaned proposal is counted in the panel header
+(`proposals (3, 1 orphaned)`) and listed flagged, but drawn at no line,
+exactly as an orphaned annotation is. The default draws nothing, so every
+page that does not ask is byte-identical to before. With the explanation family mounted,
 the tree and file faces carry explain links (`browse-explain-link` — the
 tree face one per entry plus the directory's own under a
 `browse-actions` nav), and the explain face backlinks its target
