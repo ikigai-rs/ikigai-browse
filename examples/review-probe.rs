@@ -2,9 +2,19 @@
 //! written to disk unparsed, so two prompt wordings can be compared on
 //! identical inputs.
 //!
-//!   cargo run --example review-probe -- <root> <out-dir> <n> <path>...
+//!   cargo run --example review-probe -- [--model <tag>] <root> <out-dir> <n> <path>...
 //!
 //! Each answer lands in `<out-dir>/<path with / replaced by _>.<i>.txt`.
+//!
+//! `--model` names the Ollama tag to review with; it defaults to the review
+//! tier's own model, so every invocation written before the flag existed still
+//! means what it meant. ⚠ The flag varies the MODEL, never the provider LABEL:
+//! the registry entry stays `coder`, because the pass tag is derived from the
+//! provider and a label asserted by this file would be a claim rather than a
+//! resolution. Two arms therefore produce answers that are indistinguishable
+//! by tag — keep them in separate out-dirs, which is what the arm loop does.
+//! Added for the model bake-off (ledger #491): the harness built to compare
+//! passes could not vary the one thing that comparison varies.
 //!
 //! ⚠⚠ IT USES `debug=raw`, AND THAT IS THE WHOLE POINT. A pass is archived by
 //! `(path, content-hash, prompt-tag, model)`, so running the ordinary face
@@ -21,7 +31,7 @@
 //! Anchor them yourself — substring containment against the file is exactly
 //! what the pass does — and count both populations.
 //!
-//! Needs a local Ollama with the review model pulled:
+//! Needs a local Ollama with the named model pulled:
 //!   ollama pull qwen3-coder:30b
 
 use std::sync::Arc;
@@ -84,9 +94,21 @@ impl ikigai_http::HttpTransport for UreqTransport {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // `--model <tag>` is stripped before the positional match so the shape below
+    // is unchanged. Absent, the incumbent stands: a default here is what keeps
+    // the invocations in #449, #450 and #483 meaning what they meant.
+    let mut model = "qwen3-coder:30b".to_string();
+    if let Some(i) = args.iter().position(|a| a == "--model") {
+        let Some(tag) = args.get(i + 1).cloned() else {
+            eprintln!("--model needs a tag, e.g. --model qwen3-coder-next:latest");
+            std::process::exit(2);
+        };
+        model = tag;
+        args.drain(i..=i + 1);
+    }
     let [root, out, repeats, paths @ ..] = args.as_slice() else {
-        eprintln!("usage: review-probe <root> <out-dir> <n> <path>...");
+        eprintln!("usage: review-probe [--model <tag>] <root> <out-dir> <n> <path>...");
         std::process::exit(2);
     };
     let repeats: usize = repeats.parse().expect("<n> must be a count");
@@ -98,7 +120,7 @@ fn main() {
     // (`ExplainConfig::review_provider`). Naming it here rather than labelling
     // the model keeps the tag honest: the identity is resolved from the
     // provider, not asserted by this file.
-    let mut coder = OpenAiConfig::ollama("qwen3-coder:30b");
+    let mut coder = OpenAiConfig::ollama(&model);
     coder.provider = "coder".to_string();
     let registry = Registry {
         default: "coder".to_string(),
@@ -135,8 +157,14 @@ fn main() {
             match futures::executor::block_on(kernel.issue(request, &cap)) {
                 Ok(repr) => {
                     std::fs::write(&file, &repr.bytes).expect("write");
+                    // ⚠ The model is printed on every line, not once at the
+                    // top: these runs are read from a scrollback or a tee'd log
+                    // days later, and a header scrolls away while a per-line tag
+                    // cannot. Wall time is printed for the same reason it is
+                    // measured — ollama serves one request at a time, so a
+                    // slower arm costs queue drain rate, not just patience.
                     println!(
-                        "{path} #{i}  {:.1?}  {} bytes",
+                        "{model}  {path} #{i}  {:.1?}  {} bytes",
                         started.elapsed(),
                         repr.bytes.len()
                     );
@@ -146,7 +174,7 @@ fn main() {
                 // when the analysis runs days later.
                 Err(e) => {
                     std::fs::write(&file, format!("ERROR: {e:?}")).expect("write");
-                    println!("{path} #{i}  ERROR {e:?}");
+                    println!("{model}  {path} #{i}  ERROR {e:?}");
                 }
             }
         }
