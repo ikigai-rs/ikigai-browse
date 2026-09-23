@@ -1527,6 +1527,11 @@ impl Endpoint for PrReviewEndpoint {
             tag,
             model,
             minted,
+            // A diff pass has no regions and no memo: it is one call over a
+            // (policy-truncated) diff, keyed by the head commit.
+            carried: Vec::new(),
+            reused_regions: Vec::new(),
+            derived_regions: Vec::new(),
             orphaned_items,
             reviewed_bytes: Some(truncated_len(&diff, config.max_prompt_bytes) as u64),
             total_bytes: Some(diff.len() as u64),

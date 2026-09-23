@@ -185,7 +185,38 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # not see it; and the layout palette gained `--browse-praise` /
 # `--browse-propose` plus a test that holds every foreground property to the
 # a11y contrast floor on white and near-black grounds.
-version = "0.7.0"
+#
+# 0.8.0 — MINOR: WHAT A PASS DERIVES AND STORES CHANGED, OBSERVABLY (ledger #481).
+# The review archive is keyed twice now. Beside the pass entry (still keyed by
+# the file's content hash) every derived region is memoized under the sha256 of
+# ITS OWN bytes — `urn:ikigai:browse:review-region:…`, a new IRI family in the
+# store — and a pass over a changed file asks the model only about the regions
+# whose bytes moved, carrying the unchanged regions' EXISTING finding records
+# forward: same ids, same pending/declined state, re-anchored by the one drift
+# path. Measured on the ledger's own case (`src/review.rs` a6b0900 → eb77038,
+# the 108-line doc-comment commit, qwen3-coder:30b, `examples/review-memo-probe`):
+# the pass over the changed file made 4 model calls instead of 12 and minted 15
+# findings instead of 61, carrying 59 forward under their existing ids — 9 of
+# 13 regions unchanged. Queue growth for that commit: 15, not 61. ★ Why a minor: the json face
+# gained fields (`carried`, `memo_regions`, `derived_regions`), `statement`
+# gained two clauses, `minted` now means "what THIS pass minted" rather than
+# "every finding on file for this reading" (the union is `annotations`), and a
+# consumer that counted the pending queue's growth per commit sees a different
+# number — which is the whole point, and is not a patch. gonk pins `"0.7.0"`
+# and `^0.7.0` is `<0.8.0`, so it cannot see this until its pin moves; that is
+# the hub's wave, as for 0.5.0, 0.6.0 and 0.7.0 before it. The tiling now SNAPS
+# to remembered regions (`review::tile`): without that, an insertion shifts
+# every later cut point and the memo would miss on every region after the
+# edit, which on a doc comment near the top is all of them. The prompt and
+# the tag (`review-v5`) are UNCHANGED — a memo is not a prompt change, and
+# re-keying every pass would defeat it. The root-move migration gained the new
+# prefix (`migrate::REGION_PREFIX`) so memos travel with a renamed root. Two
+# vocabulary needs are REPORTED, not invented: a class for the memo (it is
+# typed `prov:Collection` meanwhile, every term on it already published) and a
+# count of carried regions on the pass (derivable from `prov:used` links
+# meanwhile). No new capability, no resource name moved, `provider=` and the
+# PR pass untouched (a diff pass has no regions).
+version = "0.8.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]

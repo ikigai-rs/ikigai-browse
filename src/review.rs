@@ -42,6 +42,61 @@
 //!   region from reporting an absence it cannot check; the real answer is a
 //!   structural outline pass over the whole file, which is its own arc.
 //!
+//! ## The region memo: a pass re-derives only the regions whose bytes moved
+//!
+//! ★ The archive is keyed twice. The PASS is keyed by the file's content hash,
+//! as it always was. Beside it, every region a pass derived is memoized under
+//! `(repo, path, sha256 of the REGION'S bytes, tag)` — `urn:ikigai:browse:
+//! review-region:…` — with the findings that call produced. A pass over a file
+//! whose hash is new then walks its regions and, for each one whose bytes are
+//! already on record under this tag, CARRIES THE EXISTING FINDINGS FORWARD
+//! instead of asking; only the regions whose bytes moved are derived.
+//!
+//! Why: a whole-file pass re-derives every region at every new content hash, so
+//! queue volume scales with FILE SIZE × COMMIT COUNT rather than with the diff.
+//! Measured 2026-09-21 (ledger #481): one commit adding 108 lines of doc comment
+//! to this 181 KB file produced 57 findings, nearly all on code the commit did
+//! not touch, and a file-hash throttle can never fire on that — the hash did
+//! change. "Substantial change" is made exact here: substantial = the region's
+//! bytes moved. No heuristic, no timer, nothing to tune.
+//!
+//! ★★ **A carried-forward finding KEEPS ITS ID.** This is the constraint that
+//! decides whether the memo helps the queue at all. A finding id is
+//! `sha256(pass ‖ char_start ‖ exact)` and the pass IRI carries the file hash, so
+//! re-minting a carried region's findings under the new pass would give every
+//! one of them a NEW id — the memo would save the model call and save NOTHING in
+//! the queue, which is the thing that hurts. So the existing finding records
+//! stay the findings: same id, same state (pending, declined, published), same
+//! `prov:wasGeneratedBy` (the pass that actually derived them), re-anchored to
+//! their new offsets by the SAME drift reconciliation every annotation gets
+//! (`annotate::refresh`) — never a second re-anchor path. A declined finding on
+//! an unchanged region stays declined. A pending one stays pending, once. The
+//! new pass records them as `prov:used <region memo>` → `prov:hadMember
+//! <finding>`, and claims `prov:generated` only for what it minted itself.
+//!
+//! ★ **The tiling SNAPS to remembered regions, and it has to.** Regions are cut
+//! by a fixed-size line-aligned rule, and each window starts where the previous
+//! region ended — so an insertion of s bytes shifts EVERY later cut point by s,
+//! and the blank-line preference cannot re-synchronize because the window's
+//! slack (a quarter of the chunk) is smaller than an ordinary doc comment. A
+//! memo keyed on region content over that tiling would miss on every region
+//! after the edit, which on the ledger's own case (a doc comment near the top
+//! of this file) is all of them. So [`tile`] checks, at every region start,
+//! whether a remembered region's bytes sit exactly there and takes it whole if
+//! so; a fresh region is cut by the rule as before, but never past the point
+//! where the next remembered region's bytes begin. An insertion then costs the
+//! region it lands in (split by the rule if it grew past one prompt) and
+//! nothing else; a deletion likewise; a boundary never moves under unchanged
+//! bytes. Hash the CONTENT, never `(offset, content)`.
+//!
+//! What a region memo deliberately does NOT do: it does not re-derive a changed
+//! region's neighbours to chase a cross-region defect (that is the outline pass,
+//! a separate arc — widening the memo would be chasing it with the wrong tool);
+//! it does not memoize a region whose every quote misquoted (an empty memo
+//! would carry "nothing here" forward as a claim the model never made); and
+//! `debug=raw` ignores it, deriving every region by the rule alone, so a probe
+//! stays a measurement of the model rather than of the archive.
+//!
 //! ## Choosing the backend per request
 //!
 //! `provider={iri}` derives THIS pass against a backend the caller names
@@ -282,6 +337,11 @@ use crate::{
 /// above before assuming a third wording is different; the corpus and the
 /// archive-bypass harness (`examples/review-probe.rs`) are committed so that
 /// costs an afternoon rather than a week.
+///
+/// ⚠ THE REGION MEMO (0.8.0) IS NOT A PROMPT CHANGE AND DOES NOT MOVE THIS TAG.
+/// The prompt a fresh region is shown is byte-identical to a v5 pass's; what
+/// changed is which regions are ASKED. Re-keying every pass for a memo would
+/// defeat the memo — its first hit is a region derived under this very tag.
 const REVIEW_PROMPT_VERSION: &str = "review-v5";
 
 /// How many SUGGESTIONS — the tier between [`crate::finding::SERIOUS_SEVERITIES`]
@@ -523,24 +583,16 @@ impl Region {
 /// class — a defect relating byte 900 to byte 90000 spans no boundary a small
 /// overlap would bridge. The outline pass is the answer to that, and it is a
 /// separate arc.
+///
+/// This is [`tile`] with nothing remembered — the rule alone, which is what
+/// `debug=raw` and the first pass over a file get. Kept as the name the
+/// tiling tests pin the rule under.
+#[cfg(test)]
 fn split_into_regions(text: &str, chunk_bytes: usize, max_regions: usize) -> Vec<Region> {
-    let chunk_bytes = chunk_bytes.max(1);
-    let max_regions = max_regions.max(1);
-    let mut regions = Vec::new();
-    let mut start = 0usize;
-    let mut line = 1usize;
-    while start < text.len() && regions.len() < max_regions {
-        let end = region_end(text, start, chunk_bytes);
-        debug_assert!(end > start, "a region must make progress");
-        regions.push(Region {
-            start,
-            end,
-            first_line: line,
-        });
-        line += text[start..end].matches('\n').count();
-        start = end;
-    }
-    regions
+    tile(text, chunk_bytes, max_regions, &[])
+        .into_iter()
+        .map(|t| t.region)
+        .collect()
 }
 
 /// Where the region starting at `start` ends: the best boundary at or below
@@ -610,6 +662,332 @@ fn region_header(region: &Region, index: usize, total: usize, text: &str) -> Str
     )
 }
 
+// --- the region memo ---------------------------------------------------------
+
+/// `urn:ikigai:browse:review-region:{repo}:{hash}:{tag}:{path}` — the subject
+/// under which one region's derivation is remembered. A SIBLING of the pass
+/// prefix rather than a segment under it: a one-region file's region hash IS
+/// its file hash, and nesting would have made the two entries one IRI.
+pub(crate) const REGION_PREFIX: &str = "urn:ikigai:browse:review-region:";
+
+/// The memo key. `hash` is the sha256 of the REGION's bytes — content, never
+/// `(offset, content)`, so unchanged bytes keep their key wherever an insertion
+/// above them moved their offset to.
+pub(crate) fn region_iri(repo: &str, rel: &str, hash: &str, tag: &str) -> String {
+    format!(
+        "{REGION_PREFIX}{repo}:{hash}:{}:{}",
+        iri_encode(tag),
+        iri_encode(rel)
+    )
+}
+
+/// One remembered region: what a model call over exactly these bytes produced.
+///
+/// ```turtle
+/// <urn:ikigai:browse:review-region:{repo}:{hash}:{tag}:{path}> a prov:Collection ;
+///     ik:repo "demo" ; ik:path "src/lib.rs" ;
+///     ik:contentHash "sha256:…" ;               # of the region's bytes
+///     ik:versionTag "review-v5@qwen3-coder:30b" ; ik:model "qwen3-coder:30b" ;
+///     ik:reviewedBytes "16384"^^xsd:nonNegativeInteger ;   # the region's length
+///     prov:wasGeneratedBy <urn:ikigai:browse:review:{repo}:{file-hash}:{tag}:{path}> ;
+///     prov:hadMember <urn:iki:finding:…> , … .
+/// ```
+///
+/// `a prov:Collection` because that is what it is — the set of finding records
+/// the call over these bytes produced, empty for a region the model called
+/// clean — and because every term on it is already published: `ik:reviewedBytes`
+/// is "the bytes a derivation fed the model", which for a region entry is
+/// exactly its length, and the vocabulary states it carries no domain for this
+/// reason. ⚠ It is deliberately NOT `a ik:Review`: that class means a pass over a
+/// file keyed by the file's hash, and typing a region so would make every
+/// tally of passes (the root-move migration counts `ik:Review` subjects) count
+/// each region as one. A class of its own and a count of memo hits on the pass
+/// (`ik:memoRegions`, say) are vocabulary needs REPORTED rather than invented
+/// here; the count is derivable from the links meanwhile.
+///
+/// The findings are the SAME records the pass that derived them minted —
+/// `prov:hadMember`, a membership, never a second `prov:generated`: an entity
+/// has one generating activity, and it is the pass named by
+/// `prov:wasGeneratedBy` here.
+pub(crate) struct RegionEntry {
+    pub(crate) iri: String,
+    pub(crate) tag: String,
+    /// `sha256:{hex}` of the region's bytes.
+    pub(crate) hash: String,
+    /// The region's length in bytes — what lets [`tile`] find its bytes again
+    /// without storing them.
+    pub(crate) len: u64,
+    /// The finding IRIs the call over these bytes minted, sorted.
+    pub(crate) findings: Vec<String>,
+    /// The pass that derived it.
+    pub(crate) generated_by: Option<String>,
+}
+
+pub(crate) fn store_region(
+    archive: &Archive,
+    entry: &RegionEntry,
+    repo: &str,
+    rel: &str,
+    model: &str,
+) -> Result<()> {
+    use oxigraph::model::vocab::{rdf, xsd};
+    let subject = NamedNode::new(&entry.iri).map_err(store_err)?;
+    let g = archive.graph().clone();
+    let mut quads: Vec<Quad> = vec![
+        Quad::new(subject.clone(), rdf::TYPE, prov("Collection"), g.clone()),
+        Quad::new(
+            subject.clone(),
+            ik("repo"),
+            Literal::new_simple_literal(repo),
+            g.clone(),
+        ),
+        Quad::new(
+            subject.clone(),
+            ik("path"),
+            Literal::new_simple_literal(rel),
+            g.clone(),
+        ),
+        Quad::new(
+            subject.clone(),
+            ik("contentHash"),
+            Literal::new_simple_literal(&entry.hash),
+            g.clone(),
+        ),
+        Quad::new(
+            subject.clone(),
+            ik("versionTag"),
+            Literal::new_simple_literal(&entry.tag),
+            g.clone(),
+        ),
+        Quad::new(
+            subject.clone(),
+            ik("model"),
+            Literal::new_simple_literal(model),
+            g.clone(),
+        ),
+        Quad::new(
+            subject.clone(),
+            ik("reviewedBytes"),
+            Literal::new_typed_literal(entry.len.to_string(), xsd::NON_NEGATIVE_INTEGER),
+            g.clone(),
+        ),
+    ];
+    if let Some(pass) = &entry.generated_by {
+        quads.push(Quad::new(
+            subject.clone(),
+            prov("wasGeneratedBy"),
+            NamedNode::new(pass).map_err(store_err)?,
+            g.clone(),
+        ));
+    }
+    for iri in &entry.findings {
+        quads.push(Quad::new(
+            subject.clone(),
+            prov("hadMember"),
+            NamedNode::new(iri).map_err(store_err)?,
+            g.clone(),
+        ));
+    }
+    for quad in &quads {
+        archive.insert(quad).map_err(store_err)?;
+    }
+    Ok(())
+}
+
+/// Load one region memo by its key — `None` on a miss (no `ik:versionTag`
+/// under that subject).
+pub(crate) fn load_region(archive: &Archive, iri: &str) -> Result<Option<RegionEntry>> {
+    let subject = match NamedNode::new(iri) {
+        Ok(node) => node,
+        Err(_) => return Ok(None),
+    };
+    let mut entry = RegionEntry {
+        iri: iri.to_string(),
+        tag: String::new(),
+        hash: String::new(),
+        len: 0,
+        findings: Vec::new(),
+        generated_by: None,
+    };
+    let mut found = false;
+    for quad in archive.quads_for_pattern(Some(subject.as_ref().into()), None, None) {
+        let quad = quad.map_err(store_err)?;
+        let literal = |term: &Term| match term {
+            Term::Literal(l) => l.value().to_string(),
+            other => other.to_string(),
+        };
+        let predicate = quad.predicate.as_str();
+        match predicate.strip_prefix(IK) {
+            Some("versionTag") => {
+                entry.tag = literal(&quad.object);
+                found = true;
+            }
+            Some("contentHash") => entry.hash = literal(&quad.object),
+            Some("reviewedBytes") => entry.len = literal(&quad.object).parse().unwrap_or(0),
+            _ => match predicate {
+                PROV_HAD_MEMBER => {
+                    if let Term::NamedNode(node) = &quad.object {
+                        entry.findings.push(node.as_str().to_string());
+                    }
+                }
+                PROV_WAS_GENERATED_BY => {
+                    if let Term::NamedNode(node) = &quad.object {
+                        entry.generated_by = Some(node.as_str().to_string());
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+    entry.findings.sort();
+    entry.findings.dedup();
+    Ok(found.then_some(entry))
+}
+
+/// Every region memo on record for this path under this tag — what [`tile`]
+/// snaps to. Enumerated through the `ik:path` literal (one indexed pattern; the
+/// path's annotations and passes come back too and are filtered by prefix),
+/// then each loaded. Sorted by key, so the tiling is deterministic.
+///
+/// The set GROWS by one entry per freshly derived region, across passes, and is
+/// never pruned: an older region's bytes can come back (a revert) and hit
+/// again. The cost of a large set is bounded by the prefilter in [`memo_at`].
+pub(crate) fn known_regions(
+    archive: &Archive,
+    repo: &str,
+    rel: &str,
+    tag: &str,
+) -> Result<Vec<RegionEntry>> {
+    let prefix = format!("{REGION_PREFIX}{repo}:");
+    let path = Literal::new_simple_literal(rel);
+    let mut iris = std::collections::BTreeSet::new();
+    for quad in
+        archive.quads_for_pattern(None, Some(ik("path").as_ref()), Some(path.as_ref().into()))
+    {
+        let quad = quad.map_err(store_err)?;
+        if let oxigraph::model::NamedOrBlankNode::NamedNode(subject) = &quad.subject {
+            if subject.as_str().starts_with(&prefix) {
+                iris.insert(subject.as_str().to_string());
+            }
+        }
+    }
+    let mut known = Vec::new();
+    for iri in iris {
+        if let Some(entry) = load_region(archive, &iri)? {
+            if entry.tag == tag && entry.len > 0 {
+                known.push(entry);
+            }
+        }
+    }
+    Ok(known)
+}
+
+/// One region of the pass and, when its bytes are already on record, the memo
+/// that stands in for the model call.
+struct Tile<'a> {
+    region: Region,
+    memo: Option<&'a RegionEntry>,
+}
+
+/// Split `text` into regions as [`split_into_regions`] does, but SNAP to the
+/// remembered ones: at every region start, a memo whose bytes sit exactly there
+/// is taken whole; otherwise the region is cut by the rule, and never past the
+/// first later line where a remembered region's bytes begin.
+///
+/// ★ What a boundary move costs, stated because the fixed-size rule hides it:
+/// the rule's window starts where the previous region ended, so on its own an
+/// insertion moves EVERY later cut point and re-keys every later region. With
+/// the snap, an insertion inside region k makes k fresh (cut by the rule into
+/// as many regions as it now needs) and leaves k+1 onward exactly where their
+/// bytes are. A deletion is the same story. The only edit that re-keys a
+/// neighbour is one that touches the neighbour's bytes.
+///
+/// ⚠ A fresh region can therefore be TINY — one inserted line between two
+/// remembered regions is a one-line region and a one-line call. That is the
+/// diff's size, which is the point; the alternative (widening into a neighbour
+/// for context) re-keys the neighbour, which is the cost this exists to avoid.
+///
+/// The tiling invariant is unchanged: the tiles are contiguous, in order, with
+/// no gap and no overlap, and concatenate back to the text.
+fn tile<'a>(
+    text: &str,
+    chunk_bytes: usize,
+    max_regions: usize,
+    known: &'a [RegionEntry],
+) -> Vec<Tile<'a>> {
+    let chunk_bytes = chunk_bytes.max(1);
+    let max_regions = max_regions.max(1);
+    let mut tiles = Vec::new();
+    let mut start = 0usize;
+    let mut line = 1usize;
+    while start < text.len() && tiles.len() < max_regions {
+        let (end, memo) = match memo_at(text, start, known) {
+            Some(memo) => (start + memo.len as usize, Some(memo)),
+            None => {
+                let rule_end = region_end(text, start, chunk_bytes);
+                (
+                    next_memo_start(text, start, rule_end, known).unwrap_or(rule_end),
+                    None,
+                )
+            }
+        };
+        debug_assert!(end > start, "a region must make progress");
+        tiles.push(Tile {
+            region: Region {
+                start,
+                end,
+                first_line: line,
+            },
+            memo,
+        });
+        line += text[start..end].matches('\n').count();
+        start = end;
+    }
+    tiles
+}
+
+/// The remembered region whose bytes sit exactly at `at` — the longest, when
+/// more than one does (two passes cut here differently). A memo qualifies only
+/// where its bytes would end on a line boundary or at the end of the file,
+/// which is what every line-aligned region does and is the cheap test that
+/// keeps this from hashing a chunk per candidate: a remembered length whose
+/// end lands mid-line is rejected before any hashing.
+fn memo_at<'a>(text: &str, at: usize, known: &'a [RegionEntry]) -> Option<&'a RegionEntry> {
+    let bytes = text.as_bytes();
+    let mut best: Option<&RegionEntry> = None;
+    for entry in known {
+        let len = usize::try_from(entry.len).unwrap_or(usize::MAX);
+        let Some(end) = at.checked_add(len) else {
+            continue;
+        };
+        if len == 0 || end > text.len() {
+            continue;
+        }
+        if end != text.len() && bytes[end - 1] != b'\n' {
+            continue;
+        }
+        if best.is_some_and(|b| b.len >= entry.len) {
+            continue;
+        }
+        if annotate::content_hash(&bytes[at..end]) == entry.hash {
+            best = Some(entry);
+        }
+    }
+    best
+}
+
+/// The first line start in `(start, limit]` at which a remembered region's
+/// bytes begin — where a fresh region has to stop so the next one can snap.
+fn next_memo_start(text: &str, start: usize, limit: usize, known: &[RegionEntry]) -> Option<usize> {
+    if known.is_empty() {
+        return None;
+    }
+    text[start..limit]
+        .match_indices('\n')
+        .map(|(i, _)| start + i + 1)
+        .find(|&p| p < limit && memo_at(text, p, known).is_some())
+}
+
 // --- the archive entry (RDF in the shared store) ------------------------------
 
 /// One archived review pass, skolemized like the explanation archive:
@@ -621,9 +999,15 @@ fn region_header(region: &Region, index: usize, total: usize, text: &str) -> Str
 ///     ik:contentHash "sha256:…" ; ik:versionTag "review-v1@qwen3-coder:30b" ;
 ///     ik:model "qwen3-coder:30b" ;
 ///     prov:generated <urn:iki:annotation:{id}> , … ;
+///     prov:used <urn:ikigai:browse:review-region:…> , … ;   # the memos it carried forward
 ///     ik:orphanedItems "1"^^xsd:nonNegativeInteger ;
 ///     ik:derivedAt "2026-08-09T17:00:00.000Z"^^xsd:dateTime .
 /// ```
+///
+/// `prov:generated` names ONLY what this pass minted. The findings it carried
+/// forward from unchanged regions were generated by the pass that derived them
+/// and are reached through `prov:used <region memo>` → `prov:hadMember`; the
+/// region memos this pass wrote point back with `prov:wasGeneratedBy`.
 ///
 /// Every `ik:` term here is published: `ikigai-vocab` 0.1.69 added `ik:Review`,
 /// `ik:orphanedItems`, `ik:reviewedBytes` and `ik:totalBytes`, which is what put
@@ -642,7 +1026,19 @@ pub(crate) struct PassEntry {
     pub(crate) hash: String,
     pub(crate) tag: String,
     pub(crate) model: String,
+    /// The findings THIS pass minted (`prov:generated`), sorted.
     pub(crate) minted: Vec<String>,
+    /// The findings carried forward from region memos — records an EARLIER
+    /// pass minted, kept as they are (id, state, provenance) and re-anchored
+    /// on read. Sorted; the union with `minted` is [`PassEntry::findings`].
+    pub(crate) carried: Vec<String>,
+    /// The region memos this pass reused instead of asking (`prov:used`), in
+    /// key order.
+    pub(crate) reused_regions: Vec<String>,
+    /// The region memos this pass wrote (they carry `prov:wasGeneratedBy`
+    /// this pass), in key order. A collapsed region and a region whose every
+    /// quote misquoted write none.
+    pub(crate) derived_regions: Vec<String>,
     pub(crate) orphaned_items: u64,
     /// How much of the input the model actually saw vs. its full size.
     ///
@@ -696,18 +1092,46 @@ impl PassEntry {
     /// form is the ordinary one and the short form is the exception — the
     /// reverse of every version before it.
     pub(crate) fn statement(&self) -> String {
-        let head = match self.minted.len() {
+        let head = match self.findings().len() {
             0 => "nothing above threshold".to_string(),
             1 => "1 finding".to_string(),
             n => format!("{n} findings"),
         };
-        match self.coverage_note() {
+        // The carried share is named so a reader can tell "this pass found 3"
+        // from "3 are on file, 1 of them new" — the queue only grew by the
+        // difference.
+        let head = match self.carried.len() {
+            0 => head,
+            n => format!("{head} ({n} carried forward)"),
+        };
+        let coverage = match self.coverage_note() {
             Some(note) => format!("{head}{note}"),
             None => match self.total_bytes {
                 Some(total) => format!("{head} · reviewed the whole file ({total} bytes)"),
                 None => head,
             },
+        };
+        // How much of the file was unchanged since a pass under this tag last
+        // read it — the memo's own number. The denominator is the regions on
+        // record (reused + derived); a collapsed region is in neither and is
+        // already declared by the coverage note.
+        match self.reused_regions.len() {
+            0 => coverage,
+            reused => format!(
+                "{coverage} · {reused} of {} regions unchanged",
+                reused + self.derived_regions.len()
+            ),
         }
+    }
+
+    /// Every finding on file for this pass's reading of the file — minted and
+    /// carried forward alike, sorted and deduplicated. What the faces render.
+    pub(crate) fn findings(&self) -> Vec<String> {
+        let mut all = self.minted.clone();
+        all.extend(self.carried.iter().cloned());
+        all.sort();
+        all.dedup();
+        all
     }
 }
 
@@ -741,6 +1165,8 @@ fn store_err(e: impl std::fmt::Display) -> Error {
 
 const PROV_USED: &str = "http://www.w3.org/ns/prov#used";
 const PROV_GENERATED: &str = "http://www.w3.org/ns/prov#generated";
+const PROV_HAD_MEMBER: &str = "http://www.w3.org/ns/prov#hadMember";
+const PROV_WAS_GENERATED_BY: &str = "http://www.w3.org/ns/prov#wasGeneratedBy";
 
 fn prov(term: &str) -> NamedNode {
     NamedNode::new(format!("{PROV}{term}")).expect("prov terms are valid IRIs")
@@ -812,6 +1238,18 @@ pub(crate) fn store_pass(archive: &Archive, entry: &PassEntry) -> Result<()> {
             g.clone(),
         ));
     }
+    // The memos carried forward: `prov:used`, beside the file — the pass
+    // utilized them exactly as it utilized the file, and `load_pass` tells the
+    // two apart by prefix. Never `prov:generated`: their findings have their
+    // generating pass already.
+    for iri in &entry.reused_regions {
+        quads.push(Quad::new(
+            subject.clone(),
+            prov("used"),
+            NamedNode::new(iri).map_err(store_err)?,
+            g.clone(),
+        ));
+    }
     if let Some(at) = &entry.derived_at {
         quads.push(Quad::new(
             subject,
@@ -842,6 +1280,9 @@ pub(crate) fn load_pass(archive: &Archive, iri: &str) -> Result<Option<PassEntry
         tag: String::new(),
         model: String::new(),
         minted: Vec::new(),
+        carried: Vec::new(),
+        reused_regions: Vec::new(),
+        derived_regions: Vec::new(),
         orphaned_items: 0,
         reviewed_bytes: None,
         total_bytes: None,
@@ -877,7 +1318,13 @@ pub(crate) fn load_pass(archive: &Archive, iri: &str) -> Result<Option<PassEntry
             _ => match predicate {
                 PROV_USED => {
                     if let Term::NamedNode(node) = &quad.object {
-                        entry.target_iri = node.as_str().to_string();
+                        // The file the pass read, or a region memo it carried
+                        // forward — one predicate, told apart by the prefix
+                        // browse itself mints.
+                        match node.as_str().starts_with(REGION_PREFIX) {
+                            true => entry.reused_regions.push(node.as_str().to_string()),
+                            false => entry.target_iri = node.as_str().to_string(),
+                        }
                     }
                 }
                 PROV_GENERATED => {
@@ -889,10 +1336,38 @@ pub(crate) fn load_pass(archive: &Archive, iri: &str) -> Result<Option<PassEntry
             },
         }
     }
+    if !found {
+        return Ok(None);
+    }
     // A stable reading of the minted set (insertion order from the store is
     // arbitrary; the face rows re-sort by position anyway).
     entry.minted.sort();
-    Ok(found.then_some(entry))
+    entry.reused_regions.sort();
+    // The carried findings are the reused memos' members — read from the
+    // memos, never copied onto the pass, so one record stays one record.
+    for iri in &entry.reused_regions {
+        if let Some(region) = load_region(archive, iri)? {
+            entry.carried.extend(region.findings);
+        }
+    }
+    entry.carried.sort();
+    entry.carried.dedup();
+    // The memos this pass wrote point at it; the findings it minted point the
+    // same way, which is why the prefix filter is not optional.
+    for quad in archive.quads_for_pattern(
+        None,
+        Some(prov("wasGeneratedBy").as_ref()),
+        Some(subject.as_ref().into()),
+    ) {
+        let quad = quad.map_err(store_err)?;
+        if let oxigraph::model::NamedOrBlankNode::NamedNode(node) = &quad.subject {
+            if node.as_str().starts_with(REGION_PREFIX) {
+                entry.derived_regions.push(node.as_str().to_string());
+            }
+        }
+    }
+    entry.derived_regions.sort();
+    Ok(Some(entry))
 }
 
 // --- parsing the model's findings --------------------------------------------
@@ -1170,20 +1645,50 @@ impl Endpoint for ReviewEndpoint {
 
         // Miss: derive one pass over EVERY region of the file. Ask, parse,
         // anchor, mint, archive — the same five steps as v4, N times, unioned.
-        let regions = split_into_regions(&text, config.max_prompt_bytes, config.review_max_chunks);
-        let budget = region_suggestion_budget(regions.len());
-        let offered: usize = regions.iter().map(Region::len).sum();
+        //
+        // ★ Except that a region whose bytes are already on record under this
+        // tag is CARRIED FORWARD rather than asked: its memo's findings are the
+        // findings, unchanged. `debug=raw` sees no memos, so a probe derives
+        // every region by the rule alone and measures the model, not the store.
+        let known = match debug_raw {
+            true => Vec::new(),
+            false => known_regions(&config.archive, repo, &rel, &tag)?,
+        };
+        let tiles = tile(
+            &text,
+            config.max_prompt_bytes,
+            config.review_max_chunks,
+            &known,
+        );
+        let budget = region_suggestion_budget(tiles.len());
+        let offered: usize = tiles.iter().map(|t| t.region.len()).sum();
         let mut raw_answers = Vec::new();
-        let mut findings = Vec::new();
+        // Each region whose derivation was USABLE — a clean statement or
+        // parsed findings — with what it parsed, by tile index: these become
+        // the memos, once their findings are minted.
+        let mut fresh: Vec<(usize, Vec<Finding>)> = Vec::new();
+        let mut carried: Vec<String> = Vec::new();
+        let mut reused_regions: Vec<String> = Vec::new();
         let mut malformed = 0u64;
         let mut reviewed = 0usize;
         let mut collapsed: Vec<String> = Vec::new();
         let mut first_error: Option<Error> = None;
-        for (index, region) in regions.iter().enumerate() {
+        for (index, tile) in tiles.iter().enumerate() {
+            let region = &tile.region;
+            if let Some(memo) = tile.memo {
+                // The memo hit: these exact bytes were reviewed under this tag
+                // and the records of what was said are on file. Reviewed, by
+                // that earlier call — the coverage sum counts them, and the
+                // findings keep their ids.
+                reviewed += region.len();
+                carried.extend(memo.findings.iter().cloned());
+                reused_regions.push(memo.iri.clone());
+                continue;
+            }
             let prompt = format!(
                 "{}\n\nRepository: {repo}\nPath: {rel}{}\n\n```\n{}\n```\n\n{}",
                 review_prompt(budget, index == 0),
-                region_header(region, index, regions.len(), &text),
+                region_header(region, index, tiles.len(), &text),
                 &text[region.start..region.end],
                 review_reminder(budget),
             );
@@ -1221,7 +1726,7 @@ impl Endpoint for ReviewEndpoint {
                 }
             };
             if debug_raw {
-                raw_answers.push(match regions.len() {
+                raw_answers.push(match tiles.len() {
                     1 => answer,
                     n => format!(
                         "--- region {} of {n} (bytes {}–{}) ---\n{answer}",
@@ -1232,7 +1737,7 @@ impl Endpoint for ReviewEndpoint {
                 });
                 continue;
             }
-            let (mut region_findings, region_malformed) = parse_findings(&answer);
+            let (region_findings, region_malformed) = parse_findings(&answer);
             match region_findings.is_empty() {
                 // ★ A REGION IS CLEAN ONLY ON ITS OWN SAY-SO, and the pass is
                 // clean only if every region was. The naive union — "no findings
@@ -1240,9 +1745,10 @@ impl Endpoint for ReviewEndpoint {
                 // answer produce a FALSE ALL-CLEAR under a key that never
                 // re-derives. A region that neither found anything nor said so
                 // is a region that was not reviewed, and its bytes are not
-                // counted.
+                // counted — and it gets no memo, so the next pass asks again.
                 true if region_malformed == 0 && says_nothing_above_threshold(&answer) => {
                     reviewed += region.len();
+                    fresh.push((index, Vec::new()));
                 }
                 true => {
                     collapsed.push(format!(
@@ -1254,7 +1760,7 @@ impl Endpoint for ReviewEndpoint {
                 false => {
                     reviewed += region.len();
                     malformed += region_malformed;
-                    findings.append(&mut region_findings);
+                    fresh.push((index, region_findings));
                 }
             }
         }
@@ -1281,7 +1787,7 @@ impl Endpoint for ReviewEndpoint {
             // answer's opening so the collapse is diagnosable (a label-free
             // format, a refusal, an empty ceiling-starved reply all read
             // differently).
-            let scope = match regions.len() {
+            let scope = match tiles.len() {
                 1 => String::new(),
                 n => format!(" in any of its {n} regions"),
             };
@@ -1306,57 +1812,62 @@ impl Endpoint for ReviewEndpoint {
             reviewed <= offered && offered <= text.len(),
             "regions must tile a prefix of the file"
         );
-        if findings.is_empty() {
-            // ★ THE CLEAN PASS — and with regions it is a UNION, which is the
-            // one place the naive implementation is wrong. Reaching here means
-            // every region that was reviewed said in words that nothing met the
-            // threshold: a region with findings never lands here, and a region
-            // that collapsed never counted its bytes, so a clean statement is
-            // always paired with the coverage that earned it. This is a pass
-            // that HAPPENED: archived, dated, attributed to the model, and an
-            // archive hit the next time, so a quiet file costs its calls once
-            // rather than once per commit.
-            let entry = PassEntry {
-                iri,
-                repo: repo.to_string(),
-                rel: rel.clone(),
-                target_iri: file_iri(repo, &rel),
-                hash,
-                tag,
-                model,
-                minted: Vec::new(),
-                orphaned_items: 0,
-                reviewed_bytes,
-                total_bytes,
-                derived_at: created,
-            };
-            store_pass(&config.archive, &entry)?;
-            let included = annotate::included_for_ids(&config.archive, &[], &text)?;
-            return face(inv, repo, &rel, &entry, true, &included);
-        }
 
+        // Mint, region by region, so each memo records exactly what its call
+        // produced — attribution is by the CALL that quoted, not by where the
+        // quote anchored: a region-7 quote that also occurs in region 1 anchors
+        // in region 1 (first occurrence), but it is region 7's memo, so a later
+        // change to region 7 re-derives it rather than carrying it beside a
+        // fresh duplicate.
         let mut minted = Vec::new();
         let mut orphaned_items = malformed;
-        for finding in &findings {
-            match annotate::mint_pending_finding(
-                &config.archive,
-                &file_iri(repo, &rel),
-                repo,
-                &rel,
-                &text,
-                &hash,
-                &finding.quote,
-                &finding.note,
-                finding.severity.as_deref(),
-                &model,
-                &iri,
-                created.clone(),
-                annotate::Surface::File,
-            )? {
-                Some(finding_iri) => minted.push(finding_iri),
-                // The model misquoted: mint nothing for this item, count it.
-                None => orphaned_items += 1,
+        let mut memos: Vec<RegionEntry> = Vec::new();
+        let parsed: usize = fresh.iter().map(|(_, f)| f.len()).sum();
+        for (index, findings) in &fresh {
+            let mut region_minted = Vec::new();
+            for finding in findings {
+                match annotate::mint_pending_finding(
+                    &config.archive,
+                    &file_iri(repo, &rel),
+                    repo,
+                    &rel,
+                    &text,
+                    &hash,
+                    &finding.quote,
+                    &finding.note,
+                    finding.severity.as_deref(),
+                    &model,
+                    &iri,
+                    created.clone(),
+                    annotate::Surface::File,
+                )? {
+                    Some(finding_iri) => region_minted.push(finding_iri),
+                    // The model misquoted: mint nothing for this item, count it.
+                    None => orphaned_items += 1,
+                }
             }
+            region_minted.sort();
+            region_minted.dedup();
+            // ⚠ A region whose EVERY quote misquoted gets no memo. The model
+            // said something about these bytes and none of it anchored; an
+            // empty memo would carry "nothing here" forward as a clean claim
+            // the model never made, permanently. Its bytes still count as
+            // reviewed on this pass (the old rule, unchanged), and the next
+            // pass asks about them again.
+            if findings.is_empty() || !region_minted.is_empty() {
+                let region = &tiles[*index].region;
+                let region_hash =
+                    annotate::content_hash(&text.as_bytes()[region.start..region.end]);
+                memos.push(RegionEntry {
+                    iri: region_iri(repo, &rel, &region_hash, &tag),
+                    tag: tag.clone(),
+                    hash: region_hash,
+                    len: region.len() as u64,
+                    findings: region_minted.clone(),
+                    generated_by: Some(iri.clone()),
+                });
+            }
+            minted.extend(region_minted);
         }
         // The same stable order a later load reconstructs (the store keeps no
         // insertion order); the face rows re-sort by anchor position anyway.
@@ -1368,13 +1879,29 @@ impl Endpoint for ReviewEndpoint {
         // set with a repeat in it and every face would count the finding twice.
         minted.sort();
         minted.dedup();
-        if minted.is_empty() {
+        if parsed > 0 && minted.is_empty() {
             return Err(Error::Endpoint(format!(
-                "browse: none of the {} finding(s) for `{rel}` anchored (every quote was \
-                 misquoted); nothing archived",
-                findings.len()
+                "browse: none of the {parsed} finding(s) for `{rel}` anchored (every quote \
+                 was misquoted); nothing archived"
             )));
         }
+        carried.sort();
+        carried.dedup();
+        memos.sort_by(|a, b| a.iri.cmp(&b.iri));
+        memos.dedup_by(|a, b| a.iri == b.iri);
+        reused_regions.sort();
+        reused_regions.dedup();
+
+        // ★ THE CLEAN PASS — and with regions it is a UNION, which is the one
+        // place the naive implementation is wrong. `minted` and `carried` both
+        // empty means every region that was reviewed said in words that
+        // nothing met the threshold (or carried a memo that did): a region with
+        // findings never produces that, and a region that collapsed never
+        // counted its bytes, so a clean statement is always paired with the
+        // coverage that earned it. This is a pass that HAPPENED: archived,
+        // dated, attributed to the model, and an archive hit the next time, so
+        // a quiet file costs its calls once rather than once per commit — and
+        // with the memo, a quiet REGION does too.
         let entry = PassEntry {
             iri,
             repo: repo.to_string(),
@@ -1384,13 +1911,21 @@ impl Endpoint for ReviewEndpoint {
             tag,
             model,
             minted,
+            carried,
+            reused_regions,
+            derived_regions: memos.iter().map(|m| m.iri.clone()).collect(),
             orphaned_items,
             reviewed_bytes,
             total_bytes,
             derived_at: created,
         };
         store_pass(&config.archive, &entry)?;
-        let included = annotate::included_for_ids(&config.archive, &entry.minted, &text)?;
+        for memo in &memos {
+            store_region(&config.archive, memo, repo, &rel, &entry.model)?;
+        }
+        // Carried findings re-anchor here, on read, by the one drift path —
+        // their offsets move with the insertion above them, their ids do not.
+        let included = annotate::included_for_ids(&config.archive, &entry.findings(), &text)?;
         face(inv, repo, &rel, &entry, true, &included)
     }
 
@@ -1426,6 +1961,12 @@ fn face(
                 // the same inference a broken pipeline invites.
                 "statement": entry.statement(),
                 "minted": entry.minted,
+                // The memo's half: findings on file from unchanged regions
+                // (same ids an earlier pass minted), and how many regions were
+                // carried forward against how many this pass derived.
+                "carried": entry.carried,
+                "memo_regions": entry.reused_regions.len(),
+                "derived_regions": entry.derived_regions.len(),
                 "orphaned_items": entry.orphaned_items,
                 "reviewed_bytes": entry.reviewed_bytes,
                 "total_bytes": entry.total_bytes,
@@ -1482,7 +2023,7 @@ fn review_html(
     // the shape of every other way this page can fail. The statement goes
     // above it, in the page body rather than the provenance footnote, because
     // it is the page's content when there are no cards.
-    if entry.minted.is_empty() {
+    if entry.findings().is_empty() {
         out.push_str(&format!(
             "<p class=\"browse-review-clean\">This file was reviewed: {}.</p>",
             esc(&entry.statement()),
@@ -1543,6 +2084,14 @@ pub(crate) fn pass_turtle(entry: &PassEntry) -> String {
         let refs: Vec<String> = entry.minted.iter().map(|iri| format!("<{iri}>")).collect();
         props.push(format!("prov:generated {}", refs.join(", ")));
     }
+    if !entry.reused_regions.is_empty() {
+        let refs: Vec<String> = entry
+            .reused_regions
+            .iter()
+            .map(|iri| format!("<{iri}>"))
+            .collect();
+        props.push(format!("prov:used {}", refs.join(", ")));
+    }
     if let Some(at) = &entry.derived_at {
         props.push(format!("ik:derivedAt \"{at}\"^^xsd:dateTime"));
     }
@@ -1576,8 +2125,15 @@ fn review_description(config: &ExplainConfig) -> Description {
              this pass. The pass is ARCHIVED by (path, content-hash, review-tag) — \
              re-sourcing unchanged content is an archive hit that mints nothing, and a \
              re-derivation re-mints the SAME finding IRIs, so a human decision survives \
-             it. Changed content is a fresh pass; earlier findings re-anchor or orphan \
-             like annotations. Quotes that do not anchor are counted (orphaned_items), \
+             it. Changed content is a fresh pass — but ★ only the REGIONS whose bytes \
+             moved are asked: every region a pass derives is memoized by the sha256 of \
+             its own bytes, and a later pass carries an unchanged region's existing \
+             findings forward (same ids, same pending/declined state, re-anchored) \
+             instead of re-minting them, so the queue grows with the diff rather than \
+             with the file. Findings from changed regions are minted fresh; earlier \
+             findings on those bytes re-anchor or orphan like annotations. The json face \
+             says which is which: minted (this pass's), carried (from memos), \
+             memo_regions and derived_regions. Quotes that do not anchor are counted (orphaned_items), \
              never fatal; a missing or invented SEVERITY leaves the finding unrated \
              rather than dropping it. ★ The pass reports against a THRESHOLD, not a \
              quota: every problem the model rates critical or major, however many or \
@@ -2656,6 +3212,455 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// ★★ THE ACCEPTANCE TEST FOR THE REGION MEMO, AND IT IS A QUEUE-VOLUME
+    /// TEST, NOT AN LLM-COST TEST. A change confined to one region of a
+    /// three-region file: the next pass asks about THAT region only, mints
+    /// findings only there, and the findings on the two unchanged regions are
+    /// neither duplicated nor dropped — same ids, same state. A finding a human
+    /// DECLINED on an unchanged region does not come back as pending.
+    ///
+    /// ⚠ The id half is the load-bearing half. A memo that saved the call and
+    /// re-minted the carried findings under the new pass would give every one
+    /// of them a new id (`sha256(pass ‖ char_start ‖ exact)`, and the pass IRI
+    /// carries the file hash) — the queue would grow exactly as it did before,
+    /// and the test would fail on `rows.len()`.
+    #[test]
+    fn a_change_confined_to_one_region_re_derives_only_that_region() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &[
+                &finding_on("fn one__() {}"),
+                &finding_on("fn three() {}"),
+                &finding_on("fn six__() {}"),
+                // The one call the second pass makes: region 3, edited.
+                &finding_on("fn six_2() {}"),
+            ],
+        );
+
+        let first = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 3);
+        assert_eq!(first["minted"].as_array().unwrap().len(), 3);
+        assert_eq!(first["carried"].as_array().unwrap().len(), 0);
+        assert_eq!(first["memo_regions"], 0);
+        assert_eq!(first["derived_regions"], 3, "{first}");
+        assert!(
+            !first["statement"].as_str().unwrap().contains("unchanged"),
+            "a first pass has nothing to carry: {first}"
+        );
+
+        // A human declines the finding on region 2.
+        let queue = json(&k, "urn:repo:demo:findings:a.rs", &[]);
+        let three = queue
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["exact"] == "fn three() {}")
+            .map(|r| r["iri"].as_str().unwrap().to_string())
+            .expect("the region-2 finding is pending");
+        issue(&k, Verb::Sink, &three, &[("decision", "decline")], &cap()).unwrap();
+
+        // Region 3 changes, byte-for-byte the same length: regions 1 and 2 are
+        // the same bytes at the same offsets, region 3 is new bytes.
+        std::fs::write(
+            root.join("a.rs"),
+            SIX_LINES.replace("fn six__() {}", "fn six_2() {}"),
+        )
+        .unwrap();
+        let second = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(second["derived"], true);
+        assert_eq!(log.count(), 4, "ONE call: the region whose bytes moved");
+        let (prompt, _, _) = log.last();
+        assert!(
+            prompt.contains("Region: part 3 of 3, lines 5 to 6"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("fn six_2() {}"), "{prompt}");
+        assert!(!prompt.contains("fn one__() {}"), "{prompt}");
+        assert_eq!(second["memo_regions"], 2, "{second}");
+        assert_eq!(second["derived_regions"], 1, "{second}");
+        assert_eq!(second["reviewed_bytes"], SIX_LINES.len());
+        assert_eq!(second["total_bytes"], SIX_LINES.len());
+        assert_eq!(
+            second["statement"],
+            format!(
+                "3 findings (2 carried forward) · reviewed the whole file ({} bytes) · 2 of 3 \
+                 regions unchanged",
+                SIX_LINES.len()
+            )
+        );
+
+        // ★ Minted: ONE finding, on the changed region. Carried: the two
+        // records the first pass minted, BY THE SAME IRIS — including the
+        // declined one, because a decision is a property of the record and
+        // the record is what was carried.
+        let minted: Vec<&str> = second["minted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(minted.len(), 1, "{second}");
+        let carried: Vec<&str> = second["carried"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(carried.len(), 2, "{second}");
+        let first_minted: Vec<&str> = first["minted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        for iri in &carried {
+            assert!(
+                first_minted.contains(iri),
+                "carried {iri} is not a first-pass id"
+            );
+        }
+        assert!(
+            carried.contains(&three.as_str()),
+            "the declined one is carried too"
+        );
+        assert!(
+            !first_minted.contains(&minted[0]),
+            "the new region's finding is new"
+        );
+        // The face renders all three, carried and minted alike.
+        assert_eq!(second["annotations"].as_array().unwrap().len(), 3);
+
+        // ★★ THE QUEUE. Pending: region 1's finding (once — not duplicated),
+        // region 3's new finding, and the FIRST pass's region-3 finding, now
+        // orphaned (its bytes moved; that is the drift story, unchanged).
+        // NOT pending: the declined one — it did not come back.
+        let pending = json(&k, "urn:repo:demo:findings:a.rs", &[]);
+        let rows = pending.as_array().unwrap();
+        assert_eq!(rows.len(), 3, "{pending}");
+        let ones: Vec<&serde_json::Value> = rows
+            .iter()
+            .filter(|r| r["exact"] == "fn one__() {}")
+            .collect();
+        assert_eq!(ones.len(), 1, "carried, not duplicated: {pending}");
+        assert!(
+            first_minted.contains(&ones[0]["iri"].as_str().unwrap()),
+            "the pending one is the FIRST pass's record: {pending}"
+        );
+        assert!(
+            rows.iter().all(|r| r["exact"] != "fn three() {}"),
+            "{pending}"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r["exact"] == "fn six__() {}" && r["orphaned"] == true),
+            "{pending}"
+        );
+        assert!(
+            rows.iter().any(|r| r["exact"] == "fn six_2() {}"),
+            "{pending}"
+        );
+        let declined = json(&k, "urn:repo:demo:findings:a.rs", &[("state", "declined")]);
+        assert_eq!(declined.as_array().unwrap().len(), 1, "{declined}");
+        assert_eq!(declined[0]["iri"].as_str().unwrap(), three);
+
+        // The pass's own record says what it did and did not generate.
+        let ttl = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:review:a.rs",
+                &[("as", "text/turtle")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert!(ttl.contains("prov:used <urn:repo:demo:file:a.rs>"), "{ttl}");
+        assert!(
+            ttl.contains("prov:used <urn:ikigai:browse:review-region:demo:sha256:"),
+            "{ttl}"
+        );
+        assert!(
+            ttl.contains(&format!("prov:generated <{}>", minted[0])),
+            "{ttl}"
+        );
+        for iri in &carried {
+            assert!(!ttl.contains(&format!("prov:generated <{iri}>")), "{ttl}");
+        }
+        // And the carried findings still name the pass that DID generate them.
+        let all = json(&k, "urn:repo:demo:findings:a.rs", &[("state", "all")]);
+        let generated_by: std::collections::BTreeSet<&str> = all
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| carried.contains(&r["iri"].as_str().unwrap()))
+            .map(|r| r["generated_by"].as_str().unwrap())
+            .collect();
+        assert_eq!(generated_by.len(), 1);
+        assert_ne!(
+            generated_by.iter().next().unwrap(),
+            &second["about"].as_str().unwrap(),
+            "sanity: the file IRI is not a pass"
+        );
+        assert!(generated_by
+            .iter()
+            .next()
+            .unwrap()
+            .starts_with("urn:ikigai:browse:review:demo:"));
+
+        // The second pass is archived like any other: a hit, reconstructed
+        // from the store — carried set, memo count and statement alike.
+        let hit = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(hit["derived"], false);
+        assert_eq!(log.count(), 4);
+        assert_eq!(hit["carried"], second["carried"]);
+        assert_eq!(hit["minted"], second["minted"]);
+        assert_eq!(hit["memo_regions"], 2);
+        assert_eq!(hit["derived_regions"], 1);
+        assert_eq!(hit["statement"], second["statement"]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★ An insertion costs the region it lands in and nothing else — the
+    /// tiling snaps to remembered regions, so the bytes below the insertion
+    /// keep their key although every one of their offsets moved. A deletion
+    /// is the same story. Clean regions carry their clean statement forward:
+    /// the file stays "nothing above threshold" and says how much of it was
+    /// unchanged.
+    #[test]
+    fn an_insertion_moves_only_the_region_it_lands_in() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &[CLEAN, CLEAN, CLEAN, CLEAN, CLEAN],
+        );
+        let first = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 3);
+        assert_eq!(first["derived_regions"], 3);
+
+        // A line lands ABOVE everything: every old region's offset moves by
+        // 14 bytes, none of their bytes change.
+        let inserted = format!("fn zero_() {{}}\n{SIX_LINES}");
+        std::fs::write(root.join("a.rs"), &inserted).unwrap();
+        let second = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 4, "one call, for the one inserted line");
+        let (prompt, _, _) = log.last();
+        assert!(
+            prompt.contains("Region: part 1 of 4, lines 1 to 1"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("fn zero_() {}"), "{prompt}");
+        assert!(!prompt.contains("fn one__() {}"), "{prompt}");
+        assert_eq!(second["memo_regions"], 3, "{second}");
+        assert_eq!(second["derived_regions"], 1, "{second}");
+        assert_eq!(second["reviewed_bytes"], inserted.len());
+        assert_eq!(
+            second["statement"],
+            format!(
+                "nothing above threshold · reviewed the whole file ({} bytes) · 3 of 4 \
+                 regions unchanged",
+                inserted.len()
+            )
+        );
+        let html = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:review:a.rs",
+                &[("as", "text/html")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert!(html.contains("browse-review-clean"), "{html}");
+
+        // A line is DELETED from the middle: the region it was in is fresh
+        // (what is left of it), the regions on either side are unchanged.
+        let deleted = inserted.replace("fn three() {}\n", "");
+        std::fs::write(root.join("a.rs"), &deleted).unwrap();
+        let third = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 5, "one call, for the region the deletion left");
+        let (prompt, _, _) = log.last();
+        assert!(prompt.contains("fn four_() {}"), "{prompt}");
+        assert!(!prompt.contains("fn two__() {}"), "{prompt}");
+        assert!(!prompt.contains("fn five_() {}"), "{prompt}");
+        assert_eq!(third["memo_regions"], 3, "{third}");
+        assert_eq!(third["derived_regions"], 1, "{third}");
+        assert_eq!(third["reviewed_bytes"], deleted.len());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ⚠ A region whose EVERY quote misquoted is not memoized — an empty memo
+    /// would carry "nothing here" forward as a clean claim the model never
+    /// made — so the next pass asks about it again, alongside the region that
+    /// changed. Its bytes still count as reviewed on the pass that asked (the
+    /// old rule): the pass is honest through `orphaned_items`, the memo is
+    /// simply absent.
+    #[test]
+    fn a_region_whose_every_quote_misquoted_gets_no_memo() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &[
+                &finding_on("fn one__() {}"),
+                &finding_on("fn nope__() {}"),
+                &finding_on("fn six__() {}"),
+                // Pass two: region 2 again (it earned no memo), then region 3.
+                CLEAN,
+                &finding_on("fn six_2() {}"),
+            ],
+        );
+        let first = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 3);
+        assert_eq!(first["minted"].as_array().unwrap().len(), 2);
+        assert_eq!(first["orphaned_items"], 1);
+        assert_eq!(first["reviewed_bytes"], SIX_LINES.len());
+        assert_eq!(
+            first["derived_regions"], 2,
+            "no memo for the misquoted region"
+        );
+
+        std::fs::write(
+            root.join("a.rs"),
+            SIX_LINES.replace("fn six__() {}", "fn six_2() {}"),
+        )
+        .unwrap();
+        let second = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(
+            log.count(),
+            5,
+            "two calls: the unmemoized region and the changed one"
+        );
+        assert_eq!(second["memo_regions"], 1, "{second}");
+        assert_eq!(second["derived_regions"], 2, "{second}");
+        assert_eq!(second["minted"].as_array().unwrap().len(), 1);
+        assert_eq!(second["carried"].as_array().unwrap().len(), 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The tiling with memos, on its own: it snaps to remembered regions,
+    /// stops a fresh region where the next remembered one begins, tiles the
+    /// text exactly (contiguous, no gap, no overlap), and with nothing
+    /// remembered is the rule alone. A remembered length whose end would land
+    /// mid-line is never even hashed.
+    #[test]
+    fn the_tiles_snap_to_remembered_regions_and_still_tile_the_file() {
+        let remembered = |text: &str, region: &Region, iri: &str| RegionEntry {
+            iri: iri.to_string(),
+            tag: "review-v5@r1".to_string(),
+            hash: annotate::content_hash(&text.as_bytes()[region.start..region.end]),
+            len: region.len() as u64,
+            findings: Vec::new(),
+            generated_by: None,
+        };
+        let rule = split_into_regions(SIX_LINES, REGION_BYTES, 16);
+        let known: Vec<RegionEntry> = rule
+            .iter()
+            .enumerate()
+            .map(|(i, r)| remembered(SIX_LINES, r, &format!("urn:memo:{i}")))
+            .collect();
+
+        // Unchanged: every region is a memo hit at its own offset.
+        let same = tile(SIX_LINES, REGION_BYTES, 16, &known);
+        assert_eq!(same.len(), 3);
+        assert!(same.iter().all(|t| t.memo.is_some()));
+
+        // A line above: one fresh tile, then the three memos at +14.
+        let inserted = format!("fn zero_() {{}}\n{SIX_LINES}");
+        let tiles = tile(&inserted, REGION_BYTES, 16, &known);
+        assert_eq!(
+            tiles
+                .iter()
+                .map(|t| t.memo.map(|m| m.iri.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                None,
+                Some("urn:memo:0"),
+                Some("urn:memo:1"),
+                Some("urn:memo:2")
+            ]
+        );
+        assert_eq!((tiles[0].region.start, tiles[0].region.end), (0, 14));
+        assert_eq!(tiles[1].region.first_line, 2);
+
+        // A line gone from the middle: the rest of that region is fresh, the
+        // memo after it snaps back into place.
+        let deleted = SIX_LINES.replace("fn two__() {}\n", "");
+        let tiles = tile(&deleted, REGION_BYTES, 16, &known);
+        assert_eq!(
+            tiles
+                .iter()
+                .map(|t| t.memo.map(|m| m.iri.as_str()))
+                .collect::<Vec<_>>(),
+            vec![None, Some("urn:memo:1"), Some("urn:memo:2")]
+        );
+        assert_eq!(
+            &deleted[tiles[0].region.start..tiles[0].region.end],
+            "fn one__() {}\n"
+        );
+
+        // Whatever is remembered, the tiles tile.
+        for text in [
+            SIX_LINES,
+            inserted.as_str(),
+            deleted.as_str(),
+            "",
+            "fn one__() {}",
+        ] {
+            let tiles = tile(text, REGION_BYTES, 16, &known);
+            let mut at = 0;
+            for t in &tiles {
+                assert_eq!(t.region.start, at, "gap or overlap in {text:?}");
+                assert!(t.region.end > t.region.start);
+                at = t.region.end;
+            }
+            assert_eq!(at, text.len(), "{text:?}");
+            let rejoined: String = tiles
+                .iter()
+                .map(|t| &text[t.region.start..t.region.end])
+                .collect::<Vec<_>>()
+                .concat();
+            assert_eq!(rejoined, text);
+        }
+
+        // Nothing remembered is the rule alone.
+        let bare = tile(SIX_LINES, REGION_BYTES, 16, &[]);
+        assert_eq!(
+            bare.iter().map(|t| t.region.end).collect::<Vec<_>>(),
+            vec![28, 56, 84]
+        );
+        assert!(bare.iter().all(|t| t.memo.is_none()));
+
+        // A remembered length that would end mid-line is rejected without
+        // hashing: the same bytes, one byte short, is not a region here.
+        let short = RegionEntry {
+            len: 27,
+            hash: annotate::content_hash(&SIX_LINES.as_bytes()[..27]),
+            ..remembered(SIX_LINES, &rule[0], "urn:memo:short")
+        };
+        assert!(memo_at(SIX_LINES, 0, std::slice::from_ref(&short)).is_none());
+        // The region cap counts memos and fresh tiles alike.
+        assert_eq!(tile(&inserted, REGION_BYTES, 2, &known).len(), 2);
+    }
+
     /// `debug=raw` diagnoses the WHOLE pass, so on a chunked file it returns
     /// every region's unparsed answer under a header naming the region — and
     /// still archives nothing.
@@ -3516,6 +4521,10 @@ mod tests {
         assert_eq!(malformed, 2, "the stray NOTE and the noteless QUOTE");
     }
 
+    /// ★ Since 0.8.0 this also pins the TAG half of the region memo's key: the
+    /// alt backend reviews the very bytes `r1` just memoized, and it must still
+    /// ask (`alt_log.count() == 1` below) — a memo keyed on content alone would
+    /// hand `r1`'s findings to a pass attributed to `alt`.
     #[test]
     fn a_second_provider_derives_a_second_coexisting_pass() {
         let root = demo_root();
