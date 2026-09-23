@@ -23,7 +23,7 @@
 //!
 //! Every quad browse writes has a browse-MINTED subject — `urn:iki:annotation:…`
 //! (annotations and their two selector children) or `urn:ikigai:browse:…` (the
-//! explanation archive and the review passes). It writes no quad about a
+//! explanation archive, the review passes and their region memos). It writes no quad about a
 //! subject someone else minted. That is what makes the graph migration a
 //! complete one (`crate::migrate`), and it is pinned by
 //! `every_quad_browse_writes_has_a_browse_minted_subject`.

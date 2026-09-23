@@ -616,6 +616,10 @@ pub const REPO_PREFIX: &str = "urn:repo:";
 pub const EXPLAIN_PREFIX: &str = "urn:ikigai:browse:explain:";
 /// A review pass's subject: `urn:ikigai:browse:review:{root}:{hash}:{tag}:{path}`.
 pub const REVIEW_PREFIX: &str = "urn:ikigai:browse:review:";
+/// A review pass's region memo: `urn:ikigai:browse:review-region:{root}:{region-hash}:{tag}:{path}`
+/// (0.8.0). A sibling of the pass prefix, not a segment under it — see
+/// `review::REGION_PREFIX` for why — so it needs its own row here.
+pub const REGION_PREFIX: &str = crate::review::REGION_PREFIX;
 
 /// Every prefix under which the NEXT path segment is a root name.
 ///
@@ -627,7 +631,11 @@ pub const REVIEW_PREFIX: &str = "urn:ikigai:browse:review:";
 /// same argument the namespace move makes for `oa:hasSelector`, one family
 /// further out, and it is why this list is the authority rather than a list of
 /// predicates: the position is what carries the name, not the property.
-pub const ROOT_BEARING_PREFIXES: [&str; 3] = [REPO_PREFIX, EXPLAIN_PREFIX, REVIEW_PREFIX];
+/// `urn:ikigai:browse:review-region:` is an object too: a pass carries
+/// `prov:used <region memo>` for every region it carried forward, and a memo
+/// carries `prov:wasGeneratedBy <pass>`.
+pub const ROOT_BEARING_PREFIXES: [&str; 4] =
+    [REPO_PREFIX, EXPLAIN_PREFIX, REVIEW_PREFIX, REGION_PREFIX];
 
 /// `ik:repo` — the root name as a LITERAL, on explanations, review passes and
 /// annotations alike. Not addressable, so no resolution test can catch it being
@@ -846,10 +854,10 @@ impl Transfer {
 /// Which root a browse-minted subject's quads belong to.
 fn owner_root(subject: &str, annotation_roots: &BTreeMap<String, String>) -> Option<String> {
     if let Some((prefix, root, _)) = split_root(subject) {
-        // `urn:repo:` is never a browse-minted SUBJECT; only the two archive
+        // `urn:repo:` is never a browse-minted SUBJECT; only the archive
         // families are. Guarding on the prefix keeps a subject shape added later
         // from being silently mis-assigned instead of reported as unassigned.
-        if prefix == EXPLAIN_PREFIX || prefix == REVIEW_PREFIX {
+        if prefix == EXPLAIN_PREFIX || prefix == REVIEW_PREFIX || prefix == REGION_PREFIX {
             return Some(root.to_string());
         }
     }
@@ -2372,6 +2380,12 @@ mod root_move_tests {
         assert_eq!(
             split_root("urn:ikigai:browse:review:browse:sha:tag:pr:11"),
             Some((REVIEW_PREFIX, "browse", ":sha:tag:pr:11"))
+        );
+        // The region memo is a SIBLING prefix: `review-` is not `review:`, so
+        // it must have its own row or a root move leaves every memo behind.
+        assert_eq!(
+            split_root("urn:ikigai:browse:review-region:browse:sha256:ab:tag:src%2Flib.rs"),
+            Some((REGION_PREFIX, "browse", ":sha256:ab:tag:src%2Flib.rs"))
         );
         assert_eq!(split_root("urn:iki:annotation:abc"), None);
         assert_eq!(split_root("urn:repo:"), None);
