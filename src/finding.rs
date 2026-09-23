@@ -607,7 +607,26 @@ impl Endpoint for FindingsEndpoint {
                 ),
             });
         }
-        let findings: Vec<Annotation> = annotate::list_findings(&self.archive, repo, filter)?
+        // `summary=declined` widens the json face from the rows to an object
+        // that also carries the file-grain count of declines — a NEW shape
+        // under a NEW argument, so the array every existing consumer reads is
+        // byte-identical without it.
+        let summary = match inv.inline_str("summary") {
+            Ok("declined") => true,
+            Ok(other) => {
+                return Err(Error::InvalidArgument {
+                    name: "summary".to_string(),
+                    detail: format!("`{other}` is not a summary — the one summary is `declined`"),
+                })
+            }
+            Err(_) => false,
+        };
+        let all = annotate::list_findings(&self.archive, repo, filter)?;
+        // The file grain is read BEFORE the state filter: a pending-only
+        // listing still says how many declines the file carries, which is
+        // the reading that makes a recurring claim legible.
+        let declined = DeclinedSummary::of(&all);
+        let findings: Vec<Annotation> = all
             .into_iter()
             .filter(|f| state == "all" || f.state() == Some(state.as_str()))
             .collect();
@@ -618,7 +637,7 @@ impl Endpoint for FindingsEndpoint {
         match inv.inline_str("as").unwrap_or("application/json") {
             t if t.starts_with("text/html") => Ok(repr_utf8(
                 "text/html",
-                listing_html(repo, &rel, &state, &rows),
+                listing_html(repo, &rel, &state, &rows, &declined),
             )),
             t if t.starts_with("text/turtle") => {
                 let findings: Vec<Annotation> = rows.into_iter().map(|(f, _)| f).collect();
@@ -627,16 +646,25 @@ impl Endpoint for FindingsEndpoint {
                     annotate::annotation_turtle_document(&findings),
                 ))
             }
-            t if t.starts_with("text/plain") => Ok(repr_utf8("text/plain", plain(&rows))),
+            t if t.starts_with("text/plain") => {
+                Ok(repr_utf8("text/plain", plain(&rows, &declined)))
+            }
             _ => {
                 let rows: Vec<serde_json::Value> = rows
                     .iter()
                     .map(|(f, line)| annotate::annotation_json(f, *line))
                     .collect();
-                Ok(repr(
-                    "application/json",
-                    serde_json::Value::Array(rows).to_string(),
-                ))
+                let json = match summary {
+                    false => serde_json::Value::Array(rows),
+                    true => serde_json::json!({
+                        "repo": repo,
+                        "path": filter,
+                        "state": state,
+                        "rows": rows,
+                        "declined": declined.json(),
+                    }),
+                };
+                Ok(repr("application/json", json.to_string()))
             }
         }
     }
@@ -693,17 +721,138 @@ fn plain_row(finding: &Annotation, line: Option<u64>) -> String {
     } else if finding.reanchored {
         out.push_str(" [re-anchored]");
     }
+    if let Some(prior) = &finding.prior {
+        out.push_str(&format!(" [{}]", prior.words()));
+    }
     out.push_str(&format!(" \"{}\" -- {}", finding.exact, finding.body));
     out
 }
 
-fn plain(rows: &[(Annotation, Option<u64>)]) -> String {
+fn plain(rows: &[(Annotation, Option<u64>)], declined: &DeclinedSummary) -> String {
     let mut out = format!("--- findings ({}) ---\n{NOT_A_GATE}", rows.len());
+    if let Some(line) = declined.words() {
+        out.push('\n');
+        out.push_str(&line);
+    }
     for (finding, line) in rows {
         out.push('\n');
         out.push_str(&plain_row(finding, *line));
     }
     out
+}
+
+/// The FILE-GRAIN view of what a human has already said no to: how many
+/// declined findings one file carries, by the quote they declined (ledger
+/// #475).
+///
+/// ★ The mark on a row (`Annotation::prior`) is row-shaped; the recurrence it
+/// answers is file-shaped. A manifest with reasoning comments or a vocabulary
+/// draws the same misreading at every new content hash, on new lines as well
+/// as old, and no line-keyed mark can show "this file has 14 declined findings
+/// of this shape". This is what a reader — and the host's queue page, later —
+/// says it with. Computed from the findings already loaded for the listing,
+/// before the `state=` filter narrows them, so it costs nothing extra.
+struct DeclinedSummary {
+    /// Declined findings on the file, in total.
+    count: usize,
+    /// Per distinct quote, in triage order of first appearance: the quote,
+    /// how many declines it carries, the latest decision date among them, and
+    /// the declined findings' IRIs.
+    quotes: Vec<DeclinedQuote>,
+}
+
+struct DeclinedQuote {
+    exact: String,
+    count: usize,
+    latest: Option<String>,
+    findings: Vec<String>,
+}
+
+impl DeclinedSummary {
+    fn of(findings: &[Annotation]) -> Self {
+        let mut quotes: Vec<DeclinedQuote> = Vec::new();
+        let mut count = 0;
+        for finding in findings {
+            let Some(decision) = &finding.decision else {
+                continue;
+            };
+            if decision.outcome != Outcome::Declined {
+                continue;
+            }
+            count += 1;
+            match quotes.iter_mut().find(|q| q.exact == finding.exact) {
+                Some(quote) => {
+                    quote.count += 1;
+                    if decision.at > quote.latest {
+                        quote.latest = decision.at.clone();
+                    }
+                    quote.findings.push(finding.iri());
+                }
+                None => quotes.push(DeclinedQuote {
+                    exact: finding.exact.clone(),
+                    count: 1,
+                    latest: decision.at.clone(),
+                    findings: vec![finding.iri()],
+                }),
+            }
+        }
+        // Most-declined quote first; ties keep triage order.
+        quotes.sort_by_key(|quote| std::cmp::Reverse(quote.count));
+        for quote in &mut quotes {
+            quote.findings.sort();
+        }
+        DeclinedSummary { count, quotes }
+    }
+
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "count": self.count,
+            "quotes": self.quotes.iter().map(|q| serde_json::json!({
+                "exact": q.exact,
+                "count": q.count,
+                "latest_decided_at": q.latest,
+                "findings": q.findings,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    /// One line for the plain face — `None` when the file carries no decline,
+    /// so a listing with nothing to say adds no line.
+    fn words(&self) -> Option<String> {
+        match self.count {
+            0 => None,
+            n => Some(format!(
+                "{n} declined finding{} on this file, on {} distinct quote{}",
+                if n == 1 { "" } else { "s" },
+                self.quotes.len(),
+                if self.quotes.len() == 1 { "" } else { "s" },
+            )),
+        }
+    }
+
+    fn html(&self) -> String {
+        let Some(words) = self.words() else {
+            return String::new();
+        };
+        let mut out = format!(
+            "<div class=\"browse-findings-declined\"><p>{}</p><ul>",
+            esc(&words)
+        );
+        for quote in &self.quotes {
+            out.push_str(&format!(
+                "<li>{}× <code>{}</code>{}</li>",
+                quote.count,
+                esc(&quote.exact),
+                quote
+                    .latest
+                    .as_deref()
+                    .map(|at| format!(" · last {}", esc(at.get(..10).unwrap_or(at))))
+                    .unwrap_or_default(),
+            ));
+        }
+        out.push_str("</ul></div>");
+        out
+    }
 }
 
 fn one_html(finding: &Annotation, line: Option<u64>) -> String {
@@ -715,7 +864,13 @@ fn one_html(finding: &Annotation, line: Option<u64>) -> String {
     )
 }
 
-fn listing_html(repo: &str, rel: &str, state: &str, rows: &[(Annotation, Option<u64>)]) -> String {
+fn listing_html(
+    repo: &str,
+    rel: &str,
+    state: &str,
+    rows: &[(Annotation, Option<u64>)],
+    declined: &DeclinedSummary,
+) -> String {
     let mut out = String::from("<div class=\"browse\">");
     out.push_str(&crumbs_html(repo, rel));
     out.push_str(&format!(
@@ -735,6 +890,12 @@ fn listing_html(repo: &str, rel: &str, state: &str, rows: &[(Annotation, Option<
         ));
     }
     out.push_str("</nav>");
+    // The file grain, on a FILE's listing only: a repo-wide page would be
+    // summing declines across files, which is the join this count exists
+    // not to hide behind.
+    if !rel.is_empty() {
+        out.push_str(&declined.html());
+    }
     if rows.is_empty() {
         out.push_str(&format!(
             "<p class=\"browse-findings-empty\">No {} findings{}.</p>",
@@ -876,7 +1037,14 @@ fn findings_description() -> Description {
              (Sink urn:iki:finding:{id}). state= narrows to pending (the default), \
              published, declined, or all. Each read runs the annotation layer's drift pass, \
              so a finding whose file moved is re-anchored (ik:reanchored) and one whose \
-             quote is gone is flagged (ik:orphaned) rather than dropped. \
+             quote is gone is flagged (ik:orphaned) rather than dropped. ★ A finding \
+             minted where a like claim was already DECLINED on the same file carries that \
+             decision on its row (prior_decision: the declined finding, its date and \
+             reason), so the second decision is one click; summary=declined widens the \
+             json face to {repo, path, state, rows, declined: {count, quotes: [{exact, \
+             count, latest_decided_at, findings}]}} — how many declines the file carries, \
+             by the quote they declined — and the html and plain faces of a file's \
+             listing say the same in words. \
              application/json (default) is the structured rows carrying BOTH ratings; \
              as=text/html the queue page with each card's decision form; as=text/plain a \
              triage digest; as=text/turtle the findings and their decision graphs.",
@@ -898,6 +1066,18 @@ fn findings_description() -> Description {
                 .summary("which part of the pipeline to show")
                 .one_of(["pending", "published", "declined", "all"])
                 .default_value("pending"),
+        )
+        .input(
+            ArgSpec::new("summary")
+                .optional()
+                .class(XSD_STRING)
+                .summary(
+                    "declined: the json face becomes {repo, path, state, rows, declined} — \
+                     the rows as before plus the file-grain count of DECLINED findings by \
+                     the quote they declined, whatever state= shows. Without it the json \
+                     face is the bare rows array it always was.",
+                )
+                .one_of(["declined"]),
         )
         .input(
             ArgSpec::new("as")
@@ -1392,6 +1572,122 @@ mod tests {
         // repeats) serves the same set without resurrecting the answered one.
         assert_eq!(pass(&k), findings, "the same findings, not a second queue");
         assert_eq!(of(&k, &findings[0])["state"], "declined");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The FILE grain of a decline (ledger #475): `summary=declined` widens
+    /// the json face to an object carrying how many declines the file holds,
+    /// by the quote they declined — whatever `state=` shows — and the html
+    /// and plain faces of a file's listing say it in words. Without the
+    /// argument the json face is the bare array it always was, and a
+    /// repo-wide page does not sum declines across files.
+    #[test]
+    fn the_file_listing_counts_its_declines_by_quote() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        let findings = pass(&k);
+        let alpha = findings
+            .iter()
+            .find(|iri| of(&k, iri)["exact"] == "fn alpha() {}")
+            .unwrap()
+            .clone();
+        issue(
+            &k,
+            Verb::Sink,
+            &alpha,
+            &[
+                ("decision", "decline"),
+                ("content", "the severity was a misread"),
+            ],
+        )
+        .unwrap();
+
+        let bare = json(&k, "urn:repo:demo:findings:a.rs", &[]);
+        assert_eq!(bare.as_array().unwrap().len(), 1, "unchanged shape: {bare}");
+        let wide = json(
+            &k,
+            "urn:repo:demo:findings:a.rs",
+            &[("summary", "declined")],
+        );
+        assert_eq!(wide["repo"], "demo");
+        assert_eq!(wide["path"], "a.rs");
+        assert_eq!(wide["state"], "pending");
+        assert_eq!(wide["rows"], bare, "the rows are the array, as they were");
+        assert_eq!(wide["declined"]["count"], 1, "{wide}");
+        let quotes = wide["declined"]["quotes"].as_array().unwrap();
+        assert_eq!(quotes.len(), 1, "{wide}");
+        assert_eq!(quotes[0]["exact"], "fn alpha() {}");
+        assert_eq!(quotes[0]["count"], 1);
+        assert_eq!(quotes[0]["findings"], serde_json::json!([alpha]));
+        // The date is the decision's own (null here: this kernel has no
+        // clock, so the decision recorded none — and the summary invents
+        // none either).
+        assert_eq!(
+            quotes[0]["latest_decided_at"],
+            of(&k, &alpha)["decision"]["decided_at"],
+            "{wide}"
+        );
+
+        // The count is the file's, whatever state the rows show.
+        let declined_view = json(
+            &k,
+            "urn:repo:demo:findings:a.rs",
+            &[("summary", "declined"), ("state", "published")],
+        );
+        assert_eq!(declined_view["rows"].as_array().unwrap().len(), 0);
+        assert_eq!(declined_view["declined"]["count"], 1);
+
+        let html = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:findings:a.rs",
+                &[("as", "text/html")],
+            )
+            .unwrap(),
+        );
+        assert!(html.contains("browse-findings-declined"), "{html}");
+        assert!(
+            html.contains("1 declined finding on this file, on 1 distinct quote"),
+            "{html}"
+        );
+        assert!(html.contains("1× <code>fn alpha() {}</code>"), "{html}");
+        let plain = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:findings:a.rs",
+                &[("as", "text/plain")],
+            )
+            .unwrap(),
+        );
+        assert!(
+            plain.contains("1 declined finding on this file, on 1 distinct quote"),
+            "{plain}"
+        );
+        let repo_wide = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:findings",
+                &[("as", "text/html")],
+            )
+            .unwrap(),
+        );
+        assert!(
+            !repo_wide.contains("browse-findings-declined"),
+            "{repo_wide}"
+        );
+
+        let err = issue(
+            &k,
+            Verb::Source,
+            "urn:repo:demo:findings:a.rs",
+            &[("summary", "everything")],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not a summary"), "{err}");
         std::fs::remove_dir_all(&root).ok();
     }
 

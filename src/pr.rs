@@ -1490,6 +1490,7 @@ impl Endpoint for PrReviewEndpoint {
         let created = inv.now().map(|t| iso8601(t.as_millis()));
         let mut minted = Vec::new();
         let mut orphaned_items = malformed;
+        let mut suppressed_items = 0u64;
         for finding in &findings {
             match annotate::mint_pending_finding(
                 &config.archive,
@@ -1506,12 +1507,17 @@ impl Endpoint for PrReviewEndpoint {
                 created.clone(),
                 annotate::Surface::Diff,
             )? {
-                Some(finding_iri) => minted.push(finding_iri),
-                None => orphaned_items += 1,
+                annotate::Mint::Minted(finding_iri) => minted.push(finding_iri),
+                annotate::Mint::Orphaned => orphaned_items += 1,
+                // The same decline check the file pass runs, keyed on the PR
+                // page: a re-review at a new head that repeats a declined
+                // claim on the same diff line, byte for byte, is withheld and
+                // counted (ledger #475).
+                annotate::Mint::Withheld(_) => suppressed_items += 1,
             }
         }
         minted.sort();
-        if minted.is_empty() {
+        if minted.is_empty() && suppressed_items == 0 {
             return Err(Error::Endpoint(format!(
                 "browse: none of the {} finding(s) for pr {n} anchored in the diff (every \
                  quote was misquoted); nothing archived",
@@ -1533,6 +1539,7 @@ impl Endpoint for PrReviewEndpoint {
             reused_regions: Vec::new(),
             derived_regions: Vec::new(),
             orphaned_items,
+            suppressed_items,
             reviewed_bytes: Some(truncated_len(&diff, config.max_prompt_bytes) as u64),
             total_bytes: Some(diff.len() as u64),
             derived_at: created,
@@ -1570,6 +1577,7 @@ fn pr_review_face(
                 "derived": derived,
                 "minted": entry.minted,
                 "orphaned_items": entry.orphaned_items,
+                "suppressed_items": entry.suppressed_items,
                 "reviewed_bytes": entry.reviewed_bytes,
                 "total_bytes": entry.total_bytes,
                 "derived_at": entry.derived_at,
@@ -1651,12 +1659,15 @@ fn pr_review_description() -> Description {
              headRefOid, review-tag) — re-sourcing an unchanged head is an archive hit \
              that mints nothing; new commits are a fresh pass and the earlier pass's \
              annotations re-anchor or orphan as the diff drifts. Quotes that do not \
-             anchor are counted (orphaned_items), never fatal. Data flows through \
-             ikigai-repo's pr facades run in the root's directory — they must be mounted \
-             and enforce their own exec capability. text/plain (default) is the \
-             margin-notes digest; as=application/json adds {minted, orphaned_items, \
-             findings}; as=text/html the card page; as=text/turtle the pass's \
-             provenance graph.",
+             anchor are counted (orphaned_items), never fatal; an exact repeat of a \
+             finding a human DECLINED on this PR's diff (same quote, severity and note) \
+             is withheld and counted (suppressed_items), and any other finding on a \
+             declined line is minted carrying the prior decision (prior_decision). Data \
+             flows through ikigai-repo's pr facades run in the root's directory — they \
+             must be mounted and enforce their own exec capability. text/plain (default) \
+             is the margin-notes digest; as=application/json adds {minted, \
+             orphaned_items, suppressed_items, findings}; as=text/html the card page; \
+             as=text/turtle the pass's provenance graph.",
         )
         .verb(Verb::Source)
         .verb(Verb::Meta)

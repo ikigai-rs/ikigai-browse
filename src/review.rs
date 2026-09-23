@@ -97,6 +97,50 @@
 //! `debug=raw` ignores it, deriving every region by the rule alone, so a probe
 //! stays a measurement of the model rather than of the archive.
 //!
+//! ## A decline is remembered: the recurring claim arrives marked
+//!
+//! The memo covers an UNCHANGED region: a declined finding there is carried,
+//! still declined, and never re-minted. What it cannot cover is a fresh
+//! derivation — a changed region, or every region of a file's first pass
+//! after an upgrade re-keys the tag — and that is where a declined claim
+//! returns under a new id, because the id carries the pass and the pass
+//! carries the hash (ledger #475). Measured 2026-09-22: a prose-only commit to
+//! a manifest minted 17 findings, 8 of them verbatim re-raises of findings a
+//! human had declined the day before on lines the commit did not touch, and
+//! the only thing that stopped them was that human reading each one twice.
+//!
+//! So at MINT time — beside the place a misquote is discarded and counted —
+//! a fresh finding is checked against the DECLINED findings on the same file
+//! with the same `exact` (`annotate::declined_twins`, keyed `(target, exact)`
+//! after the anchor's own normalization, never on position, hash or pass):
+//!
+//! * **by default it is MINTED MARKED.** It enters the queue carrying the
+//!   declined twin's decision (`prov:wasInfluencedBy` the decision node;
+//!   `prior_decision` on the json row; "a like claim on this line was
+//!   declined {date}: {reason}" on the card), so a human declines it again in
+//!   one click — or sees that it is a different claim, which suppression could
+//!   never show. Two different findings can quote one line, and a line whose
+//!   endianness claim was declined may attract a correct claim later;
+//! * **only an EXACT repeat is WITHHELD, and it is COUNTED**: same quote,
+//!   same proposed severity, a byte-identical note. `ik:suppressedItems` on
+//!   the pass, "(N withheld as exact repeats)" in the statement — kept apart
+//!   from `ik:orphanedItems` because "we already answered this" and "the
+//!   model misquoted" are different facts. Its memo member is the twin, so an
+//!   unchanged region whose items were all withheld is not re-asked next
+//!   pass. ⚠ Deliberately narrow, and measured before shipping: of the 458
+//!   declines on file on 2026-09-22, 98 pairs shared a line and NONE shared a
+//!   byte-identical note, so this fires seldom by construction. Do not widen
+//!   it to "same severity" (78 of those 98) without measuring what a true
+//!   finding on a declined line looks like — a review that silently withholds
+//!   a true finding is worse than one that repeats a false one.
+//!
+//! Declines on a DIFFERENT file are not consulted. The same misreading recurs
+//! across files (Cargo caret semantics on every manifest, rdfs2 on every
+//! vocabulary) and that is a knowledge gap in the model, not a key this mark
+//! could carry. The findings face reports the file grain instead
+//! (`summary=declined`: how many declines this file carries, by the quote
+//! they declined), because that is the grain the recurrence actually has.
+//!
 //! ## Choosing the backend per request
 //!
 //! `provider={iri}` derives THIS pass against a backend the caller names
@@ -366,8 +410,10 @@ const REVIEW_PROMPT_VERSION: &str = "review-v5";
 /// without destroying evidence: it DIVIDES this number across the regions
 /// ([`region_suggestion_budget`]), so the whole-file ask is bounded by
 /// `max(SUGGESTION_LIMIT, regions)` rather than by their product — 9 instead of
-/// 27 for this file. That is still a request. Enforcing it needs an
-/// `ik:droppedItems` the vocabulary does not have.
+/// 27 for this file. That is still a request. Enforcing it needs somewhere to
+/// record the drop — `ik:droppedItems` exists as of `ikigai-vocab` 0.1.71 and
+/// nothing here writes it yet; that is its own arc, and it is deliberately not
+/// `ik:suppressedItems` (a withheld repeat of a decline is a different fact).
 const SUGGESTION_LIMIT: usize = 3;
 
 /// How many suggestions ONE region is asked for, given how many regions the
@@ -1001,6 +1047,7 @@ fn next_memo_start(text: &str, start: usize, limit: usize, known: &[RegionEntry]
 ///     prov:generated <urn:iki:annotation:{id}> , … ;
 ///     prov:used <urn:ikigai:browse:review-region:…> , … ;   # the memos it carried forward
 ///     ik:orphanedItems "1"^^xsd:nonNegativeInteger ;
+///     ik:suppressedItems "0"^^xsd:nonNegativeInteger ;     # exact repeats of declines withheld
 ///     ik:derivedAt "2026-08-09T17:00:00.000Z"^^xsd:dateTime .
 /// ```
 ///
@@ -1011,8 +1058,8 @@ fn next_memo_start(text: &str, start: usize, limit: usize, known: &[RegionEntry]
 ///
 /// Every `ik:` term here is published: `ikigai-vocab` 0.1.69 added `ik:Review`,
 /// `ik:orphanedItems`, `ik:reviewedBytes` and `ik:totalBytes`, which is what put
-/// this face under the conformance walk's `VOCABULARY` check. Every provenance
-/// link is standard PROV / DC / OA.
+/// this face under the conformance walk's `VOCABULARY` check, and 0.1.71 added
+/// `ik:suppressedItems`. Every provenance link is standard PROV / DC / OA.
 ///
 /// ⚠ `ik:versionTag` and `ik:derivedAt` are shared with the EXPLANATION archive
 /// and deliberately carry NO `rdfs:domain`. It was `ik:Explanation` until 0.1.69,
@@ -1040,6 +1087,16 @@ pub(crate) struct PassEntry {
     /// quote misquoted write none.
     pub(crate) derived_regions: Vec<String>,
     pub(crate) orphaned_items: u64,
+    /// How many of the model's items were WITHHELD as exact repeats of a
+    /// finding a human had already declined on the same line of this file —
+    /// same quote, same proposed severity, byte-identical note (ledger #475,
+    /// `annotate::Prior`). `ik:suppressedItems`, kept apart from
+    /// `orphaned_items` on purpose: "we already answered this" and "the model
+    /// misquoted" are different facts with different remedies. A suppression
+    /// nobody can count is a filter nobody can audit. Zero on entries
+    /// archived before the term existed, which is also the true value: no
+    /// pass withheld anything before it could.
+    pub(crate) suppressed_items: u64,
     /// How much of the input the model actually saw vs. its full size.
     ///
     /// ★ Since v5 these are an INVARIANT rather than a disclosure: the pass
@@ -1092,17 +1149,34 @@ impl PassEntry {
     /// form is the ordinary one and the short form is the exception — the
     /// reverse of every version before it.
     pub(crate) fn statement(&self) -> String {
-        let head = match self.findings().len() {
-            0 => "nothing above threshold".to_string(),
-            1 => "1 finding".to_string(),
-            n => format!("{n} findings"),
+        // ⚠ "Nothing above threshold" is the MODEL's claim, and a pass whose
+        // every item was withheld as an exact repeat of a decline is not one
+        // where the model made it — it found the same things again and the
+        // pass declined to re-raise them. That reads as "nothing new".
+        let head = match (self.findings().len(), self.suppressed_items) {
+            (0, 0) => "nothing above threshold".to_string(),
+            (0, _) => "nothing new".to_string(),
+            (1, _) => "1 finding".to_string(),
+            (n, _) => format!("{n} findings"),
         };
         // The carried share is named so a reader can tell "this pass found 3"
         // from "3 are on file, 1 of them new" — the queue only grew by the
-        // difference.
-        let head = match self.carried.len() {
-            0 => head,
-            n => format!("{head} ({n} carried forward)"),
+        // difference. The withheld count is named beside it, because a
+        // suppression nobody can see is the failure `ik:suppressedItems`
+        // exists to prevent.
+        let mut clauses = Vec::new();
+        match self.carried.len() {
+            0 => {}
+            n => clauses.push(format!("{n} carried forward")),
+        }
+        match self.suppressed_items {
+            0 => {}
+            1 => clauses.push("1 withheld as an exact repeat".to_string()),
+            n => clauses.push(format!("{n} withheld as exact repeats")),
+        }
+        let head = match clauses.is_empty() {
+            true => head,
+            false => format!("{head} ({})", clauses.join(", ")),
         };
         let coverage = match self.coverage_note() {
             Some(note) => format!("{head}{note}"),
@@ -1216,6 +1290,17 @@ pub(crate) fn store_pass(archive: &Archive, entry: &PassEntry) -> Result<()> {
             Literal::new_typed_literal(entry.orphaned_items.to_string(), xsd::NON_NEGATIVE_INTEGER),
             g.clone(),
         ),
+        // Always written, zero included: an absent count and a zero count
+        // must not read alike, for the same reason `ik:findingCount` exists.
+        Quad::new(
+            subject.clone(),
+            ik("suppressedItems"),
+            Literal::new_typed_literal(
+                entry.suppressed_items.to_string(),
+                xsd::NON_NEGATIVE_INTEGER,
+            ),
+            g.clone(),
+        ),
     ];
     for (term, value) in [
         ("reviewedBytes", entry.reviewed_bytes),
@@ -1284,6 +1369,7 @@ pub(crate) fn load_pass(archive: &Archive, iri: &str) -> Result<Option<PassEntry
         reused_regions: Vec::new(),
         derived_regions: Vec::new(),
         orphaned_items: 0,
+        suppressed_items: 0,
         reviewed_bytes: None,
         total_bytes: None,
         derived_at: None,
@@ -1307,6 +1393,9 @@ pub(crate) fn load_pass(archive: &Archive, iri: &str) -> Result<Option<PassEntry
             Some("model") => entry.model = literal(&quad.object),
             Some("orphanedItems") => {
                 entry.orphaned_items = literal(&quad.object).parse().unwrap_or(0);
+            }
+            Some("suppressedItems") => {
+                entry.suppressed_items = literal(&quad.object).parse().unwrap_or(0);
             }
             Some("reviewedBytes") => {
                 entry.reviewed_bytes = literal(&quad.object).parse().ok();
@@ -1821,10 +1910,19 @@ impl Endpoint for ReviewEndpoint {
         // fresh duplicate.
         let mut minted = Vec::new();
         let mut orphaned_items = malformed;
+        let mut suppressed_items = 0u64;
         let mut memos: Vec<RegionEntry> = Vec::new();
         let parsed: usize = fresh.iter().map(|(_, f)| f.len()).sum();
         for (index, findings) in &fresh {
             let mut region_minted = Vec::new();
+            // What the memo records for these bytes: the findings this call
+            // minted, plus — for every item WITHHELD as an exact repeat — the
+            // declined twin that already answers it. Without the twin, an
+            // unchanged region whose every item was withheld would get no
+            // memo and be re-asked at every new file hash, only to be
+            // withheld again: a model call per commit for bytes that never
+            // moved, which is the cost the memo exists to remove.
+            let mut region_members = Vec::new();
             for finding in findings {
                 match annotate::mint_pending_finding(
                     &config.archive,
@@ -1841,20 +1939,33 @@ impl Endpoint for ReviewEndpoint {
                     created.clone(),
                     annotate::Surface::File,
                 )? {
-                    Some(finding_iri) => region_minted.push(finding_iri),
+                    annotate::Mint::Minted(finding_iri) => {
+                        region_members.push(finding_iri.clone());
+                        region_minted.push(finding_iri);
+                    }
                     // The model misquoted: mint nothing for this item, count it.
-                    None => orphaned_items += 1,
+                    annotate::Mint::Orphaned => orphaned_items += 1,
+                    // An exact repeat of a decline (ledger #475): mint
+                    // nothing, count it, and let the twin stand for it.
+                    annotate::Mint::Withheld(twin) => {
+                        suppressed_items += 1;
+                        region_members.push(twin);
+                    }
                 }
             }
             region_minted.sort();
             region_minted.dedup();
+            region_members.sort();
+            region_members.dedup();
             // ⚠ A region whose EVERY quote misquoted gets no memo. The model
             // said something about these bytes and none of it anchored; an
             // empty memo would carry "nothing here" forward as a clean claim
             // the model never made, permanently. Its bytes still count as
             // reviewed on this pass (the old rule, unchanged), and the next
-            // pass asks about them again.
-            if findings.is_empty() || !region_minted.is_empty() {
+            // pass asks about them again. A region whose items were all
+            // withheld is NOT that case: its members are the declines that
+            // answered them.
+            if findings.is_empty() || !region_members.is_empty() {
                 let region = &tiles[*index].region;
                 let region_hash =
                     annotate::content_hash(&text.as_bytes()[region.start..region.end]);
@@ -1863,7 +1974,7 @@ impl Endpoint for ReviewEndpoint {
                     tag: tag.clone(),
                     hash: region_hash,
                     len: region.len() as u64,
-                    findings: region_minted.clone(),
+                    findings: region_members,
                     generated_by: Some(iri.clone()),
                 });
             }
@@ -1879,7 +1990,10 @@ impl Endpoint for ReviewEndpoint {
         // set with a repeat in it and every face would count the finding twice.
         minted.sort();
         minted.dedup();
-        if parsed > 0 && minted.is_empty() {
+        // ⚠ Withheld is not orphaned: a pass whose every item was an exact
+        // repeat of a decline DID review the file and found only what a human
+        // had already answered. That is a pass to archive, with its count.
+        if parsed > 0 && minted.is_empty() && suppressed_items == 0 {
             return Err(Error::Endpoint(format!(
                 "browse: none of the {parsed} finding(s) for `{rel}` anchored (every quote \
                  was misquoted); nothing archived"
@@ -1915,6 +2029,7 @@ impl Endpoint for ReviewEndpoint {
             reused_regions,
             derived_regions: memos.iter().map(|m| m.iri.clone()).collect(),
             orphaned_items,
+            suppressed_items,
             reviewed_bytes,
             total_bytes,
             derived_at: created,
@@ -1968,6 +2083,11 @@ fn face(
                 "memo_regions": entry.reused_regions.len(),
                 "derived_regions": entry.derived_regions.len(),
                 "orphaned_items": entry.orphaned_items,
+                // Exact repeats of declined findings this pass withheld
+                // (ledger #475) — counted here so the rate is observable;
+                // the marked ones are in `annotations`, each carrying its
+                // `prior_decision`.
+                "suppressed_items": entry.suppressed_items,
                 "reviewed_bytes": entry.reviewed_bytes,
                 "total_bytes": entry.total_bytes,
                 "derived_at": entry.derived_at,
@@ -2071,6 +2191,10 @@ pub(crate) fn pass_turtle(entry: &PassEntry) -> String {
             "ik:orphanedItems \"{}\"^^xsd:nonNegativeInteger",
             entry.orphaned_items
         ),
+        format!(
+            "ik:suppressedItems \"{}\"^^xsd:nonNegativeInteger",
+            entry.suppressed_items
+        ),
     ];
     for (term, value) in [
         ("reviewedBytes", entry.reviewed_bytes),
@@ -2133,7 +2257,15 @@ fn review_description(config: &ExplainConfig) -> Description {
              with the file. Findings from changed regions are minted fresh; earlier \
              findings on those bytes re-anchor or orphan like annotations. The json face \
              says which is which: minted (this pass's), carried (from memos), \
-             memo_regions and derived_regions. Quotes that do not anchor are counted (orphaned_items), \
+             memo_regions and derived_regions. ★ A DECLINE IS REMEMBERED: a fresh finding \
+             whose exact quote matches a finding a human DECLINED on the same file is \
+             minted carrying that prior decision (prov:wasInfluencedBy the decision node; \
+             `prior_decision` on the row: the declined finding, its date and reason), so \
+             the second decision is one click and a different claim on the same line \
+             stays visible; only an EXACT repeat — same quote, same proposed severity, a \
+             byte-identical note — is withheld, and every withheld one is counted \
+             (suppressed_items, ik:suppressedItems). Declines on other files are not \
+             consulted. Quotes that do not anchor are counted (orphaned_items), \
              never fatal; a missing or invented SEVERITY leaves the finding unrated \
              rather than dropping it. ★ The pass reports against a THRESHOLD, not a \
              quota: every problem the model rates critical or major, however many or \
@@ -3553,6 +3685,400 @@ mod tests {
         assert_eq!(second["derived_regions"], 2, "{second}");
         assert_eq!(second["minted"].as_array().unwrap().len(), 1);
         assert_eq!(second["carried"].as_array().unwrap().len(), 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★★ A DECLINE IS REMEMBERED (ledger #475), both halves at once.
+    ///
+    /// Two findings are declined: one on region 2, one on region 3. Region 3
+    /// changes. The memo carries region 2's decline as it is — still declined,
+    /// never re-minted, unmarked. Region 3 is re-derived and the model raises
+    /// the declined claim twice: once byte-for-byte (WITHHELD and counted,
+    /// its memo member the declined twin) and once as a different claim on the
+    /// same line (MINTED, MARKED with the prior decision — its IRI, date and
+    /// reason — and pending). A fresh claim on a line nobody declined arrives
+    /// with no mark at all. The mark reaches every face: json, turtle, html,
+    /// plain; the count reaches the pass's json, turtle and statement, and
+    /// survives the archive hit.
+    #[test]
+    fn a_declined_claim_on_a_re_derived_region_returns_marked_and_an_exact_repeat_is_withheld() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &[
+                &finding_on("fn one__() {}"),
+                &finding_on("fn three() {}"),
+                &finding_on("fn five_() {}"),
+                // Pass two, region 3 only: the declined claim verbatim, a
+                // different claim on the same line, and a fresh line.
+                &format!(
+                    "{}QUOTE: fn five_() {{}}\nSEVERITY: minor\nNOTE: A different claim about \
+                     this line.\n{}",
+                    finding_on("fn five_() {}"),
+                    finding_on("fn six_2() {}"),
+                ),
+            ],
+        );
+        let first = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 3);
+        assert_eq!(first["suppressed_items"], 0, "{first}");
+        let queue = json(&k, "urn:repo:demo:findings:a.rs", &[]);
+        let iri_of = |exact: &str| {
+            queue
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["exact"] == exact)
+                .map(|r| r["iri"].as_str().unwrap().to_string())
+                .unwrap_or_else(|| panic!("no pending finding on {exact}: {queue}"))
+        };
+        let three = iri_of("fn three() {}");
+        let five = iri_of("fn five_() {}");
+        issue(&k, Verb::Sink, &three, &[("decision", "decline")], &cap()).unwrap();
+        issue(
+            &k,
+            Verb::Sink,
+            &five,
+            &[("decision", "decline"), ("content", "not a defect")],
+            &cap(),
+        )
+        .unwrap();
+
+        std::fs::write(
+            root.join("a.rs"),
+            SIX_LINES.replace("fn six__() {}", "fn six_2() {}"),
+        )
+        .unwrap();
+        let second = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 4, "one call: the region whose bytes moved");
+        assert_eq!(second["derived"], true);
+        assert_eq!(second["suppressed_items"], 1, "{second}");
+        assert_eq!(second["minted"].as_array().unwrap().len(), 2, "{second}");
+        assert_eq!(second["carried"].as_array().unwrap().len(), 2, "{second}");
+        assert_eq!(
+            second["statement"],
+            format!(
+                "4 findings (2 carried forward, 1 withheld as an exact repeat) · reviewed the \
+                 whole file ({} bytes) · 2 of 3 regions unchanged",
+                SIX_LINES.len()
+            )
+        );
+
+        // The queue: region 1's pending finding (carried), the marked one on
+        // line 5, the fresh one on line 6, and — from the first pass —
+        // region 3's declined record is NOT pending and region 2's is NOT
+        // re-minted beside its carried self.
+        let pending = json(&k, "urn:repo:demo:findings:a.rs", &[]);
+        let rows = pending.as_array().unwrap();
+        assert_eq!(rows.len(), 3, "{pending}");
+        assert!(
+            rows.iter().all(|r| r["exact"] != "fn three() {}"),
+            "the carried decline is not re-minted: {pending}"
+        );
+        let fives: Vec<&serde_json::Value> = rows
+            .iter()
+            .filter(|r| r["exact"] == "fn five_() {}")
+            .collect();
+        assert_eq!(fives.len(), 1, "the repeat was withheld: {pending}");
+        let marked = fives[0];
+        assert_eq!(marked["state"], "pending");
+        assert_eq!(marked["body"], "A different claim about this line.");
+        assert_eq!(marked["decision"], serde_json::Value::Null);
+        assert_ne!(
+            marked["iri"].as_str().unwrap(),
+            five,
+            "a new id: the pass moved"
+        );
+        let prior = &marked["prior_decision"];
+        assert_eq!(prior["finding"], five, "{marked}");
+        assert_eq!(prior["iri"], format!("{five}:decision"));
+        assert_eq!(prior["outcome"], "declined");
+        assert_eq!(prior["severity"], "minor");
+        assert_eq!(prior["note"], "not a defect");
+        // The date is the twin's decision date, carried as recorded (this
+        // kernel has no clock, so both are null — and equal).
+        assert_eq!(
+            prior["decided_at"],
+            json(&k, &five, &[])["decision"]["decided_at"],
+            "{marked}"
+        );
+        let fresh = rows
+            .iter()
+            .find(|r| r["exact"] == "fn six_2() {}")
+            .expect("the fresh line's finding");
+        assert_eq!(
+            fresh["prior_decision"],
+            serde_json::Value::Null,
+            "nobody declined anything on this line"
+        );
+        let one = rows.iter().find(|r| r["exact"] == "fn one__() {}").unwrap();
+        assert_eq!(one["prior_decision"], serde_json::Value::Null);
+
+        // The carried decline is unchanged: declined, unmarked, same id.
+        let declined = json(&k, "urn:repo:demo:findings:a.rs", &[("state", "declined")]);
+        let declined = declined.as_array().unwrap();
+        assert_eq!(declined.len(), 2, "{declined:?}");
+        for row in declined {
+            assert_eq!(row["prior_decision"], serde_json::Value::Null, "{row}");
+            assert!(
+                [three.as_str(), five.as_str()].contains(&row["iri"].as_str().unwrap()),
+                "{row}"
+            );
+        }
+
+        // The mark in the graph, and in words.
+        let ttl = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:findings:a.rs",
+                &[("as", "text/turtle")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert!(
+            ttl.contains(&format!("prov:wasInfluencedBy <{five}:decision>")),
+            "{ttl}"
+        );
+        assert_eq!(ttl.matches("prov:wasInfluencedBy").count(), 1, "{ttl}");
+        let html = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:findings:a.rs",
+                &[("as", "text/html")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert!(html.contains("browse-finding-prior"), "{html}");
+        assert!(
+            html.contains("a like claim on this line was declined"),
+            "{html}"
+        );
+        assert!(html.contains(": not a defect"), "{html}");
+        assert!(
+            html.contains(&format!("hx-get=\"/k/source {five} as=text/html\"")),
+            "{html}"
+        );
+        let plain = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:findings:a.rs",
+                &[("as", "text/plain")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert!(
+            plain.contains("[a like claim on this line was declined"),
+            "{plain}"
+        );
+        assert!(
+            plain.contains("2 declined findings on this file, on 2 distinct quotes"),
+            "{plain}"
+        );
+
+        // The count in the pass's graph, and on the archive hit.
+        let ttl = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:review:a.rs",
+                &[("as", "text/turtle")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert!(
+            ttl.contains("ik:suppressedItems \"1\"^^xsd:nonNegativeInteger"),
+            "{ttl}"
+        );
+        let hit = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(hit["derived"], false);
+        assert_eq!(log.count(), 4);
+        assert_eq!(hit["suppressed_items"], 1);
+        assert_eq!(hit["statement"], second["statement"]);
+        assert!(hit["annotations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["prior_decision"]["finding"] == five));
+
+        // ★ The withheld item's memo member is its declined twin: region 3's
+        // new memo names the record that answers those bytes, so the next pass
+        // over them is a memo hit rather than a call that would be withheld
+        // again. Two memos name it — the first pass's region 3 and this one.
+        let twin = oxigraph::model::NamedNode::new(&five).unwrap();
+        let memos = store
+            .quads_for_pattern(
+                None,
+                Some(prov("hadMember").as_ref()),
+                Some(twin.as_ref().into()),
+                None,
+            )
+            .count();
+        assert_eq!(
+            memos, 2,
+            "the declined twin stands in for the withheld repeat"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The withhold rule is EXACT — the same note under a different proposed
+    /// severity is a different claim, minted marked and not withheld — and
+    /// declines on ANOTHER FILE are not consulted, even for a byte-identical
+    /// item: the key is the file and the line, never the words alone.
+    #[test]
+    fn the_withhold_rule_is_exact_and_stops_at_the_file() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &[
+                &finding_on("fn one__() {}"),
+                CLEAN,
+                CLEAN,
+                // Pass two, region 1 only: the same note, rated major.
+                "QUOTE: fn one__() {}\nSEVERITY: major\nNOTE: This one deserves a second look.\n",
+                // b.rs, whole file: the declined item byte for byte.
+                &finding_on("fn one__() {}"),
+                CLEAN,
+                CLEAN,
+            ],
+        );
+        json(&k, "urn:repo:demo:review:a.rs", &[]);
+        let queue = json(&k, "urn:repo:demo:findings:a.rs", &[]);
+        let one = queue[0]["iri"].as_str().unwrap().to_string();
+        issue(&k, Verb::Sink, &one, &[("decision", "decline")], &cap()).unwrap();
+
+        std::fs::write(
+            root.join("a.rs"),
+            SIX_LINES.replace("fn two__() {}", "fn two_2() {}"),
+        )
+        .unwrap();
+        let second = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 4);
+        assert_eq!(second["suppressed_items"], 0, "{second}");
+        assert_eq!(second["minted"].as_array().unwrap().len(), 1, "{second}");
+        let pending = json(&k, "urn:repo:demo:findings:a.rs", &[]);
+        let rows = pending.as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{pending}");
+        assert_eq!(rows[0]["severity"], "major");
+        assert_eq!(rows[0]["prior_decision"]["finding"], one, "{pending}");
+        assert_eq!(rows[0]["prior_decision"]["note"], serde_json::Value::Null);
+
+        // The same bytes under another path: nothing on file for THAT file.
+        std::fs::write(root.join("b.rs"), SIX_LINES).unwrap();
+        let other = json(&k, "urn:repo:demo:review:b.rs", &[]);
+        assert_eq!(log.count(), 7);
+        assert_eq!(other["suppressed_items"], 0, "{other}");
+        assert_eq!(other["minted"].as_array().unwrap().len(), 1, "{other}");
+        let pending = json(&k, "urn:repo:demo:findings:b.rs", &[]);
+        assert_eq!(pending.as_array().unwrap().len(), 1, "{pending}");
+        assert_eq!(
+            pending[0]["prior_decision"],
+            serde_json::Value::Null,
+            "a decline on a.rs says nothing about b.rs: {pending}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A pass whose EVERY item is an exact repeat of a decline is not an
+    /// error and not a clean pass: it is archived saying "nothing new" with
+    /// its count, mints nothing, and the queue does not grow. Its memo names
+    /// the declined twins, so unchanged bytes are a hit next time.
+    #[test]
+    fn a_wholly_withheld_pass_is_archived_as_nothing_new() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, TWO_FINDINGS);
+        let first = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        for iri in first["minted"].as_array().unwrap() {
+            issue(
+                &k,
+                Verb::Sink,
+                iri.as_str().unwrap(),
+                &[("decision", "decline")],
+                &cap(),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            json(&k, "urn:repo:demo:findings:a.rs", &[])
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+
+        // A new hash with the region's bytes changed INSIDE (an appended line
+        // would leave the old bytes at offset 0 for the memo to carry), both
+        // quotes still there, the same two items again.
+        let changed = CONTENT.replace("fn gamma() {}", "fn gamma2() {}");
+        std::fs::write(root.join("a.rs"), &changed).unwrap();
+        let second = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 2);
+        assert_eq!(second["derived"], true);
+        assert_eq!(second["memo_regions"], 0, "{second}");
+        assert_eq!(second["minted"].as_array().unwrap().len(), 0, "{second}");
+        assert_eq!(second["carried"].as_array().unwrap().len(), 0, "{second}");
+        assert_eq!(second["suppressed_items"], 2, "{second}");
+        assert_eq!(
+            second["statement"],
+            format!(
+                "nothing new (2 withheld as exact repeats) · reviewed the whole file ({} bytes)",
+                changed.len()
+            )
+        );
+        assert_eq!(
+            json(&k, "urn:repo:demo:findings:a.rs", &[])
+                .as_array()
+                .unwrap()
+                .len(),
+            0,
+            "the queue did not grow"
+        );
+        let html = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:review:a.rs",
+                &[("as", "text/html")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert!(
+            html.contains("This file was reviewed: nothing new (2 withheld"),
+            "{html}"
+        );
+        let plain =
+            body(&issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).unwrap());
+        assert!(
+            plain.contains("nothing new (2 withheld as exact repeats)"),
+            "{plain}"
+        );
+
+        // The hit reproduces the count; the memo makes the same bytes free.
+        let hit = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(hit["derived"], false);
+        assert_eq!(hit["suppressed_items"], 2);
+        assert_eq!(hit["derived_regions"], 1, "{hit}");
         std::fs::remove_dir_all(&root).ok();
     }
 

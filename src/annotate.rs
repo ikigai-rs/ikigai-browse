@@ -117,6 +117,21 @@ const PROV_WAS_GENERATED_BY: &str = "http://www.w3.org/ns/prov#wasGeneratedBy";
 pub(crate) const PROV_WAS_DERIVED_FROM: &str = "http://www.w3.org/ns/prov#wasDerivedFrom";
 pub(crate) const PROV_USED: &str = "http://www.w3.org/ns/prov#used";
 pub(crate) const PROV_GENERATED: &str = "http://www.w3.org/ns/prov#generated";
+/// `prov:wasInfluencedBy` — a fresh finding to the DECISION that already
+/// answered a like claim on the same line of the same file (ledger #475): the
+/// `urn:iki:finding:{id}:decision` node of a declined twin, from which the
+/// twin itself (`prov:used`), the date and the reason are one hop away.
+///
+/// ★ PROV's generic influence, chosen over the two closer-sounding terms for
+/// reasons that are both about entailment. `prov:wasDerivedFrom` is what a
+/// PUBLISHED annotation carries back to its finding (above), and `load_record`
+/// reads it into `derived_from` for either family, so reusing it here would
+/// make a recurrence look like a promotion. `prov:alternateOf` is declared
+/// symmetric, so writing it would assert the declined twin is an alternate of
+/// the fresh one — true, but a reasoner would then put a triple on a record
+/// this code never wrote. A dedicated `ik:priorDecision` is the right end
+/// state and is REPORTED, not invented here (the vocabulary lives in core).
+pub(crate) const PROV_WAS_INFLUENCED_BY: &str = "http://www.w3.org/ns/prov#wasInfluencedBy";
 
 /// The finding family's body predicate.
 ///
@@ -331,6 +346,63 @@ pub(crate) struct Decision {
     pub(crate) minted: Option<String>,
 }
 
+/// A decline that already answered a like claim — what a fresh finding
+/// minted on a line that carries one ARRIVES WITH (ledger #475).
+///
+/// ★ The mark, not a suppression. A finding's id is
+/// `sha256(pass ‖ char_start ‖ exact)` and the pass IRI carries the content
+/// hash, so any unrelated edit to a file resurfaces a declined claim under a
+/// new id, and the queue presents it as new: declines did not accumulate into
+/// knowledge, and the human gate — the scarcest resource in the design — was
+/// spent twice on one judgment (measured 2026-09-22: 8 of 17 findings on a
+/// prose-only commit were verbatim re-raises of the previous day's declines).
+/// The key is `(target, exact)` — the same file, the same quoted line, after
+/// the same normalization the anchor applies — never position, hash or pass.
+///
+/// ⚠ Quote-match SUPPRESSION would be too broad: two different findings can
+/// quote one line, and the `to_le_bytes` line whose endianness claim was
+/// declined could attract a different, correct claim later. So a match MARKS
+/// by default and the finding still enters the queue carrying the prior
+/// decision; a human declines it again in one click, or sees that it is a
+/// different claim — which suppression could never show. Only an EXACT repeat
+/// (same quote, same proposed severity, a byte-identical note) is withheld,
+/// and every withheld one is counted on the pass (`ik:suppressedItems`).
+#[derive(Clone, Debug)]
+pub(crate) struct Prior {
+    /// The declined twin — `urn:iki:finding:{id}`.
+    pub(crate) finding: String,
+    /// Its decision, as on file. `None` only when the twin's decision node
+    /// has since been removed; the link is kept regardless.
+    pub(crate) decision: Option<Decision>,
+}
+
+impl Prior {
+    /// The decision node the finding links to — the stored object of
+    /// `prov:wasInfluencedBy`.
+    pub(crate) fn decision_iri(&self) -> String {
+        match Family::split(&self.finding) {
+            Some((Family::Finding, id)) => decision_iri(id),
+            _ => format!("{}:decision", self.finding),
+        }
+    }
+
+    /// The prior decision in words, for the plain and html faces: when it was
+    /// declined and, if a reason was given, why.
+    pub(crate) fn words(&self) -> String {
+        let mut out = String::from("a like claim on this line was declined");
+        if let Some(decision) = &self.decision {
+            if let Some(at) = &decision.at {
+                out.push(' ');
+                out.push_str(at.get(..10).unwrap_or(at));
+            }
+            if let Some(note) = &decision.note {
+                out.push_str(&format!(": {note}"));
+            }
+        }
+        out
+    }
+}
+
 /// The two ways a human can answer a pending finding.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Outcome {
@@ -406,6 +478,11 @@ pub(crate) struct Annotation {
     pub(crate) derived_from: Option<String>,
     /// The human act. Finding family only; `None` IS the pending state.
     pub(crate) decision: Option<Decision>,
+    /// A decline that already answered a like claim on this line — the mark
+    /// a fresh finding is minted with when the same file carries a DECLINED
+    /// finding with the same `exact` (see [`Prior`]). Finding family only;
+    /// `None` means no declined twin was on file at mint time.
+    pub(crate) prior: Option<Prior>,
 }
 
 /// What an annotation's recorded target IS — derived from the stored
@@ -653,6 +730,17 @@ pub(crate) fn store_annotation(archive: &Archive, ann: &Annotation) -> Result<()
             g.clone(),
         ));
     }
+    // The mark: a fresh finding to the decision that already answered a like
+    // claim on this line. One triple, on the finding, to the twin's decision
+    // node — the twin, the date and the reason are all one hop past it.
+    if let (Family::Finding, Some(prior)) = (ann.family, &ann.prior) {
+        quads.push(Quad::new(
+            subject.clone(),
+            NamedNode::new(PROV_WAS_INFLUENCED_BY).map_err(store_err)?,
+            NamedNode::new(prior.decision_iri()).map_err(store_err)?,
+            g.clone(),
+        ));
+    }
     // The human act, on its own node — never folded into the finding, whose
     // triples are the MODEL's and stay the model's.
     if let (Family::Finding, Some(decision)) = (ann.family, &ann.decision) {
@@ -785,7 +873,9 @@ pub(crate) fn load_record(
         severity: None,
         derived_from: None,
         decision: None,
+        prior: None,
     };
+    let mut prior_id: Option<String> = None;
     let literal = |term: &Term| match term {
         Term::Literal(l) => l.value().to_string(),
         other => other.to_string(),
@@ -858,6 +948,19 @@ pub(crate) fn load_record(
             if let Term::NamedNode(node) = &quad.object {
                 ann.generated_by = Some(node.as_str().to_string());
             }
+        } else if predicate == PROV_WAS_INFLUENCED_BY && family == Family::Finding {
+            // The object is a declined twin's DECISION node; the twin's id is
+            // the middle of it. Anything else under this predicate is not a
+            // mark this code wrote, and is left where it is.
+            if let Term::NamedNode(node) = &quad.object {
+                if let Some(twin) = node
+                    .as_str()
+                    .strip_prefix(Family::Finding.prefix())
+                    .and_then(|rest| rest.strip_suffix(":decision"))
+                {
+                    prior_id = Some(twin.to_string());
+                }
+            }
         }
     }
     if !found {
@@ -865,6 +968,12 @@ pub(crate) fn load_record(
     }
     if family == Family::Finding {
         ann.decision = load_decision(archive, id)?;
+        if let Some(twin) = prior_id {
+            ann.prior = Some(Prior {
+                finding: record_iri(Family::Finding, &twin),
+                decision: load_decision(archive, &twin)?,
+            });
+        }
     }
     for (iri, is_quote) in [
         (quote_iri(family, id), true),
@@ -1527,6 +1636,9 @@ impl Included {
             if let Some(creator) = &ann.creator {
                 out.push_str(&format!("[review:{creator}] "));
             }
+            if ann.prior.is_some() {
+                out.push_str("[declined before] ");
+            }
             out.push_str(&format!(
                 "\"{}\" -- {}",
                 clip(&ann.exact),
@@ -1903,6 +2015,7 @@ impl AnnotationEndpoint {
             severity: None,
             derived_from: None,
             decision: None,
+            prior: None,
         };
         rewrite_annotation(&self.archive, &ann)?;
         match inv.inline_str("as").unwrap_or("text/plain") {
@@ -2179,6 +2292,21 @@ pub(crate) fn annotation_json(ann: &Annotation, line: Option<u64>) -> serde_json
             "note": d.note,
             "minted": d.minted,
         })),
+        // ★ The mark (ledger #475): a decline that already answered a like
+        // claim on this line, carried by the fresh finding so the second
+        // decision is one click. `finding` is the declined twin, `iri` its
+        // decision node, and the rest is that decision in the same shape as
+        // `decision` above — null when no declined twin was on file at mint
+        // time. A consumer rendering a queue row reads this to say "a like
+        // claim on this line was declined <decided_at>: <note>".
+        "prior_decision": ann.prior.as_ref().map(|p| serde_json::json!({
+            "finding": p.finding,
+            "iri": p.decision_iri(),
+            "outcome": p.decision.as_ref().map(|d| d.outcome.label()),
+            "severity": p.decision.as_ref().map(|d| d.severity.clone()),
+            "decided_at": p.decision.as_ref().and_then(|d| d.at.clone()),
+            "note": p.decision.as_ref().and_then(|d| d.note.clone()),
+        })),
     })
 }
 
@@ -2227,6 +2355,9 @@ fn annotation_turtle(ann: &Annotation) -> String {
     }
     if let Some(from) = &ann.derived_from {
         props.push(format!("prov:wasDerivedFrom <{from}>"));
+    }
+    if let (Family::Finding, Some(prior)) = (ann.family, &ann.prior) {
+        props.push(format!("prov:wasInfluencedBy <{}>", prior.decision_iri()));
     }
     let mut out = format!("<{}> {} .\n", ann.iri(), props.join(" ;\n    "));
     if let (Family::Finding, Some(decision)) = (ann.family, &ann.decision) {
@@ -2337,6 +2468,18 @@ pub(crate) fn annotation_card_html(ann: &Annotation, line: Option<u64>, show_pat
         );
     } else if ann.reanchored {
         flags.push_str("<span class=\"browse-annotation-flag\">re-anchored</span>");
+    }
+    // The mark, in words and with the twin one click away — ABOVE the
+    // decision form, because it is the thing that makes the second decision
+    // cheap: a reader sees the earlier answer before choosing again.
+    if let Some(prior) = &ann.prior {
+        flags.push_str(&format!(
+            "<p class=\"browse-finding-prior\">{} · <a class=\"browse-finding-prior-link\" \
+             href=\"#\" hx-get=\"/k/source {twin} as=text/html\" hx-target=\"#browse\" \
+             hx-swap=\"innerHTML\">{twin}</a></p>",
+            esc(&prior.words()),
+            twin = esc(&prior.finding),
+        ));
     }
     // The finding family's extra furniture: the model's proposed severity, the
     // pipeline state, and — while it is pending — the human's decision form.
@@ -2694,13 +2837,45 @@ fn proposal_card_html(finding: &Annotation, line: Option<u64>) -> String {
 /// already answered. A uuid would have made re-runs cost a second triage pass
 /// each time.
 ///
+/// ## A decline is consulted at mint time (ledger #475)
+///
+/// After the quote anchors — and only then, because the stored `exact` is the
+/// FILE's characters after the same leading-decoration strip the anchor
+/// applies, and a `⚠`-decorated quote compared before that step would never
+/// match its declined twin — the DECLINED findings on the same target with the
+/// same `exact` are looked up ([`declined_twins`]). Then, by [`Prior`]'s rule:
+///
+/// * **an exact repeat is WITHHELD and counted** — same `exact`, same proposed
+///   severity, and a note byte-identical to a declined twin's. Nothing is
+///   stored; the caller adds one to the pass's `ik:suppressedItems` and, for
+///   the region memo, records the TWIN as the member that answers these bytes
+///   (so an unchanged region is not re-asked next pass just to be withheld
+///   again). Deliberately this narrow: at temperature 0.2 notes are rarely
+///   identical, so this fires seldom — measured over the 458 declines on file
+///   on 2026-09-22, it would have fired on none of the 98 same-line pairs — and
+///   a review that silently withholds a true finding is worse than one that
+///   repeats a false one;
+/// * **anything else on a declined line is MINTED MARKED** — the finding
+///   enters the queue with [`Annotation::prior`] set to the most recently
+///   decided twin, so the row can say "a like claim on this line was declined
+///   {date}: {reason}" and the second decision costs one click, or the
+///   difference is visible, which suppression could never show.
+///
+/// Declines on a DIFFERENT file are not consulted. The recurrence has a
+/// file-shaped grain (a manifest, a vocabulary) and a knowledge-gap grain (the
+/// same misreading of Cargo caret semantics on every manifest; rdfs2 on every
+/// vocabulary), and the mark cannot fix the second: that is a prompt or model
+/// matter, and this key would be wrong for it.
+///
 /// Anchors `exact` in `text` (already in hand — the pass sourced it) with no
 /// context hints. `surface` selects the anchoring discipline — [`Surface::Diff`]
 /// for a PR pass tolerates dropped/wrong leading diff markers and stores the
-/// original diff line as the exact. Returns the finding's IRI, or `None` when
-/// the quote does not anchor — the caller counts it and moves on (one bad
-/// item must not kill the pass). `target_iri` names the reviewed surface (a
-/// file, or a PR page whose diff is `text`); `rel` is its path, empty for a PR.
+/// original diff line as the exact. Returns [`Mint::Minted`] with the finding's
+/// IRI, [`Mint::Orphaned`] when the quote does not anchor, or
+/// [`Mint::Withheld`] naming the declined twin — the caller counts the last
+/// two and moves on (one bad item must not kill the pass). `target_iri` names
+/// the reviewed surface (a file, or a PR page whose diff is `text`); `rel` is
+/// its path, empty for a PR.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn mint_pending_finding(
     archive: &Archive,
@@ -2716,13 +2891,13 @@ pub(crate) fn mint_pending_finding(
     pass_iri: &str,
     created: Option<String>,
     surface: Surface,
-) -> Result<Option<String>> {
+) -> Result<Mint> {
     let Some(DiffAnchor {
         anchor,
         stored_exact,
     }) = find_anchor_on(surface, text, exact, "", "")
     else {
-        return Ok(None);
+        return Ok(Mint::Orphaned);
     };
     let exact = stored_exact.as_deref().unwrap_or(exact);
     let (prefix, suffix) = context_around(text, &anchor);
@@ -2730,8 +2905,20 @@ pub(crate) fn mint_pending_finding(
     // Re-minting an already-answered finding must not erase the answer, and
     // must not resurrect a decided one as pending.
     if let Some(existing) = load_record(archive, Family::Finding, &id)? {
-        return Ok(Some(existing.iri()));
+        return Ok(Mint::Minted(existing.iri()));
     }
+    // The declined twins on this line, most recently decided first.
+    let twins = declined_twins(archive, target_iri, exact)?;
+    if let Some(twin) = twins
+        .iter()
+        .find(|twin| twin.body == note && twin.severity.as_deref() == severity)
+    {
+        return Ok(Mint::Withheld(twin.iri()));
+    }
+    let prior = twins.into_iter().next().map(|twin| Prior {
+        decision: twin.decision.clone(),
+        finding: twin.iri(),
+    });
     let ann = Annotation {
         family: Family::Finding,
         id,
@@ -2757,9 +2944,75 @@ pub(crate) fn mint_pending_finding(
         severity: severity.map(str::to_string),
         derived_from: None,
         decision: None,
+        prior,
     };
     store_annotation(archive, &ann)?;
-    Ok(Some(ann.iri()))
+    Ok(Mint::Minted(ann.iri()))
+}
+
+/// What [`mint_pending_finding`] did with one of the model's items.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Mint {
+    /// Anchored and on file (freshly stored, or the same id already was) —
+    /// the finding's IRI.
+    Minted(String),
+    /// The quote is not in the text character-for-character: nothing stored;
+    /// the caller counts it (`ik:orphanedItems`).
+    Orphaned,
+    /// An exact repeat of a DECLINED finding on the same line — nothing
+    /// stored; the caller counts it (`ik:suppressedItems`). Carries the
+    /// declined twin's IRI: the record that already answers these bytes.
+    Withheld(String),
+}
+
+/// The DECLINED findings on `target_iri` whose stored `exact` is `exact`,
+/// most recently decided first (then by id, so the order is total).
+///
+/// The lookup runs from the quote selector inward — every `oa:exact` literal
+/// equal to the quote, filtered to the finding family's selector nodes — so it
+/// costs one indexed pattern plus a load per candidate, never a walk over
+/// every finding in the store. `exact` is compared as stored, which is the
+/// file's characters for both sides (see [`find_anchor_on_file`]).
+pub(crate) fn declined_twins(
+    archive: &Archive,
+    target_iri: &str,
+    exact: &str,
+) -> Result<Vec<Annotation>> {
+    let quote = Literal::new_simple_literal(exact);
+    let mut ids = std::collections::BTreeSet::new();
+    for quad in archive.quads_for_pattern(
+        None,
+        Some(oa("exact").as_ref()),
+        Some(quote.as_ref().into()),
+    ) {
+        let quad = quad.map_err(store_err)?;
+        let subject = quad.subject.to_string();
+        let iri = subject.trim_start_matches('<').trim_end_matches('>');
+        if let Some(id) = iri
+            .strip_prefix(Family::Finding.prefix())
+            .and_then(|rest| rest.strip_suffix(":selector:quote"))
+        {
+            ids.insert(id.to_string());
+        }
+    }
+    let mut twins = Vec::new();
+    for id in ids {
+        let Some(finding) = load_record(archive, Family::Finding, &id)? else {
+            continue;
+        };
+        let declined = finding
+            .decision
+            .as_ref()
+            .is_some_and(|d| d.outcome == Outcome::Declined);
+        if declined && finding.target_iri == target_iri && finding.exact == exact {
+            twins.push(finding);
+        }
+    }
+    twins.sort_by(|a, b| {
+        let at = |f: &Annotation| f.decision.as_ref().and_then(|d| d.at.clone());
+        at(b).cmp(&at(a)).then_with(|| a.id.cmp(&b.id))
+    });
+    Ok(twins)
 }
 
 /// The deterministic finding id — see [`mint_pending_finding`]. 24 hex
