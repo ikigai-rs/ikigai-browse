@@ -2495,8 +2495,10 @@ mod tests {
                 None,
                 annotate::Surface::File,
             )
-            .unwrap()
-            .expect("the quote anchors in v1");
+            .unwrap();
+            let annotate::Mint::Minted(iri) = iri else {
+                panic!("the quote anchors in v1: {iri:?}");
+            };
             ids.insert(
                 key,
                 iri.strip_prefix("urn:iki:finding:").unwrap().to_string(),

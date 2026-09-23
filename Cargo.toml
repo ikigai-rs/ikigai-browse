@@ -216,7 +216,43 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # count of carried regions on the pass (derivable from `prov:used` links
 # meanwhile). No new capability, no resource name moved, `provider=` and the
 # PR pass untouched (a diff pass has no regions).
-version = "0.8.0"
+#
+# 0.9.0 — MINOR: A DECLINE IS REMEMBERED (ledger #475). A finding's id carries
+# the pass and the pass carries the content hash, so any edit to a file could
+# resurface a claim a human had declined, under a new id, presented as new —
+# measured 2026-09-22: a prose-only commit to a manifest minted 17 findings, 8
+# of them verbatim re-raises of the previous day's declines on lines the commit
+# did not touch. Now, at mint time, a fresh finding is checked against the
+# DECLINED findings on the same file with the same `exact` (after the anchor's
+# own decoration strip): it is minted CARRYING the prior decision — a
+# `prov:wasInfluencedBy` link to the declined twin's decision node, and on the
+# json row a `prior_decision` object {finding, iri, outcome, severity,
+# decided_at, note} — so the second decision is one click and a different claim
+# on the same line stays visible; only an EXACT repeat (same quote, same
+# proposed severity, byte-identical note) is withheld, and every withheld one
+# is counted (`suppressed_items` on the pass's json face, `ik:suppressedItems`
+# in its graph, "(N withheld as exact repeats)" in its statement). ★ Why a
+# minor: the finding's faces gained a field, the pass's faces gained a count
+# and a statement clause, a pass whose every item was withheld is now an
+# ARCHIVED pass saying "nothing new" where before the same answer would have
+# been "none anchored" and an error, and `urn:repo:{repo}:findings:{path}`
+# gained `summary=declined`, which widens its json face from the rows array to
+# an object carrying the file-grain count of declines by quote — all
+# observable, all additive, none of it a patch. The default json face of the
+# findings listing is byte-identical without the argument, deliberately: gonk
+# reads it as an array. gonk pins `"0.8.0"` and `^0.8.0` is `<0.9.0`, so it
+# cannot see any of this until its pin moves — the hub's wave, as for every
+# minor before it — and the mark is what its queue row should render next
+# (the exact field names are in the release report). ⚠ The withhold rule was
+# measured on the 458 declines on file before it shipped: 98 pairs shared a
+# line, 78 shared a severity, NONE shared a byte-identical note — so it fires
+# seldom by construction, and the mark carries the weight. Declines on other
+# files are not consulted (the cross-file recurrence is a knowledge gap in the
+# model, which the file-grain count makes visible and no key could fix). One
+# vocabulary need REPORTED, not invented: a dedicated `ik:priorDecision` in
+# place of the generic PROV influence. The `ikigai-vocab` dev-dependency floor
+# moves to 0.1.71, where `ik:suppressedItems` landed.
+version = "0.9.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -341,12 +377,13 @@ ikigai-conformance = "0.2.0"
 # The suite's `VOCABULARY` check reads `ikigai_vocab::VOCABULARY` as its oracle,
 # and the suite's own pin (`^0.1.66`) is the floor for the SUITE's API, not for
 # this module's terms. The review face uses `ik:Review`, `ik:orphanedItems`,
-# `ik:reviewedBytes` and `ik:totalBytes`, which landed in **0.1.69** — below it
-# `tests/conformance.rs` goes red with four "invented term" findings that are
+# `ik:reviewedBytes` and `ik:totalBytes`, which landed in 0.1.69, and
+# `ik:suppressedItems`, which landed in **0.1.71** — below it
+# `tests/conformance.rs` goes red with an "invented term" finding that is
 # really "the registry index is stale". Cargo unifies to the greater of the two
 # requirements, so saying it here raises the floor without touching the suite.
 # Dev-dependencies do not propagate, so no consumer of this crate pays for it.
-ikigai-vocab = "0.1.69"
+ikigai-vocab = "0.1.71"
 futures = "0.3"
 # Validates the Turtle face in tests — the graph must actually parse.
 oxttl = "0.2"
