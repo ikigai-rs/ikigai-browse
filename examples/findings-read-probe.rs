@@ -27,9 +27,10 @@
 //! median / min / max wall time over `<reps>` reads after one warm-up, then the
 //! `summary=states` counts when the build serves them (0.11.0 on), and the
 //! file face's `proposals=` read for the root's busiest file (the other read
-//! supersession joins). Run it on two builds to compare them: the probe
-//! declares no argument the older build lacks except `summary=states`, which
-//! it reports as unavailable rather than failing on.
+//! supersession joins), and — 0.12.0 on — each `group=` kind's groups, member
+//! findings and read time per root. Run it on two builds to compare them: the
+//! probe declares no argument the older build lacks except `summary=states` and
+//! `group=`, which it reports as unavailable rather than failing on.
 
 use std::collections::BTreeMap;
 use std::io::BufReader;
@@ -133,6 +134,50 @@ fn main() {
             times[0],
             times[times.len() - 1],
         );
+    }
+
+    // `group=` (0.12.0 on): per root, per kind, the size of each lever — the
+    // groups and the member findings — and what the grouped read costs. Not on
+    // the badge path (a host fetches it when a person opens a batch view), but
+    // it is the pending listing plus one in-memory pass per kind, so it should
+    // cost what the badge read costs.
+    println!(
+        "\n{:<18} {:<16} {:>7} {:>9} {:>7} {:>10} {:>10}",
+        "root", "group=", "groups", "findings", "marked", "median", "max"
+    );
+    for name in &names {
+        let iri = format!("urn:repo:{name}:findings");
+        for kind in ["recurrence", "near-duplicate", "comment-shape", "file"] {
+            let args = [("group", kind), ("as", "application/json")];
+            let Ok((bytes, _)) = read(&iri, &args) else {
+                println!("{name:<18} {kind:<16} n/a (this build serves no group=)");
+                break;
+            };
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+            let groups = v["groups"].as_array().map(Vec::len).unwrap_or(0);
+            let members: Vec<&serde_json::Value> = v["groups"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|g| g["members"].as_array().into_iter().flatten())
+                .collect();
+            let findings = members.len();
+            // Members that already arrived carrying the 0.9.0 mark — the rest
+            // are what `recurrence` adds over the mark.
+            let marked = members
+                .iter()
+                .filter(|m| !m["prior_decision"].is_null())
+                .count();
+            let mut times: Vec<Duration> = (0..reps)
+                .map(|_| read(&iri, &args).expect("the group read").1)
+                .collect();
+            times.sort();
+            println!(
+                "{name:<18} {kind:<16} {groups:>7} {findings:>9} {marked:>7} {:>10.1?} {:>10.1?}",
+                times[times.len() / 2],
+                times[times.len() - 1],
+            );
+        }
     }
 
     // The file face's `proposals=` read — the other read supersession joins —

@@ -1751,9 +1751,13 @@ impl Endpoint for ReviewEndpoint {
             if let Some(mut entry) = load_pass(&config.archive, &iri)? {
                 entry.superseded =
                     crate::supersede::superseded_on(&config.archive, repo, &rel, &hash)?;
-                // The hit path: mints NOTHING. The recorded annotations are
-                // drift-reconciled against the very content in hand.
-                let included = annotate::included_for_ids(&config.archive, &entry.minted, &text)?;
+                // The hit path: mints NOTHING. The recorded findings — minted
+                // AND carried, exactly the set a fresh derivation renders — are
+                // drift-reconciled against the very content in hand. ⚠ Minted
+                // alone (ledger #507) served a stored pass short by its carried
+                // share while its own statement counted both.
+                let included =
+                    annotate::included_for_ids(&config.archive, &entry.findings(), &text)?;
                 return face(inv, repo, &rel, &entry, false, &included);
             }
         }
@@ -3606,6 +3610,31 @@ mod tests {
         assert_eq!(hit["memo_regions"], 2);
         assert_eq!(hit["derived_regions"], 1);
         assert_eq!(hit["statement"], second["statement"]);
+        // ★ And it RENDERS the same (ledger #507): the stored pass lists its
+        // carried findings beside its minted one, row for row as the fresh
+        // derivation did — not the one it minted while its statement counts
+        // three.
+        assert_eq!(hit["annotations"].as_array().unwrap().len(), 3, "{hit}");
+        assert_eq!(hit["annotations"], second["annotations"]);
+        let listed = |face: &str| {
+            body(
+                &issue(
+                    &k,
+                    Verb::Source,
+                    "urn:repo:demo:review:a.rs",
+                    &[("as", face)],
+                    &cap(),
+                )
+                .unwrap(),
+            )
+        };
+        let html = listed("text/html");
+        for quote in ["fn one__() {}", "fn three() {}", "fn six_2() {}"] {
+            assert!(
+                html.contains(quote),
+                "{quote} missing from the stored pass: {html}"
+            );
+        }
         std::fs::remove_dir_all(&root).ok();
     }
 

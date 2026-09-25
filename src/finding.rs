@@ -401,7 +401,8 @@ pub(crate) fn decision_html(
 
 /// The standing note every queue face carries. ⚠ It is not decoration: "queued
 /// for review" reads like a gate, and this pipeline gates nothing.
-const NOT_A_GATE: &str = "Findings wait for a person. Nothing here blocks a commit, a push or a \
+pub(crate) const NOT_A_GATE: &str =
+    "Findings wait for a person. Nothing here blocks a commit, a push or a \
                           merge, and nothing reaches the annotation family until someone \
                           publishes it.";
 
@@ -780,6 +781,53 @@ impl Endpoint for FindingsEndpoint {
             }
             Err(_) => None,
         };
+        // `group=` (ledger #506) is a different read of the SAME pending set:
+        // it narrows nothing new and decides nothing, so it rides this face
+        // (one binding, one capability, one supersession pass) rather than a
+        // sibling IRI. It is refused beside anything that would ask it to
+        // group something other than pending, or to be a second shape at once
+        // — an argument accepted and then ignored is the failure invisible
+        // from the caller's side.
+        let group = match inv.inline_str("group") {
+            Ok(word) => Some(crate::group::kind_arg(word)?),
+            Err(_) => None,
+        };
+        if let Some(kind) = group {
+            let conflict = |name: &str, detail: String| Error::InvalidArgument {
+                name: name.to_string(),
+                detail,
+            };
+            if state != "pending" {
+                return Err(conflict(
+                    "state",
+                    format!(
+                        "`group={kind}` proposes groups of PENDING findings only — drop \
+                         `state={state}`, or drop `group`"
+                    ),
+                ));
+            }
+            if let Some(word) = &summary {
+                return Err(conflict(
+                    "summary",
+                    format!(
+                        "`group={kind}` is its own shape and already counts every kind — drop \
+                         `summary={word}`"
+                    ),
+                ));
+            }
+            if inv
+                .inline_str("as")
+                .is_ok_and(|t| t.starts_with("text/turtle"))
+            {
+                return Err(conflict(
+                    "as",
+                    format!(
+                        "`group={kind}` has json, html and plain faces — a group is a proposal, \
+                         not a graph; the members' graphs are the pending listing's turtle"
+                    ),
+                ));
+            }
+        }
         let mut all = annotate::list_findings(&self.archive, repo, filter)?;
         // The file grain is read BEFORE the state filter: a pending-only
         // listing still says how many declines the file carries, which is
@@ -812,6 +860,16 @@ impl Endpoint for FindingsEndpoint {
             })?;
         }
         let states = supersession.then(|| StateCounts::of(&all));
+        // The declined findings `recurrence` looks its twins up in — already
+        // loaded, before the state filter drops them.
+        let declined_records: Vec<Annotation> = match group {
+            Some(_) => all
+                .iter()
+                .filter(|f| f.state() == Some("declined"))
+                .cloned()
+                .collect(),
+            None => Vec::new(),
+        };
         let findings: Vec<Annotation> = all
             .into_iter()
             .filter(|f| state == "all" || f.state() == Some(state.as_str()))
@@ -820,6 +878,23 @@ impl Endpoint for FindingsEndpoint {
             annotate::reconcile_findings(inv, &self.archive, &self.roots, repo, findings, contents)
                 .await?;
         annotate::sort_finding_rows(&mut rows);
+        if let Some(kind) = group {
+            let groups = crate::group::groups(kind, &rows, &declined_records);
+            let counts = crate::group::counts(&rows, &declined_records);
+            return Ok(match inv.inline_str("as").unwrap_or("application/json") {
+                t if t.starts_with("text/html") => repr_utf8(
+                    "text/html",
+                    crate::group::html(repo, &rel, kind, &groups, &counts),
+                ),
+                t if t.starts_with("text/plain") => {
+                    repr_utf8("text/plain", crate::group::plain(kind, &groups, &counts))
+                }
+                _ => repr(
+                    "application/json",
+                    crate::group::json(repo, filter, kind, &groups, &counts).to_string(),
+                ),
+            });
+        }
         // The one line a PENDING listing owes its reader: how many findings
         // are not in it because they were superseded. A suppression nobody
         // can measure is how an orphan rate hid (ledger #488).
@@ -901,7 +976,7 @@ fn face_one(
     }
 }
 
-fn plain_row(finding: &Annotation, line: Option<u64>) -> String {
+pub(crate) fn plain_row(finding: &Annotation, line: Option<u64>) -> String {
     let mut out = String::new();
     if !finding.rel.is_empty() {
         out.push_str(&finding.rel);
@@ -1422,7 +1497,12 @@ pub(crate) fn findings_description() -> Description {
              [{path, pending, superseded, superseded_by}]}} — the count in each state \
              whatever state= shows, and per file what is pending against what was \
              superseded; a pending listing's html and plain faces say how many superseded \
-             findings they do not list. \
+             findings they do not list. ★ group=<kind> PROPOSES batches of pending \
+             findings for one human decision each — recurrence, near-duplicate, \
+             comment-shape or file (see the group input) — each with a suggested reason \
+             word from the finding Sink's reason one_of, never applied: nothing here \
+             decides anything, and a host fans a batch out to the finding Sink one call \
+             per member. \
              application/json (default) is the structured rows carrying BOTH ratings; \
              as=text/html the queue page with each card's decision form; as=text/plain a \
              triage digest; as=text/turtle the findings and their decision graphs.",
@@ -1464,6 +1544,13 @@ pub(crate) fn findings_description() -> Description {
                      face is the bare rows array it always was.",
                 )
                 .one_of(SUMMARIES),
+        )
+        .input(
+            ArgSpec::new("group")
+                .optional()
+                .class(XSD_STRING)
+                .summary(crate::group::group_summary())
+                .one_of(crate::group::GROUP_KINDS),
         )
         .input(
             ArgSpec::new("as")

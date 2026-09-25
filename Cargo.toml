@@ -300,7 +300,39 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # content hash is the one the drift pass already fetches, and fewer rows are
 # reconciled. gonk pins `"0.10.0"` and `^0.10.0` is `<0.11.0`, so the hub moves
 # its pin; its state nav gains the tab from the contract with no other change.
-version = "0.11.0"
+#
+# 0.12.0 — MINOR: THE MACHINE PROPOSES A GROUP, A HUMAN DECIDES IT ONCE (ledger
+# #506). The bounded queue still held ~1100 undecided findings, decided one row
+# at a time; an auto-decline was refused on principle (a decline is a HUMAN
+# judgment, and 0.9.0's mark reads every decline as a prior "no"). The findings
+# face gains `group=` — a `one_of` of four kinds in picker order, `recurrence`
+# (the mark computed backwards: pending findings on a line whose like claim was
+# already declined, one group per declined twin, the twin's word suggested),
+# `near-duplicate` (same file, current line and severity; the oldest is `kept`
+# and is not a member; `duplicate` suggested), `comment-shape` (a quote that is
+# a comment or doc line — the `restates` shape, a MIXED set to read) and `file`
+# — each group `{kind, key, label, repo, path, annotates, reason, twin, kept,
+# members}`, members in the exact row shape the json face already serves, and
+# `kinds` counting every kind per read. Groups are over PENDING only (never
+# superseded, published or declined), a suggested word is read from the
+# Sink's `reason` one_of and never applied, and there is NO batch Sink: gonk
+# fans a batch out to the finding Sink, one call per member, so a batch
+# decline is an ordinary decision node per member and the mark reads it
+# exactly like a single one. It rides the existing face rather than a sibling
+# IRI (one binding, one capability, one supersession pass), refused beside
+# any `state` but pending, beside `summary=`, and on the turtle face. ★ Why a
+# minor: a new public argument and a new json shape — additive; every call a
+# 0.11.0 caller makes is byte-identical. Also folded in, ledger #507: a STORED
+# review pass now renders minted ∪ carried, as a fresh derivation always did
+# (it rendered only its mints, short by the carried count its own statement
+# included). Measured on a copy of the live graph (63,005 triples, gonk's
+# seven roots, `examples/findings-read-probe.rs`): a grouped read costs what
+# the pending read costs (11–29 ms per root, within a millisecond of it), and
+# the levers over 1185 pending are recurrence 78 groups / 79 findings (44 of
+# them unmarked), near-duplicate 6 / 6, comment-shape 36 / 255, file 66 /
+# 1185. gonk pins `"0.11.0"` and `^0.11.0` is `<0.12.0`, so the hub moves its
+# pin before the batch view can read any of it.
+version = "0.12.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
