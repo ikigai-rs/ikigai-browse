@@ -303,6 +303,20 @@ padding:.3rem}\n\
 .browse-findings-states{display:flex;flex-wrap:wrap;gap:.4rem;margin:.5rem 0}\n\
 .browse-findings-state-current{font-weight:600;text-decoration:underline}\n\
 .browse-findings-link{font:inherit}\n\
+/* Finding groups (ledger #506): proposals a human decides once — a group is a
+   bordered section so its members read as one batch, and the twin or the kept
+   finding sits above them, set apart, because it is context, not a member. */\n\
+.browse-findings-groups-note{font-size:.85em;opacity:.7;margin:.5rem 0}\n\
+.browse-findings-group-kinds{display:flex;flex-wrap:wrap;gap:.4rem;margin:.5rem 0}\n\
+.browse-findings-group-kind{font:inherit}\n\
+.browse-findings-group-kind-current{font-weight:600;text-decoration:underline}\n\
+.browse-findings-group-count{font-size:.8em;opacity:.7}\n\
+.browse-findings-group{border:1px solid var(--browse-rule);border-radius:4px;\
+padding:.5rem .75rem;margin:.75rem 0}\n\
+.browse-findings-group-label{font-size:1em;margin:.25rem 0}\n\
+.browse-findings-group-reason{font-size:.85em;opacity:.8;margin:.25rem 0}\n\
+.browse-findings-group-twin,.browse-findings-group-kept{font-size:.9em;opacity:.85;\
+margin:.25rem 0 .5rem 0}\n\
 \
 .browse-annotate{display:grid;gap:.4rem;max-width:32rem;margin:1rem 0}\n\
 .browse-annotate input,.browse-annotate textarea{font:inherit;padding:.3rem}\n\
@@ -421,6 +435,8 @@ mod tests {
         "browse-finding-severity-unrated",
         // `finding.rs`: the current state button in the queue's state nav.
         "browse-findings-state-current",
+        // `group.rs`: the current kind button in the group view's kind nav.
+        "browse-findings-group-kind-current",
         // `lib.rs` / `annotate.rs`: `proposals=` — the line wrapper's class,
         // and `browse-proposal-marker-{severity}`, `browse-proposal-{severity}`,
         // `browse-proposal-severity-{severity}`, one per `finding::SEVERITIES`
@@ -530,6 +546,7 @@ mod tests {
             include_str!("review.rs"),
             include_str!("pr.rs"),
             include_str!("finding.rs"),
+            include_str!("group.rs"),
         ];
         let mut emitted: BTreeSet<&str> = DYNAMIC_CLASSES.iter().copied().collect();
         for source in sources {

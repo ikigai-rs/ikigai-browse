@@ -151,6 +151,9 @@ mod annotate;
 mod archive;
 mod explain;
 mod finding;
+/// Finding GROUPS — `group=` on the findings face: the machine proposes a set
+/// of pending findings, a human decides it once. Proposals only; no Sink.
+mod group;
 mod hash;
 /// The layout stylesheet for the `browse-*` classes the HTML faces emit —
 /// `urn:repo:style:layout`, the sibling of `urn:repo:style`. See the module

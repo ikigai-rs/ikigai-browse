@@ -587,7 +587,7 @@ impl Annotation {
     }
 
     /// Where this annotation lives, for display: the file path, or `pr#{n}`.
-    fn place(&self) -> String {
+    pub(crate) fn place(&self) -> String {
         match self.target_ref() {
             TargetRef::Pr(n) => format!("pr#{n}"),
             TargetRef::File(rel) => rel.to_string(),
