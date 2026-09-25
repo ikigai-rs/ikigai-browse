@@ -71,7 +71,13 @@
 //!
 //! Declining KEEPS the finding, with the human's reason if they gave one: a
 //! re-run then knows a person looked and said no, which is the beginning of a
-//! feedback signal rather than churn. And a decision that would CHANGE a
+//! feedback signal rather than churn. The reason has two halves, both
+//! optional and kept apart: `reason=` is ONE WORD from [`DECLINE_REASONS`],
+//! stored on the decision node as a term (`dcterms:subject
+//! <urn:iki:decline-reason:restates>` — an interim predicate, see
+//! [`crate::annotate::DCTERMS_SUBJECT`]) so it can be counted; the piped
+//! `content` is the free-text note (`dcterms:description`). A word is refused
+//! beside `decision=publish` — a publish reason has no consumer. And a decision that would CHANGE a
 //! recorded one is REFUSED, naming what is on file — silently overwriting the
 //! record is the same failure as overwriting the proposal, one level up. (An
 //! identical repeat is a no-op, so a double-clicked button is not an error.) Undoing a publication is `Delete urn:iki:annotation:{id}`, which
@@ -177,6 +183,57 @@ pub(crate) fn is_severity(word: &str) -> bool {
     SEVERITIES.contains(&word)
 }
 
+/// **Why a human declined** — the closed list, one word each, in the order a
+/// picker shows them. It is the `one_of` on the decision Sink's `reason`, and
+/// the ONLY place the words are spelled: gonk's decide form reads them from
+/// the Meta face, as it reads [`SEVERITIES`], because a word set written down
+/// in the host is the one place the words could drift.
+///
+/// ★ The set came from the 2026-09-21/22 hand triage, not from a taxonomy:
+/// each word names a shape that recurred in the 96 declines read that night
+/// (`restates` alone was 60 of them). What each MEANS is
+/// [`DECLINE_REASON_MEANINGS`], the text the ArgSpec summary carries.
+///
+/// ⚠ Stored as a TERM, `urn:iki:decline-reason:{word}`, never as text — so
+/// "how many of this file's declines were `restates`?" is a count over IRIs,
+/// and a word outside the set reads back as no reason rather than as an
+/// invented one.
+pub(crate) const DECLINE_REASONS: [&str; 5] =
+    ["misread", "restates", "no-issue", "wont-fix", "duplicate"];
+
+/// What each of [`DECLINE_REASONS`] MEANS, in the same order. The Sink's
+/// `reason` summary is built from this, so a manifold reader sees the
+/// definitions a human chose against.
+pub(crate) const DECLINE_REASON_MEANINGS: [&str; 5] = [
+    "the claim is false — the model misunderstood the code or the domain",
+    "the text already says it — a comment or doc that DISCLOSES a hazard, restated as a finding",
+    "true, but not a defect — style, \"could be clearer\", or an absence asserted as a finding",
+    "real, and deliberately left as it is",
+    "already raised — a twin exists",
+];
+
+/// Whether `word` is one of [`DECLINE_REASONS`] — the one place the set is
+/// checked, by the Sink and by the loader alike.
+pub(crate) fn is_decline_reason(word: &str) -> bool {
+    DECLINE_REASONS.contains(&word)
+}
+
+/// The Sink's `reason` summary: when it applies, then every word with its
+/// meaning, in contract order.
+fn decline_reason_summary() -> String {
+    let words: Vec<String> = DECLINE_REASONS
+        .iter()
+        .zip(DECLINE_REASON_MEANINGS)
+        .map(|(word, meaning)| format!("{word}: {meaning}"))
+        .collect();
+    format!(
+        "why a human declined, in one word — only with decision=decline (refused with \
+         publish). Omitted = no reason stated. Stored as the term \
+         urn:iki:decline-reason:{{word}}, separate from the free-text content. {}.",
+        words.join("; ")
+    )
+}
+
 /// Severity words as prose for the prompt — `join_words(&["minor", "info"],
 /// "or")` reads `minor or info`. The prompt hands the model the SAME words the
 /// contract declares rather than a retyped list.
@@ -268,6 +325,12 @@ pub(crate) fn decision_html(
             "<p class=\"browse-finding-decision\">{} by a human",
             esc(decision.outcome.label())
         );
+        if let Some(reason) = &decision.reason {
+            out.push_str(&format!(
+                " <span class=\"browse-finding-decline-reason\">({})</span>",
+                esc(reason)
+            ));
+        }
         if let Some(at) = &decision.at {
             out.push_str(&format!(" · {}", esc(at)));
         }
@@ -298,11 +361,24 @@ pub(crate) fn decision_html(
             "<option value=\"{severity}\"{selected}>{severity}</option>"
         ));
     }
+    // The reason picker: every word of [`DECLINE_REASONS`], its meaning as the
+    // option's title, behind an EMPTY default — which the Sink reads as
+    // "omitted", so the publish button sharing this form is never refused
+    // for it and a decline without a word stays one click.
+    let mut reasons = String::from("<option value=\"\" selected>—</option>");
+    for (word, meaning) in DECLINE_REASONS.iter().zip(DECLINE_REASON_MEANINGS) {
+        reasons.push_str(&format!(
+            "<option value=\"{word}\" title=\"{}\">{word}</option>",
+            esc(meaning)
+        ));
+    }
     format!(
         "<form class=\"browse-finding-decide\" hx-post=\"/k/sink {iri}\" hx-target=\"#browse\" \
          hx-swap=\"innerHTML\">\
          <label class=\"browse-finding-label\">severity \
          <select name=\"severity\">{options}</select></label>\
+         <label class=\"browse-finding-label\">reason (decline only) \
+         <select name=\"reason\">{reasons}</select></label>\
          <textarea name=\"content\" placeholder=\"why (optional; kept either way)\"></textarea>\
          <button type=\"submit\" name=\"decision\" value=\"{PUBLISH}\">publish</button>\
          <button type=\"submit\" name=\"decision\" value=\"{DECLINE}\">decline</button>\
@@ -471,25 +547,71 @@ impl FindingEndpoint {
                     ),
                 })?,
         };
+        // Why a decline, in one contract word. An EMPTY value is "omitted",
+        // exactly as for `severity`: a form's unselected picker submits one,
+        // and a publish button sharing that form must not be refused for it.
+        // ⚠ A real word beside a publish IS refused, by name — a publish
+        // reason has no consumer, and an argument accepted and then ignored
+        // is the failure that is invisible from the caller's side.
+        let reason = match inv.inline_str("reason").ok().map(str::trim) {
+            Some(word) if !word.is_empty() => {
+                if outcome != Outcome::Declined {
+                    return Err(Error::InvalidArgument {
+                        name: "reason".to_string(),
+                        detail: format!(
+                            "`reason={word}` says why a finding was declined, and this \
+                             decision is {PUBLISH} — drop `reason`, or use decision={DECLINE}"
+                        ),
+                    });
+                }
+                if !is_decline_reason(word) {
+                    return Err(Error::InvalidArgument {
+                        name: "reason".to_string(),
+                        detail: format!(
+                            "`{word}` is not a decline reason — one of: {}",
+                            DECLINE_REASONS.join(", ")
+                        ),
+                    });
+                }
+                Some(word.to_string())
+            }
+            _ => None,
+        };
         // ★ A decision is the RECORD, and a record is not overwritten. A
         // repeat of the SAME answer is accepted as a no-op (a double-clicked
         // button must not be an error, and promotion is idempotent anyway);
-        // anything that would CHANGE the recorded outcome or rating is
-        // refused, naming what is on file. ⚠ The identical repeat keeps the
-        // FIRST decision entirely, reason included.
+        // anything that would CHANGE the recorded outcome, rating or reason is
+        // refused, naming what is on file. A repeat that states no reason does
+        // not contradict one on file; a repeat that states a DIFFERENT one
+        // (including a reason where none was recorded) does. ⚠ The identical
+        // repeat keeps the FIRST decision entirely, note included.
         if let Some(existing) = &finding.decision {
-            if existing.outcome == outcome && existing.severity == severity {
+            let same_reason = reason.is_none() || reason == existing.reason;
+            let same_answer = existing.outcome == outcome && existing.severity == severity;
+            if same_answer && same_reason {
                 return ack(inv, &finding);
             }
+            // Name the argument that differs: a repeat that changes only the
+            // reason is refused for its `reason`, not for its `decision`.
+            let name = match same_answer {
+                true => "reason",
+                false => "decision",
+            };
             return Err(Error::InvalidArgument {
-                name: "decision".to_string(),
+                name: name.to_string(),
                 detail: format!(
-                    "`{}` was already {} as `{}` by a human{} — a decision is the record and \
+                    "`{}` was already {} as `{}`{} by a human{} — a decision is the record and \
                      is not overwritten. Undo a publication by deleting the annotation it \
                      minted{}.",
                     finding_iri(&id),
                     existing.outcome.label(),
                     existing.severity,
+                    match &existing.reason {
+                        Some(word) => format!(" ({word})"),
+                        None if existing.outcome == Outcome::Declined =>
+                            " (no reason stated)".to_string(),
+                        None => String::new(),
+                    },
                     existing
                         .at
                         .as_deref()
@@ -522,6 +644,7 @@ impl FindingEndpoint {
             severity,
             at,
             note,
+            reason,
             minted,
         });
         annotate::rewrite_annotation(&self.archive, &finding)?;
@@ -715,6 +838,9 @@ fn plain_row(finding: &Annotation, line: Option<u64>) -> String {
     ));
     if let Some(decision) = &finding.decision {
         out.push_str(&format!(" -> {}", decision.severity));
+        if let Some(reason) = &decision.reason {
+            out.push_str(&format!(" ({reason})"));
+        }
     }
     if finding.orphaned {
         out.push_str(" [orphaned]");
@@ -755,6 +881,12 @@ fn plain(rows: &[(Annotation, Option<u64>)], declined: &DeclinedSummary) -> Stri
 struct DeclinedSummary {
     /// Declined findings on the file, in total.
     count: usize,
+    /// How many of them carry each of [`DECLINE_REASONS`], in contract order,
+    /// and last how many state none. ★ This is the number ledger #483 wants:
+    /// "this file's declines are mostly `restates`" is the disclosure shape,
+    /// measured rather than remembered.
+    by_reason: [usize; DECLINE_REASONS.len()],
+    unstated: usize,
     /// Per distinct quote, in triage order of first appearance: the quote,
     /// how many declines it carries, the latest decision date among them, and
     /// the declined findings' IRIs.
@@ -772,6 +904,8 @@ impl DeclinedSummary {
     fn of(findings: &[Annotation]) -> Self {
         let mut quotes: Vec<DeclinedQuote> = Vec::new();
         let mut count = 0;
+        let mut by_reason = [0; DECLINE_REASONS.len()];
+        let mut unstated = 0;
         for finding in findings {
             let Some(decision) = &finding.decision else {
                 continue;
@@ -780,6 +914,14 @@ impl DeclinedSummary {
                 continue;
             }
             count += 1;
+            match decision
+                .reason
+                .as_deref()
+                .and_then(|word| DECLINE_REASONS.iter().position(|w| *w == word))
+            {
+                Some(i) => by_reason[i] += 1,
+                None => unstated += 1,
+            }
             match quotes.iter_mut().find(|q| q.exact == finding.exact) {
                 Some(quote) => {
                     quote.count += 1;
@@ -801,12 +943,46 @@ impl DeclinedSummary {
         for quote in &mut quotes {
             quote.findings.sort();
         }
-        DeclinedSummary { count, quotes }
+        DeclinedSummary {
+            count,
+            by_reason,
+            unstated,
+            quotes,
+        }
+    }
+
+    /// The per-reason counts as a fixed-shape list: every word of
+    /// [`DECLINE_REASONS`] in contract order, zeros included, then `null` for
+    /// the declines that state none — so a consumer renders it without
+    /// knowing the words, and no word can collide with "unstated".
+    fn reasons_json(&self) -> serde_json::Value {
+        let mut out: Vec<serde_json::Value> = DECLINE_REASONS
+            .iter()
+            .zip(self.by_reason)
+            .map(|(word, count)| serde_json::json!({"reason": word, "count": count}))
+            .collect();
+        out.push(serde_json::json!({"reason": null, "count": self.unstated}));
+        serde_json::Value::Array(out)
+    }
+
+    /// The non-zero reasons in words — `restates 3, misread 1, no reason 2`.
+    fn reasons_words(&self) -> String {
+        let mut parts: Vec<String> = DECLINE_REASONS
+            .iter()
+            .zip(self.by_reason)
+            .filter(|(_, n)| *n > 0)
+            .map(|(word, n)| format!("{word} {n}"))
+            .collect();
+        if self.unstated > 0 {
+            parts.push(format!("no reason {}", self.unstated));
+        }
+        parts.join(", ")
     }
 
     fn json(&self) -> serde_json::Value {
         serde_json::json!({
             "count": self.count,
+            "reasons": self.reasons_json(),
             "quotes": self.quotes.iter().map(|q| serde_json::json!({
                 "exact": q.exact,
                 "count": q.count,
@@ -822,10 +998,11 @@ impl DeclinedSummary {
         match self.count {
             0 => None,
             n => Some(format!(
-                "{n} declined finding{} on this file, on {} distinct quote{}",
+                "{n} declined finding{} on this file, on {} distinct quote{} ({})",
                 if n == 1 { "" } else { "s" },
                 self.quotes.len(),
                 if self.quotes.len() == 1 { "" } else { "s" },
+                self.reasons_words(),
             )),
         }
     }
@@ -928,8 +1105,10 @@ fn finding_description() -> Description {
              store, NOT an oa:Annotation. A review pass mints findings and nothing else; \
              Sink with decision=publish is the ONLY path into the urn:iki:annotation: \
              family, and it needs urn:cap:annotate. decision=decline keeps the finding as \
-             a record that a human looked and said no (with the piped reason, if given) — \
-             it is never discarded, and a decision is not overwritten by a second one. The \
+             a record that a human looked and said no (with reason= — one contract word: \
+             misread, restates, no-issue, wont-fix or duplicate — and the piped note, both \
+             optional) — it is never discarded, and a decision is not overwritten by a \
+             second one. The \
              finding carries the MODEL'S proposed sh:resultSeverity; the decision node \
              carries the human's final one, so both survive and calibration stays a query. \
              Reads run the annotation layer's drift pass (ik:reanchored / ik:orphaned). \
@@ -1002,6 +1181,13 @@ fn finding_description() -> Description {
                         .one_of(SEVERITIES),
                 )
                 .input(
+                    ArgSpec::new("reason")
+                        .class(XSD_STRING)
+                        .optional()
+                        .summary(decline_reason_summary())
+                        .one_of(DECLINE_REASONS),
+                )
+                .input(
                     ArgSpec::new("content")
                         .class(XSD_STRING)
                         .optional()
@@ -1039,11 +1225,13 @@ fn findings_description() -> Description {
              so a finding whose file moved is re-anchored (ik:reanchored) and one whose \
              quote is gone is flagged (ik:orphaned) rather than dropped. ★ A finding \
              minted where a like claim was already DECLINED on the same file carries that \
-             decision on its row (prior_decision: the declined finding, its date and \
-             reason), so the second decision is one click; summary=declined widens the \
-             json face to {repo, path, state, rows, declined: {count, quotes: [{exact, \
-             count, latest_decided_at, findings}]}} — how many declines the file carries, \
-             by the quote they declined — and the html and plain faces of a file's \
+             decision on its row (prior_decision: the declined finding, its date, its \
+             reason word and its note), so the second decision is one click; \
+             summary=declined widens the json face to {repo, path, state, rows, declined: \
+             {count, reasons: [{reason, count}], quotes: [{exact, count, latest_decided_at, \
+             findings}]}} — how many declines the file carries, by reason word (every word \
+             in contract order, then reason null for none stated) and by the quote they \
+             declined — and the html and plain faces of a file's \
              listing say the same in words. \
              application/json (default) is the structured rows carrying BOTH ratings; \
              as=text/html the queue page with each card's decision form; as=text/plain a \
@@ -1074,7 +1262,8 @@ fn findings_description() -> Description {
                 .summary(
                     "declined: the json face becomes {repo, path, state, rows, declined} — \
                      the rows as before plus the file-grain count of DECLINED findings by \
-                     the quote they declined, whatever state= shows. Without it the json \
+                     reason word and by the quote they declined, whatever state= shows. \
+                     Without it the json \
                      face is the bare rows array it always was.",
                 )
                 .one_of(["declined"]),
@@ -1688,6 +1877,386 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("not a summary"), "{err}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The finding named by its quote — the fixture's two lines are distinct.
+    fn finding_on(k: &Kernel, findings: &[String], exact: &str) -> String {
+        findings
+            .iter()
+            .find(|iri| of(k, iri)["exact"] == exact)
+            .unwrap_or_else(|| panic!("no finding on {exact}"))
+            .clone()
+    }
+
+    /// ★ The reason words are the CONTRACT's, read exactly the way gonk reads
+    /// its menus: `Kernel::describe` on a finding IRI, the Sink action's
+    /// `reason` input, its `one_of` — the five, in the picker's order. The
+    /// meanings travel in the summary, and browse's own form renders from the
+    /// same constant behind an empty "omitted" default.
+    #[test]
+    fn the_decline_reasons_are_declared_in_order() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        let description = k
+            .describe(&Iri::parse("urn:iki:finding:x".to_string()).unwrap())
+            .expect("a finding describes itself");
+        let sink = description
+            .action_specs()
+            .into_iter()
+            .find(|s| s.verb == Verb::Sink)
+            .expect("the Sink action");
+        let reason = sink
+            .inputs
+            .iter()
+            .find(|i| i.name == "reason")
+            .expect("reason is declared");
+        assert_eq!(
+            reason.one_of,
+            ["misread", "restates", "no-issue", "wont-fix", "duplicate"]
+        );
+        assert!(!reason.required, "omitted stays valid");
+        let summary = &reason.summary;
+        for (word, meaning) in DECLINE_REASONS.iter().zip(DECLINE_REASON_MEANINGS) {
+            assert!(summary.contains(&format!("{word}: {meaning}")), "{summary}");
+        }
+        // The Source action takes no reason: it is an answer, not a filter.
+        let source = description
+            .action_specs()
+            .into_iter()
+            .find(|s| s.verb == Verb::Source)
+            .unwrap();
+        assert!(source.inputs.iter().all(|i| i.name != "reason"));
+
+        let form = decision_html("x", Some("major"), None);
+        assert!(
+            form.contains("<select name=\"reason\"><option value=\"\" selected>"),
+            "{form}"
+        );
+        let mut at = 0;
+        for word in DECLINE_REASONS {
+            let here = form
+                .find(&format!("<option value=\"{word}\""))
+                .unwrap_or_else(|| panic!("{word} missing: {form}"));
+            assert!(here > at, "{word} out of order: {form}");
+            at = here;
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★★ Every word round-trips — stored as a TERM on the decision node, read
+    /// back on every face: the json `decision.reason`, the turtle
+    /// `dcterms:subject <urn:iki:decline-reason:{word}>`, the plain row and the
+    /// html card, in words.
+    #[test]
+    fn every_decline_reason_round_trips_on_every_face() {
+        for word in DECLINE_REASONS {
+            let root = demo_root();
+            let store = Arc::new(Store::new().unwrap());
+            let k = kernel(&root, &store);
+            let findings = pass(&k);
+            let alpha = finding_on(&k, &findings, "fn alpha() {}");
+            issue(
+                &k,
+                Verb::Sink,
+                &alpha,
+                &[
+                    ("decision", "decline"),
+                    ("reason", word),
+                    ("content", "a free-text note, kept apart"),
+                ],
+            )
+            .unwrap();
+
+            let row = of(&k, &alpha);
+            assert_eq!(row["decision"]["reason"], word, "{row}");
+            assert_eq!(row["decision"]["note"], "a free-text note, kept apart");
+            assert_eq!(row["decision"]["outcome"], "declined");
+
+            // In the store as an IRI object, not a literal.
+            let subject = oxigraph::model::NamedNode::new(format!("{alpha}:decision")).unwrap();
+            let predicate =
+                oxigraph::model::NamedNode::new(crate::annotate::DCTERMS_SUBJECT).unwrap();
+            let objects: Vec<String> = store
+                .quads_for_pattern(
+                    Some(subject.as_ref().into()),
+                    Some(predicate.as_ref()),
+                    None,
+                    None,
+                )
+                .map(|q| q.unwrap().object.to_string())
+                .collect();
+            assert_eq!(objects, [format!("<urn:iki:decline-reason:{word}>")]);
+
+            let ttl = body(&issue(&k, Verb::Source, &alpha, &[("as", "text/turtle")]).unwrap());
+            assert!(
+                ttl.contains(&format!("dcterms:subject <urn:iki:decline-reason:{word}>")),
+                "{ttl}"
+            );
+            assert!(ttl.contains("dcterms:type <urn:iki:finding:outcome:declined>"));
+            let plain = body(&issue(&k, Verb::Source, &alpha, &[("as", "text/plain")]).unwrap());
+            assert!(plain.contains(&format!("-> major ({word})")), "{plain}");
+            let html = body(&issue(&k, Verb::Source, &alpha, &[("as", "text/html")]).unwrap());
+            assert!(
+                html.contains(&format!(
+                    "declined by a human <span class=\"browse-finding-decline-reason\">\
+                     ({word})</span>"
+                )),
+                "{html}"
+            );
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// Fail loud: a word beside a publish is refused BY NAME (a publish reason
+    /// has no consumer, and an accepted-then-ignored argument is invisible), a
+    /// word outside the set is refused naming the set — and neither writes
+    /// anything. An EMPTY value is omitted, so the publish button sharing a
+    /// form with an unselected picker still publishes.
+    #[test]
+    fn a_reason_is_refused_beside_a_publish_and_outside_the_set() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        let findings = pass(&k);
+        let alpha = finding_on(&k, &findings, "fn alpha() {}");
+
+        let err = issue(
+            &k,
+            Verb::Sink,
+            &alpha,
+            &[("decision", "publish"), ("reason", "restates")],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidArgument { name, .. } if name == "reason"),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("decision=decline"), "{err}");
+
+        let err = issue(
+            &k,
+            Verb::Sink,
+            &alpha,
+            &[("decision", "decline"), ("reason", "bogus")],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidArgument { name, .. } if name == "reason"),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("one of: misread, restates, no-issue, wont-fix, duplicate"),
+            "{err}"
+        );
+        assert_eq!(of(&k, &alpha)["state"], "pending", "nothing was recorded");
+
+        issue(
+            &k,
+            Verb::Sink,
+            &alpha,
+            &[("decision", "publish"), ("reason", " ")],
+        )
+        .expect("an empty reason is omitted, not refused");
+        let row = of(&k, &alpha);
+        assert_eq!(row["state"], "published");
+        assert_eq!(row["decision"]["reason"], serde_json::Value::Null);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Omitted is today's behaviour and stays valid: the decision reads back
+    /// `reason: null` and writes no reason triple. And the record rule covers
+    /// the reason: a repeat stating none, or the same word, is the no-op a
+    /// double click needs; a repeat stating a DIFFERENT word — including one
+    /// where none was recorded — is refused, by `reason`, naming what is on
+    /// file.
+    #[test]
+    fn a_decline_without_a_reason_reads_back_null_and_a_reason_is_not_rewritten() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        let findings = pass(&k);
+        let alpha = finding_on(&k, &findings, "fn alpha() {}");
+        let beta = finding_on(&k, &findings, "fn beta() {}");
+
+        issue(&k, Verb::Sink, &alpha, &[("decision", "decline")]).unwrap();
+        let row = of(&k, &alpha);
+        assert_eq!(row["decision"]["reason"], serde_json::Value::Null, "{row}");
+        assert!(
+            row["decision"].get("reason").is_some(),
+            "the key is present"
+        );
+        let ttl = body(&issue(&k, Verb::Source, &alpha, &[("as", "text/turtle")]).unwrap());
+        assert!(!ttl.contains("dcterms:subject"), "{ttl}");
+        let err = issue(
+            &k,
+            Verb::Sink,
+            &alpha,
+            &[("decision", "decline"), ("reason", "misread")],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidArgument { name, .. } if name == "reason"),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("(no reason stated)"), "{err}");
+
+        issue(
+            &k,
+            Verb::Sink,
+            &beta,
+            &[
+                ("decision", "decline"),
+                ("severity", "info"),
+                ("reason", "no-issue"),
+            ],
+        )
+        .unwrap();
+        for repeat in [
+            &[("decision", "decline"), ("severity", "info")][..],
+            &[
+                ("decision", "decline"),
+                ("severity", "info"),
+                ("reason", "no-issue"),
+            ][..],
+        ] {
+            issue(&k, Verb::Sink, &beta, repeat).expect("an identical repeat is a no-op");
+        }
+        let err = issue(
+            &k,
+            Verb::Sink,
+            &beta,
+            &[
+                ("decision", "decline"),
+                ("severity", "info"),
+                ("reason", "duplicate"),
+            ],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("as `info` (no-issue)"), "{err}");
+        assert_eq!(of(&k, &beta)["decision"]["reason"], "no-issue");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★ Load-back is EXACT, the way the severity loader is: a decision node
+    /// whose reason term is not a word of the set — a word a later release
+    /// adds, a typo in a hand-written triple, an IRI from somewhere else —
+    /// reads back as `reason: null`, never mapped onto a real word, and the
+    /// rest of the decision is untouched.
+    #[test]
+    fn an_unknown_reason_term_reads_back_as_no_reason() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        let findings = pass(&k);
+        let alpha = finding_on(&k, &findings, "fn alpha() {}");
+        let beta = finding_on(&k, &findings, "fn beta() {}");
+        issue(
+            &k,
+            Verb::Sink,
+            &alpha,
+            &[("decision", "decline"), ("content", "hand-edited later")],
+        )
+        .unwrap();
+        issue(
+            &k,
+            Verb::Sink,
+            &beta,
+            &[("decision", "decline"), ("severity", "minor")],
+        )
+        .unwrap();
+        let predicate = oxigraph::model::NamedNode::new(crate::annotate::DCTERMS_SUBJECT).unwrap();
+        for (finding, object) in [
+            (&alpha, "urn:iki:decline-reason:restatez"),
+            (&beta, "urn:example:restates"),
+        ] {
+            store
+                .insert(&oxigraph::model::Quad::new(
+                    oxigraph::model::NamedNode::new(format!("{finding}:decision")).unwrap(),
+                    predicate.clone(),
+                    oxigraph::model::NamedNode::new(object).unwrap(),
+                    oxigraph::model::GraphName::DefaultGraph,
+                ))
+                .unwrap();
+            let row = of(&k, finding);
+            assert_eq!(row["decision"]["reason"], serde_json::Value::Null, "{row}");
+            assert_eq!(row["decision"]["outcome"], "declined", "{row}");
+        }
+        assert_eq!(of(&k, &alpha)["decision"]["note"], "hand-edited later");
+        let wide = json(
+            &k,
+            "urn:repo:demo:findings:a.rs",
+            &[("summary", "declined")],
+        );
+        assert_eq!(
+            wide["declined"]["reasons"][5],
+            serde_json::json!({"reason": null, "count": 2}),
+            "{wide}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The file grain counts declines BY REASON (the number ledger #483
+    /// wants): every word in contract order with zeros, then `null` for the
+    /// declines that state none — and the plain and html faces say the
+    /// non-zero ones in words.
+    #[test]
+    fn the_file_listing_counts_its_declines_by_reason() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        let findings = pass(&k);
+        let alpha = finding_on(&k, &findings, "fn alpha() {}");
+        let beta = finding_on(&k, &findings, "fn beta() {}");
+        issue(
+            &k,
+            Verb::Sink,
+            &alpha,
+            &[("decision", "decline"), ("reason", "restates")],
+        )
+        .unwrap();
+        issue(
+            &k,
+            Verb::Sink,
+            &beta,
+            &[("decision", "decline"), ("severity", "info")],
+        )
+        .unwrap();
+
+        let wide = json(
+            &k,
+            "urn:repo:demo:findings:a.rs",
+            &[("summary", "declined")],
+        );
+        assert_eq!(wide["declined"]["count"], 2);
+        assert_eq!(
+            wide["declined"]["reasons"],
+            serde_json::json!([
+                {"reason": "misread", "count": 0},
+                {"reason": "restates", "count": 1},
+                {"reason": "no-issue", "count": 0},
+                {"reason": "wont-fix", "count": 0},
+                {"reason": "duplicate", "count": 0},
+                {"reason": null, "count": 1},
+            ]),
+            "{wide}"
+        );
+        let words =
+            "2 declined findings on this file, on 2 distinct quotes (restates 1, no reason 1)";
+        for face in ["text/plain", "text/html"] {
+            let out = body(
+                &issue(
+                    &k,
+                    Verb::Source,
+                    "urn:repo:demo:findings:a.rs",
+                    &[("as", face)],
+                )
+                .unwrap(),
+            );
+            assert!(out.contains(words), "{out}");
+        }
         std::fs::remove_dir_all(&root).ok();
     }
 

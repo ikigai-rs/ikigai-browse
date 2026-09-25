@@ -281,6 +281,7 @@ color:var(--browse-flag)}\n\
 .browse-finding-decision,.browse-finding-reason{font-size:.85em;opacity:.75;\
 margin:.25rem 0}\n\
 .browse-finding-minted{color:inherit}\n\
+.browse-finding-decline-reason{font-weight:600}\n\
 .browse-finding-prior{font-size:.85em;opacity:.85;margin:.25rem 0;\
 border-left:3px solid var(--browse-flag);padding-left:.5rem}\n\
 .browse-finding-prior-link{color:inherit}\n\

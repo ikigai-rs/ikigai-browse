@@ -3745,7 +3745,11 @@ mod tests {
             &k,
             Verb::Sink,
             &five,
-            &[("decision", "decline"), ("content", "not a defect")],
+            &[
+                ("decision", "decline"),
+                ("reason", "no-issue"),
+                ("content", "not a defect"),
+            ],
             &cap(),
         )
         .unwrap();
@@ -3801,6 +3805,9 @@ mod tests {
         assert_eq!(prior["outcome"], "declined");
         assert_eq!(prior["severity"], "minor");
         assert_eq!(prior["note"], "not a defect");
+        // The twin's reason WORD rides the mark too (0.10.0): the recurrence
+        // arrives saying why it was declined, not only when.
+        assert_eq!(prior["reason"], "no-issue", "{marked}");
         // The date is the twin's decision date, carried as recorded (this
         // kernel has no clock, so both are null — and equal).
         assert_eq!(
@@ -3865,6 +3872,10 @@ mod tests {
         );
         assert!(html.contains(": not a defect"), "{html}");
         assert!(
+            html.contains("a like claim on this line was declined (no-issue)"),
+            "{html}"
+        );
+        assert!(
             html.contains(&format!("hx-get=\"/k/source {five} as=text/html\"")),
             "{html}"
         );
@@ -3883,7 +3894,9 @@ mod tests {
             "{plain}"
         );
         assert!(
-            plain.contains("2 declined findings on this file, on 2 distinct quotes"),
+            plain.contains(
+                "2 declined findings on this file, on 2 distinct quotes (no-issue 1, no reason 1)"
+            ),
             "{plain}"
         );
 

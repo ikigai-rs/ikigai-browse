@@ -145,6 +145,20 @@ pub(crate) const DCTERMS_DESCRIPTION: &str = "http://purl.org/dc/terms/descripti
 /// `dcterms:type` — the decision node's outcome, one of
 /// [`Outcome::iri`]'s two values.
 pub(crate) const DCTERMS_TYPE: &str = "http://purl.org/dc/terms/type";
+/// `dcterms:subject` — the decision node's DECLINE REASON, one of
+/// [`decline_reason_iri`]'s values. An INTERIM predicate.
+///
+/// ★ Chosen because DCMI defines a subject as, typically, a *classification
+/// code* drawn from a *controlled vocabulary* — which is exactly what a closed
+/// set of five reason words is — and because it declares no domain and no
+/// range, so writing it types nothing. ⚠ Not `dcterms:type`: the decision node
+/// already uses that for its OUTCOME and the loader reads it as the
+/// discriminator between a decision and not-a-decision. Not `skos:note`: the
+/// free-text reason is `dcterms:description` on the same node, and two
+/// "note"s side by side would read as one. A dedicated `ik:declineReason` is
+/// the right end state and is REPORTED, not invented here (the vocabulary
+/// lives in core; ledger #457's batch).
+pub(crate) const DCTERMS_SUBJECT: &str = "http://purl.org/dc/terms/subject";
 
 /// `sh:resultSeverity` — the severity of an assessment result.
 ///
@@ -341,6 +355,12 @@ pub(crate) struct Decision {
     /// ★ A declined finding with a reason is the beginning of a feedback
     /// signal; a discarded one is churn.
     pub(crate) note: Option<String>,
+    /// WHY a decline, in one of [`crate::finding::DECLINE_REASONS`] — `None`
+    /// when the human stated none, on every publish, and when the stored term
+    /// is not a word of the set (a future word, a hand-written typo): the
+    /// loader never invents one. Stored as [`decline_reason_iri`] under
+    /// [`DCTERMS_SUBJECT`].
+    pub(crate) reason: Option<String>,
     /// The annotation minted on publish — `None` for a decline, which is
     /// exactly what makes a decline a RECORD rather than a deletion.
     pub(crate) minted: Option<String>,
@@ -391,6 +411,9 @@ impl Prior {
     pub(crate) fn words(&self) -> String {
         let mut out = String::from("a like claim on this line was declined");
         if let Some(decision) = &self.decision {
+            if let Some(reason) = &decision.reason {
+                out.push_str(&format!(" ({reason})"));
+            }
             if let Some(at) = &decision.at {
                 out.push(' ');
                 out.push_str(at.get(..10).unwrap_or(at));
@@ -785,6 +808,14 @@ pub(crate) fn store_annotation(archive: &Archive, ann: &Annotation) -> Result<()
                 g.clone(),
             ));
         }
+        if let Some(reason) = &decision.reason {
+            quads.push(Quad::new(
+                node.clone(),
+                NamedNode::new(DCTERMS_SUBJECT).map_err(store_err)?,
+                NamedNode::new(decline_reason_iri(reason)).map_err(store_err)?,
+                g.clone(),
+            ));
+        }
         if let Some(minted) = &decision.minted {
             quads.push(Quad::new(
                 node,
@@ -806,6 +837,14 @@ pub(crate) fn store_annotation(archive: &Archive, ann: &Annotation) -> Result<()
 pub(crate) fn severity_iri(name: &str) -> String {
     format!("urn:iki:severity:{name}")
 }
+
+/// The IRI of a decline reason — `urn:iki:decline-reason:{word}`, read
+/// alike with [`severity_iri`]. Data, like a severity, not a vocabulary term.
+pub(crate) fn decline_reason_iri(word: &str) -> String {
+    format!("{DECLINE_REASON_PREFIX}{word}")
+}
+
+const DECLINE_REASON_PREFIX: &str = "urn:iki:decline-reason:";
 
 /// Remove every quad under the record's subjects — the record, both
 /// selectors, and (finding family) its decision node.
@@ -1006,6 +1045,7 @@ fn load_decision(archive: &Archive, id: &str) -> Result<Option<Decision>> {
     let mut severity = None;
     let mut at = None;
     let mut note = None;
+    let mut reason = None;
     let mut minted = None;
     for quad in archive.quads_for_pattern(Some(subject.as_ref().into()), None, None) {
         let quad = quad.map_err(store_err)?;
@@ -1029,6 +1069,18 @@ fn load_decision(archive: &Archive, id: &str) -> Result<Option<Decision>> {
             }
             DCTERMS_CREATED => at = Some(value),
             DCTERMS_DESCRIPTION => note = Some(value),
+            // ⚠ Exact, like the severity: a term outside the contract's set
+            // (a word a later release adds, a typo in a hand-written triple)
+            // reads back as NO reason — never mapped onto a real word.
+            DCTERMS_SUBJECT => {
+                if let Term::NamedNode(node) = &quad.object {
+                    reason = node
+                        .as_str()
+                        .strip_prefix(DECLINE_REASON_PREFIX)
+                        .filter(|word| crate::finding::is_decline_reason(word))
+                        .map(str::to_string);
+                }
+            }
             PROV_GENERATED => {
                 if let Term::NamedNode(node) = &quad.object {
                     minted = Some(node.as_str().to_string());
@@ -1046,6 +1098,7 @@ fn load_decision(archive: &Archive, id: &str) -> Result<Option<Decision>> {
         severity: severity.unwrap_or_else(|| "info".to_string()),
         at,
         note,
+        reason,
         minted,
     }))
 }
@@ -2290,6 +2343,7 @@ pub(crate) fn annotation_json(ann: &Annotation, line: Option<u64>) -> serde_json
             "severity": d.severity,
             "decided_at": d.at,
             "note": d.note,
+            "reason": d.reason,
             "minted": d.minted,
         })),
         // ★ The mark (ledger #475): a decline that already answered a like
@@ -2298,7 +2352,8 @@ pub(crate) fn annotation_json(ann: &Annotation, line: Option<u64>) -> serde_json
         // decision node, and the rest is that decision in the same shape as
         // `decision` above — null when no declined twin was on file at mint
         // time. A consumer rendering a queue row reads this to say "a like
-        // claim on this line was declined <decided_at>: <note>".
+        // claim on this line was declined (<reason>) <decided_at>: <note>".
+        // `reason` is one of `crate::finding::DECLINE_REASONS` or null.
         "prior_decision": ann.prior.as_ref().map(|p| serde_json::json!({
             "finding": p.finding,
             "iri": p.decision_iri(),
@@ -2306,6 +2361,7 @@ pub(crate) fn annotation_json(ann: &Annotation, line: Option<u64>) -> serde_json
             "severity": p.decision.as_ref().map(|d| d.severity.clone()),
             "decided_at": p.decision.as_ref().and_then(|d| d.at.clone()),
             "note": p.decision.as_ref().and_then(|d| d.note.clone()),
+            "reason": p.decision.as_ref().and_then(|d| d.reason.clone()),
         })),
     })
 }
@@ -2372,6 +2428,9 @@ fn annotation_turtle(ann: &Annotation) -> String {
         }
         if let Some(note) = &decision.note {
             act.push(format!("dcterms:description {}", ttl_str(note)));
+        }
+        if let Some(reason) = &decision.reason {
+            act.push(format!("dcterms:subject <{}>", decline_reason_iri(reason)));
         }
         if let Some(minted) = &decision.minted {
             act.push(format!("prov:generated <{minted}>"));

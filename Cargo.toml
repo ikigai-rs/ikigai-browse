@@ -252,7 +252,31 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # vocabulary need REPORTED, not invented: a dedicated `ik:priorDecision` in
 # place of the generic PROV influence. The `ikigai-vocab` dev-dependency floor
 # moves to 0.1.71, where `ik:suppressedItems` landed.
-version = "0.9.0"
+#
+# 0.10.0 — MINOR: A DECLINE SAYS WHY IN ONE WORD, AND THE WORD IS THE CONTRACT'S.
+# Only 14 of 458 declines on file carried a reason, so 0.9.0's mark showed a
+# date and nothing else on 97% of rows. The finding Sink gains an optional
+# `reason` input whose `one_of` is five words in picker order — `misread`,
+# `restates`, `no-issue`, `wont-fix`, `duplicate` — declared beside
+# `SEVERITIES` (`finding::DECLINE_REASONS`, meanings in the ArgSpec summary),
+# because gonk never spells a word a contract owns and reads its menus from
+# the Meta face. A word beside `decision=publish` is refused BY NAME, a word
+# outside the set is refused naming the set, and omitted stays valid (an
+# empty value is omitted, so a form's unselected picker is never refused).
+# Stored as a TERM on the decision node — `dcterms:subject
+# <urn:iki:decline-reason:{word}>`, an interim predicate (not `dcterms:type`,
+# which carries the outcome); `ik:declineReason` is REPORTED for core's vocab
+# batch, not invented. Read back exactly: an unknown term is `reason: null`.
+# ★ Why a minor: a new argument on a public Sink, a new `reason` field on the
+# json `decision` and `prior_decision` objects, words on the plain and html
+# faces, a reason picker on browse's own decision form, and a `reasons` list
+# in `summary=declined` — all observable, all additive. A repeat that states a
+# DIFFERENT reason than the one on file is now refused (by `reason`), which is
+# the record rule applied to a new field, not a behaviour change for any call
+# a 0.9.0 caller could make. gonk pins `"0.9.0"` and `^0.9.0` is `<0.10.0`, so
+# it sees none of this until the hub moves its pin — and the picker is gonk's
+# follow-up, reading `reason`'s `one_of` from the contract.
+version = "0.10.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
