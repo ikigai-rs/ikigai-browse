@@ -276,7 +276,31 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # a 0.9.0 caller could make. gonk pins `"0.9.0"` and `^0.9.0` is `<0.10.0`, so
 # it sees none of this until the hub moves its pin — and the picker is gonk's
 # follow-up, reading `reason`'s `one_of` from the contract.
-version = "0.10.0"
+#
+# 0.11.0 — MINOR: A RE-REVIEW RETIRES WHAT IT REPLACED (ledger #504). Nothing
+# moved a finding out of `pending` but a human, so a changed region's old
+# findings stayed pending forever and the queue grew with COMMIT COUNT: 561 of
+# 1697 pending on 2026-09-24 were in no standing set of their file's newest
+# pass. An undecided file finding is now `superseded` when its file's current
+# reading — every pass over the current content hash, else the passes on the
+# hash of the most recently derived one — neither minted nor carried it. It is
+# COMPUTED ON READ AND STORED NOWHERE (`crate::supersede`): no migration, no
+# drift, and a revert makes the older pass current again. ★ Why a minor, and
+# not a patch: `superseded` joins the findings face's public `state` one_of, and
+# `state=pending` — the DEFAULT, and what gonk's badge counts — CHANGES what it
+# returns for a call a 0.10.0 caller already makes (the retired rows leave it).
+# Also observable, all additive: `superseded_by` on every json row,
+# `summary=states` (counts per root and per file), a line on a pending
+# listing's plain and html faces, `superseded_items` and "N earlier findings
+# superseded" on the review face, and the file page's `proposals=` no longer
+# drawing superseded findings. Decided findings never change state, PR-page
+# findings are never superseded, and superseded never feeds the declined-twin
+# mark. Measured on a copy of the live graph (`examples/findings-read-probe.rs`):
+# the badge read over gonk's seven roots went ~120 ms → ~106 ms — the current
+# content hash is the one the drift pass already fetches, and fewer rows are
+# reconciled. gonk pins `"0.10.0"` and `^0.10.0` is `<0.11.0`, so the hub moves
+# its pin; its state nav gains the tab from the contract with no other change.
+version = "0.11.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]

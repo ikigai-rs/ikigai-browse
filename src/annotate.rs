@@ -506,6 +506,18 @@ pub(crate) struct Annotation {
     /// finding with the same `exact` (see [`Prior`]). Finding family only;
     /// `None` means no declined twin was on file at mint time.
     pub(crate) prior: Option<Prior>,
+    /// The review pass that SUPERSEDES this undecided finding — the newest of
+    /// the passes that are its file's current reading, when the finding is not
+    /// in their standing set (ledger #504, [`crate::supersede`]).
+    ///
+    /// ★ COMPUTED ON READ, NEVER STORED. It is a pure function of the store
+    /// and the file's current content hash, so nothing writes it, nothing
+    /// migrates it, and a revert that makes an older pass current again
+    /// un-supersedes that pass's findings with no code for it. A loader
+    /// leaves it `None`; only [`crate::supersede::mark`] sets it, and only on
+    /// an undecided FILE finding — a decision is a record and never changes
+    /// state, and a PR-family finding is keyed to a PR page, not a pass.
+    pub(crate) superseded_by: Option<String>,
 }
 
 /// What an annotation's recorded target IS — derived from the stored
@@ -522,14 +534,18 @@ impl Annotation {
     }
 
     /// Where a finding is in the human pipeline: `pending` until someone
-    /// answers it, then the decision's outcome. `None` for an annotation —
-    /// an annotation IS the published state, it does not have one.
+    /// answers it, then the decision's outcome — or, while undecided,
+    /// `superseded` when its file's current review does not stand behind it
+    /// (only once [`crate::supersede::mark`] has run over it). `None` for an
+    /// annotation — an annotation IS the published state, it does not have
+    /// one.
     pub(crate) fn state(&self) -> Option<&'static str> {
         match self.family {
             Family::Annotation => None,
-            Family::Finding => Some(match &self.decision {
-                None => "pending",
-                Some(d) => d.outcome.label(),
+            Family::Finding => Some(match (&self.decision, &self.superseded_by) {
+                (Some(d), _) => d.outcome.label(),
+                (None, Some(_)) => "superseded",
+                (None, None) => "pending",
             }),
         }
     }
@@ -913,6 +929,7 @@ pub(crate) fn load_record(
         derived_from: None,
         decision: None,
         prior: None,
+        superseded_by: None,
     };
     let mut prior_id: Option<String> = None;
     let literal = |term: &Term| match term {
@@ -1474,6 +1491,17 @@ pub(crate) enum CurrentContent {
     Unknown,
 }
 
+impl CurrentContent {
+    /// The `sha256:{hex}` of the content, when there is content — the key a
+    /// review pass is archived under, so the one supersession compares.
+    pub(crate) fn hash(&self) -> Option<&str> {
+        match self {
+            CurrentContent::Text(_, hash) => Some(hash),
+            _ => None,
+        }
+    }
+}
+
 /// `sha256:{hex}` of raw bytes — the annotation layer's content key (also
 /// what the review layers stamp on annotations they mint against text they
 /// already hold).
@@ -1562,15 +1590,41 @@ async fn reconcile(
     archive: &Archive,
     roots: &BTreeMap<String, std::path::PathBuf>,
     repo: &str,
-    mut anns: Vec<Annotation>,
+    anns: Vec<Annotation>,
 ) -> Result<Vec<(Annotation, Option<u64>)>> {
-    let mut contents: BTreeMap<String, CurrentContent> = BTreeMap::new();
-    for ann in &anns {
+    reconcile_with(inv, archive, roots, repo, anns, BTreeMap::new()).await
+}
+
+/// Fetch the current content of every target in `anns` not already in
+/// `contents` — one fetch per distinct target, keyed by the target IRI.
+pub(crate) async fn fetch_contents<'a>(
+    inv: &Invocation<'_>,
+    roots: &BTreeMap<String, std::path::PathBuf>,
+    repo: &str,
+    anns: impl IntoIterator<Item = &'a Annotation>,
+    contents: &mut BTreeMap<String, CurrentContent>,
+) -> Result<()> {
+    for ann in anns {
         if !contents.contains_key(&ann.target_iri) {
             let current = current_content_for(inv, roots, repo, &ann.target_ref()).await?;
             contents.insert(ann.target_iri.clone(), current);
         }
     }
+    Ok(())
+}
+
+/// [`reconcile`] over contents some of which are already in hand — the
+/// findings listing fetched them to decide supersession, and reading a file
+/// twice per listing would be the cost this hands over instead.
+async fn reconcile_with(
+    inv: &Invocation<'_>,
+    archive: &Archive,
+    roots: &BTreeMap<String, std::path::PathBuf>,
+    repo: &str,
+    mut anns: Vec<Annotation>,
+    mut contents: BTreeMap<String, CurrentContent>,
+) -> Result<Vec<(Annotation, Option<u64>)>> {
+    fetch_contents(inv, roots, repo, &anns, &mut contents).await?;
     let mut rows: Vec<(Annotation, Option<u64>)> = Vec::with_capacity(anns.len());
     for mut ann in anns.drain(..) {
         let current = contents.get(&ann.target_iri).expect("fetched above");
@@ -1586,14 +1640,18 @@ async fn reconcile(
 /// the same `reconcile` the annotation listing runs: one content fetch per
 /// distinct target, then re-anchor or orphan each. ★ Findings do not get a
 /// drift story of their own; they get THE drift story.
+///
+/// `contents` is what the caller already fetched (see [`fetch_contents`]);
+/// anything missing is fetched here.
 pub(crate) async fn reconcile_findings(
     inv: &Invocation<'_>,
     archive: &Archive,
     roots: &BTreeMap<String, std::path::PathBuf>,
     repo: &str,
     findings: Vec<Annotation>,
+    contents: BTreeMap<String, CurrentContent>,
 ) -> Result<Vec<(Annotation, Option<u64>)>> {
-    reconcile(inv, archive, roots, repo, findings).await
+    reconcile_with(inv, archive, roots, repo, findings, contents).await
 }
 
 /// Restore triage order after the drift pass has moved positions.
@@ -2069,6 +2127,7 @@ impl AnnotationEndpoint {
             derived_from: None,
             decision: None,
             prior: None,
+            superseded_by: None,
         };
         rewrite_annotation(&self.archive, &ann)?;
         match inv.inline_str("as").unwrap_or("text/plain") {
@@ -2337,6 +2396,11 @@ pub(crate) fn annotation_json(ann: &Annotation, line: Option<u64>) -> serde_json
         "severity": ann.severity,
         "effective_severity": ann.effective_severity(),
         "state": ann.state(),
+        // ★ WHY a row is `superseded` (ledger #504): the review pass that is
+        // its file's current reading and does not stand behind it — null on
+        // every other row. Computed on read, never stored; see
+        // `crate::supersede`.
+        "superseded_by": ann.superseded_by,
         "derived_from": ann.derived_from,
         "decision": ann.decision.as_ref().map(|d| serde_json::json!({
             "outcome": d.outcome.label(),
@@ -2528,6 +2592,15 @@ pub(crate) fn annotation_card_html(ann: &Annotation, line: Option<u64>, show_pat
     } else if ann.reanchored {
         flags.push_str("<span class=\"browse-annotation-flag\">re-anchored</span>");
     }
+    // Superseded, in words: the claim is still decidable (it is undecided),
+    // but a reader must see that the file's current review does not carry it
+    // before spending a decision on it.
+    if ann.superseded_by.is_some() && ann.decision.is_none() {
+        flags.push_str(
+            "<span class=\"browse-annotation-flag browse-finding-superseded-note\">superseded — the \
+             code it was about changed, and the file's current review does not carry it</span>",
+        );
+    }
     // The mark, in words and with the twin one click away — ABOVE the
     // decision form, because it is the thing that makes the second decision
     // cheap: a reader sees the earlier answer before choosing again.
@@ -2709,10 +2782,16 @@ pub(crate) struct Proposals {
 }
 
 impl Proposals {
-    /// Select and reconcile: pending (undecided) findings on `rel` whose
-    /// proposed severity is one of `severities`. An unrated finding (the
-    /// model invented a word or said nothing) matches no word and is never
-    /// drawn — it is in the queue, where a human can rate it.
+    /// Select and reconcile: PENDING findings on `rel` whose proposed
+    /// severity is one of `severities`. An unrated finding (the model
+    /// invented a word or said nothing) matches no word and is never drawn —
+    /// it is in the queue, where a human can rate it.
+    ///
+    /// ★ Pending means undecided AND not superseded (ledger #504): a finding
+    /// the file's current review does not stand behind is about code that
+    /// changed, and drawing it as a proposal on the current text would put a
+    /// retired claim beside lines it may no longer describe. The text is in
+    /// hand, so its hash is what decides the current reading.
     pub(crate) fn for_text(
         archive: &Archive,
         repo: &str,
@@ -2720,7 +2799,7 @@ impl Proposals {
         text: &str,
         severities: &[String],
     ) -> Result<Proposals> {
-        let pending: Vec<Annotation> = list_findings(archive, repo, Some(rel))?
+        let mut undecided: Vec<Annotation> = list_findings(archive, repo, Some(rel))?
             .into_iter()
             .filter(|f| f.decision.is_none())
             .filter(|f| {
@@ -2728,6 +2807,12 @@ impl Proposals {
                     .as_deref()
                     .is_some_and(|s| severities.iter().any(|w| w == s))
             })
+            .collect();
+        let hash = content_hash(text.as_bytes());
+        crate::supersede::mark(archive, &mut undecided, |_| Some(hash.clone()))?;
+        let pending: Vec<Annotation> = undecided
+            .into_iter()
+            .filter(|f| f.superseded_by.is_none())
             .collect();
         Ok(Proposals {
             rows: reconcile_against_text(archive, pending, text)?,
@@ -3004,6 +3089,7 @@ pub(crate) fn mint_pending_finding(
         derived_from: None,
         decision: None,
         prior,
+        superseded_by: None,
     };
     store_annotation(archive, &ann)?;
     Ok(Mint::Minted(ann.iri()))

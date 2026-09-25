@@ -166,6 +166,9 @@ mod layout;
 pub mod migrate;
 mod pr;
 mod review;
+/// `superseded` — the state of an undecided finding whose file's current
+/// review does not stand behind it; computed on read, never stored.
+mod supersede;
 /// The watch that keeps `urn:repo:style` fresh — see [`Mount::space_watched`].
 mod watch;
 

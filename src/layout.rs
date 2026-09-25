@@ -271,6 +271,12 @@ color:var(--browse-flag)}\n\
 .browse-finding-pending{border-left-color:var(--browse-flag)}\n\
 .browse-finding-published{border-left-style:solid}\n\
 .browse-finding-declined{opacity:.6}\n\
+/* Superseded (ledger #504): undecided, but the file's current review does not
+   carry it — still answerable, so dimmed rather than hidden, and the note says
+   why before anyone spends a decision on it. */\n\
+.browse-finding-superseded{opacity:.75}\n\
+.browse-finding-superseded-note{font-style:italic}\n\
+.browse-findings-superseded{font-size:.85em;opacity:.8;margin:.5rem 0}\n\
 .browse-finding-severity{font-size:.72em;white-space:nowrap;margin-right:.35rem;\
 padding:.05em .5em;border:1px solid currentColor;border-radius:999px}\n\
 .browse-finding-severity-critical,.browse-finding-severity-major{\
@@ -404,6 +410,7 @@ mod tests {
         "browse-finding-pending",
         "browse-finding-published",
         "browse-finding-declined",
+        "browse-finding-superseded",
         // `finding.rs`: `browse-finding-severity-{severity}`, one per
         // `finding::SEVERITIES` plus the unrated case.
         "browse-finding-severity-critical",

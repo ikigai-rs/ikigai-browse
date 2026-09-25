@@ -1543,6 +1543,8 @@ impl Endpoint for PrReviewEndpoint {
             reviewed_bytes: Some(truncated_len(&diff, config.max_prompt_bytes) as u64),
             total_bytes: Some(diff.len() as u64),
             derived_at: created,
+            // PR-page findings are never superseded (ledger #504).
+            superseded: 0,
         };
         store_pass(&config.archive, &entry)?;
         let included = annotate::included_for_ids(&config.archive, &entry.minted, &diff)?;

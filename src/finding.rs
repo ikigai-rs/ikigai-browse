@@ -94,6 +94,18 @@
 //! annotation layer keeps reconciling it. There is exactly one drift story in
 //! this crate and findings are inside it.
 //!
+//! ## Superseded: a state nobody decides and nothing stores
+//!
+//! An undecided finding whose file's CURRENT review does not stand behind it
+//! — the code it was about changed, and no pass over the file's current
+//! content minted or carried it — is `superseded`, not `pending` (ledger
+//! #504). Without it, a changed region's old findings stayed pending forever
+//! and the queue grew with commit count. It is computed on every read from the
+//! store and the file's current hash ([`crate::supersede`]), never written, so
+//! a revert un-supersedes with no code for it. It asserts no judgment: a human
+//! may still publish or decline a superseded finding, and it never feeds the
+//! declined-twin mark.
+//!
 //! ## Capabilities
 //!
 //! Source requires the browse read wildcard (reading a finding is reading about
@@ -393,6 +405,20 @@ const NOT_A_GATE: &str = "Findings wait for a person. Nothing here blocks a comm
                           merge, and nothing reaches the annotation family until someone \
                           publishes it.";
 
+/// **The queue states** a listing can show — the `one_of` on the findings
+/// face's `state`, the state nav's buttons, and the check the listing makes,
+/// all from this one list. gonk builds its own state nav from the contract, so
+/// a state added here reaches it with no host change.
+///
+/// `superseded` (ledger #504) is an UNDECIDED finding whose file's current
+/// review does not stand behind it — computed on read, see
+/// [`crate::supersede`]. `pending` no longer includes it; `all` does.
+pub(crate) const STATES: [&str; 5] = ["pending", "superseded", "published", "declined", "all"];
+
+/// What `summary=` may ask for — each widens the json face to an object that
+/// carries the rows plus its own key, and names a different grain.
+pub(crate) const SUMMARIES: [&str; 2] = ["declined", "states"];
+
 // --- binding ----------------------------------------------------------------
 
 pub(crate) fn bind(space: EndpointSpace, roots: &Roots, archive: &Arc<Archive>) -> EndpointSpace {
@@ -496,6 +522,13 @@ impl FindingEndpoint {
         let current =
             annotate::current_content_for(inv, &self.roots, &finding.repo, &finding.target_ref())
                 .await?;
+        // The same state the queue listing shows, from the content already in
+        // hand — one finding's face must not say `pending` where its file's
+        // listing says `superseded`.
+        let hash = current.hash().map(str::to_string);
+        crate::supersede::mark(&self.archive, std::slice::from_mut(&mut finding), |_| {
+            hash.clone()
+        })?;
         let line = annotate::refresh(&self.archive, &mut finding, &current)?;
         face_one(inv, &finding, line)
     }
@@ -722,45 +755,83 @@ impl Endpoint for FindingsEndpoint {
         let rel = path_binding(inv)?;
         let filter = (!rel.is_empty()).then_some(rel.as_str());
         let state = inv.inline_str("state").unwrap_or("pending").to_string();
-        if !["pending", "published", "declined", "all"].contains(&state.as_str()) {
+        if !STATES.contains(&state.as_str()) {
             return Err(Error::InvalidArgument {
                 name: "state".to_string(),
                 detail: format!(
-                    "`{state}` is not a queue state — one of: pending, published, declined, all"
+                    "`{state}` is not a queue state — one of: {}",
+                    STATES.join(", ")
                 ),
             });
         }
-        // `summary=declined` widens the json face from the rows to an object
-        // that also carries the file-grain count of declines — a NEW shape
-        // under a NEW argument, so the array every existing consumer reads is
-        // byte-identical without it.
+        // `summary=` widens the json face from the rows to an object that
+        // also carries a count — a NEW shape under a NEW argument, so the
+        // array every existing consumer reads is byte-identical without it.
         let summary = match inv.inline_str("summary") {
-            Ok("declined") => true,
+            Ok(word) if SUMMARIES.contains(&word) => Some(word.to_string()),
             Ok(other) => {
                 return Err(Error::InvalidArgument {
                     name: "summary".to_string(),
-                    detail: format!("`{other}` is not a summary — the one summary is `declined`"),
+                    detail: format!(
+                        "`{other}` is not a summary — one of: {}",
+                        SUMMARIES.join(", ")
+                    ),
                 })
             }
-            Err(_) => false,
+            Err(_) => None,
         };
-        let all = annotate::list_findings(&self.archive, repo, filter)?;
+        let mut all = annotate::list_findings(&self.archive, repo, filter)?;
         // The file grain is read BEFORE the state filter: a pending-only
         // listing still says how many declines the file carries, which is
         // the reading that makes a recurring claim legible.
         let declined = DeclinedSummary::of(&all);
+        // ★ Supersession (ledger #504) is decided BEFORE the state filter,
+        // because it is what `pending` now means. It needs each undecided
+        // file finding's CURRENT content hash — which the drift pass below
+        // fetches anyway, so it is fetched once here and the same map is
+        // handed on: a pending listing reads exactly the files it read
+        // before. A listing of decided findings needs none of it (a decision
+        // never changes state), unless the caller asked for the counts.
+        let supersession = !matches!(state.as_str(), "published" | "declined")
+            || summary.as_deref() == Some("states");
+        let mut contents = std::collections::BTreeMap::new();
+        if supersession {
+            let undecided_files: Vec<&Annotation> = all
+                .iter()
+                .filter(|f| {
+                    f.decision.is_none() && matches!(f.target_ref(), annotate::TargetRef::File(_))
+                })
+                .collect();
+            annotate::fetch_contents(inv, &self.roots, repo, undecided_files, &mut contents)
+                .await?;
+            crate::supersede::mark(&self.archive, &mut all, |f| {
+                contents
+                    .get(&f.target_iri)
+                    .and_then(|c| c.hash())
+                    .map(str::to_string)
+            })?;
+        }
+        let states = supersession.then(|| StateCounts::of(&all));
         let findings: Vec<Annotation> = all
             .into_iter()
             .filter(|f| state == "all" || f.state() == Some(state.as_str()))
             .collect();
         let mut rows =
-            annotate::reconcile_findings(inv, &self.archive, &self.roots, repo, findings).await?;
+            annotate::reconcile_findings(inv, &self.archive, &self.roots, repo, findings, contents)
+                .await?;
         annotate::sort_finding_rows(&mut rows);
+        // The one line a PENDING listing owes its reader: how many findings
+        // are not in it because they were superseded. A suppression nobody
+        // can measure is how an orphan rate hid (ledger #488).
+        let hidden = match (state.as_str(), &states) {
+            ("pending", Some(counts)) => counts.hidden_words(),
+            _ => None,
+        };
 
         match inv.inline_str("as").unwrap_or("application/json") {
             t if t.starts_with("text/html") => Ok(repr_utf8(
                 "text/html",
-                listing_html(repo, &rel, &state, &rows, &declined),
+                listing_html(repo, &rel, &state, &rows, &declined, hidden.as_deref()),
             )),
             t if t.starts_with("text/turtle") => {
                 let findings: Vec<Annotation> = rows.into_iter().map(|(f, _)| f).collect();
@@ -769,23 +840,31 @@ impl Endpoint for FindingsEndpoint {
                     annotate::annotation_turtle_document(&findings),
                 ))
             }
-            t if t.starts_with("text/plain") => {
-                Ok(repr_utf8("text/plain", plain(&rows, &declined)))
-            }
+            t if t.starts_with("text/plain") => Ok(repr_utf8(
+                "text/plain",
+                plain(&rows, &declined, hidden.as_deref()),
+            )),
             _ => {
                 let rows: Vec<serde_json::Value> = rows
                     .iter()
                     .map(|(f, line)| annotate::annotation_json(f, *line))
                     .collect();
-                let json = match summary {
-                    false => serde_json::Value::Array(rows),
-                    true => serde_json::json!({
+                let json = match (summary.as_deref(), &states) {
+                    (Some("declined"), _) => serde_json::json!({
                         "repo": repo,
                         "path": filter,
                         "state": state,
                         "rows": rows,
                         "declined": declined.json(),
                     }),
+                    (Some("states"), Some(counts)) => serde_json::json!({
+                        "repo": repo,
+                        "path": filter,
+                        "state": state,
+                        "rows": rows,
+                        "states": counts.json(),
+                    }),
+                    _ => serde_json::Value::Array(rows),
                 };
                 Ok(repr("application/json", json.to_string()))
             }
@@ -854,8 +933,16 @@ fn plain_row(finding: &Annotation, line: Option<u64>) -> String {
     out
 }
 
-fn plain(rows: &[(Annotation, Option<u64>)], declined: &DeclinedSummary) -> String {
+fn plain(
+    rows: &[(Annotation, Option<u64>)],
+    declined: &DeclinedSummary,
+    hidden: Option<&str>,
+) -> String {
     let mut out = format!("--- findings ({}) ---\n{NOT_A_GATE}", rows.len());
+    if let Some(line) = hidden {
+        out.push('\n');
+        out.push_str(line);
+    }
     if let Some(line) = declined.words() {
         out.push('\n');
         out.push_str(&line);
@@ -1032,6 +1119,89 @@ impl DeclinedSummary {
     }
 }
 
+/// How many findings are in each state, over the whole listing (repo or
+/// file) BEFORE the `state=` filter — and, per file, how many are pending
+/// against how many superseded (ledger #504). The observability half of
+/// supersession: `summary=states` on the json face, one line on a pending
+/// listing's plain and html faces.
+struct StateCounts {
+    pending: usize,
+    superseded: usize,
+    published: usize,
+    declined: usize,
+    /// Per path with anything undecided, in path order: pending, superseded,
+    /// and the pass that superseded them (the newest current pass — one per
+    /// file, since the reading is per file).
+    files: std::collections::BTreeMap<String, FileStates>,
+}
+
+#[derive(Default)]
+struct FileStates {
+    pending: usize,
+    superseded: usize,
+    superseded_by: Option<String>,
+}
+
+impl StateCounts {
+    fn of(findings: &[Annotation]) -> Self {
+        let mut counts = StateCounts {
+            pending: 0,
+            superseded: 0,
+            published: 0,
+            declined: 0,
+            files: std::collections::BTreeMap::new(),
+        };
+        for finding in findings {
+            match finding.state() {
+                Some("pending") => {
+                    counts.pending += 1;
+                    counts.files.entry(finding.rel.clone()).or_default().pending += 1;
+                }
+                Some("superseded") => {
+                    counts.superseded += 1;
+                    let file = counts.files.entry(finding.rel.clone()).or_default();
+                    file.superseded += 1;
+                    file.superseded_by.clone_from(&finding.superseded_by);
+                }
+                Some("published") => counts.published += 1,
+                Some("declined") => counts.declined += 1,
+                _ => {}
+            }
+        }
+        counts
+    }
+
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "pending": self.pending,
+            "superseded": self.superseded,
+            "published": self.published,
+            "declined": self.declined,
+            "files": self.files.iter().map(|(path, file)| serde_json::json!({
+                "path": path,
+                "pending": file.pending,
+                "superseded": file.superseded,
+                "superseded_by": file.superseded_by,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    /// The line a pending listing carries when it is not showing everything
+    /// undecided — `None` when nothing was superseded.
+    fn hidden_words(&self) -> Option<String> {
+        match self.superseded {
+            0 => None,
+            n => Some(format!(
+                "{n} superseded finding{s} not listed: the code {they} about changed, and the \
+                 file's current review does not carry {them} (state=superseded lists {them})",
+                s = if n == 1 { "" } else { "s" },
+                they = if n == 1 { "it was" } else { "they were" },
+                them = if n == 1 { "it" } else { "them" },
+            )),
+        }
+    }
+}
+
 fn one_html(finding: &Annotation, line: Option<u64>) -> String {
     format!(
         "<div class=\"browse\">{}<p class=\"browse-findings-note\">{NOT_A_GATE}</p>\
@@ -1047,6 +1217,7 @@ fn listing_html(
     state: &str,
     rows: &[(Annotation, Option<u64>)],
     declined: &DeclinedSummary,
+    hidden: Option<&str>,
 ) -> String {
     let mut out = String::from("<div class=\"browse\">");
     out.push_str(&crumbs_html(repo, rel));
@@ -1054,7 +1225,7 @@ fn listing_html(
         "<p class=\"browse-findings-note\">{NOT_A_GATE}</p>\
          <nav class=\"browse-findings-states\">"
     ));
-    for option in ["pending", "published", "declined", "all"] {
+    for option in STATES {
         let current = match option == state {
             true => " browse-findings-state-current",
             false => "",
@@ -1067,6 +1238,12 @@ fn listing_html(
         ));
     }
     out.push_str("</nav>");
+    if let Some(line) = hidden {
+        out.push_str(&format!(
+            "<p class=\"browse-findings-superseded\">{}</p>",
+            esc(line)
+        ));
+    }
     // The file grain, on a FILE's listing only: a repo-wide page would be
     // summing declines across files, which is the join this count exists
     // not to hide behind.
@@ -1212,7 +1389,7 @@ fn finding_description() -> Description {
 
 /// `repo` is not an ArgSpec: every advertised row fixes the root in its
 /// pattern (see `crate::bind_family`); the binding is grammar-injected.
-fn findings_description() -> Description {
+pub(crate) fn findings_description() -> Description {
     Description::new("browse-findings")
         .title("The review queue: findings awaiting a human")
         .summary(
@@ -1221,7 +1398,15 @@ fn findings_description() -> Description {
              and position. ⚠ A queue, not a gate: nothing here blocks a commit, a push or a \
              merge, and nothing reaches the annotation family until a human publishes it \
              (Sink urn:iki:finding:{id}). state= narrows to pending (the default), \
-             published, declined, or all. Each read runs the annotation layer's drift pass, \
+             superseded, published, declined, or all. ★ superseded is an UNDECIDED \
+             finding its file's current review does not stand behind — the code it was \
+             about changed, and no pass over the file's current content (else the most \
+             recently derived pass) minted or carried it. It is computed on every read, \
+             never stored, so a revert makes the older pass current again and its \
+             findings pending again; it asserts no human judgment, never feeds the \
+             declined-twin mark, and a human may still publish or decline it. Decided \
+             findings and PR-page findings are never superseded. Each row carries \
+             superseded_by (the pass, else null). Each read runs the annotation layer's drift pass, \
              so a finding whose file moved is re-anchored (ik:reanchored) and one whose \
              quote is gone is flagged (ik:orphaned) rather than dropped. ★ A finding \
              minted where a like claim was already DECLINED on the same file carries that \
@@ -1232,7 +1417,12 @@ fn findings_description() -> Description {
              findings}]}} — how many declines the file carries, by reason word (every word \
              in contract order, then reason null for none stated) and by the quote they \
              declined — and the html and plain faces of a file's \
-             listing say the same in words. \
+             listing say the same in words. summary=states widens it instead to {repo, \
+             path, state, rows, states: {pending, superseded, published, declined, files: \
+             [{path, pending, superseded, superseded_by}]}} — the count in each state \
+             whatever state= shows, and per file what is pending against what was \
+             superseded; a pending listing's html and plain faces say how many superseded \
+             findings they do not list. \
              application/json (default) is the structured rows carrying BOTH ratings; \
              as=text/html the queue page with each card's decision form; as=text/plain a \
              triage digest; as=text/turtle the findings and their decision graphs.",
@@ -1251,8 +1441,13 @@ fn findings_description() -> Description {
             ArgSpec::new("state")
                 .optional()
                 .class(XSD_STRING)
-                .summary("which part of the pipeline to show")
-                .one_of(["pending", "published", "declined", "all"])
+                .summary(
+                    "which part of the pipeline to show. pending: undecided and stood behind \
+                     by the file's current review. superseded: undecided, and the file's \
+                     current review does not carry it. published / declined: a human \
+                     decided. all: every finding.",
+                )
+                .one_of(STATES)
                 .default_value("pending"),
         )
         .input(
@@ -1263,10 +1458,12 @@ fn findings_description() -> Description {
                     "declined: the json face becomes {repo, path, state, rows, declined} — \
                      the rows as before plus the file-grain count of DECLINED findings by \
                      reason word and by the quote they declined, whatever state= shows. \
-                     Without it the json \
+                     states: {repo, path, state, rows, states} — the count in each queue \
+                     state and, per file, pending against superseded (with the pass that \
+                     superseded them). Without it the json \
                      face is the bare rows array it always was.",
                 )
-                .one_of(["declined"]),
+                .one_of(SUMMARIES),
         )
         .input(
             ArgSpec::new("as")

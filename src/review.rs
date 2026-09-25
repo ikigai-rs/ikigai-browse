@@ -1111,6 +1111,16 @@ pub(crate) struct PassEntry {
     pub(crate) reviewed_bytes: Option<u64>,
     pub(crate) total_bytes: Option<u64>,
     pub(crate) derived_at: Option<String>,
+    /// How many UNDECIDED findings on this file are superseded while this
+    /// pass is part of the file's current reading — the earlier findings the
+    /// pass's arrival retired from the pending queue (ledger #504).
+    ///
+    /// ★ COMPUTED ON READ, NEVER STORED, like the state itself (see
+    /// [`crate::supersede`]): the review endpoint sets it before rendering,
+    /// every loader and the PR pass leave it 0, and nothing writes it — a
+    /// stored count would go stale the first time a human decided one of
+    /// them, or a revert made an older pass current again.
+    pub(crate) superseded: usize,
 }
 
 impl PassEntry {
@@ -1169,6 +1179,14 @@ impl PassEntry {
             0 => {}
             n => clauses.push(format!("{n} carried forward")),
         }
+        // The other half of what the queue did: findings from earlier passes
+        // on this file that this reading does not carry, retired from
+        // pending without anyone's judgment on them.
+        match self.superseded {
+            0 => {}
+            1 => clauses.push("1 earlier finding superseded".to_string()),
+            n => clauses.push(format!("{n} earlier findings superseded")),
+        }
         match self.suppressed_items {
             0 => {}
             1 => clauses.push("1 withheld as an exact repeat".to_string()),
@@ -1225,9 +1243,14 @@ pub(crate) fn answer_excerpt(answer: &str) -> String {
     format!("{}…", &flat[..end])
 }
 
+/// Every review pass IRI begins here — `{PASS_PREFIX}{repo}:{hash}:{tag}:{path}`.
+/// ⚠ The colon is load-bearing: [`REGION_PREFIX`] shares the stem up to
+/// `review`, and only the `:` tells a pass from a region memo.
+pub(crate) const PASS_PREFIX: &str = "urn:ikigai:browse:review:";
+
 pub(crate) fn pass_iri(repo: &str, rel: &str, hash: &str, tag: &str) -> String {
     format!(
-        "urn:ikigai:browse:review:{repo}:{hash}:{}:{}",
+        "{PASS_PREFIX}{repo}:{hash}:{}:{}",
         iri_encode(tag),
         iri_encode(rel)
     )
@@ -1373,6 +1396,7 @@ pub(crate) fn load_pass(archive: &Archive, iri: &str) -> Result<Option<PassEntry
         reviewed_bytes: None,
         total_bytes: None,
         derived_at: None,
+        superseded: 0,
     };
     let mut found = false;
     for quad in archive.quads_for_pattern(Some(subject.as_ref().into()), None, None) {
@@ -1724,7 +1748,9 @@ impl Endpoint for ReviewEndpoint {
 
         let iri = pass_iri(repo, &rel, &hash, &tag);
         if !debug_raw {
-            if let Some(entry) = load_pass(&config.archive, &iri)? {
+            if let Some(mut entry) = load_pass(&config.archive, &iri)? {
+                entry.superseded =
+                    crate::supersede::superseded_on(&config.archive, repo, &rel, &hash)?;
                 // The hit path: mints NOTHING. The recorded annotations are
                 // drift-reconciled against the very content in hand.
                 let included = annotate::included_for_ids(&config.archive, &entry.minted, &text)?;
@@ -2033,6 +2059,7 @@ impl Endpoint for ReviewEndpoint {
             reviewed_bytes,
             total_bytes,
             derived_at: created,
+            superseded: 0,
         };
         store_pass(&config.archive, &entry)?;
         for memo in &memos {
@@ -2041,6 +2068,9 @@ impl Endpoint for ReviewEndpoint {
         // Carried findings re-anchor here, on read, by the one drift path —
         // their offsets move with the insertion above them, their ids do not.
         let included = annotate::included_for_ids(&config.archive, &entry.findings(), &text)?;
+        let mut entry = entry;
+        entry.superseded =
+            crate::supersede::superseded_on(&config.archive, repo, &rel, &entry.hash)?;
         face(inv, repo, &rel, &entry, true, &included)
     }
 
@@ -2088,6 +2118,9 @@ fn face(
                 // the marked ones are in `annotations`, each carrying its
                 // `prior_decision`.
                 "suppressed_items": entry.suppressed_items,
+                // Undecided findings on this file that this reading does not
+                // carry (ledger #504) — computed on read, never stored.
+                "superseded_items": entry.superseded,
                 "reviewed_bytes": entry.reviewed_bytes,
                 "total_bytes": entry.total_bytes,
                 "derived_at": entry.derived_at,
@@ -3421,9 +3454,12 @@ mod tests {
         assert_eq!(second["total_bytes"], SIX_LINES.len());
         assert_eq!(
             second["statement"],
+            // ★ The region-3 finding of the first pass is not carried (its
+            // bytes moved) and was undecided, so this pass's arrival retired it
+            // from pending — and the statement says so (ledger #504).
             format!(
-                "3 findings (2 carried forward) · reviewed the whole file ({} bytes) · 2 of 3 \
-                 regions unchanged",
+                "3 findings (2 carried forward, 1 earlier finding superseded) · reviewed the \
+                 whole file ({} bytes) · 2 of 3 regions unchanged",
                 SIX_LINES.len()
             )
         );
@@ -3469,13 +3505,15 @@ mod tests {
         // The face renders all three, carried and minted alike.
         assert_eq!(second["annotations"].as_array().unwrap().len(), 3);
 
-        // ★★ THE QUEUE. Pending: region 1's finding (once — not duplicated),
-        // region 3's new finding, and the FIRST pass's region-3 finding, now
-        // orphaned (its bytes moved; that is the drift story, unchanged).
-        // NOT pending: the declined one — it did not come back.
+        // ★★ THE QUEUE. Pending: region 1's finding (once — not duplicated)
+        // and region 3's new finding. NOT pending: the declined one — it did
+        // not come back — and the FIRST pass's region-3 finding, whose bytes
+        // moved: this pass does not carry it, so it is SUPERSEDED (ledger
+        // #504). Before 0.11.0 it stayed pending forever, orphaned, which is
+        // exactly the leak: one such row per changed region per commit.
         let pending = json(&k, "urn:repo:demo:findings:a.rs", &[]);
         let rows = pending.as_array().unwrap();
-        assert_eq!(rows.len(), 3, "{pending}");
+        assert_eq!(rows.len(), 2, "{pending}");
         let ones: Vec<&serde_json::Value> = rows
             .iter()
             .filter(|r| r["exact"] == "fn one__() {}")
@@ -3490,14 +3528,26 @@ mod tests {
             "{pending}"
         );
         assert!(
-            rows.iter()
-                .any(|r| r["exact"] == "fn six__() {}" && r["orphaned"] == true),
-            "{pending}"
-        );
-        assert!(
             rows.iter().any(|r| r["exact"] == "fn six_2() {}"),
             "{pending}"
         );
+        // The retired one is still on file, still drift-reconciled (orphaned:
+        // its quote is gone), and names the pass that does not carry it.
+        let superseded = json(
+            &k,
+            "urn:repo:demo:findings:a.rs",
+            &[("state", "superseded")],
+        );
+        let superseded = superseded.as_array().unwrap();
+        assert_eq!(superseded.len(), 1, "{superseded:?}");
+        assert_eq!(superseded[0]["exact"], "fn six__() {}");
+        assert_eq!(superseded[0]["orphaned"], true);
+        let second_pass = rows
+            .iter()
+            .find(|r| r["exact"] == "fn six_2() {}")
+            .map(|r| r["generated_by"].clone())
+            .unwrap();
+        assert_eq!(superseded[0]["superseded_by"], second_pass);
         let declined = json(&k, "urn:repo:demo:findings:a.rs", &[("state", "declined")]);
         assert_eq!(declined.as_array().unwrap().len(), 1, "{declined}");
         assert_eq!(declined[0]["iri"].as_str().unwrap(), three);
@@ -4681,9 +4731,29 @@ mod tests {
         // ★ A pending finding gets THE drift story, not a second one: a
         // finding whose file has since changed is stale by construction, and
         // the answer to that already existed.
-        let listing = json(&k, "urn:repo:demo:findings:a.rs", &[]);
+        //
+        // ★ `state=all`, because pass one's findings are no longer PENDING: the
+        // second pass is the file's current reading and carries neither of
+        // them, so both are superseded (ledger #504) — still listed, still
+        // drift-reconciled, still answerable, just out of the pending queue.
+        let listing = json(&k, "urn:repo:demo:findings:a.rs", &[("state", "all")]);
         let rows = listing.as_array().unwrap();
         assert_eq!(rows.len(), 3, "2 from pass one + 1 anchoring from pass two");
+        let pass_two = fresh["minted"].as_array().unwrap();
+        for row in rows {
+            match pass_two.contains(&row["iri"]) {
+                true => assert_eq!(row["state"], "pending", "{row}"),
+                false => assert_eq!(row["state"], "superseded", "{row}"),
+            }
+        }
+        assert_eq!(
+            json(&k, "urn:repo:demo:findings:a.rs", &[])
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "the pending queue is what the current review stands behind"
+        );
         let alpha_old: Vec<&serde_json::Value> = rows
             .iter()
             .filter(|r| r["exact"] == "fn alpha() {}" && r["reanchored"] == true)
