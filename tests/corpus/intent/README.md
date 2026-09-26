@@ -147,6 +147,11 @@ that needs the code.
     ./target/debug/examples/review-probe --model $M --lens intent tests/corpus/intent <out>/intent 2 $F
     python3 tests/corpus/intent/score.py --arm general=<out>/general --arm intent=<out>/intent
 
+`--lens intent` asks the shipped lens (`lens=intent` on the review face, 0.13.0 — the text is
+`INTENT_LENS` in `src/review.rs`). The measurement above was taken with the same text before it
+shipped, through the probe seam; a NEW candidate lens runs the same way, `--guidance <file>`, and
+is measured against the plain pass by this method — noise floor first.
+
 Then read the per-entry listings against `corpus.json`'s `finding` text. The `CANDIDATES` list at
 the end is only the findings anchored near a ground-truth anchor; a correct finding can anchor on
 a doc comment thirty lines away, so read the whole listing for each entry before calling a miss.

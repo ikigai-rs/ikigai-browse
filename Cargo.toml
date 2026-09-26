@@ -332,7 +332,33 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # them unmarked), near-duplicate 6 / 6, comment-shape 36 / 255, file 66 /
 # 1185. gonk pins `"0.11.0"` and `^0.11.0` is `<0.12.0`, so the hub moves its
 # pin before the batch view can read any of it.
-version = "0.12.0"
+#
+# 0.13.0 — MINOR: A LENS IS A DIMENSION OF THE ARCHIVE KEY (ledger #455, #456).
+# The review face gains `lens=` — a `one_of` over the lenses that exist, `intent`
+# the first: the constitution's four authority questions (declared = enforced,
+# the confused deputy, the tenancy boundary, a verb that lies) between the
+# per-file instruction and the file, the format contract and the reminder
+# untouched. The tag becomes `review-v5+intent@{model}`, so a lensed pass and
+# the plain pass COEXIST on one file at one hash — own findings, own region
+# memos, own dated entry — and the lens-less tag is byte-identical to 0.12.0's,
+# so nothing existing re-pays the cold-pass tax (#481). The json face gains
+# `lens` (null for the general pass) and every statement of a lensed pass says
+# "through the intent lens", because a lensed all-clear is the narrower claim.
+# ★ Shipped on a measurement, not a menu (tests/corpus/intent/README.md): on
+# six real pre-fix intent defects the general pass found 0 of 6 in two runs
+# each, the lens 2 of 6, losing nothing — against the general pass's own
+# run-to-run floor of 0.43 Jaccard on anchor lines. And shipped with what it
+# costs on record: it re-labels rather than narrows (serious share 42% → 69%,
+# 32 findings a pass either way), its first question invents "declares X but
+# never checks X" on requires the kernel enforces, and it is 1.23× the wall
+# clock — a lens to SELECT for a file that carries authority, never to arm on
+# the trigger. Also: `ExplainConfig::review_guidance`, the probe seam a
+# CANDIDATE lens is measured through (outside the key, so refused unless
+# `debug=raw`). ★ Why a minor: a new public argument and a new json field —
+# additive; every call a 0.12.0 caller makes is byte-identical. gonk pins
+# `"0.12.0"` and `^0.12.0` is `<0.13.0`, so the hub moves its pin before a
+# queue row can carry a lens.
+version = "0.13.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]

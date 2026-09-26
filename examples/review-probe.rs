@@ -2,7 +2,8 @@
 //! written to disk unparsed, so two prompt wordings can be compared on
 //! identical inputs.
 //!
-//!   cargo run --example review-probe -- [--model <tag>] [--lens <name>] <root> <out-dir> <n> <path>...
+//!   cargo run --example review-probe -- [--model <tag>] [--lens <name> | --guidance <file>] \
+//!       <root> <out-dir> <n> <path>...
 //!
 //! Each answer lands in `<out-dir>/<path with / replaced by _>.<i>.txt`.
 //!
@@ -16,14 +17,13 @@
 //! Added for the model bake-off (ledger #491): the harness built to compare
 //! passes could not vary the one thing that comparison varies.
 //!
-//! `--lens <name>` adds a lens's guidance to the prompt, between the per-file
-//! instruction and the file, through `ExplainConfig::review_guidance`. The
-//! format contract, the reminder and the system prompt are untouched; only
-//! the guidance varies, so a lensed arm and a plain arm differ in exactly one
-//! thing. The lenses are the constants below — the text lives HERE, not in
-//! the crate, until a lens has earned its place in the archive key (ledger
-//! #456's verdict rule; `intent` is the first candidate, ledger #518 idea 3).
-//! Same caveat as `--model`: the tag does not carry the lens, so keep arms in
+//! `--lens <name>` asks the review face for a SHIPPED lens (`lens=<name>` on
+//! the request — `intent` is the first; the manifold's `one_of` is the list).
+//! `--guidance <file>` runs a CANDIDATE lens: the file's text goes between
+//! the per-file instruction and the file through `ExplainConfig::review_guidance`,
+//! which is how `intent` was measured before it shipped (ledger #456). Either
+//! way the format contract, the reminder and the system prompt are untouched,
+//! so a lensed arm and a plain arm differ in exactly one thing. Keep arms in
 //! separate out-dirs.
 //!
 //! ⚠⚠ IT USES `debug=raw`, AND THAT IS THE WHOLE POINT. A pass is archived by
@@ -33,8 +33,8 @@
 //! the archive quoting itself. `debug=raw` derives fresh, consults nothing and
 //! writes nothing — no annotation, no archive entry, no poisoned key. Three
 //! prompt arcs have needed this (ledger #449, #450, #483) and each rebuilt it,
-//! which is why it is committed. (It is also the only face a guided pass may
-//! run under, for the same reason: guidance is outside the key.)
+//! which is why it is committed. (It is also the only face a `--guidance` pass
+//! may run under, for the same reason: candidate guidance is outside the key.)
 //!
 //! ⚠ The answers are UNPARSED on purpose. The pass discards a finding whose
 //! quote does not occur in the file, so anything measured through the ordinary
@@ -52,44 +52,6 @@ use std::time::Instant;
 use ikigai_core::{ArgRef, Capability, Fallback, Iri, Kernel, Request, SystemClock, Verb};
 use ikigai_llm::{OpenAiConfig, Registry};
 use oxigraph::store::Store;
-
-/// The INTENT lens: the four questions the constitution already states as
-/// machine-checkable rules (declared = enforced; the confused deputy; the
-/// tenancy boundary; a verb that lies), in the review prompt's own register —
-/// a threshold, not a quota, and the clean-file line unchanged. Written for
-/// ledger #456's experiment against `tests/corpus/intent/`; the verdict and
-/// the numbers are in that corpus's README.
-///
-/// ⚠ It NARROWS: a lensed pass reports what the four questions turn up and
-/// nothing else, so "nothing found" through it is a weaker all-clear than the
-/// general pass's (ledger #455's second trap).
-const INTENT_LENS: &str = "This pass looks through one lens: the authority this file exercises \
-     and declares. Confine the review to four questions, asked of every endpoint, action and \
-     privileged call in it.\n\
-     1. Declared equals enforced. Is every capability the code checks also named in the \
-     description it serves under, and every capability the description names actually \
-     checked, by this code or by the kernel's floor over the declaration? An action that \
-     enforces what it does not declare under-offers; one that declares what it never enforces \
-     lies, which is worse. A parameterized family (net hosts, fs paths, store graphs) is \
-     declared in its wildcard form and enforced against the exact member, and where a verb has \
-     its own action spec, that spec's requires replaces the flat description's rather than \
-     adding to it.\n\
-     2. The confused deputy. Does a value the caller supplied - an argument, a path segment, \
-     a name, a body - reach a privileged sub-request, a query, a command line or an emitted \
-     document as syntax rather than as a typed term?\n\
-     3. The tenancy boundary. Can a read or write reach beyond the graph, path or host the \
-     caller's token names? Is there a surface that acts for a caller nobody identified - a \
-     peer address, a loopback connection or a browser page standing in for an identity?\n\
-     4. A verb that lies. Does a Source mutate, or an Exists write? Does anything run later - \
-     a job, a timer, a callback - under an authority its caller never held, such as the \
-     process's own capability rather than the one that scheduled it?\n\
-     Answer from the code, not from the comments: a comment saying a check is made or a value \
-     is safe is a claim to verify. Report what the questions turn up at the same bar as any \
-     other finding, and nothing outside them; if they turn up nothing, the answer is the \
-     single line NOTHING ABOVE THRESHOLD.";
-
-/// The lenses this probe knows, by the name `--lens` takes.
-const LENSES: &[(&str, &str)] = &[("intent", INTENT_LENS)];
 
 /// A blocking ureq transport (the ikigai-embedded pattern): runtime-free, and
 /// redirects are NOT followed here — the endpoint follows them, re-running the
@@ -162,20 +124,25 @@ fn main() {
     // keeps the invocations in #449, #450 and #483 meaning what they meant.
     let model = take_flag(&mut args, "--model", "qwen3-coder-next:latest")
         .unwrap_or_else(|| "qwen3-coder:30b".to_string());
-    let lens = take_flag(&mut args, "--lens", "intent").map(|name| {
-        let Some((_, text)) = LENSES.iter().find(|(known, _)| *known == name) else {
-            let known: Vec<&str> = LENSES.iter().map(|(name, _)| *name).collect();
-            eprintln!(
-                "unknown lens `{name}`; the lenses are: {}",
-                known.join(", ")
-            );
-            std::process::exit(2);
-        };
-        (name, *text)
+    let lens = take_flag(&mut args, "--lens", "intent");
+    let guidance = take_flag(&mut args, "--guidance", "candidate-lens.txt").map(|file| {
+        let text = std::fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("--guidance {file}: {e}"))
+            .trim()
+            .to_string();
+        (file, text)
     });
+    if lens.is_some() && guidance.is_some() {
+        // The review face refuses the combination too; say it here first.
+        eprintln!(
+            "--lens and --guidance are exclusive: a candidate is measured against the plain pass"
+        );
+        std::process::exit(2);
+    }
     let [root, out, repeats, paths @ ..] = args.as_slice() else {
         eprintln!(
-            "usage: review-probe [--model <tag>] [--lens <name>] <root> <out-dir> <n> <path>..."
+            "usage: review-probe [--model <tag>] [--lens <name> | --guidance <file>] \
+             <root> <out-dir> <n> <path>..."
         );
         std::process::exit(2);
     };
@@ -198,8 +165,8 @@ fn main() {
     // because the config takes one.
     let store = Arc::new(Store::new().expect("store"));
     let mut config = ikigai_browse::ExplainConfig::new(Arc::clone(&store));
-    if let Some((_, text)) = &lens {
-        config = config.review_guidance(*text);
+    if let Some((_, text)) = &guidance {
+        config = config.review_guidance(text.clone());
     }
     let browse = ikigai_browse::space_with_explain(
         [("probe".to_string(), std::path::PathBuf::from(root))],
@@ -217,17 +184,21 @@ fn main() {
         "urn:cap:net:localhost",
         "urn:cap:annotate",
     ]);
-    let arm = match &lens {
-        Some((name, _)) => format!("{model}+{name}"),
-        None => model.clone(),
+    let arm = match (&lens, &guidance) {
+        (Some(name), _) => format!("{model}+{name}"),
+        (None, Some((file, _))) => format!("{model}+guidance:{file}"),
+        (None, None) => model.clone(),
     };
 
     for path in paths {
         for i in 0..repeats {
             let iri = format!("urn:repo:probe:review:{path}");
             let started = Instant::now();
-            let request = Request::new(Verb::Source, Iri::parse(&iri).expect("iri"))
+            let mut request = Request::new(Verb::Source, Iri::parse(&iri).expect("iri"))
                 .with_arg("debug", ArgRef::Inline(b"raw".to_vec()));
+            if let Some(name) = &lens {
+                request = request.with_arg("lens", ArgRef::Inline(name.as_bytes().to_vec()));
+            }
             let file = out.join(format!("{}.{i}.txt", path.replace('/', "_")));
             match futures::executor::block_on(kernel.issue(request, &cap)) {
                 Ok(repr) => {
