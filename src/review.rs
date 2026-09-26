@@ -388,6 +388,95 @@ use crate::{
 /// defeat the memo — its first hit is a region derived under this very tag.
 const REVIEW_PROMPT_VERSION: &str = "review-v5";
 
+/// The INTENT lens: the four questions the constitution already states as
+/// machine-checkable rules — declared = enforced; the confused deputy; the
+/// tenancy boundary; a verb that lies — in the prompt's own register (a
+/// threshold, not a quota; the clean-file line unchanged). Inserted between
+/// [`review_prompt`] and the file when a request asks `lens=intent`; the
+/// format contract, the reminder and the system prompt are untouched.
+///
+/// ★ Kept because it was MEASURED, not because it reads well (ledger #456's
+/// rule, `tests/corpus/intent/README.md` the numbers): on six real pre-fix
+/// intent defects the general pass found 0 of 6 in either of two runs and
+/// this lens found 2 of 6 (one in both runs, one in one), losing nothing.
+///
+/// ⚠ And kept with its weaknesses on record. It does NOT narrow — 32 findings
+/// a pass either way — it RE-LABELS (serious share 42% → 69%, the #449
+/// effect); its first question produces confident false "declares X but never
+/// checks X" claims on `requires` the KERNEL enforces (core ≥ 0.1.49); and it
+/// is 1.23× the general pass's wall clock. So it is a lens to SELECT for a
+/// file that carries authority — a door, a registry, a store's endpoint table
+/// — never one to arm on the trigger. ⚠ A lensed all-clear is a WEAKER
+/// all-clear than the general pass's, and every face says which lens it was
+/// through (#455's second trap).
+const INTENT_LENS: &str = "This pass looks through one lens: the authority this file exercises \
+     and declares. Confine the review to four questions, asked of every endpoint, action and \
+     privileged call in it.\n\
+     1. Declared equals enforced. Is every capability the code checks also named in the \
+     description it serves under, and every capability the description names actually \
+     checked, by this code or by the kernel's floor over the declaration? An action that \
+     enforces what it does not declare under-offers; one that declares what it never enforces \
+     lies, which is worse. A parameterized family (net hosts, fs paths, store graphs) is \
+     declared in its wildcard form and enforced against the exact member, and where a verb has \
+     its own action spec, that spec's requires replaces the flat description's rather than \
+     adding to it.\n\
+     2. The confused deputy. Does a value the caller supplied - an argument, a path segment, \
+     a name, a body - reach a privileged sub-request, a query, a command line or an emitted \
+     document as syntax rather than as a typed term?\n\
+     3. The tenancy boundary. Can a read or write reach beyond the graph, path or host the \
+     caller's token names? Is there a surface that acts for a caller nobody identified - a \
+     peer address, a loopback connection or a browser page standing in for an identity?\n\
+     4. A verb that lies. Does a Source mutate, or an Exists write? Does anything run later - \
+     a job, a timer, a callback - under an authority its caller never held, such as the \
+     process's own capability rather than the one that scheduled it?\n\
+     Answer from the code, not from the comments: a comment saying a check is made or a value \
+     is safe is a claim to verify. Report what the questions turn up at the same bar as any \
+     other finding, and nothing outside them; if they turn up nothing, the answer is the \
+     single line NOTHING ABOVE THRESHOLD.";
+
+/// The lenses a request may ask for, by the name `lens=` takes — and the
+/// `one_of` the manifold publishes for it, so a caller learns what exists from
+/// the contract rather than from a refusal.
+///
+/// ★ A lens joins the archive KEY: the tag becomes `{prompt}+{lens}@{model}`,
+/// so a lensed pass and the plain pass COEXIST on one file at one hash, each
+/// with its own findings, its own region memos and its own dated entry, and
+/// neither overwrites the other (ledger #455). The lens-less tag is
+/// byte-identical to what it was, so nothing existing re-pays the cold-pass
+/// tax (ledger #481). Adding a lens here is adding a tag; it is not a prompt
+/// version bump.
+pub(crate) const LENSES: &[(&str, &str)] = &[("intent", INTENT_LENS)];
+
+/// The lens a request named, if any, resolved against [`LENSES`] — or a
+/// refusal that names what exists.
+fn requested_lens(inv: &Invocation<'_>) -> Result<Option<(&'static str, &'static str)>> {
+    let Ok(name) = inv.inline_str("lens") else {
+        return Ok(None);
+    };
+    match LENSES.iter().find(|(known, _)| *known == name) {
+        Some(lens) => Ok(Some(*lens)),
+        None => Err(Error::InvalidArgument {
+            name: "lens".to_string(),
+            detail: format!(
+                "unknown lens `{name}`; the lenses are: {}",
+                LENSES
+                    .iter()
+                    .map(|(known, _)| *known)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }),
+    }
+}
+
+/// The lens name carried in a version tag — `review-v5+intent@coder` ⇒
+/// `intent`; `review-v5@coder` ⇒ `None`. The tag is the record; nothing else
+/// needs storing to know which lens a pass was read through.
+pub(crate) fn lens_of_tag(tag: &str) -> Option<&str> {
+    let (prompt, _) = tag.split_once('@')?;
+    prompt.split_once('+').map(|(_, lens)| lens)
+}
+
 /// How many SUGGESTIONS — the tier between [`crate::finding::SERIOUS_SEVERITIES`]
 /// and [`crate::finding::PRAISE_SEVERITY`] — a pass is asked to carry at most.
 ///
@@ -1169,6 +1258,15 @@ impl PassEntry {
             (1, _) => "1 finding".to_string(),
             (n, _) => format!("{n} findings"),
         };
+        // ⚠ A lensed pass's all-clear is the NARROWER claim — "nothing the
+        // four questions turn up", not "nothing" — and a reader must never be
+        // able to mistake one for the other (ledger #455). Said on every count,
+        // not only the clean one, so a lensed "3 findings" is not read as the
+        // general pass's either.
+        let head = match lens_of_tag(&self.tag) {
+            Some(lens) => format!("{head} through the {lens} lens"),
+            None => head,
+        };
         // The carried share is named so a reader can tell "this pass found 3"
         // from "3 are on file, 1 of them new" — the queue only grew by the
         // difference. The withheld count is named beside it, because a
@@ -1730,7 +1828,13 @@ impl Endpoint for ReviewEndpoint {
                 .await
                 .unwrap_or_else(|| provider_label(&provider)),
         };
-        let tag = format!("{REVIEW_PROMPT_VERSION}@{model}");
+        // The lens, if asked for, is IN the tag — see [`LENSES`] — so the
+        // plain pass's tag is exactly what it always was.
+        let lens = requested_lens(inv)?;
+        let tag = match lens {
+            Some((name, _)) => format!("{REVIEW_PROMPT_VERSION}+{name}@{model}"),
+            None => format!("{REVIEW_PROMPT_VERSION}@{model}"),
+        };
 
         // `debug=raw` is the diagnosis face: derive one fresh answer and
         // return it UNPARSED — nothing minted, nothing archived, the archive
@@ -1745,21 +1849,35 @@ impl Endpoint for ReviewEndpoint {
             }
             Err(_) => false,
         };
-        // ⚠ Guidance is outside the archive key (`ExplainConfig::review_guidance`
-        // says why), so a guided derivation may only happen where nothing is
-        // written or consulted. Refused BEFORE the archive lookup: a hit would
-        // otherwise serve the unguided pass's answer as if it were the guided
-        // one, silently.
-        let guidance = match (&config.review_guidance, debug_raw) {
-            (None, _) => String::new(),
-            (Some(text), true) => format!("\n\n{text}"),
-            (Some(_), false) => {
+        // What sits between the instruction and the file: a lens's text (in the
+        // key), or the probe seam's (NOT in the key). ⚠ The seam is outside the
+        // archive key (`ExplainConfig::review_guidance` says why), so a guided
+        // derivation may only happen where nothing is written or consulted.
+        // Refused BEFORE the archive lookup: a hit would otherwise serve the
+        // unguided pass's answer as if it were the guided one, silently. And
+        // never both: a candidate lens is measured against the plain pass, the
+        // way `intent` was, not layered on a shipped one.
+        let guidance = match (lens, &config.review_guidance, debug_raw) {
+            (None, None, _) => String::new(),
+            (Some((_, text)), None, _) => format!("\n\n{text}"),
+            (None, Some(text), true) => format!("\n\n{text}"),
+            (None, Some(_), false) => {
                 return Err(Error::Endpoint(
                     "review guidance is configured but is not part of the archive key: a \
                      guided pass runs only under `debug=raw` (see \
                      `ExplainConfig::review_guidance`)"
                         .to_string(),
                 ))
+            }
+            (Some((name, _)), Some(_), _) => {
+                return Err(Error::InvalidArgument {
+                    name: "lens".to_string(),
+                    detail: format!(
+                        "`lens={name}` cannot be combined with configured review guidance: a \
+                         candidate lens is measured against the plain pass, not on top of a \
+                         shipped one"
+                    ),
+                })
             }
         };
 
@@ -2120,6 +2238,10 @@ fn face(
                 "about": entry.target_iri,
                 "content_hash": entry.hash,
                 "version_tag": entry.tag,
+                // The lens this pass read through, or null for the general
+                // pass — so a consumer never has to parse the tag to know
+                // that "nothing above threshold" here is the narrower claim.
+                "lens": lens_of_tag(&entry.tag),
                 "model": entry.model,
                 "derived": derived,
                 // The affirmative statement, for a machine consumer that would
@@ -2382,6 +2504,24 @@ fn review_description(config: &ExplainConfig) -> Description {
                      is exclusive with nothing.",
                 )
                 .one_of(config.selectable()),
+        )
+        .input(
+            ArgSpec::new("lens")
+                .optional()
+                .class(crate::XSD_STRING)
+                .summary(
+                    "read the file through ONE lens — a class of question the general pass \
+                     has no reason to ask — instead of the general pass; one_of is the lenses \
+                     that exist. `intent`: the constitution's four authority questions \
+                     (declared = enforced, the confused deputy, the tenancy boundary, a verb \
+                     that lies). The lens joins the archive key (`review-v5+intent@…`), so a \
+                     lensed pass COEXISTS with the plain pass on the same content: its own \
+                     findings, its own memos, neither replacing the other. ⚠ A lensed pass \
+                     reports what its questions turn up and nothing else, so its all-clear \
+                     is weaker than the general pass's; every face names the lens. Select it \
+                     for a file that carries authority; it costs a full pass",
+                )
+                .one_of(LENSES.iter().map(|(name, _)| *name)),
         )
         .input(
             ArgSpec::new("as")
@@ -5035,7 +5175,17 @@ mod tests {
         // No `repo` ArgSpec: rows fix the root; the binding is
         // grammar-injected.
         let names: Vec<&str> = description.inputs.iter().map(|i| i.name.as_str()).collect();
-        assert_eq!(names, ["path", "provider", "as", "debug"]);
+        assert_eq!(names, ["path", "provider", "lens", "as", "debug"]);
+        // The lenses that exist are the manifold's to publish: a caller learns
+        // `intent` from the contract, and validate can refuse `lens=nope`
+        // before dispatch.
+        let lens_spec = description
+            .inputs
+            .iter()
+            .find(|i| i.name == "lens")
+            .expect("lens");
+        assert_eq!(lens_spec.one_of, vec!["intent".to_string()]);
+        assert!(!lens_spec.required, "the general pass is the default");
 
         // The manifold publishes the allowlist: `provider`'s one_of IS what
         // this host permits, so validate can reject before dispatch and a UI
@@ -5797,5 +5947,155 @@ mod tests {
         assert_eq!(first["derived"], true);
         assert_eq!(plain_log.count(), 1);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    // --- lenses (`lens=`) ----------------------------------------------------
+
+    /// ★ A lens is IN THE KEY. The lensed pass and the plain pass coexist on
+    /// one file at one hash — each derived once, each with its own findings —
+    /// and the plain pass's tag, prompt and archive entry are byte-for-byte
+    /// what they were before lenses existed (ledger #455, #481).
+    #[test]
+    fn a_lens_joins_the_tag_and_coexists_with_the_plain_pass() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, TWO_FINDINGS);
+
+        let plain = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(plain["version_tag"], "review-v5@r1");
+        assert_eq!(plain["lens"], serde_json::Value::Null);
+        assert_eq!(plain["derived"], true);
+        let (plain_prompt, _, _) = log.last();
+        assert!(!plain_prompt.contains("through one lens"), "{plain_prompt}");
+
+        let lensed = json(&k, "urn:repo:demo:review:a.rs", &[("lens", "intent")]);
+        assert_eq!(lensed["version_tag"], "review-v5+intent@r1");
+        assert_eq!(lensed["lens"], "intent");
+        assert_eq!(
+            lensed["derived"], true,
+            "a different key: not a hit on the plain pass"
+        );
+        assert_eq!(log.count(), 2);
+        let (lensed_prompt, _, _) = log.last();
+        // The lens text sits between the instruction and the file, and
+        // nothing else moves: the lensed prompt is the plain prompt with one
+        // paragraph inserted before `Repository:`.
+        let expected = plain_prompt.replacen(
+            "\n\nRepository: demo",
+            &format!("\n\n{INTENT_LENS}\n\nRepository: demo"),
+            1,
+        );
+        assert_eq!(lensed_prompt, expected, "{lensed_prompt}");
+
+        // Its own findings — the same two quotes, minted under its own pass —
+        // beside the plain pass's, not instead of them.
+        assert_eq!(lensed["minted"].as_array().unwrap().len(), 2);
+        assert_ne!(lensed["minted"], plain["minted"]);
+        let queue = json(&k, "urn:repo:demo:findings:a.rs", &[]);
+        assert_eq!(queue.as_array().unwrap().len(), 4);
+        // And every face says which lens it was read through.
+        assert!(
+            lensed["statement"]
+                .as_str()
+                .unwrap()
+                .contains("2 findings through the intent lens"),
+            "{}",
+            lensed["statement"]
+        );
+        assert!(
+            !plain["statement"].as_str().unwrap().contains("lens"),
+            "{}",
+            plain["statement"]
+        );
+
+        // Both are archive hits from here: no ask, the same recorded set.
+        let again = json(&k, "urn:repo:demo:review:a.rs", &[("lens", "intent")]);
+        assert_eq!(again["derived"], false);
+        assert_eq!(again["minted"], lensed["minted"]);
+        let plain_again = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(plain_again["derived"], false);
+        assert_eq!(plain_again["minted"], plain["minted"]);
+        assert_eq!(log.count(), 2);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ⚠ A lensed all-clear is the NARROWER claim, and the clean statement
+    /// says so — "nothing above threshold" through a lens must never render as
+    /// the general pass's "nothing above threshold" (ledger #455).
+    #[test]
+    fn a_lensed_clean_pass_names_its_lens_in_the_statement() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, CLEAN);
+
+        let lensed = json(&k, "urn:repo:demo:review:a.rs", &[("lens", "intent")]);
+        assert_eq!(lensed["minted"].as_array().unwrap().len(), 0);
+        let statement = lensed["statement"].as_str().unwrap();
+        assert!(
+            statement.starts_with("nothing above threshold through the intent lens"),
+            "{statement}"
+        );
+        let text = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:review:a.rs",
+                &[("lens", "intent")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert!(text.contains("through the intent lens"), "{text}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The manifold decides what a caller may ask for: an unknown lens is
+    /// refused by name, naming what exists, and nothing is asked or archived.
+    /// And a shipped lens does not stack on the probe seam.
+    #[test]
+    fn an_unknown_lens_is_refused_and_a_lens_does_not_stack_on_guidance() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, TWO_FINDINGS);
+
+        let refused = issue(
+            &k,
+            Verb::Source,
+            "urn:repo:demo:review:a.rs",
+            &[("lens", "nope")],
+            &cap(),
+        );
+        let err = refused.expect_err("unknown lens");
+        assert!(err.to_string().contains("intent"), "{err}");
+        assert_eq!(log.count(), 0);
+
+        let guided_log = Arc::new(Log::default());
+        let guided = guided_kernel(&root, &store, &guided_log);
+        let refused = issue(
+            &guided,
+            Verb::Source,
+            "urn:repo:demo:review:a.rs",
+            &[("lens", "intent"), ("debug", "raw")],
+            &cap(),
+        );
+        let err = refused.expect_err("lens on top of guidance");
+        assert!(err.to_string().contains("cannot be combined"), "{err}");
+        assert_eq!(guided_log.count(), 0);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_lens_is_read_back_from_the_tag() {
+        assert_eq!(
+            lens_of_tag("review-v5+intent@qwen3-coder:30b"),
+            Some("intent")
+        );
+        assert_eq!(lens_of_tag("review-v5@qwen3-coder:30b"), None);
+        // A model tag may itself carry a `+`; only the prompt half is read.
+        assert_eq!(lens_of_tag("review-v5@some+model"), None);
+        assert_eq!(lens_of_tag("review-v5+intent@some+model"), Some("intent"));
     }
 }
