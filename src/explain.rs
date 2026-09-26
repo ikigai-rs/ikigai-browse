@@ -212,6 +212,9 @@ pub struct ExplainConfig {
     pub(crate) ignore: BTreeSet<String>,
     pub(crate) max_prompt_bytes: usize,
     pub(crate) review_max_chunks: usize,
+    /// Extra guidance the REVIEW pass shows the model between its instruction
+    /// and the file — [`ExplainConfig::review_guidance`], the probe seam.
+    pub(crate) review_guidance: Option<String>,
 }
 
 impl ExplainConfig {
@@ -245,7 +248,30 @@ impl ExplainConfig {
             ignore: crate::hash::default_ignore(),
             max_prompt_bytes: 16 * 1024,
             review_max_chunks: 16,
+            review_guidance: None,
         }
+    }
+
+    /// Extra guidance for the REVIEW pass, inserted between the per-file
+    /// instruction and the file — the seam `examples/review-probe.rs --lens`
+    /// runs a prompt experiment through. The format contract, the reminder
+    /// after the content and the system prompt are untouched by it, and with
+    /// nothing set the prompt is byte-identical to the unguided pass.
+    ///
+    /// ⚠ **It does NOT join the archive key, so a guided pass may only run
+    /// `debug=raw`.** A pass is keyed `(path, content-hash, prompt-tag, model)`
+    /// and this text is in none of those: a guided pass archived under the
+    /// plain tag would be served, byte for byte, as the plain pass's answer to
+    /// every later reader, and the memo would carry its regions forward under
+    /// a tag that never saw the guidance (ledger #455 — a lens outside the key
+    /// collides with the pass it is not). The review face therefore REFUSES to
+    /// derive with guidance set unless the request is `debug=raw`, which
+    /// archives nothing and consults nothing. If a guided pass earns a place
+    /// in the key, that is a `lens` argument and a tag of its own (ledger
+    /// #456), not this seam.
+    pub fn review_guidance(mut self, text: impl Into<String>) -> Self {
+        self.review_guidance = Some(text.into());
+        self
     }
 
     /// The **graph** the explanation archive, the review passes and the

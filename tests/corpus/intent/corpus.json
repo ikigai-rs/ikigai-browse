@@ -1,0 +1,90 @@
+[
+  {
+    "entry": "ledger",
+    "repo": "ikigai-rs/ikigai-ledger",
+    "path": "src/endpoints.rs",
+    "sha": "21e25b6b64f915d69c7daee35a59175e4abfa498",
+    "fixed_by": "4e6f46e (0.2.1, ikigai-ledger PR #5)",
+    "question": 1,
+    "anchors": [
+      "spec.requires(CAP_READ).requires(ikigai_store::CAP_READ)",
+      ".requires(ikigai_store::CAP_READ_GRAPH)"
+    ],
+    "finding": "item:{id}'s per-verb action spec (`read_action`) requires the broad `urn:cap:store:read` (`ikigai_store::CAP_READ`) while every other read (`read_scopes`) declares the per-graph family `CAP_READ_GRAPH` and the reads themselves name one graph. A caller holding only the narrow published grants can list a ledger and file into it but is denied reading a single item: the declaration demands more than the code enforces, and the two authoring forms of the same authority disagree.",
+    "note": "The two declarations are ~480 lines apart in a 112 KB file, so at the 16 KiB tiling they land in different regions; a correct finding from the `read_action` region alone must argue from the broad token against the per-graph sub-requests it can see."
+  },
+  {
+    "entry": "llm",
+    "repo": "ikigai-rs/ikigai-llm",
+    "path": "src/lib.rs",
+    "sha": "6b1930a",
+    "fixed_by": "e6f8eee (0.9.1, ikigai-llm PR #3)",
+    "question": 1,
+    "anchors": [
+      "const CAP_NET: &str = \"urn:cap:net\";",
+      ".requires(CAP_NET)",
+      "(needs urn:cap:net:{host})"
+    ],
+    "finding": "`CAP_NET` is declared in the exact form `urn:cap:net` while `require_net` enforces the per-host family `urn:cap:net:<host>`. A host-scoped grant such as `urn:cap:net:localhost` passes the enforcement but does not satisfy the declaration, so the manifold does not offer `ask` to it and a kernel floor over the declaration denies it before the per-host check runs. A parameterized family is declared in its wildcard form, `urn:cap:net:*`.",
+    "note": "The constant is at the top of an 88 KB file and `require_net` at the bottom, so the two halves of the mismatch are in different regions; the `.requires(CAP_NET)` calls sit near `require_net`."
+  },
+  {
+    "entry": "time",
+    "repo": "ikigai-rs/ikigai-cli",
+    "path": "crates/ikigai-time/src/lib.rs",
+    "sha": "e4211a8",
+    "fixed_by": "f7c53bf (ikigai-time 0.4.0, ikigai-cli PR #356; ledger #79)",
+    "question": 4,
+    "anchors": [
+      "capability: Capability::root(),",
+      "Some(r) => (Arc::clone(r), inner.capability.clone()),",
+      "pub fn with_capability(self, capability: Capability) -> Self {",
+      "resolver.issue_as(Request::new(verb, iri), &capability)"
+    ],
+    "finding": "A scheduled job fires under the registry's own capability — `Capability::root()` at construction, narrowed only by a host that calls `with_capability` — never under the capability of the caller that scheduled it: `schedule` captures nothing from the invocation and `fire` issues with `inner.capability`. An attenuated caller permitted to schedule can have a Sink or Delete against any IRI executed at root. Also Q1-adjacent: no `urn:time:*` action declares `requires`, so the manifold offers scheduling to every capability.",
+    "note": "The constructor, `with_capability` and `fire` are within ~200 lines of each other; the endpoint `describe()`s with no `requires` are ~170 lines further on."
+  },
+  {
+    "entry": "gonk",
+    "repo": "ikigai-rs/ikigai-gonk",
+    "path": "src/doors.rs",
+    "sha": "22e34cd",
+    "fixed_by": "d586aa6 (ikigai-gonk PR #2: Host / Origin / Sec-Fetch-Site checks on the HTTP door)",
+    "question": 3,
+    "anchors": [
+      "Some(peer) if is_loopback(peer) => Capability::scoped(grants.clone()),",
+      "any local process"
+    ],
+    "finding": "`http_cap` hands the configured ledgers' read AND write tokens to any request whose TCP peer is loopback. A browser is a local process: a page from any origin can POST to the mechanically-mapped write routes (`POST /iki/ledger/append` -> `Sink urn:iki:ledger:append`) and write to the ledger with the operator's grants — cross-site request forgery. Nothing checks Origin, Host or Sec-Fetch-Site; a peer address is not an identity.",
+    "note": "7 KB, one region; the whole mechanism is on the page."
+  },
+  {
+    "entry": "store",
+    "repo": "ikigai-rs/ikigai-store",
+    "path": "src/endpoints.rs",
+    "sha": "fe676d0",
+    "fixed_by": "139e09e (0.2.2, ikigai-store PR #4: the per-graph read doors)",
+    "question": 3,
+    "anchors": [
+      "pub const CAP_READ: &str = \"urn:cap:store:read\";",
+      "pub const CAP_WRITE_GRAPH: &str = \"urn:cap:store:write:graph:*\";",
+      ".requires(CAP_READ)"
+    ],
+    "finding": "Writes are scoped per graph (`urn:iki:store:graph-update` under `urn:cap:store:write:graph:<iri>`) but every read declares the dataset-wide `urn:cap:store:read` and no per-graph read door exists. The tenancy boundary is half a boundary: a module confining its callers to its own graph is bypassed by anyone holding the broad read token querying the store directly, and a tenant granted a write of one graph cannot be granted a read of only that graph.",
+    "note": "The two capability constants are adjacent (lines ~82-108); the read endpoints' `.requires(CAP_READ)` and `graph-update` are within the first 24 KB, so the asymmetry is visible inside one or two regions."
+  },
+  {
+    "entry": "vocab",
+    "repo": "ikigai-rs/ikigai-core",
+    "path": "crates/ikigai-vocab/src/lib.rs",
+    "sha": "f005754",
+    "fixed_by": "0cd382e (ikigai-core PR #99: escape identifiers on the way into RDF IRI positions)",
+    "question": 2,
+    "anchors": [
+      "let subject = format!(\"<urn:ikigai:endpoint:{}>\", description.id);",
+      "// `id` is a resource identifier (no Turtle-significant characters)."
+    ],
+    "finding": "`to_turtle` interpolates `description.id` straight into an IRI position (`<urn:ikigai:endpoint:{id}>`) on the strength of a comment, while the literal position a few lines below is escaped. `Description::new` validates nothing, so an id containing `>` or whitespace closes the subject early and the rest parses as Turtle — arbitrary triples in every Meta response and the action manifold. The value should be validated or percent-encoded at the IRI position, as the literal is escaped.",
+    "note": "Carving caveat: the value is AUTHOR-supplied (an endpoint id), not caller-supplied, so this is the injection mechanism of question 2 without its confused-deputy authority shape. It is the closest one-file Q2 blob the ecosystem has shipped; the ledger's 0.2.0 confused-deputy shape (its own SPARQL escaper over the broad store token) is disclosed in that file's own header, so a finding there could not be told from a restatement (ledger #483)."
+  }
+]

@@ -1745,6 +1745,23 @@ impl Endpoint for ReviewEndpoint {
             }
             Err(_) => false,
         };
+        // ⚠ Guidance is outside the archive key (`ExplainConfig::review_guidance`
+        // says why), so a guided derivation may only happen where nothing is
+        // written or consulted. Refused BEFORE the archive lookup: a hit would
+        // otherwise serve the unguided pass's answer as if it were the guided
+        // one, silently.
+        let guidance = match (&config.review_guidance, debug_raw) {
+            (None, _) => String::new(),
+            (Some(text), true) => format!("\n\n{text}"),
+            (Some(_), false) => {
+                return Err(Error::Endpoint(
+                    "review guidance is configured but is not part of the archive key: a \
+                     guided pass runs only under `debug=raw` (see \
+                     `ExplainConfig::review_guidance`)"
+                        .to_string(),
+                ))
+            }
+        };
 
         let iri = pass_iri(repo, &rel, &hash, &tag);
         if !debug_raw {
@@ -1805,7 +1822,7 @@ impl Endpoint for ReviewEndpoint {
                 continue;
             }
             let prompt = format!(
-                "{}\n\nRepository: {repo}\nPath: {rel}{}\n\n```\n{}\n```\n\n{}",
+                "{}{guidance}\n\nRepository: {repo}\nPath: {rel}{}\n\n```\n{}\n```\n\n{}",
                 review_prompt(budget, index == 0),
                 region_header(region, index, tiles.len(), &text),
                 &text[region.start..region.end],
@@ -5668,6 +5685,117 @@ mod tests {
         // And the resource agrees, for the reason the markup encodes.
         let refused = issue(&k, Verb::Source, "urn:repo:demo:review:", &[], &cap());
         assert!(refused.is_err(), "{refused:?}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // --- the guidance seam (`ExplainConfig::review_guidance`) ---------------
+
+    const GUIDANCE: &str = "Look only at the authority this file exercises.";
+
+    /// A kernel whose review config carries `GUIDANCE`; the fake model answers
+    /// every ask with `reply`.
+    fn guided_kernel(root: &std::path::Path, store: &Arc<Store>, log: &Arc<Log>) -> Kernel {
+        let cfg = ExplainConfig::new(Arc::clone(store))
+            .review_model_label("r1")
+            .review_guidance(GUIDANCE);
+        let browse = crate::space_with_explain(vec![("demo".to_string(), root.to_path_buf())], cfg);
+        Kernel::new(Arc::new(Fallback::new(vec![
+            Arc::new(browse),
+            Arc::new(llm_space(log, TWO_FINDINGS)),
+        ])))
+    }
+
+    /// ★ The guidance sits between the instruction and the file, and NOTHING
+    /// ELSE MOVES: the guided prompt is the plain prompt with one paragraph
+    /// inserted before `Repository:` — so the format contract, the region
+    /// header and the reminder are byte-identical between the two arms, and a
+    /// difference between them is the guidance and only the guidance.
+    #[test]
+    fn review_guidance_lands_between_the_instruction_and_the_file_under_debug_raw() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let plain_log = Arc::new(Log::default());
+        let plain = kernel_with(&root, &store, &plain_log, TWO_FINDINGS);
+        let raw = [("debug", "raw")];
+        issue(
+            &plain,
+            Verb::Source,
+            "urn:repo:demo:review:a.rs",
+            &raw,
+            &cap(),
+        )
+        .unwrap();
+        let (plain_prompt, plain_system, _) = plain_log.last();
+
+        let guided_log = Arc::new(Log::default());
+        let guided = guided_kernel(&root, &store, &guided_log);
+        let answer = issue(
+            &guided,
+            Verb::Source,
+            "urn:repo:demo:review:a.rs",
+            &raw,
+            &cap(),
+        )
+        .unwrap();
+        assert_eq!(
+            body(&answer),
+            TWO_FINDINGS,
+            "raw returns the answer unparsed"
+        );
+        let (guided_prompt, guided_system, _) = guided_log.last();
+
+        let expected = plain_prompt.replacen(
+            "\n\nRepository: demo",
+            &format!("\n\n{GUIDANCE}\n\nRepository: demo"),
+            1,
+        );
+        assert_eq!(guided_prompt, expected, "{guided_prompt}");
+        assert_eq!(
+            guided_system, plain_system,
+            "the system prompt is not the seam"
+        );
+        // The contract still closes the prompt, after the file.
+        assert!(
+            guided_prompt.rfind("format contract").unwrap()
+                > guided_prompt.rfind("fn gamma()").unwrap(),
+            "{guided_prompt}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ⚠ Guidance is outside the archive key, so a guided pass through the
+    /// ordinary face is REFUSED — before any ask is spent and before the
+    /// archive is consulted or written. The refusal is the whole protection
+    /// against a guided answer being archived, and later served, as the plain
+    /// pass's (ledger #455).
+    #[test]
+    fn a_guided_pass_refuses_to_derive_or_archive_outside_debug_raw() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let guided = guided_kernel(&root, &store, &log);
+
+        let refused = issue(
+            &guided,
+            Verb::Source,
+            "urn:repo:demo:review:a.rs",
+            &[],
+            &cap(),
+        );
+        let err = refused.expect_err("a guided pass must not run through the archive");
+        assert!(
+            err.to_string().contains("not part of the archive key"),
+            "{err}"
+        );
+        assert_eq!(log.count(), 0, "nothing was asked");
+
+        // And nothing was archived: a plain kernel over the same store derives
+        // fresh rather than hitting anything the refused pass left behind.
+        let plain_log = Arc::new(Log::default());
+        let plain = kernel_with(&root, &store, &plain_log, TWO_FINDINGS);
+        let first = json(&plain, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(first["derived"], true);
+        assert_eq!(plain_log.count(), 1);
         std::fs::remove_dir_all(&root).ok();
     }
 }
