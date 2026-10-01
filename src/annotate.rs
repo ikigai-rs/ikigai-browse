@@ -102,7 +102,7 @@ use crate::{
 pub const CAP_ANNOTATE: &str = "urn:cap:annotate";
 
 const OA: &str = "http://www.w3.org/ns/oa#";
-const DCTERMS_CREATED: &str = "http://purl.org/dc/terms/created";
+pub(crate) const DCTERMS_CREATED: &str = "http://purl.org/dc/terms/created";
 /// Machine provenance (S4, the review layer) — all STANDARD terms, no vocab
 /// publish needed: `dcterms:creator` carries the model identity on
 /// machine-minted annotations, `oa:motivatedBy` distinguishes the review's
@@ -159,6 +159,25 @@ pub(crate) const DCTERMS_TYPE: &str = "http://purl.org/dc/terms/type";
 /// the right end state and is REPORTED, not invented here (the vocabulary
 /// lives in core; ledger #457's batch).
 pub(crate) const DCTERMS_SUBJECT: &str = "http://purl.org/dc/terms/subject";
+/// `dcterms:replaces` — a REVISION's decision node to the decision node it
+/// revises (ledger #653). An INTERIM predicate, like [`DCTERMS_SUBJECT`].
+///
+/// ★ Not `prov:wasRevisionOf`, which is the obvious name and the wrong
+/// entailment: PROV-O gives it `rdfs:domain prov:Entity` and `rdfs:range
+/// prov:Entity`, and a decision node is a `prov:Activity` — a class PROV-O
+/// declares DISJOINT from `prov:Entity`. Writing it would type every decision
+/// node as both, which a reasoner reports as an inconsistency and no code path
+/// here would ever show (the same trap as `oa:bodyValue` on a finding).
+/// `dcterms:replaces` declares no domain, says exactly "this supplants that",
+/// and types nothing. A dedicated `ik:revises` is the right end state and is
+/// REPORTED, not invented here (the vocabulary lives in core).
+pub(crate) const DCTERMS_REPLACES: &str = "http://purl.org/dc/terms/replaces";
+/// `dcterms:provenance` — HOW a decision was made: one of [`Made`]'s terms
+/// (`urn:iki:decision-made:single`, `urn:iki:decision-made:batch:{key}`). An
+/// INTERIM predicate: domain-free (its range, `dcterms:ProvenanceStatement`,
+/// types only the term, which is a statement about provenance). A dedicated
+/// `ik:` term is the right end state and is REPORTED.
+pub(crate) const DCTERMS_PROVENANCE: &str = "http://purl.org/dc/terms/provenance";
 
 /// `sh:resultSeverity` — the severity of an assessment result.
 ///
@@ -184,6 +203,10 @@ pub(crate) const MOTIVATION_REVIEW: &str = "assessing";
 /// values, and the match that reads them.
 pub(crate) const PUBLISH: &str = "publish";
 pub(crate) const DECLINE: &str = "decline";
+/// The third decision word (ledger #653): withdraw the CURRENT decision, so
+/// the finding has none again. Only ever a revision — there is nothing to
+/// retract on an undecided finding.
+pub(crate) const RETRACT: &str = "retract";
 
 /// How much context the stored quote selector carries on each side of the
 /// exact quote (characters). Part of the re-anchoring contract.
@@ -261,6 +284,33 @@ fn position_iri(family: Family, id: &str) -> String {
 /// on the finding is never overwritten by it.
 pub(crate) fn decision_iri(id: &str) -> String {
     format!("{}:decision", record_iri(Family::Finding, id))
+}
+
+/// The `n`th decision node on a finding (1-based): the first is
+/// [`decision_iri`] — the node every decision before ledger #653 wrote, and
+/// the one a recurrence mark links — and each REVISION appends
+/// `{decision_iri}:{n}`. Nothing is renamed when a revision lands: the chain
+/// grows at its end, and every node keeps the IRI it was written under.
+pub(crate) fn revision_iri(id: &str, n: u32) -> String {
+    match n {
+        0 | 1 => decision_iri(id),
+        n => format!("{}:{n}", decision_iri(id)),
+    }
+}
+
+/// Where a decision node sits in its finding's chain — the inverse of
+/// [`revision_iri`] for the node IRIs of the finding `finding_iri`, and
+/// `None` for anything else.
+fn revision_number(finding_iri: &str, node: &str) -> Option<u32> {
+    let rest = node.strip_prefix(finding_iri)?.strip_prefix(":decision")?;
+    match rest {
+        "" => Some(1),
+        _ => rest
+            .strip_prefix(':')?
+            .parse::<u32>()
+            .ok()
+            .filter(|n| *n >= 2),
+    }
 }
 
 /// Caller-supplied slugs must embed cleanly in the URN (and must not collide
@@ -344,13 +394,44 @@ fn parse_target(target: &str, roots: &BTreeMap<String, std::path::PathBuf>) -> R
 /// stays a query rather than an impression (ledger #444, comment 2). One
 /// field that the human overwrote would destroy the only signal that could
 /// ever answer it, unrecoverably, on the first write.
+///
+/// ★ **A decision node is never rewritten, and a later one may REVISE it**
+/// (ledger #653). Each node is written once ([`append_decision`]) and nothing
+/// in this crate removes or re-stores it; a revision is a NEW node
+/// ([`revision_iri`]) that links the one it revises ([`DCTERMS_REPLACES`]), so
+/// every answer a human ever gave stays in the graph, in order, the way both
+/// severity ratings do.
 #[derive(Clone, Debug)]
 pub(crate) struct Decision {
+    /// This node's IRI — [`revision_iri`] of its place in the chain.
+    pub(crate) iri: String,
     pub(crate) outcome: Outcome,
     /// The FINAL severity — the human's re-rating, or the model's proposal
-    /// accepted unchanged. Always present: a decision states a rating.
-    pub(crate) severity: String,
+    /// accepted unchanged. Present on every publish and decline (a decision
+    /// states a rating; a legacy node without one reads as `info`), and
+    /// `None` on a retraction, which states none.
+    pub(crate) severity: Option<String>,
     pub(crate) at: Option<String>,
+    /// The decision node this one revises — `None` on a finding's first
+    /// decision. Stored as [`DCTERMS_REPLACES`].
+    pub(crate) revises: Option<String>,
+    /// How the decision was made, when the caller said: singly, or as part of
+    /// a batch with that batch's group key. `None` on every decision made
+    /// before ledger #653 and on any caller that did not say — which is what
+    /// lets [`crate::revision`] infer a burst from timestamps for exactly
+    /// those, and never for one whose provenance is on record.
+    pub(crate) made: Option<Made>,
+    /// COMPUTED, never stored: whether this decision is one a human evidently
+    /// meant ([`crate::revision::confirmed`]). The loader sets it
+    /// PESSIMISTICALLY — a wordless decline with no recorded provenance reads
+    /// unconfirmed until [`crate::revision::mark`] has looked for its burst —
+    /// so a face that forgot the mark under-reports confirmation, which only
+    /// withholds a pre-tick, rather than over-reporting it.
+    pub(crate) confirmed: bool,
+    /// COMPUTED, never stored: the first timestamp of the burst this decline
+    /// was made in (legacy declines without provenance only) — `None` when
+    /// it was in none, or before [`crate::revision::mark`] ran.
+    pub(crate) burst: Option<String>,
     /// The human's reason, if they gave one (the Sink's piped `content`).
     /// ★ A declined finding with a reason is the beginning of a feedback
     /// signal; a discarded one is churn.
@@ -364,6 +445,60 @@ pub(crate) struct Decision {
     /// The annotation minted on publish — `None` for a decline, which is
     /// exactly what makes a decline a RECORD rather than a deletion.
     pub(crate) minted: Option<String>,
+}
+
+/// How a decision was made — recorded when the caller says (gonk stamps it at
+/// its door), never inferred into the store.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Made {
+    /// One finding, one decision.
+    Single,
+    /// One of many decided together — carrying the batch's group key (the
+    /// `key` of a `group=` proposal, e.g. `recurrence:{twin id}`).
+    Batch(String),
+}
+
+/// The words `made=` accepts, in the Sink's `one_of` order.
+pub(crate) const MADE_WORDS: [&str; 2] = ["single", "batch"];
+
+const MADE_PREFIX: &str = "urn:iki:decision-made:";
+
+impl Made {
+    pub(crate) fn word(&self) -> &'static str {
+        match self {
+            Made::Single => MADE_WORDS[0],
+            Made::Batch(_) => MADE_WORDS[1],
+        }
+    }
+
+    /// The batch's group key, on a batch.
+    pub(crate) fn batch(&self) -> Option<&str> {
+        match self {
+            Made::Single => None,
+            Made::Batch(key) => Some(key),
+        }
+    }
+
+    /// The stored term: `urn:iki:decision-made:single`, or
+    /// `urn:iki:decision-made:batch:{key}` with the key percent-encoded the
+    /// way a path is, so any key embeds and round-trips.
+    pub(crate) fn iri(&self) -> String {
+        match self {
+            Made::Single => format!("{MADE_PREFIX}single"),
+            Made::Batch(key) => format!("{MADE_PREFIX}batch:{}", crate::iri_encode(key)),
+        }
+    }
+
+    /// Read a stored term back — `None` for anything this code did not write.
+    pub(crate) fn from_iri(iri: &str) -> Option<Made> {
+        match iri.strip_prefix(MADE_PREFIX)? {
+            "single" => Some(Made::Single),
+            rest => {
+                let key = crate::iri_decode(rest.strip_prefix("batch:")?).ok()?;
+                (!key.is_empty()).then_some(Made::Batch(key))
+            }
+        }
+    }
 }
 
 /// A decline that already answered a like claim — what a fresh finding
@@ -391,14 +526,19 @@ pub(crate) struct Decision {
 pub(crate) struct Prior {
     /// The declined twin — `urn:iki:finding:{id}`.
     pub(crate) finding: String,
-    /// Its decision, as on file. `None` only when the twin's decision node
-    /// has since been removed; the link is kept regardless.
+    /// The twin's CURRENT decision (ledger #653) — the head of its chain, so
+    /// the mark follows a revision: `None` when the twin's decision was
+    /// retracted, or its node has since been removed. The stored link is kept
+    /// regardless (it is the twin's FIRST node, and a later decline of the
+    /// twin makes the mark steer again); [`Prior::active`] is what every face
+    /// reads.
     pub(crate) decision: Option<Decision>,
 }
 
 impl Prior {
     /// The decision node the finding links to — the stored object of
-    /// `prov:wasInfluencedBy`.
+    /// `prov:wasInfluencedBy`: the twin's FIRST node, whatever revised it
+    /// since.
     pub(crate) fn decision_iri(&self) -> String {
         match Family::split(&self.finding) {
             Some((Family::Finding, id)) => decision_iri(id),
@@ -406,13 +546,28 @@ impl Prior {
         }
     }
 
+    /// The twin's current decision WHEN IT IS A DECLINE — the only case in
+    /// which the mark says anything. ★ A retracted decline is not a prior
+    /// decision, and neither is one reversed to a publish: the mark means "a
+    /// like claim was declined", and a reader (or a host pre-ticking a batch
+    /// from it) must never see that said of a decline the human withdrew.
+    pub(crate) fn active(&self) -> Option<&Decision> {
+        self.decision
+            .as_ref()
+            .filter(|d| d.outcome == Outcome::Declined)
+    }
+
     /// The prior decision in words, for the plain and html faces: when it was
-    /// declined and, if a reason was given, why.
+    /// declined, if a reason was given, why — and, when it is unconfirmed,
+    /// that too, so the reader weighs it as what it is.
     pub(crate) fn words(&self) -> String {
         let mut out = String::from("a like claim on this line was declined");
-        if let Some(decision) = &self.decision {
+        if let Some(decision) = self.active() {
             if let Some(reason) = &decision.reason {
                 out.push_str(&format!(" ({reason})"));
+            }
+            if !decision.confirmed {
+                out.push_str(" (unconfirmed)");
             }
             if let Some(at) = &decision.at {
                 out.push(' ');
@@ -426,11 +581,16 @@ impl Prior {
     }
 }
 
-/// The two ways a human can answer a pending finding.
+/// The ways a human can answer a pending finding — and, once answered,
+/// withdraw the answer.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Outcome {
     Published,
     Declined,
+    /// The current decision is withdrawn (ledger #653): the finding has no
+    /// current decision again. Only a revision can be one, and it is never
+    /// what [`Annotation::decision`] holds — that is the effective answer.
+    Retracted,
 }
 
 impl Outcome {
@@ -438,6 +598,7 @@ impl Outcome {
         match self {
             Outcome::Published => "published",
             Outcome::Declined => "declined",
+            Outcome::Retracted => "retracted",
         }
     }
 
@@ -449,6 +610,7 @@ impl Outcome {
         match iri.strip_prefix("urn:iki:finding:outcome:")? {
             "published" => Some(Outcome::Published),
             "declined" => Some(Outcome::Declined),
+            "retracted" => Some(Outcome::Retracted),
             _ => None,
         }
     }
@@ -499,8 +661,17 @@ pub(crate) struct Annotation {
     /// `prov:wasDerivedFrom` — the pending finding a published annotation was
     /// promoted from. Annotation family only.
     pub(crate) derived_from: Option<String>,
-    /// The human act. Finding family only; `None` IS the pending state.
+    /// The human act that CURRENTLY answers the finding — the head of
+    /// [`Annotation::history`] unless that head is a retraction. Finding
+    /// family only; `None` IS the undecided state (pending or superseded),
+    /// whether nothing was ever decided or the last answer was withdrawn.
+    /// ⚠ Derived: [`Annotation::settle`] sets it from `history`, and every
+    /// path that changes `history` calls it.
     pub(crate) decision: Option<Decision>,
+    /// EVERY decision node on the finding, oldest first — the first decision
+    /// and each revision of it, retractions included (ledger #653). Finding
+    /// family only; empty while nothing was ever decided.
+    pub(crate) history: Vec<Decision>,
     /// A decline that already answered a like claim on this line — the mark
     /// a fresh finding is minted with when the same file carries a DECLINED
     /// finding with the same `exact` (see [`Prior`]). Finding family only;
@@ -553,9 +724,15 @@ impl Annotation {
     /// The rating that governs: the human's, once there is one.
     pub(crate) fn effective_severity(&self) -> Option<&str> {
         match &self.decision {
-            Some(d) => Some(d.severity.as_str()),
+            Some(d) => d.severity.as_deref(),
             None => self.severity.as_deref(),
         }
+    }
+
+    /// Re-derive [`Annotation::decision`] from [`Annotation::history`]: its
+    /// head, unless the head withdrew the answer.
+    pub(crate) fn settle(&mut self) {
+        self.decision = effective(&self.history);
     }
 
     fn machine(&self) -> bool {
@@ -780,66 +957,98 @@ pub(crate) fn store_annotation(archive: &Archive, ann: &Annotation) -> Result<()
             g.clone(),
         ));
     }
-    // The human act, on its own node — never folded into the finding, whose
-    // triples are the MODEL's and stay the model's.
-    if let (Family::Finding, Some(decision)) = (ann.family, &ann.decision) {
-        let node = NamedNode::new(decision_iri(&ann.id)).map_err(store_err)?;
-        quads.push(Quad::new(
+    // ⚠ No decision node here. A record is re-stored whenever drift moves
+    // its anchor (`rewrite_annotation`), and a decision is never re-stored:
+    // [`append_decision`] writes each node once, and nothing removes one.
+    for quad in &quads {
+        archive.insert(quad).map_err(store_err)?;
+    }
+    Ok(())
+}
+
+/// Write ONE decision node — the first answer on a finding, or a revision
+/// of its current one (ledger #653). The node is written once and never
+/// touched again: no path in this crate re-stores or removes it, so the chain
+/// of answers is append-only by construction rather than by care.
+pub(crate) fn append_decision(
+    archive: &Archive,
+    finding_iri: &str,
+    decision: &Decision,
+) -> Result<()> {
+    use oxigraph::model::vocab::{rdf, xsd};
+    let g = archive.graph().clone();
+    let node = NamedNode::new(&decision.iri).map_err(store_err)?;
+    let named = |iri: &str| NamedNode::new(iri).map_err(store_err);
+    let mut quads = vec![
+        Quad::new(
             node.clone(),
             rdf::TYPE,
-            NamedNode::new(format!("{PROV}Activity")).map_err(store_err)?,
+            named(&format!("{PROV}Activity"))?,
             g.clone(),
-        ));
+        ),
+        Quad::new(
+            node.clone(),
+            named(PROV_USED)?,
+            named(finding_iri)?,
+            g.clone(),
+        ),
+        Quad::new(
+            node.clone(),
+            named(DCTERMS_TYPE)?,
+            named(&decision.outcome.iri())?,
+            g.clone(),
+        ),
+    ];
+    if let Some(severity) = &decision.severity {
         quads.push(Quad::new(
             node.clone(),
-            NamedNode::new(PROV_USED).map_err(store_err)?,
-            subject,
+            named(SH_RESULT_SEVERITY)?,
+            named(&severity_iri(severity))?,
             g.clone(),
         ));
+    }
+    if let Some(at) = &decision.at {
         quads.push(Quad::new(
             node.clone(),
-            NamedNode::new(DCTERMS_TYPE).map_err(store_err)?,
-            NamedNode::new(decision.outcome.iri()).map_err(store_err)?,
+            named(DCTERMS_CREATED)?,
+            Literal::new_typed_literal(at, xsd::DATE_TIME),
             g.clone(),
         ));
+    }
+    if let Some(note) = &decision.note {
         quads.push(Quad::new(
             node.clone(),
-            NamedNode::new(SH_RESULT_SEVERITY).map_err(store_err)?,
-            NamedNode::new(severity_iri(&decision.severity)).map_err(store_err)?,
+            named(DCTERMS_DESCRIPTION)?,
+            Literal::new_simple_literal(note),
             g.clone(),
         ));
-        if let Some(at) = &decision.at {
-            quads.push(Quad::new(
-                node.clone(),
-                NamedNode::new(DCTERMS_CREATED).map_err(store_err)?,
-                Literal::new_typed_literal(at, xsd::DATE_TIME),
-                g.clone(),
-            ));
-        }
-        if let Some(note) = &decision.note {
-            quads.push(Quad::new(
-                node.clone(),
-                NamedNode::new(DCTERMS_DESCRIPTION).map_err(store_err)?,
-                Literal::new_simple_literal(note),
-                g.clone(),
-            ));
-        }
-        if let Some(reason) = &decision.reason {
-            quads.push(Quad::new(
-                node.clone(),
-                NamedNode::new(DCTERMS_SUBJECT).map_err(store_err)?,
-                NamedNode::new(decline_reason_iri(reason)).map_err(store_err)?,
-                g.clone(),
-            ));
-        }
-        if let Some(minted) = &decision.minted {
-            quads.push(Quad::new(
-                node,
-                NamedNode::new(PROV_GENERATED).map_err(store_err)?,
-                NamedNode::new(minted).map_err(store_err)?,
-                g,
-            ));
-        }
+    }
+    if let Some(reason) = &decision.reason {
+        quads.push(Quad::new(
+            node.clone(),
+            named(DCTERMS_SUBJECT)?,
+            named(&decline_reason_iri(reason))?,
+            g.clone(),
+        ));
+    }
+    if let Some(revises) = &decision.revises {
+        quads.push(Quad::new(
+            node.clone(),
+            named(DCTERMS_REPLACES)?,
+            named(revises)?,
+            g.clone(),
+        ));
+    }
+    if let Some(made) = &decision.made {
+        quads.push(Quad::new(
+            node.clone(),
+            named(DCTERMS_PROVENANCE)?,
+            named(&made.iri())?,
+            g.clone(),
+        ));
+    }
+    if let Some(minted) = &decision.minted {
+        quads.push(Quad::new(node, named(PROV_GENERATED)?, named(minted)?, g));
     }
     for quad in &quads {
         archive.insert(quad).map_err(store_err)?;
@@ -862,17 +1071,17 @@ pub(crate) fn decline_reason_iri(word: &str) -> String {
 
 const DECLINE_REASON_PREFIX: &str = "urn:iki:decline-reason:";
 
-/// Remove every quad under the record's subjects — the record, both
-/// selectors, and (finding family) its decision node.
+/// Remove every quad under the record's subjects — the record and both
+/// selectors. ⚠ Never a decision node: those are append-only (see
+/// [`append_decision`]), and a record is removed only to be re-stored
+/// ([`rewrite_annotation`]) or deleted from the ANNOTATION family, which has
+/// none.
 pub(crate) fn remove_annotation(archive: &Archive, family: Family, id: &str) -> Result<()> {
-    let mut subjects = vec![
+    let subjects = [
         record_iri(family, id),
         quote_iri(family, id),
         position_iri(family, id),
     ];
-    if family == Family::Finding {
-        subjects.push(decision_iri(id));
-    }
     for iri in subjects {
         let subject = NamedNode::new(&iri).map_err(store_err)?;
         let quads: Vec<Quad> = archive
@@ -887,7 +1096,8 @@ pub(crate) fn remove_annotation(archive: &Archive, family: Family, id: &str) -> 
 }
 
 /// Replace the annotation's stored state (the update path and the
-/// re-anchor/orphan persistence path).
+/// re-anchor/orphan persistence path). A finding's decision nodes are not
+/// part of it and are left exactly as they are.
 pub(crate) fn rewrite_annotation(archive: &Archive, ann: &Annotation) -> Result<()> {
     remove_annotation(archive, ann.family, &ann.id)?;
     store_annotation(archive, ann)
@@ -928,6 +1138,7 @@ pub(crate) fn load_record(
         severity: None,
         derived_from: None,
         decision: None,
+        history: Vec::new(),
         prior: None,
         superseded_by: None,
     };
@@ -1023,11 +1234,12 @@ pub(crate) fn load_record(
         return Ok(None);
     }
     if family == Family::Finding {
-        ann.decision = load_decision(archive, id)?;
+        ann.history = load_decisions(archive, id)?;
+        ann.settle();
         if let Some(twin) = prior_id {
             ann.prior = Some(Prior {
                 finding: record_iri(Family::Finding, &twin),
-                decision: load_decision(archive, &twin)?,
+                decision: effective(&load_decisions(archive, &twin)?),
             });
         }
     }
@@ -1051,10 +1263,51 @@ pub(crate) fn load_record(
     Ok(Some(ann))
 }
 
-/// The human act on a finding, if there has been one. `None` IS "pending" —
-/// the absence of a decision node, not a flag on the finding.
-fn load_decision(archive: &Archive, id: &str) -> Result<Option<Decision>> {
-    let subject = match NamedNode::new(decision_iri(id)) {
+/// The answer a chain of decisions amounts to: its head, unless the head
+/// withdrew the answer. `None` IS "undecided".
+pub(crate) fn effective(history: &[Decision]) -> Option<Decision> {
+    history
+        .last()
+        .filter(|d| d.outcome != Outcome::Retracted)
+        .cloned()
+}
+
+/// Every decision node on a finding, oldest first — the first decision and
+/// each revision (ledger #653). Found from the finding inward (`prov:used`,
+/// one indexed pattern) and ordered by each node's place in the chain
+/// ([`revision_number`]), so a chain reads back in the order it was written
+/// however the store iterates. A node without an outcome is not a decision
+/// and is skipped.
+pub(crate) fn load_decisions(archive: &Archive, id: &str) -> Result<Vec<Decision>> {
+    let finding_iri = record_iri(Family::Finding, id);
+    let Ok(finding) = NamedNode::new(&finding_iri) else {
+        return Ok(Vec::new());
+    };
+    let used = NamedNode::new(PROV_USED).map_err(store_err)?;
+    let mut nodes: Vec<(u32, String)> = Vec::new();
+    for quad in archive.quads_for_pattern(None, Some(used.as_ref()), Some(finding.as_ref().into()))
+    {
+        let quad = quad.map_err(store_err)?;
+        let subject = quad.subject.to_string();
+        let node = subject.trim_start_matches('<').trim_end_matches('>');
+        if let Some(n) = revision_number(&finding_iri, node) {
+            nodes.push((n, node.to_string()));
+        }
+    }
+    nodes.sort();
+    nodes.dedup();
+    let mut out = Vec::new();
+    for (_, node) in nodes {
+        if let Some(decision) = load_decision(archive, &node)? {
+            out.push(decision);
+        }
+    }
+    Ok(out)
+}
+
+/// One decision node, by IRI — `None` when it carries no outcome.
+fn load_decision(archive: &Archive, iri: &str) -> Result<Option<Decision>> {
+    let subject = match NamedNode::new(iri) {
         Ok(node) => node,
         Err(_) => return Ok(None),
     };
@@ -1064,25 +1317,28 @@ fn load_decision(archive: &Archive, id: &str) -> Result<Option<Decision>> {
     let mut note = None;
     let mut reason = None;
     let mut minted = None;
+    let mut revises = None;
+    let mut made = None;
     for quad in archive.quads_for_pattern(Some(subject.as_ref().into()), None, None) {
         let quad = quad.map_err(store_err)?;
         let value = match &quad.object {
             Term::Literal(l) => l.value().to_string(),
             other => other.to_string(),
         };
+        let node = match &quad.object {
+            Term::NamedNode(node) => Some(node.as_str()),
+            _ => None,
+        };
         match quad.predicate.as_str() {
             DCTERMS_TYPE => {
-                if let Term::NamedNode(node) = &quad.object {
-                    outcome = Outcome::from_iri(node.as_str());
+                if let Some(node) = node {
+                    outcome = Outcome::from_iri(node);
                 }
             }
             SH_RESULT_SEVERITY => {
-                if let Term::NamedNode(node) = &quad.object {
-                    severity = node
-                        .as_str()
-                        .strip_prefix("urn:iki:severity:")
-                        .map(str::to_string);
-                }
+                severity = node
+                    .and_then(|n| n.strip_prefix("urn:iki:severity:"))
+                    .map(str::to_string);
             }
             DCTERMS_CREATED => at = Some(value),
             DCTERMS_DESCRIPTION => note = Some(value),
@@ -1090,19 +1346,16 @@ fn load_decision(archive: &Archive, id: &str) -> Result<Option<Decision>> {
             // (a word a later release adds, a typo in a hand-written triple)
             // reads back as NO reason — never mapped onto a real word.
             DCTERMS_SUBJECT => {
-                if let Term::NamedNode(node) = &quad.object {
-                    reason = node
-                        .as_str()
-                        .strip_prefix(DECLINE_REASON_PREFIX)
-                        .filter(|word| crate::finding::is_decline_reason(word))
-                        .map(str::to_string);
-                }
+                reason = node
+                    .and_then(|n| n.strip_prefix(DECLINE_REASON_PREFIX))
+                    .filter(|word| crate::finding::is_decline_reason(word))
+                    .map(str::to_string);
             }
-            PROV_GENERATED => {
-                if let Term::NamedNode(node) = &quad.object {
-                    minted = Some(node.as_str().to_string());
-                }
-            }
+            DCTERMS_REPLACES => revises = node.map(str::to_string),
+            // Exact as well: a term this code did not write reads back as
+            // "not said", which is what lets the burst rule look at it.
+            DCTERMS_PROVENANCE => made = node.and_then(Made::from_iri),
+            PROV_GENERATED => minted = node.map(str::to_string),
             _ => {}
         }
     }
@@ -1110,14 +1363,28 @@ fn load_decision(archive: &Archive, id: &str) -> Result<Option<Decision>> {
     let Some(outcome) = outcome else {
         return Ok(None);
     };
-    Ok(Some(Decision {
+    // A publish or decline states a rating (a legacy node without one reads
+    // as `info`, as it always has); a retraction states none.
+    let severity = match outcome {
+        Outcome::Retracted => None,
+        _ => Some(severity.unwrap_or_else(|| "info".to_string())),
+    };
+    let mut decision = Decision {
+        iri: iri.to_string(),
         outcome,
-        severity: severity.unwrap_or_else(|| "info".to_string()),
+        severity,
         at,
+        revises,
+        made,
+        confirmed: false,
+        burst: None,
         note,
         reason,
         minted,
-    }))
+    };
+    // Pessimistic until the burst pass has run — see `Decision::confirmed`.
+    decision.confirmed = crate::revision::confirmed(&decision, true);
+    Ok(Some(decision))
 }
 
 /// Every annotation in the store for one repo — optionally narrowed to one
@@ -1747,7 +2014,7 @@ impl Included {
             if let Some(creator) = &ann.creator {
                 out.push_str(&format!("[review:{creator}] "));
             }
-            if ann.prior.is_some() {
+            if ann.prior.as_ref().is_some_and(|p| p.active().is_some()) {
                 out.push_str("[declined before] ");
             }
             out.push_str(&format!(
@@ -2126,6 +2393,7 @@ impl AnnotationEndpoint {
             severity: None,
             derived_from: None,
             decision: None,
+            history: Vec::new(),
             prior: None,
             superseded_by: None,
         };
@@ -2402,31 +2670,55 @@ pub(crate) fn annotation_json(ann: &Annotation, line: Option<u64>) -> serde_json
         // `crate::supersede`.
         "superseded_by": ann.superseded_by,
         "derived_from": ann.derived_from,
-        "decision": ann.decision.as_ref().map(|d| serde_json::json!({
-            "outcome": d.outcome.label(),
-            "severity": d.severity,
-            "decided_at": d.at,
-            "note": d.note,
-            "reason": d.reason,
-            "minted": d.minted,
-        })),
+        // The answer that CURRENTLY stands (null while undecided, including
+        // after a retraction) — see `decision_json` for the fields.
+        "decision": ann.decision.as_ref().map(decision_json),
+        // ★ Every answer ever given, oldest first (ledger #653): the first
+        // decision and each revision, retractions included, each in the
+        // `decision` shape. Empty on an undecided finding and on every
+        // annotation; one entry until someone revises.
+        "decisions": ann.history.iter().map(decision_json).collect::<Vec<_>>(),
         // ★ The mark (ledger #475): a decline that already answered a like
         // claim on this line, carried by the fresh finding so the second
-        // decision is one click. `finding` is the declined twin, `iri` its
-        // decision node, and the rest is that decision in the same shape as
-        // `decision` above — null when no declined twin was on file at mint
-        // time. A consumer rendering a queue row reads this to say "a like
-        // claim on this line was declined (<reason>) <decided_at>: <note>".
-        // `reason` is one of `crate::finding::DECLINE_REASONS` or null.
-        "prior_decision": ann.prior.as_ref().map(|p| serde_json::json!({
-            "finding": p.finding,
-            "iri": p.decision_iri(),
-            "outcome": p.decision.as_ref().map(|d| d.outcome.label()),
-            "severity": p.decision.as_ref().map(|d| d.severity.clone()),
-            "decided_at": p.decision.as_ref().and_then(|d| d.at.clone()),
-            "note": p.decision.as_ref().and_then(|d| d.note.clone()),
-            "reason": p.decision.as_ref().and_then(|d| d.reason.clone()),
-        })),
+        // decision is one click. `finding` is the declined twin and the rest
+        // is the twin's CURRENT decision in the `decision` shape (`iri` is
+        // that decision's node — what `revises=` names to revise it). Null
+        // when no declined twin was on file at mint time, and ★ null when the
+        // twin's current decision is no longer a decline (retracted, or
+        // reversed to a publish, ledger #653): a withdrawn decline steers
+        // nothing. `confirmed: false` says the decline is one a host should
+        // not treat as evidence. A consumer rendering a queue row reads this
+        // to say "a like claim on this line was declined (<reason>)
+        // <decided_at>: <note>".
+        "prior_decision": ann.prior.as_ref().and_then(|p| {
+            let d = p.active()?;
+            let mut json = decision_json(d);
+            json["finding"] = serde_json::Value::String(p.finding.clone());
+            Some(json)
+        }),
+    })
+}
+
+/// One decision node as JSON — the shape of `decision`, of each entry of
+/// `decisions`, and (with `finding` added) of `prior_decision`.
+///
+/// `confirmed` and `burst` are computed on read ([`crate::revision`]);
+/// `made` is `"single"`, `"batch"` or null (not recorded), with `batch` the
+/// batch's group key; `revises` is the node this one revises, or null.
+pub(crate) fn decision_json(d: &Decision) -> serde_json::Value {
+    serde_json::json!({
+        "iri": d.iri,
+        "outcome": d.outcome.label(),
+        "severity": d.severity,
+        "decided_at": d.at,
+        "note": d.note,
+        "reason": d.reason,
+        "minted": d.minted,
+        "revises": d.revises,
+        "made": d.made.as_ref().map(Made::word),
+        "batch": d.made.as_ref().and_then(Made::batch),
+        "confirmed": d.confirmed,
+        "burst": d.burst,
     })
 }
 
@@ -2480,13 +2772,16 @@ fn annotation_turtle(ann: &Annotation) -> String {
         props.push(format!("prov:wasInfluencedBy <{}>", prior.decision_iri()));
     }
     let mut out = format!("<{}> {} .\n", ann.iri(), props.join(" ;\n    "));
-    if let (Family::Finding, Some(decision)) = (ann.family, &ann.decision) {
+    // Every decision node, oldest first — the record is the chain.
+    for decision in &ann.history {
         let mut act = vec![
             "a prov:Activity".to_string(),
             format!("prov:used <{}>", ann.iri()),
             format!("dcterms:type <{}>", decision.outcome.iri()),
-            format!("sh:resultSeverity <{}>", severity_iri(&decision.severity)),
         ];
+        if let Some(severity) = &decision.severity {
+            act.push(format!("sh:resultSeverity <{}>", severity_iri(severity)));
+        }
         if let Some(at) = &decision.at {
             act.push(format!("dcterms:created \"{at}\"^^xsd:dateTime"));
         }
@@ -2496,12 +2791,18 @@ fn annotation_turtle(ann: &Annotation) -> String {
         if let Some(reason) = &decision.reason {
             act.push(format!("dcterms:subject <{}>", decline_reason_iri(reason)));
         }
+        if let Some(revises) = &decision.revises {
+            act.push(format!("dcterms:replaces <{revises}>"));
+        }
+        if let Some(made) = &decision.made {
+            act.push(format!("dcterms:provenance <{}>", made.iri()));
+        }
         if let Some(minted) = &decision.minted {
             act.push(format!("prov:generated <{minted}>"));
         }
         out.push_str(&format!(
             "\n<{}> {} .\n",
-            decision_iri(&ann.id),
+            decision.iri,
             act.join(" ;\n    ")
         ));
     }
@@ -2604,7 +2905,7 @@ pub(crate) fn annotation_card_html(ann: &Annotation, line: Option<u64>, show_pat
     // The mark, in words and with the twin one click away — ABOVE the
     // decision form, because it is the thing that makes the second decision
     // cheap: a reader sees the earlier answer before choosing again.
-    if let Some(prior) = &ann.prior {
+    if let Some(prior) = ann.prior.as_ref().filter(|p| p.active().is_some()) {
         flags.push_str(&format!(
             "<p class=\"browse-finding-prior\">{} · <a class=\"browse-finding-prior-link\" \
              href=\"#\" hx-get=\"/k/source {twin} as=text/html\" hx-target=\"#browse\" \
@@ -2626,7 +2927,12 @@ pub(crate) fn annotation_card_html(ann: &Annotation, line: Option<u64>, show_pat
                 ann.state().unwrap_or("pending")
             ),
             crate::finding::severity_badge_html(ann.severity.as_deref(), ann.decision.as_ref()),
-            crate::finding::decision_html(&ann.id, ann.severity.as_deref(), ann.decision.as_ref()),
+            crate::finding::decision_html(
+                &ann.id,
+                ann.severity.as_deref(),
+                ann.decision.as_ref(),
+                ann.history.last(),
+            ),
         ),
     };
     format!(
@@ -3088,6 +3394,7 @@ pub(crate) fn mint_pending_finding(
         severity: severity.map(str::to_string),
         derived_from: None,
         decision: None,
+        history: Vec::new(),
         prior,
         superseded_by: None,
     };
@@ -3190,6 +3497,12 @@ pub(crate) fn included_for_ids(archive: &Archive, iris: &[String], text: &str) -
         rows.push((ann, line));
     }
     rows.sort_by(|(a, _), (b, _)| (a.start, &a.id).cmp(&(b.start, &b.id)));
+    // A pass's findings carry decisions and recurrence marks, so the faces
+    // that fold them in settle `confirmed` like every other finding face.
+    let bursts = crate::revision::Bursts::of(archive)?;
+    for (ann, _) in &mut rows {
+        bursts.apply(std::slice::from_mut(ann));
+    }
     Ok(Included {
         rows,
         with_paths: false,

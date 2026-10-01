@@ -169,6 +169,9 @@ mod layout;
 pub mod migrate;
 mod pr;
 mod review;
+/// Revised and unconfirmed decisions (ledger #653): the computed `confirmed`
+/// flag, bursts, and the `summary=unconfirmed` walk.
+mod revision;
 /// `superseded` — the state of an undecided finding whose file's current
 /// review does not stand behind it; computed on read, never stored.
 mod supersede;
