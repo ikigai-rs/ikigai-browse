@@ -263,6 +263,12 @@ border-left:2px solid var(--browse-rule);font-style:italic;opacity:.85}\n\
 .browse-annotation-flag{font-size:.72em;white-space:nowrap;margin-left:.35rem;\
 padding:.05em .5em;border:1px solid var(--browse-flag);border-radius:999px;\
 color:var(--browse-flag)}\n\
+/* A successful annotate (ledger #658): the note shown while the target's view\n\
+   loads back, and the new card in that view, marked and focused. */\n\
+.browse-annotated-note{font-size:.85em;opacity:.8}\n\
+.browse-annotated-back{color:var(--browse-link)}\n\
+.browse-annotation-new{border-left-color:var(--browse-link);background:var(--browse-mark)}\n\
+.browse-annotation-new:focus{outline:2px solid var(--browse-link);outline-offset:2px}\n\
 \
 /* The pending review queue (ledger #444). A finding is a MACHINE CLAIM
    AWAITING A HUMAN, and it must never read as a published note: the dashed
@@ -429,6 +435,7 @@ mod tests {
         // `annotate.rs`: appended to `browse-annotation`.
         "browse-annotation-orphaned",
         "browse-annotation-machine",
+        "browse-annotation-new",
         // `annotate.rs`: `browse-finding-{state}`, state from
         // `Annotation::state()`.
         "browse-finding",

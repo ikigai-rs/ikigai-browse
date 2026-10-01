@@ -69,6 +69,35 @@
 //! restored), but the store is only touched when something actually changes,
 //! so repeat reads of an orphan do not re-flag or churn the graph.
 //!
+//! ## The create form, and where a successful annotate lands (ledger #658)
+//!
+//! Every HTML face that shows a target's annotations ends its panel with a
+//! create form posting `urn:iki:annotation`'s Sink through the host's `/k/`
+//! adapter, with a hidden `as=text/html`. The Sink's HTML acknowledgement is
+//! not the bare IRI (which, swapped into `#browse`, used to replace the whole
+//! file view with one line and no way back): it is a small fragment that, on
+//! `load`, GETs the TARGET's own HTML view with `focus={id}` and swaps it into
+//! `#browse`. That view draws the new card marked (`browse-annotation-new`)
+//! with `autofocus`, which htmx honors after a swap, so the reader lands on
+//! the note they just wrote with the file around it. Every other caller's
+//! acknowledgement (plain IRI, JSON) is unchanged.
+//!
+//! ★ A GET of the view, rather than the Sink rendering the view itself: the
+//! view is already a resource, and reading it back through the host's adapter
+//! is the composition — the host's own decoration of that read (gonk's
+//! `proposals=`), the caller's capability and the face's drift pass all apply
+//! exactly as on any other visit, with no second rendering path to drift.
+//!
+//! A refusal (quote not found, empty body, no grant) stays a typed ERROR. The
+//! host answers it as a 4xx, htmx swaps nothing on a 4xx, and so the form,
+//! with everything typed into it, is left exactly as it was; saying why is the
+//! host's error display (gonk's `gonk.js` writes the refusal beside the form).
+//!
+//! The form also carries hidden `prefix`/`suffix` fields, empty by default: a
+//! host hook that fills `exact` from a selected line can fill them from its
+//! neighbors (the text IMMEDIATELY before and after the quote), which is how
+//! a quote that occurs twice anchors where it was selected.
+//!
 //! ## Capabilities (per-verb — the multi-verb rule)
 //!
 //! Source requires `urn:cap:browse:read:*` (wildcard offering; the target's
@@ -2404,6 +2433,9 @@ impl AnnotationEndpoint {
                 json["minted"] = serde_json::Value::Bool(minted);
                 Ok(repr("application/json", json.to_string()))
             }
+            // The browser's acknowledgement: back to the target's own view,
+            // the new card marked (see the module doc, ledger #658).
+            t if t.starts_with("text/html") => Ok(repr_utf8("text/html", annotated_html(&ann))),
             // The plain acknowledgement is the annotation's IRI — sinkable
             // output that pipes straight into a Source.
             _ => Ok(repr_utf8("text/plain", ann.iri())),
@@ -2516,12 +2548,17 @@ fn annotation_description() -> Description {
                     ArgSpec::new("as")
                         .optional()
                         .class(XSD_STRING)
-                        .summary("application/json for the structured acknowledgement")
-                        .one_of(["text/plain", "application/json"])
+                        .summary(
+                            "application/json for the structured acknowledgement; text/html \
+                             (what the create form sends) for an htmx fragment that loads \
+                             the target's own view with the new annotation focused",
+                        )
+                        .one_of(["text/plain", "application/json", "text/html"])
                         .default_value("text/plain"),
                 )
                 .output("text/plain;charset=utf-8")
-                .output("application/json"),
+                .output("application/json")
+                .output("text/html;charset=utf-8"),
         )
         .action(
             ActionSpec::new(Verb::Delete)
@@ -2850,6 +2887,16 @@ pub(crate) fn annotation_turtle_document(anns: &[Annotation]) -> String {
 /// flagged. `show_path` labels the card with its file (subtree folds span
 /// many files).
 pub(crate) fn annotation_card_html(ann: &Annotation, line: Option<u64>, show_path: bool) -> String {
+    card_html(ann, line, show_path, false)
+}
+
+/// [`annotation_card_html`], with `just_written` marking the card the reader
+/// has just created (ledger #658): the `browse-annotation-new` class, a "just
+/// added" flag in words, and `tabindex="-1" autofocus` — htmx focuses an
+/// `[autofocus]` element after a swap, and focusing scrolls it into view, so
+/// the reader lands on their note without a script or a CSS-escaped selector
+/// (a slug id may carry `.` or `~`).
+fn card_html(ann: &Annotation, line: Option<u64>, show_path: bool, just_written: bool) -> String {
     let orphan_class = if ann.orphaned {
         " browse-annotation-orphaned"
     } else {
@@ -2885,6 +2932,9 @@ pub(crate) fn annotation_card_html(ann: &Annotation, line: Option<u64>, show_pat
         None => String::new(),
     };
     let mut flags = String::new();
+    if just_written {
+        flags.push_str("<span class=\"browse-annotation-flag\">just added</span>");
+    }
     if ann.orphaned {
         flags.push_str(
             "<span class=\"browse-annotation-flag\">orphaned — quote no longer in the current \
@@ -2935,9 +2985,13 @@ pub(crate) fn annotation_card_html(ann: &Annotation, line: Option<u64>, show_pat
             ),
         ),
     };
+    let (new_class, focus) = match just_written {
+        true => (" browse-annotation-new", " tabindex=\"-1\" autofocus"),
+        false => ("", ""),
+    };
     format!(
-        "<div class=\"browse-annotation{orphan_class}{machine_class}{state_class}\" \
-         id=\"annotation-{id}\">{path}{anchor}{model}{severity_html}\
+        "<div class=\"browse-annotation{orphan_class}{machine_class}{state_class}{new_class}\" \
+         id=\"annotation-{id}\"{focus}>{path}{anchor}{model}{severity_html}\
          <blockquote class=\"browse-annotation-quote\">{exact}</blockquote>\
          <p class=\"browse-annotation-body\">{body}</p>{flags}{decision_html}</div>",
         id = esc(&ann.id),
@@ -2950,11 +3004,25 @@ pub(crate) fn annotation_card_html(ann: &Annotation, line: Option<u64>, show_pat
 /// turns into a Sink of `urn:iki:annotation` (form fields become sink args — the
 /// same adapter assumption the S0 faces document for `hx-get`). htmx
 /// attributes only; no scripts.
+///
+/// - `as=text/html` (hidden) asks the Sink for its browser acknowledgement,
+///   which returns the reader to this target's view with the new card focused
+///   ([`annotated_html`], ledger #658). A refusal is a typed error, so htmx
+///   swaps nothing and the form keeps what was typed.
+/// - `prefix`/`suffix` (hidden, empty) are the Sink's existing disambiguation
+///   hints, here for a HOST hook that fills `exact` from a selected line to
+///   fill from its neighbors: the text immediately before the quote (for a
+///   whole line, the previous line and its newline) and immediately after. An
+///   empty field is no hint. The hook finds them as
+///   `form.browse-annotate input[name=exact|prefix|suffix]`.
 fn annotation_form_html(target_iri: &str) -> String {
     format!(
         "<form class=\"browse-annotate\" hx-post=\"/k/sink urn:iki:annotation\" \
          hx-target=\"#browse\" hx-swap=\"innerHTML\">\
          <input type=\"hidden\" name=\"target\" value=\"{target}\">\
+         <input type=\"hidden\" name=\"as\" value=\"text/html\">\
+         <input type=\"hidden\" name=\"prefix\" value=\"\">\
+         <input type=\"hidden\" name=\"suffix\" value=\"\">\
          <input name=\"exact\" placeholder=\"quote to anchor\" required>\
          <textarea name=\"body\" placeholder=\"note\" required></textarea>\
          <button type=\"submit\">annotate</button></form>",
@@ -2962,12 +3030,45 @@ fn annotation_form_html(target_iri: &str) -> String {
     )
 }
 
+/// The Sink's `as=text/html` acknowledgement (ledger #658): a fragment that,
+/// swapped into `#browse`, immediately GETs the target's own HTML view with
+/// `focus={id}` through the host's `/k/` adapter — so a successful annotate
+/// lands on the SAME file (or pull request) with the new card marked and
+/// focused, instead of a bare IRI with no way back. The IRI is still said,
+/// and a link repeats the GET for a host whose `load` trigger did not fire.
+fn annotated_html(ann: &Annotation) -> String {
+    let view = format!("/k/source {} as=text/html focus={}", ann.target_iri, ann.id);
+    let back = match ann.target_ref() {
+        TargetRef::Pr(_) => "back to the pull request",
+        TargetRef::File(_) => "back to the file",
+    };
+    format!(
+        "<div class=\"browse-annotated\" hx-get=\"{view}\" hx-trigger=\"load\" \
+         hx-target=\"#browse\" hx-swap=\"innerHTML\">\
+         <p class=\"browse-annotated-note\" role=\"status\">annotated: {iri} · \
+         <a class=\"browse-annotated-back\" href=\"#\" hx-get=\"{view}\" hx-target=\"#browse\" \
+         hx-swap=\"innerHTML\">{back}</a></p></div>",
+        view = esc(&view),
+        iri = esc(&ann.iri()),
+    )
+}
+
 /// The annotations panel under a file view (or the standalone listing
 /// fragment): cards in reading order, then the create affordance.
-fn annotations_panel_html(target_iri: &str, rows: &[(Annotation, Option<u64>)]) -> String {
+/// `focus` names the card just written (ledger #658), marked and focused.
+fn annotations_panel_html(
+    target_iri: &str,
+    rows: &[(Annotation, Option<u64>)],
+    focus: Option<&str>,
+) -> String {
     let mut out = String::from("<div class=\"browse-annotations\">");
     for (ann, line) in rows {
-        out.push_str(&annotation_card_html(ann, *line, false));
+        out.push_str(&card_html(
+            ann,
+            *line,
+            false,
+            focus == Some(ann.id.as_str()),
+        ));
     }
     out.push_str(&annotation_form_html(target_iri));
     out.push_str("</div>");
@@ -2986,7 +3087,7 @@ fn annotations_listing_html(repo: &str, rel: &str, rows: &[(Annotation, Option<u
         }
         out.push_str("</div>");
     } else {
-        out.push_str(&annotations_panel_html(&file_iri(repo, rel), rows));
+        out.push_str(&annotations_panel_html(&file_iri(repo, rel), rows, None));
     }
     out.push_str("</div>");
     out
@@ -3029,13 +3130,14 @@ pub(crate) fn file_overlay(
     repo: &str,
     rel: &str,
     text: &str,
+    focus: Option<&str>,
 ) -> Result<(BTreeMap<u64, Vec<Marker>>, String)> {
     let rows = reconcile_against_text(archive, list_annotations(archive, repo, Some(rel))?, text)?;
     let marked = markers_of(&rows, |ann| match ann.machine() {
         true => MarkerKind::Machine,
         false => MarkerKind::Human,
     });
-    let panel = annotations_panel_html(&file_iri(repo, rel), &rows);
+    let panel = annotations_panel_html(&file_iri(repo, rel), &rows, focus);
     Ok((marked, panel))
 }
 
@@ -3566,13 +3668,14 @@ pub(crate) fn target_overlay(
     archive: &Archive,
     target_iri: &str,
     text: &str,
+    focus: Option<&str>,
 ) -> Result<(BTreeMap<u64, Vec<Marker>>, String)> {
     let rows = reconcile_target_against_text(archive, target_iri, text)?;
     let marked = markers_of(&rows, |ann| match ann.machine() {
         true => MarkerKind::Machine,
         false => MarkerKind::Human,
     });
-    let panel = annotations_panel_html(target_iri, &rows);
+    let panel = annotations_panel_html(target_iri, &rows, focus);
     Ok((marked, panel))
 }
 
@@ -4537,6 +4640,207 @@ mod tests {
         assert!(matches!(err, Error::InvalidArgument { .. }), "{err:?}");
         // Nothing was stored.
         assert_eq!(store.len().unwrap(), 0);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The host's half of the create form, done by hand: every hidden field of
+    /// the face's `browse-annotate` form, as the `(name, value)` pairs a
+    /// form-encoded post turns into Sink arguments.
+    fn hidden_fields(html: &str) -> Vec<(String, String)> {
+        let form = html
+            .split("<form class=\"browse-annotate\"")
+            .nth(1)
+            .and_then(|rest| rest.split("</form>").next())
+            .expect("the face carries the create form");
+        form.split("<input type=\"hidden\" ")
+            .skip(1)
+            .map(|input| {
+                let attr = |name: &str| {
+                    input
+                        .split(&format!("{name}=\""))
+                        .nth(1)
+                        .and_then(|v| v.split('"').next())
+                        .unwrap()
+                        .to_string()
+                };
+                (attr("name"), attr("value"))
+            })
+            .collect()
+    }
+
+    /// The host's `/k/` adapter for a READ, done by hand: `source <iri> [k=v …]`.
+    fn follow(k: &Kernel, command: &str) -> String {
+        let mut tokens = command.split_whitespace();
+        assert_eq!(tokens.next(), Some("source"), "{command}");
+        let iri = tokens.next().unwrap();
+        let args: Vec<(&str, &str)> = tokens.map(|t| t.split_once('=').unwrap()).collect();
+        body(&issue(k, Verb::Source, iri, &args, &cap()).unwrap())
+    }
+
+    /// ★ Ledger #658: a successful annotate from the file view returns the
+    /// reader to the SAME file view, the new card marked and focused — not to
+    /// a bare annotation IRI with no way back. Walked the way a browser and
+    /// the host walk it: the form's own fields, the Sink, the fragment's GET.
+    #[test]
+    fn annotating_from_the_file_view_returns_to_that_view_with_the_new_card_focused() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "fn one() {}\nfn two() {}\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        let view = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:file:a.rs",
+                &[("as", "text/html")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        let fields = hidden_fields(&view);
+        let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["target", "as", "prefix", "suffix"], "{view}");
+        assert!(
+            fields.contains(&("as".to_string(), "text/html".to_string())),
+            "the form asks for the browser acknowledgement: {fields:?}"
+        );
+
+        // The submission: the hidden fields plus what the person typed.
+        let mut args: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(n, v)| (n.as_str(), v.as_str()))
+            .collect();
+        args.push(("exact", "fn two()"));
+        args.push(("body", "the second one"));
+        let ack = issue(&k, Verb::Sink, "urn:iki:annotation", &args, &cap()).unwrap();
+        assert!(ack.repr_type.media_type.starts_with("text/html"), "{ack:?}");
+        let ack = body(&ack);
+        let listed = json_of(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:annotations:a.rs",
+                &[("as", "application/json")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        let id = listed[0]["id"]
+            .as_str()
+            .expect("the annotation was stored")
+            .to_string();
+        let command = format!("source urn:repo:demo:file:a.rs as=text/html focus={id}");
+        assert!(
+            ack.contains(&format!(
+                "hx-get=\"/k/{command}\" hx-trigger=\"load\" hx-target=\"#browse\""
+            )),
+            "the acknowledgement loads the file's own view back: {ack}"
+        );
+        assert!(ack.contains(&format!("urn:iki:annotation:{id}")), "{ack}");
+        assert!(ack.contains("back to the file"), "{ack}");
+
+        // What that GET answers: the file view, the new card marked and
+        // focused, and the line it anchors on marked in the code.
+        let back = follow(&k, &command);
+        assert!(back.contains("browse-code"), "the file itself: {back}");
+        assert!(
+            back.contains(&format!(
+                "browse-annotation browse-annotation-new\" id=\"annotation-{id}\" \
+                 tabindex=\"-1\" autofocus>"
+            )),
+            "{back}"
+        );
+        assert!(back.contains("the second one"), "{back}");
+        assert!(
+            back.contains("class=\"browse-line browse-line-annotated\" id=\"L2\""),
+            "{back}"
+        );
+        assert_eq!(
+            back.matches("autofocus").count(),
+            1,
+            "one card focused: {back}"
+        );
+        // An ordinary visit marks nothing.
+        assert!(!view.contains("browse-annotation-new"), "{view}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The other half of ledger #658: a refused annotate keeps what was typed.
+    /// The refusal is a typed ERROR, never a 200 page — the host answers it as
+    /// a 4xx and htmx swaps nothing on a 4xx, so the form, with its quote and
+    /// note, stays exactly as it was; the error's words are what the host
+    /// shows beside it. A refusal rendered as a success page would swap the
+    /// form away with everything in it.
+    #[test]
+    fn a_refused_annotate_from_the_form_is_an_error_that_names_why_and_writes_nothing() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "fn one() {}\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        let view = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:file:a.rs",
+                &[("as", "text/html")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        let fields = hidden_fields(&view);
+        let submit = |exact: &'static str, note: &'static str| {
+            let mut args: Vec<(&str, &str)> = fields
+                .iter()
+                .map(|(n, v)| (n.as_str(), v.as_str()))
+                .collect();
+            args.push(("exact", exact));
+            args.push(("body", note));
+            issue(&k, Verb::Sink, "urn:iki:annotation", &args, &cap())
+        };
+        match submit("fn missing()", "a careful note") {
+            Err(Error::InvalidArgument { name, detail }) => {
+                assert_eq!(name, "exact");
+                assert!(detail.contains("not found"), "{detail}");
+            }
+            other => panic!("a quote that is not there must refuse: {other:?}"),
+        }
+        match submit("fn one()", "   ") {
+            Err(Error::MissingArgument(name)) => assert_eq!(name, "body"),
+            other => panic!("an empty note must refuse: {other:?}"),
+        }
+        assert_eq!(store.len().unwrap(), 0, "a refusal writes nothing");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The hidden `prefix`/`suffix` fields reach the Sink's existing
+    /// disambiguation: a line that occurs twice anchors on the occurrence its
+    /// neighbors name (what a host's line hook fills them with), not the first.
+    #[test]
+    fn the_forms_prefix_and_suffix_pick_the_occurrence_a_line_hook_selected() {
+        let root = temp_dir();
+        std::fs::write(
+            root.join("a.rs"),
+            "fn a() {\n    todo!()\n}\nfn b() {\n    todo!()\n}\n",
+        )
+        .unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        let ack = issue(
+            &k,
+            Verb::Sink,
+            "urn:iki:annotation:second",
+            &[
+                ("target", "urn:repo:demo:file:a.rs"),
+                ("exact", "    todo!()"),
+                ("prefix", "fn b() {\n"),
+                ("suffix", "\n}"),
+                ("body", "this one"),
+                ("as", "application/json"),
+            ],
+            &cap(),
+        )
+        .unwrap();
+        assert_eq!(json_of(&ack)["line"], 5, "the selected line, not the first");
         std::fs::remove_dir_all(&root).ok();
     }
 
