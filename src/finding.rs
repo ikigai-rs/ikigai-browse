@@ -67,7 +67,7 @@
 //! wrong. A UI (this module's, or gonk's) builds its menu from the description,
 //! never from a hard-coded list.
 //!
-//! ## A decision is final, and a decline is a record
+//! ## A decision is a record, and a later one may revise it
 //!
 //! Declining KEEPS the finding, with the human's reason if they gave one: a
 //! re-run then knows a person looked and said no, which is the beginning of a
@@ -77,13 +77,92 @@
 //! <urn:iki:decline-reason:restates>` — an interim predicate, see
 //! [`crate::annotate::DCTERMS_SUBJECT`]) so it can be counted; the piped
 //! `content` is the free-text note (`dcterms:description`). A word is refused
-//! beside `decision=publish` — a publish reason has no consumer. And a decision that would CHANGE a
-//! recorded one is REFUSED, naming what is on file — silently overwriting the
-//! record is the same failure as overwriting the proposal, one level up. (An
-//! identical repeat is a no-op, so a double-clicked button is not an error.) Undoing a publication is `Delete urn:iki:annotation:{id}`, which
-//! the annotation family already offers under the same capability: a separate,
-//! visible act.
+//! beside anything but `decision=decline` — it would have no consumer.
 //!
+//! ★ **The record is append-only (ledger #653).** Every decision is its own
+//! node, written once and never re-stored or removed; a finding's answers are
+//! a CHAIN of them, oldest first. Nothing is overwritten — what can change is
+//! which node is CURRENT:
+//!
+//! ```turtle
+//! <urn:iki:finding:{id}:decision> a prov:Activity ;       # the first answer
+//!     prov:used <urn:iki:finding:{id}> ;
+//!     dcterms:type <urn:iki:finding:outcome:declined> ;
+//!     sh:resultSeverity <urn:iki:severity:major> ;
+//!     dcterms:created "2026-09-23T02:42:38.120Z"^^xsd:dateTime .
+//!
+//! <urn:iki:finding:{id}:decision:2> a prov:Activity ;     # its revision
+//!     prov:used <urn:iki:finding:{id}> ;
+//!     dcterms:type <urn:iki:finding:outcome:declined> ;
+//!     sh:resultSeverity <urn:iki:severity:major> ;
+//!     dcterms:subject <urn:iki:decline-reason:restates> ;
+//!     dcterms:replaces <urn:iki:finding:{id}:decision> ;
+//!     dcterms:provenance <urn:iki:decision-made:single> ;
+//!     dcterms:created "2026-10-01T16:05:11.004Z"^^xsd:dateTime .
+//! ```
+//!
+//! (`dcterms:replaces`, not `prov:wasRevisionOf`: PROV-O types that term's
+//! subject and object as `prov:Entity`, which a `prov:Activity` cannot be —
+//! see [`crate::annotate::DCTERMS_REPLACES`].)
+//!
+//! The Sink's rules, each one a test:
+//!
+//! * **A second decision is refused by default**, naming what is on file and
+//!   the IRI to revise — a stray double-submit must not rewrite history. An
+//!   IDENTICAL repeat is a no-op (a double-clicked button is not an error), and
+//!   so is the second submit of a revision that already landed.
+//! * **`revises=<decision IRI>` makes it a revision**, accepted only when it
+//!   names the finding's CURRENT decision (the head of the chain). Naming an
+//!   earlier one, or one that is not the finding's, is refused with the
+//!   current one's IRI. The revision keeps its own author, time, rating,
+//!   reason, note and provenance, and becomes current. Three revisions matter:
+//!   *confirm* (a wordless decline gains a word: decline → decline),
+//!   *retract*, and *reverse* (decline → publish, which promotes exactly as a
+//!   first publish does — orphaned if the quote is gone).
+//! * **`decision=retract` withdraws the current answer.** It is an OUTCOME
+//!   word with its own node (`dcterms:type <urn:iki:finding:outcome:retracted>`),
+//!   not a revision with no outcome: the outcome is how the loader tells a
+//!   decision node from anything else, and a retraction is a human act with an
+//!   author, a time, a note and a provenance like any other. It rates nothing
+//!   (`severity=` is refused beside it). After it the finding is UNDECIDED —
+//!   pending or superseded as its file says — and takes a decision like any
+//!   undecided finding, without `revises=` (the new node still links the
+//!   retraction, so the chain stays one chain). A retracted decline is not a
+//!   `prior_decision` for any recurrence, and neither is a decline reversed to
+//!   a publish: the mark follows the twin's CURRENT decision.
+//! * **A publication stands while its annotation does.** Publish → anything
+//!   is refused while `urn:iki:annotation:{id}` exists, with the instruction:
+//!   delete it (`Delete urn:iki:annotation:{id}`, the annotation family's own
+//!   visible act, under the same capability), then revise. ★ Chosen over a
+//!   revision that deletes the annotation as a side effect, because a decision
+//!   Sink that silently removes a published note from every reader is the
+//!   invisible write this family exists to prevent; once the annotation is
+//!   gone, the revision is an ordinary one, and the publish stays in the chain.
+//! * Capability: exactly what the first decision needs, `urn:cap:annotate`.
+//!
+//! ## How a decision was made, and whether it was meant
+//!
+//! `made=single`, or `made=batch batch=<group key>` (a `group=` proposal's
+//! `key`), is recorded on the node (`dcterms:provenance`) when the caller says
+//! — gonk stamps it at its door. Older decisions have none. Every decision and
+//! every `prior_decision` then carries a COMPUTED `confirmed` flag: false for a
+//! decline with no reason word that was made in a batch or, with no provenance
+//! on record, in a BURST (three or more declines inside one second —
+//! [`crate::revision`] says why those numbers). A confirming revision is a new
+//! decision and reads true by the same rule. Nothing is hidden or dropped by
+//! it: it is information for a host's pre-tick rule and display. And
+//! `summary=unconfirmed` lists the unconfirmed declines that still steer a
+//! pending finding, by burst, oldest first — the list a human walks.
+//!
+//! ### The JSON a host reads (the contract)
+//!
+//! On a finding row: `decision` (the CURRENT answer, null while undecided),
+//! `decisions` (every node, oldest first) and `prior_decision`, each decision
+//! in one shape — `iri`, `outcome` (`published` | `declined` | `retracted`),
+//! `severity`, `decided_at`, `note`, `reason`, `minted`, `revises` (the node it
+//! revises, or null), `made` (`single` | `batch` | null), `batch` (the group
+//! key, or null), `confirmed` (bool) and `burst` (the burst's first timestamp,
+//! or null); `prior_decision` adds `finding`, the declined twin.
 //! ## Staleness borrows the annotation layer's answer; it does not invent one
 //!
 //! A pending finding whose file has since changed is stale by construction.
@@ -130,7 +209,8 @@ use ikigai_core::{
 };
 
 use crate::annotate::{
-    self, Annotation, Decision, Family, Outcome, CAP_ANNOTATE, DECLINE, PUBLISH,
+    self, Annotation, Decision, Family, Made, Outcome, CAP_ANNOTATE, DECLINE, MADE_WORDS, PUBLISH,
+    RETRACT,
 };
 use crate::archive::Archive;
 use crate::explain::iso8601;
@@ -307,7 +387,7 @@ pub(crate) fn severity_badge_html(proposed: Option<&str>, decision: Option<&Deci
         out.push_str(&format!(
             "<span class=\"browse-finding-severity browse-finding-severity-{s}\">{s}</span>\
              <span class=\"browse-finding-rater\">{outcome} by a human</span>",
-            s = esc(&decision.severity),
+            s = esc(decision.severity.as_deref().unwrap_or("unrated")),
             outcome = decision.outcome.label(),
         ));
     }
@@ -331,6 +411,7 @@ pub(crate) fn decision_html(
     id: &str,
     proposed: Option<&str>,
     decision: Option<&Decision>,
+    head: Option<&Decision>,
 ) -> String {
     if let Some(decision) = decision {
         let mut out = format!(
@@ -341,6 +422,19 @@ pub(crate) fn decision_html(
             out.push_str(&format!(
                 " <span class=\"browse-finding-decline-reason\">({})</span>",
                 esc(reason)
+            ));
+        }
+        if !decision.confirmed {
+            out.push_str(&format!(
+                " <span class=\"browse-finding-unconfirmed\">unconfirmed — no word, made in {}\
+                 </span>",
+                match &decision.made {
+                    Some(Made::Batch(key)) => format!("batch {}", esc(key)),
+                    _ => format!(
+                        "a burst at {}",
+                        esc(decision.burst.as_deref().unwrap_or("an unknown time"))
+                    ),
+                }
             ));
         }
         if let Some(at) = &decision.at {
@@ -361,7 +455,23 @@ pub(crate) fn decision_html(
                 esc(note)
             ));
         }
+        if decision.outcome == Outcome::Declined {
+            out.push_str(&revise_html(id, decision));
+        }
         return out;
+    }
+    let mut out = String::new();
+    // Undecided AGAIN: say so, so the form below reads as a second answer.
+    if let Some(retraction) = head.filter(|d| d.outcome == Outcome::Retracted) {
+        out.push_str(&format!(
+            "<p class=\"browse-finding-decision browse-finding-retracted\">an earlier answer \
+             was retracted by a human{}</p>",
+            retraction
+                .at
+                .as_deref()
+                .map(|at| format!(" · {}", esc(at)))
+                .unwrap_or_default()
+        ));
     }
     let mut options = String::new();
     for severity in SEVERITIES {
@@ -373,18 +483,7 @@ pub(crate) fn decision_html(
             "<option value=\"{severity}\"{selected}>{severity}</option>"
         ));
     }
-    // The reason picker: every word of [`DECLINE_REASONS`], its meaning as the
-    // option's title, behind an EMPTY default — which the Sink reads as
-    // "omitted", so the publish button sharing this form is never refused
-    // for it and a decline without a word stays one click.
-    let mut reasons = String::from("<option value=\"\" selected>—</option>");
-    for (word, meaning) in DECLINE_REASONS.iter().zip(DECLINE_REASON_MEANINGS) {
-        reasons.push_str(&format!(
-            "<option value=\"{word}\" title=\"{}\">{word}</option>",
-            esc(meaning)
-        ));
-    }
-    format!(
+    out.push_str(&format!(
         "<form class=\"browse-finding-decide\" hx-post=\"/k/sink {iri}\" hx-target=\"#browse\" \
          hx-swap=\"innerHTML\">\
          <label class=\"browse-finding-label\">severity \
@@ -396,6 +495,78 @@ pub(crate) fn decision_html(
          <button type=\"submit\" name=\"decision\" value=\"{DECLINE}\">decline</button>\
          </form>",
         iri = esc(&finding_iri(id)),
+        reasons = reason_options(None),
+    ));
+    out
+}
+
+/// The reason picker: every word of [`DECLINE_REASONS`], its meaning as the
+/// option's title, behind an EMPTY default — which the Sink reads as
+/// "omitted", so the publish button sharing a form is never refused for it
+/// and a decline without a word stays one click. `current` pre-selects a word
+/// on file instead.
+fn reason_options(current: Option<&str>) -> String {
+    let mut reasons = format!(
+        "<option value=\"\"{}>—</option>",
+        if current.is_none() { " selected" } else { "" }
+    );
+    for (word, meaning) in DECLINE_REASONS.iter().zip(DECLINE_REASON_MEANINGS) {
+        reasons.push_str(&format!(
+            "<option value=\"{word}\" title=\"{}\"{}>{word}</option>",
+            esc(meaning),
+            if current == Some(*word) {
+                " selected"
+            } else {
+                ""
+            }
+        ));
+    }
+    reasons
+}
+
+/// The REVISION affordance under a declined finding's record (ledger #653):
+/// confirm (decline again, with a word), reverse (publish), or retract — each
+/// naming the decision it revises, so the Sink accepts it and keeps both.
+///
+/// ★ Two forms, not one: a retraction states no rating and is refused one,
+/// so it cannot share the form whose severity menu always submits a value.
+/// Behind `<details>`, because a decline is usually final and the record is
+/// what a reader came for. Markup only, like every other S0 face — and it
+/// stamps no `made=`: how a decision was made is the host's to say at its
+/// door, and a form cannot know whether it is being fanned out.
+fn revise_html(id: &str, decision: &Decision) -> String {
+    let iri = esc(&finding_iri(id));
+    let revises = esc(&decision.iri);
+    let mut options = String::new();
+    for severity in SEVERITIES {
+        let selected = match decision.severity.as_deref() == Some(severity) {
+            true => " selected",
+            false => "",
+        };
+        options.push_str(&format!(
+            "<option value=\"{severity}\"{selected}>{severity}</option>"
+        ));
+    }
+    format!(
+        "<details class=\"browse-finding-revise\"><summary>revise this decision</summary>\
+         <form class=\"browse-finding-decide\" hx-post=\"/k/sink {iri}\" hx-target=\"#browse\" \
+         hx-swap=\"innerHTML\">\
+         <input type=\"hidden\" name=\"revises\" value=\"{revises}\">\
+         <label class=\"browse-finding-label\">severity \
+         <select name=\"severity\">{options}</select></label>\
+         <label class=\"browse-finding-label\">reason (decline only) \
+         <select name=\"reason\">{reasons}</select></label>\
+         <textarea name=\"content\" placeholder=\"why (optional; kept either way)\"></textarea>\
+         <button type=\"submit\" name=\"decision\" value=\"{DECLINE}\">decline (confirm)</button>\
+         <button type=\"submit\" name=\"decision\" value=\"{PUBLISH}\">publish instead</button>\
+         </form>\
+         <form class=\"browse-finding-retract\" hx-post=\"/k/sink {iri}\" hx-target=\"#browse\" \
+         hx-swap=\"innerHTML\">\
+         <input type=\"hidden\" name=\"revises\" value=\"{revises}\">\
+         <textarea name=\"content\" placeholder=\"why withdraw it (optional)\"></textarea>\
+         <button type=\"submit\" name=\"decision\" value=\"{RETRACT}\">retract</button>\
+         </form></details>",
+        reasons = reason_options(decision.reason.as_deref()),
     )
 }
 
@@ -418,7 +589,7 @@ pub(crate) const STATES: [&str; 5] = ["pending", "superseded", "published", "dec
 
 /// What `summary=` may ask for — each widens the json face to an object that
 /// carries the rows plus its own key, and names a different grain.
-pub(crate) const SUMMARIES: [&str; 2] = ["declined", "states"];
+pub(crate) const SUMMARIES: [&str; 3] = ["declined", "states", "unconfirmed"];
 
 // --- binding ----------------------------------------------------------------
 
@@ -530,13 +701,16 @@ impl FindingEndpoint {
         crate::supersede::mark(&self.archive, std::slice::from_mut(&mut finding), |_| {
             hash.clone()
         })?;
+        crate::revision::mark(&self.archive, std::slice::from_mut(&mut finding))?;
         let line = annotate::refresh(&self.archive, &mut finding, &current)?;
         face_one(inv, &finding, line)
     }
 
     /// Sink: the human's answer. `decision=publish` promotes into the
     /// annotation family (this is the ONLY promotion path); `decision=decline`
-    /// records that a person looked and said no.
+    /// records that a person looked and said no; `decision=retract`
+    /// withdraws the current answer. A second answer on a decided finding is
+    /// a REVISION and must name the decision it revises (`revises=`).
     async fn decide(&self, inv: &Invocation<'_>) -> Result<Representation> {
         let id = Self::id_binding(inv)?;
         let mut finding = self.load_required(&id)?;
@@ -545,19 +719,39 @@ impl FindingEndpoint {
         let outcome = match word.as_str() {
             PUBLISH => Outcome::Published,
             DECLINE => Outcome::Declined,
+            RETRACT => Outcome::Retracted,
             other => {
                 return Err(Error::InvalidArgument {
                     name: "decision".to_string(),
-                    detail: format!("`{other}` is not a decision — one of: {PUBLISH}, {DECLINE}"),
+                    detail: format!(
+                        "`{other}` is not a decision — one of: {PUBLISH}, {DECLINE}, {RETRACT}"
+                    ),
                 })
             }
         };
+        let stated = |name: &str| {
+            inv.inline_str(name)
+                .ok()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
         // The final rating: the human's choice, or the model's proposal
         // accepted unchanged. ⚠ The proposal on the finding is never touched
-        // by either path.
-        let severity = match inv.inline_str("severity").ok().map(str::trim) {
-            Some(chosen) if !chosen.is_empty() => {
-                if !is_severity(chosen) {
+        // by either path. A retraction states none, and is refused one by
+        // name rather than accepting a rating it would not record.
+        let severity = match (outcome, stated("severity")) {
+            (Outcome::Retracted, Some(chosen)) => {
+                return Err(Error::InvalidArgument {
+                    name: "severity".to_string(),
+                    detail: format!(
+                        "`severity={chosen}` rates a finding, and decision={RETRACT} withdraws                          an answer without giving one — drop `severity`"
+                    ),
+                })
+            }
+            (Outcome::Retracted, None) => None,
+            (_, Some(chosen)) => {
+                if !is_severity(&chosen) {
                     return Err(Error::InvalidArgument {
                         name: "severity".to_string(),
                         detail: format!(
@@ -566,39 +760,39 @@ impl FindingEndpoint {
                         ),
                     });
                 }
-                chosen.to_string()
+                Some(chosen)
             }
-            _ => finding
-                .severity
-                .clone()
-                .ok_or_else(|| Error::InvalidArgument {
+            (_, None) => Some(finding.severity.clone().ok_or_else(|| {
+                Error::InvalidArgument {
                     name: "severity".to_string(),
                     detail: format!(
                         "the model proposed no severity for `{}`, so a decision must state one — \
-                     one of: {}",
+                         one of: {}",
                         finding_iri(&id),
                         SEVERITIES.join(", ")
                     ),
-                })?,
+                }
+            })?),
         };
         // Why a decline, in one contract word. An EMPTY value is "omitted",
         // exactly as for `severity`: a form's unselected picker submits one,
         // and a publish button sharing that form must not be refused for it.
-        // ⚠ A real word beside a publish IS refused, by name — a publish
-        // reason has no consumer, and an argument accepted and then ignored
-        // is the failure that is invisible from the caller's side.
-        let reason = match inv.inline_str("reason").ok().map(str::trim) {
-            Some(word) if !word.is_empty() => {
+        // ⚠ A real word beside anything but a decline IS refused, by name —
+        // it has no consumer, and an argument accepted and then ignored is
+        // the failure that is invisible from the caller's side.
+        let reason = match stated("reason") {
+            Some(word) => {
                 if outcome != Outcome::Declined {
                     return Err(Error::InvalidArgument {
                         name: "reason".to_string(),
                         detail: format!(
                             "`reason={word}` says why a finding was declined, and this \
-                             decision is {PUBLISH} — drop `reason`, or use decision={DECLINE}"
+                             decision is {} — drop `reason`, or use decision={DECLINE}",
+                            word_of(outcome)
                         ),
                     });
                 }
-                if !is_decline_reason(word) {
+                if !is_decline_reason(&word) {
                     return Err(Error::InvalidArgument {
                         name: "reason".to_string(),
                         detail: format!(
@@ -607,82 +801,263 @@ impl FindingEndpoint {
                         ),
                     });
                 }
-                Some(word.to_string())
+                Some(word)
+            }
+            None => None,
+        };
+        let made = made_arg(inv)?;
+        let revises_arg = stated("revises");
+        let head = finding.history.last().cloned();
+        let same_answer = |d: &Decision| {
+            d.outcome == outcome
+                && d.severity == severity
+                && (reason.is_none() || reason == d.reason)
+        };
+
+        // ★ A decision is the RECORD, and a record is not overwritten. What
+        // may follow one is a REVISION — a new node that names the one it
+        // revises — and nothing else; see the module doc for every case.
+        let revises = match (&revises_arg, &head) {
+            (Some(named), None) => {
+                return Err(Error::InvalidArgument {
+                    name: "revises".to_string(),
+                    detail: format!(
+                        "`{}` has no decision to revise — `{named}` is not on file; drop \
+                         `revises` to make the first decision",
+                        finding_iri(&id)
+                    ),
+                })
+            }
+            (Some(named), Some(head)) if *named != head.iri => {
+                // The second submit of a revision that already landed is the
+                // double click of THIS path: a no-op, not an error.
+                if head.revises.as_deref() == Some(named.as_str()) && same_answer(head) {
+                    return self.answer(inv, finding);
+                }
+                return Err(Error::InvalidArgument {
+                    name: "revises".to_string(),
+                    detail: format!(
+                        "`{named}` is not the current decision on `{}`{} — a revision names the \
+                         decision it revises, and the current one is `{}` ({}). Revise that one.",
+                        finding_iri(&id),
+                        match finding.history.iter().any(|d| d.iri == *named) {
+                            true => " (a later decision already revised it)",
+                            false => " (it is not one of its decisions)",
+                        },
+                        head.iri,
+                        on_file(head),
+                    ),
+                });
+            }
+            (Some(_), Some(head)) => {
+                self.revisable(&id, head, outcome)?;
+                Some(head.iri.clone())
+            }
+            (None, Some(head)) if head.outcome != Outcome::Retracted => {
+                // A repeat of the SAME answer is accepted as a no-op (a
+                // double-clicked button must not be an error, and promotion
+                // is idempotent anyway); anything that would CHANGE the
+                // answer on file is refused, naming it and the way to
+                // revise. A repeat that states no reason does not
+                // contradict one on file; a repeat that states a DIFFERENT
+                // one (including a reason where none was recorded) does.
+                if same_answer(head) {
+                    return self.answer(inv, finding);
+                }
+                let name = match head.outcome == outcome && head.severity == severity {
+                    true => "reason",
+                    false => "decision",
+                };
+                return Err(Error::InvalidArgument {
+                    name: name.to_string(),
+                    detail: format!(
+                        "`{}` was already {} — a decision is the record and is not \
+                         overwritten. To REVISE it, name it: revises={} (both answers are \
+                         kept).{}",
+                        finding_iri(&id),
+                        on_file(head),
+                        head.iri,
+                        match &head.minted {
+                            Some(iri) => format!(
+                                " A publication is revised only once the annotation it minted \
+                                 (`{iri}`) is deleted."
+                            ),
+                            None => String::new(),
+                        },
+                    ),
+                });
+            }
+            (None, Some(head)) => {
+                // The current answer was withdrawn, so the finding is
+                // undecided again and takes a decision like any pending one;
+                // the chain stays one chain by linking the retraction. A
+                // second retraction is the double click of the first.
+                if outcome == Outcome::Retracted {
+                    return self.answer(inv, finding);
+                }
+                Some(head.iri.clone())
+            }
+            (None, None) => {
+                if outcome == Outcome::Retracted {
+                    return Err(Error::InvalidArgument {
+                        name: "decision".to_string(),
+                        detail: format!(
+                            "`{}` has no decision to retract — it is undecided",
+                            finding_iri(&id)
+                        ),
+                    });
+                }
+                None
+            }
+        };
+
+        // Pipeline citizenship: a piped value is the human's reason.
+        let note = stated("content");
+        let at = inv.now().map(|t| iso8601(t.as_millis()));
+        let minted = match (outcome, &severity) {
+            (Outcome::Published, Some(severity)) => {
+                Some(promote(&self.archive, &finding, severity)?)
             }
             _ => None,
         };
-        // ★ A decision is the RECORD, and a record is not overwritten. A
-        // repeat of the SAME answer is accepted as a no-op (a double-clicked
-        // button must not be an error, and promotion is idempotent anyway);
-        // anything that would CHANGE the recorded outcome, rating or reason is
-        // refused, naming what is on file. A repeat that states no reason does
-        // not contradict one on file; a repeat that states a DIFFERENT one
-        // (including a reason where none was recorded) does. ⚠ The identical
-        // repeat keeps the FIRST decision entirely, note included.
-        if let Some(existing) = &finding.decision {
-            let same_reason = reason.is_none() || reason == existing.reason;
-            let same_answer = existing.outcome == outcome && existing.severity == severity;
-            if same_answer && same_reason {
-                return ack(inv, &finding);
-            }
-            // Name the argument that differs: a repeat that changes only the
-            // reason is refused for its `reason`, not for its `decision`.
-            let name = match same_answer {
-                true => "reason",
-                false => "decision",
-            };
-            return Err(Error::InvalidArgument {
-                name: name.to_string(),
-                detail: format!(
-                    "`{}` was already {} as `{}`{} by a human{} — a decision is the record and \
-                     is not overwritten. Undo a publication by deleting the annotation it \
-                     minted{}.",
-                    finding_iri(&id),
-                    existing.outcome.label(),
-                    existing.severity,
-                    match &existing.reason {
-                        Some(word) => format!(" ({word})"),
-                        None if existing.outcome == Outcome::Declined =>
-                            " (no reason stated)".to_string(),
-                        None => String::new(),
-                    },
-                    existing
-                        .at
-                        .as_deref()
-                        .map(|at| format!(" at {at}"))
-                        .unwrap_or_default(),
-                    existing
-                        .minted
-                        .as_deref()
-                        .map(|iri| format!(" (`{iri}`)"))
-                        .unwrap_or_default(),
-                ),
-            });
-        }
-
-        // Pipeline citizenship: a piped value is the human's reason.
-        let note = inv
-            .inline_str("content")
-            .ok()
-            .map(str::trim)
-            .filter(|n| !n.is_empty())
-            .map(str::to_string);
-        let at = inv.now().map(|t| iso8601(t.as_millis()));
-
-        let minted = match outcome {
-            Outcome::Declined => None,
-            Outcome::Published => Some(promote(&self.archive, &finding, &severity)?),
-        };
-        finding.decision = Some(Decision {
+        let n = finding.history.len() as u32 + 1;
+        let decision = Decision {
+            iri: annotate::revision_iri(&id, n),
             outcome,
             severity,
             at,
+            revises,
+            made,
+            confirmed: false,
+            burst: None,
             note,
             reason,
             minted,
-        });
-        annotate::rewrite_annotation(&self.archive, &finding)?;
+        };
+        annotate::append_decision(&self.archive, &finding.iri(), &decision)?;
+        finding.history.push(decision);
+        finding.settle();
+        self.answer(inv, finding)
+    }
+
+    /// Whether the CURRENT decision may be revised to `outcome` — refused,
+    /// naming the way, when not.
+    ///
+    /// ★ A PUBLICATION stands while the annotation it minted does. Revising
+    /// it is "delete the annotation (`Delete urn:iki:annotation:{id}`, the
+    /// annotation family's own visible act), then revise" — never a decision
+    /// Sink that reaches into the annotation family and removes a published
+    /// note as a side effect. Once the annotation is gone, a publish may be
+    /// revised to anything, including a fresh publish that re-mints it.
+    fn revisable(&self, id: &str, head: &Decision, outcome: Outcome) -> Result<()> {
+        if head.outcome == Outcome::Retracted && outcome == Outcome::Retracted {
+            return Err(Error::InvalidArgument {
+                name: "decision".to_string(),
+                detail: format!(
+                    "`{}` is already retracted — there is no answer to withdraw",
+                    finding_iri(id)
+                ),
+            });
+        }
+        if let Some(minted) = &head.minted {
+            let still = match Family::split(minted) {
+                Some((Family::Annotation, aid)) => annotate::load_annotation(&self.archive, aid)?,
+                _ => None,
+            };
+            if still.is_some() {
+                return Err(Error::InvalidArgument {
+                    name: "revises".to_string(),
+                    detail: format!(
+                        "`{}` was published as `{minted}`, and a publication stands while its \
+                         annotation does — Delete `{minted}` first (the annotation family's own \
+                         act), then revise",
+                        finding_iri(id)
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The finding, settled for the faces (confirmation), as an ack.
+    fn answer(&self, inv: &Invocation<'_>, mut finding: Annotation) -> Result<Representation> {
+        crate::revision::mark(&self.archive, std::slice::from_mut(&mut finding))?;
         ack(inv, &finding)
+    }
+}
+
+/// The decision word for an outcome, as the Sink spells it.
+fn word_of(outcome: Outcome) -> &'static str {
+    match outcome {
+        Outcome::Published => PUBLISH,
+        Outcome::Declined => DECLINE,
+        Outcome::Retracted => RETRACT,
+    }
+}
+
+/// What is on file, in the words a refusal quotes: `declined as `major` (no
+/// reason stated) by a human at …` and its kin.
+fn on_file(d: &Decision) -> String {
+    let mut out = d.outcome.label().to_string();
+    if let Some(severity) = &d.severity {
+        out.push_str(&format!(" as `{severity}`"));
+    }
+    match &d.reason {
+        Some(word) => out.push_str(&format!(" ({word})")),
+        None if d.outcome == Outcome::Declined => out.push_str(" (no reason stated)"),
+        None => {}
+    }
+    out.push_str(" by a human");
+    if let Some(at) = &d.at {
+        out.push_str(&format!(" at {at}"));
+    }
+    if let Some(iri) = &d.minted {
+        out.push_str(&format!(" (`{iri}`)"));
+    }
+    out
+}
+
+/// `made=` and `batch=`: how the decision was made, when the caller says.
+/// Omitted = not recorded (and so open to the burst rule). `batch=` is the
+/// batch's group key, required beside `made=batch` and refused beside
+/// `made=single` — an argument accepted and ignored is invisible.
+fn made_arg(inv: &Invocation<'_>) -> Result<Option<Made>> {
+    let stated = |name: &str| {
+        inv.inline_str(name)
+            .ok()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let refuse = |name: &str, detail: String| Error::InvalidArgument {
+        name: name.to_string(),
+        detail,
+    };
+    match (stated("made").as_deref(), stated("batch")) {
+        (None, None) => Ok(None),
+        (None, Some(key)) => Err(refuse(
+            "batch",
+            format!("`batch={key}` names a batch's group, and only beside made=batch"),
+        )),
+        (Some("single"), None) => Ok(Some(Made::Single)),
+        (Some("single"), Some(key)) => Err(refuse(
+            "batch",
+            format!("`batch={key}` names a batch's group, and this decision was made=single"),
+        )),
+        (Some("batch"), Some(key)) => Ok(Some(Made::Batch(key))),
+        (Some("batch"), None) => Err(refuse(
+            "batch",
+            "made=batch states that a decision was one of a batch; batch= names the batch's \
+             group key (a group= proposal's `key`)"
+                .to_string(),
+        )),
+        (Some(other), _) => Err(refuse(
+            "made",
+            format!(
+                "`{other}` is not how a decision is made — one of: {}",
+                MADE_WORDS.join(", ")
+            ),
+        )),
     }
 }
 
@@ -731,6 +1106,7 @@ fn promote(archive: &Archive, finding: &Annotation, severity: &str) -> Result<St
     annotation.severity = Some(severity.to_string());
     annotation.derived_from = Some(finding.iri());
     annotation.decision = None;
+    annotation.history = Vec::new();
     annotate::store_annotation(archive, &annotation)?;
     Ok(annotation.iri())
 }
@@ -841,7 +1217,7 @@ impl Endpoint for FindingsEndpoint {
         // before. A listing of decided findings needs none of it (a decision
         // never changes state), unless the caller asked for the counts.
         let supersession = !matches!(state.as_str(), "published" | "declined")
-            || summary.as_deref() == Some("states");
+            || matches!(summary.as_deref(), Some("states" | "unconfirmed"));
         let mut contents = std::collections::BTreeMap::new();
         if supersession {
             let undecided_files: Vec<&Annotation> = all
@@ -860,6 +1236,24 @@ impl Endpoint for FindingsEndpoint {
             })?;
         }
         let states = supersession.then(|| StateCounts::of(&all));
+        // Confirmation (ledger #653), once over everything loaded — the rows,
+        // the declined twins a group names, and every recurrence mark.
+        let bursts = crate::revision::Bursts::of(&self.archive)?;
+        bursts.apply(&mut all);
+        // The walk (`summary=unconfirmed`) reads every state, so it is read
+        // here, before the state filter, and rendered in the face asked for.
+        let face = inv
+            .inline_str("as")
+            .unwrap_or("application/json")
+            .to_string();
+        let walk = (summary.as_deref() == Some("unconfirmed")).then(|| {
+            let view = crate::revision::Unconfirmed::of(&all, &bursts);
+            match face.as_str() {
+                t if t.starts_with("text/html") => Walk::Text(view.html()),
+                t if t.starts_with("text/plain") => Walk::Text(view.plain()),
+                _ => Walk::Json(view.json()),
+            }
+        });
         // The declined findings `recurrence` looks its twins up in — already
         // loaded, before the state filter drops them.
         let declined_records: Vec<Annotation> = match group {
@@ -906,7 +1300,15 @@ impl Endpoint for FindingsEndpoint {
         match inv.inline_str("as").unwrap_or("application/json") {
             t if t.starts_with("text/html") => Ok(repr_utf8(
                 "text/html",
-                listing_html(repo, &rel, &state, &rows, &declined, hidden.as_deref()),
+                listing_html(
+                    repo,
+                    &rel,
+                    &state,
+                    &rows,
+                    &declined,
+                    hidden.as_deref(),
+                    walk.as_ref().and_then(Walk::text),
+                ),
             )),
             t if t.starts_with("text/turtle") => {
                 let findings: Vec<Annotation> = rows.into_iter().map(|(f, _)| f).collect();
@@ -915,10 +1317,14 @@ impl Endpoint for FindingsEndpoint {
                     annotate::annotation_turtle_document(&findings),
                 ))
             }
-            t if t.starts_with("text/plain") => Ok(repr_utf8(
-                "text/plain",
-                plain(&rows, &declined, hidden.as_deref()),
-            )),
+            t if t.starts_with("text/plain") => {
+                let mut out = plain(&rows, &declined, hidden.as_deref());
+                if let Some(text) = walk.as_ref().and_then(Walk::text) {
+                    out.push('\n');
+                    out.push_str(text);
+                }
+                Ok(repr_utf8("text/plain", out))
+            }
             _ => {
                 let rows: Vec<serde_json::Value> = rows
                     .iter()
@@ -939,6 +1345,16 @@ impl Endpoint for FindingsEndpoint {
                         "rows": rows,
                         "states": counts.json(),
                     }),
+                    (Some("unconfirmed"), _) => serde_json::json!({
+                        "repo": repo,
+                        "path": filter,
+                        "state": state,
+                        "rows": rows,
+                        "unconfirmed": match walk {
+                            Some(Walk::Json(v)) => v,
+                            _ => serde_json::Value::Null,
+                        },
+                    }),
                     _ => serde_json::Value::Array(rows),
                 };
                 Ok(repr("application/json", json.to_string()))
@@ -956,6 +1372,21 @@ impl Endpoint for FindingsEndpoint {
 }
 
 // --- faces ------------------------------------------------------------------
+
+/// The `summary=unconfirmed` walk, rendered in the face the listing serves.
+enum Walk {
+    Json(serde_json::Value),
+    Text(String),
+}
+
+impl Walk {
+    fn text(&self) -> Option<&str> {
+        match self {
+            Walk::Text(text) => Some(text),
+            Walk::Json(_) => None,
+        }
+    }
+}
 
 fn face_one(
     inv: &Invocation<'_>,
@@ -991,9 +1422,15 @@ pub(crate) fn plain_row(finding: &Annotation, line: Option<u64>) -> String {
         finding.severity.as_deref().unwrap_or("unrated"),
     ));
     if let Some(decision) = &finding.decision {
-        out.push_str(&format!(" -> {}", decision.severity));
+        out.push_str(&format!(
+            " -> {}",
+            decision.severity.as_deref().unwrap_or("unrated")
+        ));
         if let Some(reason) = &decision.reason {
             out.push_str(&format!(" ({reason})"));
+        }
+        if !decision.confirmed {
+            out.push_str(" [unconfirmed]");
         }
     }
     if finding.orphaned {
@@ -1001,7 +1438,7 @@ pub(crate) fn plain_row(finding: &Annotation, line: Option<u64>) -> String {
     } else if finding.reanchored {
         out.push_str(" [re-anchored]");
     }
-    if let Some(prior) = &finding.prior {
+    if let Some(prior) = finding.prior.as_ref().filter(|p| p.active().is_some()) {
         out.push_str(&format!(" [{}]", prior.words()));
     }
     out.push_str(&format!(" \"{}\" -- {}", finding.exact, finding.body));
@@ -1293,6 +1730,7 @@ fn listing_html(
     rows: &[(Annotation, Option<u64>)],
     declined: &DeclinedSummary,
     hidden: Option<&str>,
+    walk: Option<&str>,
 ) -> String {
     let mut out = String::from("<div class=\"browse\">");
     out.push_str(&crumbs_html(repo, rel));
@@ -1324,6 +1762,9 @@ fn listing_html(
     // not to hide behind.
     if !rel.is_empty() {
         out.push_str(&declined.html());
+    }
+    if let Some(walk) = walk {
+        out.push_str(walk);
     }
     if rows.is_empty() {
         out.push_str(&format!(
@@ -1359,14 +1800,20 @@ fn finding_description() -> Description {
              family, and it needs urn:cap:annotate. decision=decline keeps the finding as \
              a record that a human looked and said no (with reason= — one contract word: \
              misread, restates, no-issue, wont-fix or duplicate — and the piped note, both \
-             optional) — it is never discarded, and a decision is not overwritten by a \
-             second one. The \
+             optional) — it is never discarded. A decision is never overwritten: a second \
+             one is refused unless it names the CURRENT decision with revises=, and then it \
+             is a REVISION — a new decision node linked to the old (dcterms:replaces), both \
+             kept. decision=retract (only as a revision) withdraws the current answer, so \
+             the finding is undecided again; a publication is revised only after the \
+             annotation it minted is deleted. made=single|batch (with batch=<group key>) \
+             records how a decision was made. The \
              finding carries the MODEL'S proposed sh:resultSeverity; the decision node \
              carries the human's final one, so both survive and calibration stays a query. \
              Reads run the annotation layer's drift pass (ik:reanchored / ik:orphaned). \
              text/plain (default) is one triage line; as=application/json the full row \
-             including both ratings; as=text/html the card with its decision form; \
-             as=text/turtle the finding and its decision graph.",
+             including both ratings, the current decision, every decision (decisions) and \
+             each one's computed confirmed flag; as=text/html the card with its decision \
+             form; as=text/turtle the finding and its decision graph.",
         )
         .verb(Verb::Meta)
         .action(
@@ -1394,9 +1841,11 @@ fn finding_description() -> Description {
         .action(
             ActionSpec::new(Verb::Sink)
                 .summary(
-                    "the human's answer: publish (mints the annotation) or decline (keeps the \
-                     finding as a record). An identical repeat is a no-op; anything that \
-                     would CHANGE a recorded decision is refused.",
+                    "the human's answer: publish (mints the annotation), decline (keeps the \
+                     finding as a record), or retract (withdraws the current answer). An \
+                     identical repeat is a no-op; anything that would CHANGE a recorded \
+                     decision is refused unless it names that decision with revises=, which \
+                     makes it a revision and keeps both.",
                 )
                 // Publishing MINTS into the annotation family; declining writes
                 // the record of a holder's decision. Both are this authority.
@@ -1417,9 +1866,11 @@ fn finding_description() -> Description {
                         .summary(
                             "publish: mint the annotation (urn:cap:annotate). decline: record \
                              that a human looked and said no — the finding is kept, so a \
-                             re-run knows.",
+                             re-run knows. retract: withdraw the current decision (with \
+                             revises=, or a repeat of a retraction) — the finding is \
+                             undecided again and a retracted decline marks nothing.",
                         )
-                        .one_of([PUBLISH, DECLINE]),
+                        .one_of([PUBLISH, DECLINE, RETRACT]),
                 )
                 .input(
                     ArgSpec::new("severity")
@@ -1428,7 +1879,8 @@ fn finding_description() -> Description {
                         .summary(
                             "the human's FINAL rating. Omitted = accept the model's proposal \
                              unchanged (required when the model proposed none). ⚠ It never \
-                             overwrites the proposal: both are stored, on different nodes.",
+                             overwrites the proposal: both are stored, on different nodes. \
+                             Refused beside decision=retract, which rates nothing.",
                         )
                         .one_of(SEVERITIES),
                 )
@@ -1440,12 +1892,42 @@ fn finding_description() -> Description {
                         .one_of(DECLINE_REASONS),
                 )
                 .input(
+                    ArgSpec::new("revises")
+                        .class(XSD_STRING)
+                        .optional()
+                        .summary(
+                            "the IRI of the decision this one REVISES — required to change a \
+                             decided finding's answer, and it must be the finding's CURRENT \
+                             decision (decision.iri on its json row). The new decision links \
+                             it and both are kept. Refused on an undecided finding, and on a \
+                             publication whose minted annotation still exists (delete that \
+                             first).",
+                        ),
+                )
+                .input(
+                    ArgSpec::new("made")
+                        .class(XSD_STRING)
+                        .optional()
+                        .summary(
+                            "how the decision was made, recorded on it: single (one finding, \
+                             one decision) or batch (one of many decided together; name the \
+                             batch's group key with batch=). Omitted = not recorded — and a \
+                             wordless decline without it is read as unconfirmed when it falls \
+                             in a burst of declines inside one second.",
+                        )
+                        .one_of(MADE_WORDS),
+                )
+                .input(ArgSpec::new("batch").class(XSD_STRING).optional().summary(
+                    "the batch's group key (a group= proposal's key) — required with \
+                             made=batch, refused otherwise",
+                ))
+                .input(
                     ArgSpec::new("content")
                         .class(XSD_STRING)
                         .optional()
                         .summary(
-                            "the human's reason, by pipe or request body — kept on a publish \
-                             and on a decline alike",
+                            "the human's reason, by pipe or request body — kept on a publish, \
+                             a decline and a retraction alike",
                         ),
                 )
                 .input(
@@ -1486,7 +1968,16 @@ pub(crate) fn findings_description() -> Description {
              quote is gone is flagged (ik:orphaned) rather than dropped. ★ A finding \
              minted where a like claim was already DECLINED on the same file carries that \
              decision on its row (prior_decision: the declined finding, its date, its \
-             reason word and its note), so the second decision is one click; \
+             reason word and its note — the twin's CURRENT decision, absent once it is \
+             retracted or reversed), so the second decision is one click. ★ Every decision \
+             and prior_decision carries a computed confirmed flag: false for a decline \
+             with no reason word made in a batch (made=batch) or, with no recorded \
+             provenance, in a burst of three or more declines inside one second; \
+             summary=unconfirmed widens the json face to {repo, path, state, rows, \
+             unconfirmed: {count, steered, groups: [{by, key, first_decided_at, size, \
+             count, declines: [row + pending]}]}} — the unconfirmed declines that still \
+             steer a pending finding, by burst or batch, oldest first, for a human to \
+             confirm, retract or reverse; the html and plain faces say the same. \
              summary=declined widens the json face to {repo, path, state, rows, declined: \
              {count, reasons: [{reason, count}], quotes: [{exact, count, latest_decided_at, \
              findings}]}} — how many declines the file carries, by reason word (every word \
@@ -1540,8 +2031,10 @@ pub(crate) fn findings_description() -> Description {
                      reason word and by the quote they declined, whatever state= shows. \
                      states: {repo, path, state, rows, states} — the count in each queue \
                      state and, per file, pending against superseded (with the pass that \
-                     superseded them). Without it the json \
-                     face is the bare rows array it always was.",
+                     superseded them). unconfirmed: {repo, path, state, rows, \
+                     unconfirmed} — the unconfirmed declines that still steer a pending \
+                     finding, grouped by the burst or batch they were made in, oldest first. \
+                     Without it the json face is the bare rows array it always was.",
                 )
                 .one_of(SUMMARIES),
         )
@@ -1602,7 +2095,14 @@ mod tests {
     }
 
     fn kernel(root: &std::path::Path, store: &Arc<Store>) -> Kernel {
-        let reply = FINDINGS.to_string();
+        kernel_replying(root, store, FINDINGS)
+    }
+
+    /// A kernel whose stub model answers `reply` — a second pass with
+    /// different notes re-raises the first pass's claims without being an
+    /// exact repeat (which the mint would withhold).
+    fn kernel_replying(root: &std::path::Path, store: &Arc<Store>, reply: &str) -> Kernel {
+        let reply = reply.to_string();
         let llm = EndpointSpace::new().bind(
             Exact::new(PROVIDER),
             FnEndpoint::new("fake-llm", move |_inv: &Invocation<'_>| {
@@ -1870,12 +2370,12 @@ mod tests {
             .iter()
             .find(|i| i.name == "decision")
             .expect("decision is declared");
-        assert_eq!(decision.one_of, [PUBLISH, DECLINE]);
+        assert_eq!(decision.one_of, [PUBLISH, DECLINE, RETRACT]);
         // Pipeline citizenship: the piped reason is declared.
         assert!(sink.inputs.iter().any(|i| i.name == "content"));
 
         // The menu renders every declared value and nothing else.
-        let menu = decision_html("x", Some("major"), None);
+        let menu = decision_html("x", Some("major"), None, None);
         for value in SEVERITIES {
             assert!(
                 menu.contains(&format!("<option value=\"{value}\"")),
@@ -2213,7 +2713,7 @@ mod tests {
             .unwrap();
         assert!(source.inputs.iter().all(|i| i.name != "reason"));
 
-        let form = decision_html("x", Some("major"), None);
+        let form = decision_html("x", Some("major"), None, None);
         assert!(
             form.contains("<select name=\"reason\"><option value=\"\" selected>"),
             "{form}"
@@ -2581,6 +3081,771 @@ mod tests {
             .unwrap(),
         );
         assert!(file.contains("browse-findings-link"), "{file}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // --- revisions (ledger #653) ---------------------------------------------
+
+    /// The second pass's notes: the same two quotes, reworded, so each is a
+    /// RECURRENCE of the first pass's claim on its line (marked with the
+    /// declined twin), never an exact repeat the mint would withhold.
+    const REWORDED: &str = "QUOTE: fn alpha() {}\nSEVERITY: major\nNOTE: still no caller.\n\
+                            QUOTE: fn beta() {}\nSEVERITY: minor\nNOTE: role unclear.\n";
+
+    /// Edit the file and run the reworded pass: the findings it mints on
+    /// `fn alpha() {}` and `fn beta() {}`, in that order.
+    fn recur(root: &std::path::Path, store: &Arc<Store>) -> (Kernel, String, String) {
+        std::fs::write(root.join("a.rs"), format!("{CONTENT}// edited\n")).unwrap();
+        let k = kernel_replying(root, store, REWORDED);
+        let findings = pass(&k);
+        let alpha = finding_on(&k, &findings, "fn alpha() {}");
+        let beta = finding_on(&k, &findings, "fn beta() {}");
+        (k, alpha, beta)
+    }
+
+    fn sink(k: &Kernel, iri: &str, args: &[(&str, &str)]) -> Result<String> {
+        issue(k, Verb::Sink, iri, args).map(|r| body(&r))
+    }
+
+    fn refused(result: Result<String>, name: &str, says: &str) {
+        match result {
+            Err(Error::InvalidArgument { name: got, detail }) => {
+                assert_eq!(got, name, "{detail}");
+                assert!(detail.contains(says), "{detail}");
+            }
+            other => panic!("expected `{name}` refused saying `{says}`, got {other:?}"),
+        }
+    }
+
+    /// Every decision node on a finding, from the STORE, with its outcome —
+    /// the record a revision must leave whole.
+    fn nodes(store: &Store, finding: &str) -> Vec<(String, String)> {
+        let used = oxigraph::model::NamedNode::new(crate::annotate::PROV_USED).unwrap();
+        let object = oxigraph::model::NamedNode::new(finding).unwrap();
+        let ty = oxigraph::model::NamedNode::new(crate::annotate::DCTERMS_TYPE).unwrap();
+        let mut out: Vec<(String, String)> = store
+            .quads_for_pattern(
+                None,
+                Some(used.as_ref()),
+                Some(object.as_ref().into()),
+                None,
+            )
+            .map(|q| q.unwrap().subject.to_string())
+            .map(|s| s.trim_matches(|c| c == '<' || c == '>').to_string())
+            .map(|node| {
+                let subject = oxigraph::model::NamedNode::new(&node).unwrap();
+                let outcome = store
+                    .quads_for_pattern(Some(subject.as_ref().into()), Some(ty.as_ref()), None, None)
+                    .map(|q| q.unwrap().object.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                (node, outcome)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// ★★ **Confirm**: a wordless decline gains a word — but only by NAMING the
+    /// decision it revises. Without `revises=` the change is refused, naming
+    /// the IRI to revise; with it, a second node lands, links the first, and
+    /// becomes current — and the first is still in the store exactly as it
+    /// was written.
+    #[test]
+    fn a_wordless_decline_is_confirmed_by_a_revision_and_both_are_kept() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        let findings = pass(&k);
+        let alpha = finding_on(&k, &findings, "fn alpha() {}");
+        sink(&k, &alpha, &[("decision", "decline")]).unwrap();
+        let first = format!("{alpha}:decision");
+        assert_eq!(of(&k, &alpha)["decision"]["iri"], first.as_str());
+
+        refused(
+            sink(
+                &k,
+                &alpha,
+                &[("decision", "decline"), ("reason", "restates")],
+            ),
+            "reason",
+            &format!("revises={first}"),
+        );
+
+        sink(
+            &k,
+            &alpha,
+            &[
+                ("decision", "decline"),
+                ("reason", "restates"),
+                ("revises", &first),
+                ("content", "the comment above says so"),
+            ],
+        )
+        .unwrap();
+        let row = of(&k, &alpha);
+        let second = format!("{alpha}:decision:2");
+        assert_eq!(row["state"], "declined");
+        assert_eq!(row["decision"]["iri"], second.as_str(), "{row}");
+        assert_eq!(row["decision"]["reason"], "restates");
+        assert_eq!(row["decision"]["revises"], first.as_str());
+        assert_eq!(row["decision"]["note"], "the comment above says so");
+        let chain = row["decisions"].as_array().unwrap();
+        assert_eq!(chain.len(), 2, "{row}");
+        assert_eq!(chain[0]["iri"], first.as_str());
+        assert_eq!(
+            chain[0]["reason"],
+            serde_json::Value::Null,
+            "the first is untouched"
+        );
+        assert_eq!(chain[1], row["decision"]);
+
+        // In the store: both nodes, both declines, the link on the second.
+        let declined = "<urn:iki:finding:outcome:declined>".to_string();
+        assert_eq!(
+            nodes(&store, &alpha),
+            [
+                (first.clone(), declined.clone()),
+                (second.clone(), declined)
+            ]
+        );
+        let ttl = body(&issue(&k, Verb::Source, &alpha, &[("as", "text/turtle")]).unwrap());
+        assert!(
+            ttl.contains(&format!("<{second}> a prov:Activity")),
+            "{ttl}"
+        );
+        assert!(
+            ttl.contains(&format!("dcterms:replaces <{first}>")),
+            "{ttl}"
+        );
+        assert!(!ttl.contains("wasRevisionOf"), "{ttl}");
+
+        // A drift rewrite of the record leaves the chain alone.
+        std::fs::write(root.join("a.rs"), format!("// moved\n{CONTENT}")).unwrap();
+        assert_eq!(of(&k, &alpha)["decisions"].as_array().unwrap().len(), 2);
+        assert_eq!(nodes(&store, &alpha).len(), 2);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★★ **Retract**: the decline is withdrawn, the finding is undecided
+    /// again, and the recurrence mark FOLLOWS the current decision — a
+    /// retracted decline is no `prior_decision`, forms no recurrence group,
+    /// and lists in no decline count. A fresh decline after it needs no
+    /// `revises=`, links the retraction, and makes the mark steer again.
+    #[test]
+    fn a_retracted_decline_is_undecided_and_marks_nothing() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        let findings = pass(&k);
+        let alpha = finding_on(&k, &findings, "fn alpha() {}");
+        sink(&k, &alpha, &[("decision", "decline")]).unwrap();
+        let (k, again, _) = recur(&root, &store);
+        let mark = &of(&k, &again)["prior_decision"];
+        assert_eq!(mark["finding"], alpha.as_str(), "the recurrence is marked");
+        assert_eq!(mark["outcome"], "declined");
+
+        let first = format!("{alpha}:decision");
+        sink(
+            &k,
+            &alpha,
+            &[
+                ("decision", "retract"),
+                ("revises", &first),
+                ("content", "mis-click"),
+            ],
+        )
+        .unwrap();
+        let row = of(&k, &alpha);
+        assert_eq!(row["decision"], serde_json::Value::Null, "{row}");
+        assert_ne!(row["state"], "declined");
+        let chain = row["decisions"].as_array().unwrap();
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[1]["outcome"], "retracted");
+        assert_eq!(chain[1]["severity"], serde_json::Value::Null);
+        assert_eq!(chain[1]["note"], "mis-click");
+        assert_eq!(chain[1]["revises"], first.as_str());
+
+        assert_eq!(
+            of(&k, &again)["prior_decision"],
+            serde_json::Value::Null,
+            "a retracted decline steers nothing"
+        );
+        let groups = json(&k, "urn:repo:demo:findings", &[("group", "recurrence")]);
+        assert!(
+            groups["groups"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|g| g["twin"]["iri"] != alpha.as_str()),
+            "{groups}"
+        );
+        let wide = json(
+            &k,
+            "urn:repo:demo:findings:a.rs",
+            &[("summary", "declined")],
+        );
+        assert_eq!(wide["declined"]["count"], 0, "{wide}");
+        // A second retraction is the double click of the first.
+        sink(&k, &alpha, &[("decision", "retract")]).unwrap();
+        assert_eq!(of(&k, &alpha)["decisions"].as_array().unwrap().len(), 2);
+
+        // Undecided again: a plain decision is accepted and links the
+        // retraction — and the mark steers again.
+        sink(
+            &k,
+            &alpha,
+            &[("decision", "decline"), ("reason", "misread")],
+        )
+        .unwrap();
+        let row = of(&k, &alpha);
+        assert_eq!(row["decisions"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            row["decision"]["revises"],
+            format!("{alpha}:decision:2").as_str()
+        );
+        let mark = &of(&k, &again)["prior_decision"];
+        assert_eq!(mark["reason"], "misread", "{mark}");
+        assert_eq!(mark["iri"], format!("{alpha}:decision:3").as_str());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★★ **Reverse**: decline → publish promotes exactly as a first publish
+    /// does, both answers stay on record, and the recurrence mark stops — a
+    /// like claim was not declined any more.
+    #[test]
+    fn a_decline_reversed_to_a_publish_promotes_and_stops_marking() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        let findings = pass(&k);
+        let alpha = finding_on(&k, &findings, "fn alpha() {}");
+        sink(&k, &alpha, &[("decision", "decline")]).unwrap();
+        let (k, again, _) = recur(&root, &store);
+
+        let minted = sink(
+            &k,
+            &alpha,
+            &[
+                ("decision", "publish"),
+                ("severity", "minor"),
+                ("revises", &format!("{alpha}:decision")),
+            ],
+        )
+        .unwrap();
+        let row = of(&k, &alpha);
+        assert_eq!(row["state"], "published", "{row}");
+        assert_eq!(row["decision"]["minted"], minted.as_str());
+        assert_eq!(row["decisions"][0]["outcome"], "declined");
+        let published = json(&k, &minted, &[]);
+        assert_eq!(published["severity"], "minor");
+        assert_eq!(published["derived_from"], alpha.as_str());
+        assert_eq!(of(&k, &again)["prior_decision"], serde_json::Value::Null);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A PUBLICATION stands while its annotation does: revising it is refused,
+    /// naming the Delete — and once the annotation is deleted, the revision is
+    /// an ordinary one and the publish stays in the chain.
+    #[test]
+    fn a_publication_is_revised_only_after_its_annotation_is_deleted() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        let findings = pass(&k);
+        let alpha = finding_on(&k, &findings, "fn alpha() {}");
+        let minted = sink(&k, &alpha, &[("decision", "publish")]).unwrap();
+        let first = format!("{alpha}:decision");
+        for decision in ["decline", "retract"] {
+            refused(
+                sink(&k, &alpha, &[("decision", decision), ("revises", &first)]),
+                "revises",
+                &format!("Delete `{minted}` first"),
+            );
+        }
+        // Without `revises`, the refusal says both halves of the way.
+        refused(
+            sink(&k, &alpha, &[("decision", "decline")]),
+            "decision",
+            "revised only once the annotation it minted",
+        );
+
+        issue(&k, Verb::Delete, &minted, &[]).unwrap();
+        sink(
+            &k,
+            &alpha,
+            &[
+                ("decision", "decline"),
+                ("reason", "wont-fix"),
+                ("revises", &first),
+            ],
+        )
+        .unwrap();
+        let row = of(&k, &alpha);
+        assert_eq!(row["state"], "declined");
+        assert_eq!(row["decisions"][0]["outcome"], "published");
+        assert_eq!(
+            row["decisions"][0]["minted"],
+            minted.as_str(),
+            "the record of it"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The refusals: `revises` on an undecided finding, naming a decision that
+    /// is not current (with the current one named back), naming something that
+    /// is not the finding's; a retraction with nothing to retract or with a
+    /// rating; a word beside a revision to publish or retract; and `made`
+    /// arguments that disagree. None of them writes anything — and the second
+    /// submit of a revision that already landed is a no-op, not a refusal.
+    #[test]
+    fn revisions_refuse_what_they_cannot_revise() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        let findings = pass(&k);
+        let alpha = finding_on(&k, &findings, "fn alpha() {}");
+        let first = format!("{alpha}:decision");
+
+        refused(
+            sink(&k, &alpha, &[("decision", "decline"), ("revises", &first)]),
+            "revises",
+            "has no decision to revise",
+        );
+        refused(
+            sink(&k, &alpha, &[("decision", "retract")]),
+            "decision",
+            "no decision to retract",
+        );
+        sink(&k, &alpha, &[("decision", "decline")]).unwrap();
+        refused(
+            sink(
+                &k,
+                &alpha,
+                &[
+                    ("decision", "retract"),
+                    ("severity", "minor"),
+                    ("revises", &first),
+                ],
+            ),
+            "severity",
+            "drop `severity`",
+        );
+        refused(
+            sink(
+                &k,
+                &alpha,
+                &[
+                    ("decision", "retract"),
+                    ("reason", "misread"),
+                    ("revises", &first),
+                ],
+            ),
+            "reason",
+            "this decision is retract",
+        );
+        refused(
+            sink(
+                &k,
+                &alpha,
+                &[
+                    ("decision", "publish"),
+                    ("reason", "misread"),
+                    ("revises", &first),
+                ],
+            ),
+            "reason",
+            "this decision is publish",
+        );
+        refused(
+            sink(
+                &k,
+                &alpha,
+                &[
+                    ("decision", "decline"),
+                    ("revises", "urn:iki:finding:x:decision"),
+                ],
+            ),
+            "revises",
+            "it is not one of its decisions",
+        );
+        let revision = [
+            ("decision", "decline"),
+            ("reason", "restates"),
+            ("revises", first.as_str()),
+        ];
+        sink(&k, &alpha, &revision).unwrap();
+        sink(&k, &alpha, &revision).expect("the second submit of a landed revision is a no-op");
+        refused(
+            sink(
+                &k,
+                &alpha,
+                &[
+                    ("decision", "decline"),
+                    ("reason", "misread"),
+                    ("revises", &first),
+                ],
+            ),
+            "revises",
+            &format!(
+                "(a later decision already revised it) — a revision names the decision it \
+                      revises, and the current one is `{alpha}:decision:2`"
+            ),
+        );
+        for (args, name) in [
+            (&[("decision", "decline"), ("made", "batch")][..], "batch"),
+            (
+                &[("decision", "decline"), ("batch", "file:a.rs")][..],
+                "batch",
+            ),
+            (
+                &[("decision", "decline"), ("made", "single"), ("batch", "k")][..],
+                "batch",
+            ),
+            (&[("decision", "decline"), ("made", "twice")][..], "made"),
+        ] {
+            let beta = finding_on(&k, &findings, "fn beta() {}");
+            let mut args = args.to_vec();
+            args.push(("severity", "info"));
+            let err = sink(&k, &beta, &args).unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidArgument { name: n, .. } if n == name),
+                "{err:?}"
+            );
+            assert_eq!(of(&k, &beta)["state"], "pending", "nothing was recorded");
+        }
+        assert_eq!(
+            nodes(&store, &alpha).len(),
+            2,
+            "only the one revision landed"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★ **How a decision was made** is recorded when the caller says and
+    /// returned on every face, and it decides `confirmed` with the reason word:
+    /// a wordless decline made in a batch is UNCONFIRMED — on its own row and
+    /// on the `prior_decision` of every recurrence it marks — while a worded
+    /// one, or one made singly, is confirmed. A revision made singly confirms.
+    #[test]
+    fn made_is_recorded_and_a_wordless_batch_decline_is_unconfirmed() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        let findings = pass(&k);
+        let alpha = finding_on(&k, &findings, "fn alpha() {}");
+        let beta = finding_on(&k, &findings, "fn beta() {}");
+        let key = "recurrence:abc def";
+        sink(
+            &k,
+            &alpha,
+            &[("decision", "decline"), ("made", "batch"), ("batch", key)],
+        )
+        .unwrap();
+        sink(
+            &k,
+            &beta,
+            &[
+                ("decision", "decline"),
+                ("severity", "info"),
+                ("made", "single"),
+            ],
+        )
+        .unwrap();
+        let row = of(&k, &alpha);
+        assert_eq!(row["decision"]["made"], "batch");
+        assert_eq!(row["decision"]["batch"], key);
+        assert_eq!(row["decision"]["confirmed"], false, "{row}");
+        assert_eq!(row["decision"]["burst"], serde_json::Value::Null);
+        let row = of(&k, &beta);
+        assert_eq!(row["decision"]["made"], "single");
+        assert_eq!(row["decision"]["batch"], serde_json::Value::Null);
+        assert_eq!(row["decision"]["confirmed"], true);
+        let ttl = body(&issue(&k, Verb::Source, &alpha, &[("as", "text/turtle")]).unwrap());
+        assert!(
+            ttl.contains("dcterms:provenance <urn:iki:decision-made:batch:recurrence:abc%20def>"),
+            "{ttl}"
+        );
+        let plain = body(&issue(&k, Verb::Source, &alpha, &[("as", "text/plain")]).unwrap());
+        assert!(plain.contains("[unconfirmed]"), "{plain}");
+
+        let (k, again, _) = recur(&root, &store);
+        let mark = &of(&k, &again)["prior_decision"];
+        assert_eq!(mark["confirmed"], false, "{mark}");
+        assert_eq!(mark["made"], "batch");
+        let plain = body(&issue(&k, Verb::Source, &again, &[("as", "text/plain")]).unwrap());
+        assert!(plain.contains("(unconfirmed)"), "{plain}");
+
+        // Confirmed by a single revision with a word: the old node keeps its
+        // own reading, the new one is current and confirmed.
+        sink(
+            &k,
+            &alpha,
+            &[
+                ("decision", "decline"),
+                ("reason", "no-issue"),
+                ("made", "single"),
+                ("revises", &format!("{alpha}:decision")),
+            ],
+        )
+        .unwrap();
+        let row = of(&k, &alpha);
+        assert_eq!(row["decisions"][0]["confirmed"], false);
+        assert_eq!(row["decision"]["confirmed"], true);
+        assert_eq!(of(&k, &again)["prior_decision"]["confirmed"], true);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Write a decision node exactly as 0.13 did — no provenance, a
+    /// timestamp — the shape every decline before ledger #653 has.
+    fn legacy_decline(store: &Store, node: &str, finding: &str, at: &str) {
+        use oxigraph::model::{GraphName, Literal, NamedNode, Quad};
+        let n = NamedNode::new(node).unwrap();
+        let p = |iri: &str| NamedNode::new(iri).unwrap();
+        for (predicate, object) in [
+            (
+                "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                oxigraph::model::Term::from(p("http://www.w3.org/ns/prov#Activity")),
+            ),
+            (crate::annotate::PROV_USED, p(finding).into()),
+            (
+                crate::annotate::DCTERMS_TYPE,
+                p("urn:iki:finding:outcome:declined").into(),
+            ),
+            (
+                crate::annotate::SH_RESULT_SEVERITY,
+                p("urn:iki:severity:major").into(),
+            ),
+            (
+                crate::annotate::DCTERMS_CREATED,
+                Literal::new_typed_literal(at, oxigraph::model::vocab::xsd::DATE_TIME).into(),
+            ),
+        ] {
+            store
+                .insert(&Quad::new(
+                    n.clone(),
+                    p(predicate),
+                    object,
+                    GraphName::DefaultGraph,
+                ))
+                .unwrap();
+        }
+    }
+
+    /// ★★ **Legacy bursts, and the walk.** Three declines written the 0.13
+    /// way inside one second (two on this repo's findings, one elsewhere in
+    /// the graph) read UNCONFIRMED, named by their burst; a fourth, alone, is
+    /// confirmed. `summary=unconfirmed` lists the two that still steer a
+    /// pending recurrence, under their burst (its graph-wide size), oldest
+    /// first, with the findings they steer — and the walk shrinks as a human
+    /// confirms one and retracts the other.
+    #[test]
+    fn legacy_burst_declines_read_unconfirmed_and_the_walk_lists_them() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        let findings = pass(&k);
+        let alpha = finding_on(&k, &findings, "fn alpha() {}");
+        let beta = finding_on(&k, &findings, "fn beta() {}");
+        // ⚠ Three significant fraction digits: the store keeps an
+        // xsd:dateTime as a value and serves its CANONICAL form, so `.120Z`
+        // would read back as `.12Z`.
+        let burst = "2026-09-23T02:42:38.125Z";
+        legacy_decline(&store, &format!("{alpha}:decision"), &alpha, burst);
+        legacy_decline(
+            &store,
+            &format!("{beta}:decision"),
+            &beta,
+            "2026-09-23T02:42:38.400Z",
+        );
+        legacy_decline(
+            &store,
+            "urn:iki:finding:elsewhere:decision",
+            "urn:iki:finding:elsewhere",
+            "2026-09-23T02:42:39.050Z",
+        );
+        legacy_decline(
+            &store,
+            "urn:iki:finding:alone:decision",
+            "urn:iki:finding:alone",
+            "2026-09-23T02:43:10.000Z",
+        );
+        let row = of(&k, &alpha);
+        assert_eq!(row["decision"]["confirmed"], false, "{row}");
+        assert_eq!(row["decision"]["burst"], burst);
+        assert_eq!(row["decision"]["made"], serde_json::Value::Null);
+
+        let (k, alpha_again, beta_again) = recur(&root, &store);
+        let walk = json(&k, "urn:repo:demo:findings", &[("summary", "unconfirmed")]);
+        let unconfirmed = &walk["unconfirmed"];
+        assert_eq!(unconfirmed["count"], 2, "{walk}");
+        assert_eq!(unconfirmed["steered"], 2);
+        let groups = unconfirmed["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 1, "{walk}");
+        assert_eq!(groups[0]["by"], "burst");
+        assert_eq!(groups[0]["key"], burst);
+        assert_eq!(groups[0]["size"], 3, "the burst is counted graph-wide");
+        assert_eq!(groups[0]["first_decided_at"], burst);
+        let declines = groups[0]["declines"].as_array().unwrap();
+        assert_eq!(declines[0]["iri"], alpha.as_str(), "oldest first");
+        assert_eq!(declines[0]["pending"], serde_json::json!([alpha_again]));
+        assert_eq!(declines[1]["iri"], beta.as_str());
+        assert_eq!(declines[1]["pending"], serde_json::json!([beta_again]));
+        // The rows are the listing's, unchanged in shape.
+        assert_eq!(
+            walk["rows"],
+            json(&k, "urn:repo:demo:findings", &[]),
+            "{walk}"
+        );
+        for face in ["text/plain", "text/html"] {
+            let out = body(
+                &issue(
+                    &k,
+                    Verb::Source,
+                    "urn:repo:demo:findings",
+                    &[("summary", "unconfirmed"), ("as", face)],
+                )
+                .unwrap(),
+            );
+            assert!(
+                out.contains("2 unconfirmed declines still steer 2 pending findings"),
+                "{out}"
+            );
+            assert!(
+                out.contains(&format!("burst at {burst} (3 declines")),
+                "{out}"
+            );
+        }
+        let html = body(&issue(&k, Verb::Source, &alpha, &[("as", "text/html")]).unwrap());
+        assert!(html.contains("browse-finding-unconfirmed"), "{html}");
+        assert!(
+            html.contains(&format!("name=\"revises\" value=\"{alpha}:decision\"")),
+            "{html}"
+        );
+
+        // Walk it: confirm alpha with a word, retract beta.
+        sink(
+            &k,
+            &alpha,
+            &[
+                ("decision", "decline"),
+                ("reason", "restates"),
+                ("revises", &format!("{alpha}:decision")),
+            ],
+        )
+        .unwrap();
+        let walk = json(&k, "urn:repo:demo:findings", &[("summary", "unconfirmed")]);
+        assert_eq!(walk["unconfirmed"]["count"], 1, "{walk}");
+        sink(
+            &k,
+            &beta,
+            &[
+                ("decision", "retract"),
+                ("revises", &format!("{beta}:decision")),
+            ],
+        )
+        .unwrap();
+        let walk = json(&k, "urn:repo:demo:findings", &[("summary", "unconfirmed")]);
+        assert_eq!(walk["unconfirmed"]["count"], 0, "{walk}");
+        let plain = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:findings",
+                &[("summary", "unconfirmed"), ("as", "text/plain")],
+            )
+            .unwrap(),
+        );
+        assert!(plain.contains("no unconfirmed decline steers"), "{plain}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★ The loader is PESSIMISTIC and every face runs the burst pass: a
+    /// wordless decline with no provenance that is in NO burst reads
+    /// `confirmed: true` on the single read, the Sink's json ack, the listing,
+    /// a recurrence group's twin and the `prior_decision` of the row it marks
+    /// — any face that skipped the pass would say `false` here.
+    #[test]
+    fn a_lone_decline_reads_confirmed_on_every_face() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        let findings = pass(&k);
+        let alpha = finding_on(&k, &findings, "fn alpha() {}");
+        let ack: serde_json::Value = serde_json::from_str(
+            &sink(
+                &k,
+                &alpha,
+                &[("decision", "decline"), ("as", "application/json")],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(ack["decision"]["confirmed"], true, "{ack}");
+        assert_eq!(of(&k, &alpha)["decision"]["confirmed"], true);
+        let declined = json(&k, "urn:repo:demo:findings", &[("state", "declined")]);
+        assert_eq!(declined[0]["decision"]["confirmed"], true, "{declined}");
+        let (k, again, _) = recur(&root, &store);
+        let pending = json(&k, "urn:repo:demo:findings", &[]);
+        let row = pending
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["iri"] == again.as_str())
+            .unwrap();
+        assert_eq!(row["prior_decision"]["confirmed"], true, "{row}");
+        let groups = json(&k, "urn:repo:demo:findings", &[("group", "recurrence")]);
+        let twin = groups["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["twin"]["iri"] == alpha.as_str())
+            .unwrap_or_else(|| panic!("{groups}"));
+        assert_eq!(twin["twin"]["decision"]["confirmed"], true, "{groups}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★ The JSON a host reads, pinned by NAME: every decision object —
+    /// `decision`, each of `decisions`, `prior_decision` (plus `finding`) —
+    /// carries exactly these keys. A rename here is a host's silent break.
+    #[test]
+    fn the_decision_json_carries_the_fields_a_host_reads() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        let findings = pass(&k);
+        let alpha = finding_on(&k, &findings, "fn alpha() {}");
+        let pending = of(&k, &alpha);
+        assert_eq!(pending["decision"], serde_json::Value::Null);
+        assert_eq!(pending["decisions"], serde_json::json!([]));
+        sink(&k, &alpha, &[("decision", "decline")]).unwrap();
+        let keys = |v: &serde_json::Value| -> Vec<String> {
+            let mut keys: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        let expected = [
+            "batch",
+            "burst",
+            "confirmed",
+            "decided_at",
+            "iri",
+            "made",
+            "minted",
+            "note",
+            "outcome",
+            "reason",
+            "revises",
+            "severity",
+        ];
+        let row = of(&k, &alpha);
+        assert_eq!(keys(&row["decision"]), expected);
+        assert_eq!(keys(&row["decisions"][0]), expected);
+        let (k, again, _) = recur(&root, &store);
+        let mut with_finding: Vec<&str> = expected.to_vec();
+        with_finding.push("finding");
+        with_finding.sort();
+        assert_eq!(keys(&of(&k, &again)["prior_decision"]), with_finding);
         std::fs::remove_dir_all(&root).ok();
     }
 

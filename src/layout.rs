@@ -297,6 +297,17 @@ border-left:3px solid var(--browse-flag);padding-left:.5rem}\n\
 .browse-finding-decide textarea,.browse-finding-decide select{font:inherit;\
 padding:.3rem}\n\
 .browse-finding-decide button{justify-self:start}\n\
+/* Revisions (ledger #653): an unconfirmed decline says so in the flag color, the
+   revise affordance stays folded under the record, and a retraction reads as a
+   record line above the form that answers the finding again. */\n\
+.browse-finding-unconfirmed{color:var(--browse-flag);font-style:italic}\n\
+.browse-finding-retracted{font-style:italic}\n\
+.browse-finding-revise{font-size:.85em;margin:.25rem 0}\n\
+.browse-finding-retract{display:grid;gap:.4rem;max-width:32rem;margin:.5rem 0}\n\
+.browse-finding-retract textarea{font:inherit;padding:.3rem}\n\
+.browse-finding-retract button{justify-self:start}\n\
+.browse-findings-unconfirmed{margin:.5rem 0}\n\
+.browse-findings-unconfirmed-group{font-size:.95em;margin:.75rem 0 .25rem}\n\
 .browse-finding-label{font-size:.85em;opacity:.8}\n\
 .browse-findings-note{font-size:.85em;opacity:.7;margin:.5rem 0}\n\
 .browse-findings-empty{opacity:.7;font-style:italic}\n\
@@ -547,6 +558,7 @@ mod tests {
             include_str!("pr.rs"),
             include_str!("finding.rs"),
             include_str!("group.rs"),
+            include_str!("revision.rs"),
         ];
         let mut emitted: BTreeSet<&str> = DYNAMIC_CLASSES.iter().copied().collect();
         for source in sources {

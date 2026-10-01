@@ -741,7 +741,7 @@ mod tests {
             .iter()
             .find(|i| i.name == "summary")
             .expect("summary is declared");
-        assert_eq!(summary.one_of, ["declined", "states"]);
+        assert_eq!(summary.one_of, ["declined", "states", "unconfirmed"]);
         std::fs::remove_dir_all(&root).ok();
     }
 
