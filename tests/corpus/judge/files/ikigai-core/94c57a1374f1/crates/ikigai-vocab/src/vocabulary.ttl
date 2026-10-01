@@ -1,0 +1,730 @@
+@prefix ik:   <https://ikigai-rs.dev/ns#> .
+@prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl:  <http://www.w3.org/2002/07/owl#> .
+@prefix prov: <http://www.w3.org/ns/prov#> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+
+# The ikigai self-description vocabulary. Endpoints project their structured
+# Description to RDF using these terms; the kernel's catalog is a graph of them.
+# Hand-maintained; bundled into ikigai-vocab via include_str! and served at
+# urn:ikigai:vocab (and, externally, at this namespace URL).
+#
+# ⚠ When you add/change/remove a term here, regenerate the JSON-LD @context:
+#     python3 crates/ikigai-vocab/context.gen.py
+# (the tests `context_covers_every_vocabulary_term` and `context_generator_sees_no_drift`
+# fail if they drift — the second runs `context.gen.py --check`, so a changed rdfs:range
+# cannot leave a stale coercion behind). A published namespace change also needs a vocab
+# publish + an ikigai-rs.dev/ns deploy.
+#
+# ⚠ owl:versionInfo below is the crate version, so the deployed /ns can be told apart
+# from the previous deploy. A test (`ontology_version_is_the_crate_version`) fails the
+# release bump until this line is bumped with it.
+#
+# Conventions: `rdfs:Class` / `rdf:Property`; every term carries rdfs:label + rdfs:comment;
+# rdfs:range drives the JSON-LD coercion (rdfs:Resource or an ik: class -> @id, an xsd
+# datatype -> typed), so an IRI-valued property DECLARES its range rather than being
+# special-cased in the generator. rdfs:domain only where a term is genuinely single-domain:
+# under RDFS entailment a domain is an assertion about every subject, and a domain that is
+# merely "usually" true types nodes it should not (the four endpoint-contract properties
+# below once carried `rdfs:domain ik:Endpoint` and made every ik:Action an ik:Endpoint).
+#
+# Plan IRIs (the process vocabulary, at the end of this file) — skolemized, no blank nodes:
+#     urn:plan:{plan-id}              the ik:Process itself
+#     urn:plan:{plan-id}:step:{n}     one ik:Step, n = 1-based position in the text face
+#     urn:plan:{plan-id}:var:{name}   a bound name (a step's ik:binds, or a parameter's
+#                                     ik:inputName) — what an ik:ref points at
+#     urn:plan:{plan-id}:fork:{n}     one ik:Fork
+#     urn:plan:{plan-id}:input:{name} a declared parameter (an ArgSpec node, as on an endpoint)
+#     urn:plan:{plan-id}:step:{n}:arg:{name}  one ik:Argument of a step
+# {plan-id} is the program's name when the plan is stored (`urn:program:{name}` is then the
+# RESOLVABLE face that runs it; `urn:plan:{name}` the graph that describes it) and the
+# plan's content address when it is anonymous. `{name}` segments pass through
+# `ikigai_core::escape_iri_fragment`; `ikigai_vocab::plan` builds each kind and is the
+# one place the scheme is coded.
+
+<https://ikigai-rs.dev/ns#> a owl:Ontology ;
+    rdfs:label "ikigai endpoint vocabulary" ;
+    rdfs:comment "Self-description vocabulary for ikigai resource-oriented endpoints, and the process vocabulary that makes a plan (a DAG of requests) a resource in the same graph." ;
+    owl:versionInfo "0.1.71" .
+
+#
+# Classes
+#
+
+ik:Endpoint a rdfs:Class ;
+    rdfs:label "Endpoint" ;
+    rdfs:comment "A resolvable resource-oriented endpoint." .
+
+ik:Transreptor a rdfs:Class ;
+    rdfs:subClassOf ik:Endpoint ;
+    rdfs:label "Transreptor" ;
+    rdfs:comment "An endpoint that converts a representation from one media type to another (a transreption)." .
+
+#
+# Properties
+#
+
+ik:id a rdf:Property ;
+    rdfs:domain ik:Endpoint ;
+    rdfs:range xsd:string ;
+    rdfs:label "id" ;
+    rdfs:comment "The endpoint's resource identifier." .
+
+ik:title a rdf:Property ;
+    rdfs:domain ik:Endpoint ;
+    rdfs:range xsd:string ;
+    rdfs:label "title" ;
+    rdfs:comment "A short human title for the endpoint." .
+
+ik:Action a rdfs:Class ;
+    rdfs:label "Action" ;
+    rdfs:comment "One verb's contract on an endpoint — the (endpoint, verb) pair is the unit of selection. Carries its own ik:verb, ik:input set, ik:output set, and ik:requires capability scopes. Normalized from the endpoint description: single-verb endpoints' flat declarations synthesize one, per-verb declarations author them explicitly." .
+
+ik:action a rdf:Property ;
+    rdfs:domain ik:Endpoint ;
+    rdfs:range ik:Action ;
+    rdfs:label "action" ;
+    rdfs:comment "Links an endpoint to one of its per-verb contracts." .
+
+ik:summary a rdf:Property ;
+    rdfs:range xsd:string ;
+    rdfs:label "summary" ;
+    rdfs:comment "A longer human description of the subject — an endpoint, one of its ik:Action nodes, or an input. No domain: it is emitted on all three." .
+
+ik:verb a rdf:Property ;
+    rdfs:range xsd:string ;
+    rdfs:label "verb" ;
+    rdfs:comment "A verb: Source, Sink, Exists, Delete, or Meta. On an ik:Endpoint, one it answers (multi-valued); on an ik:Action, the one the contract is for; on an ik:Step, the one the step issues. No domain: the same five words on all three." .
+
+ik:output a rdf:Property ;
+    rdfs:range xsd:string ;
+    rdfs:label "output" ;
+    rdfs:comment "A media type the subject can produce — an endpoint, one of its ik:Action nodes, or an ik:Process (the media type of its ik:result). No domain: emitted on all three." .
+
+ik:input a rdf:Property ;
+    rdfs:range rdfs:Resource ;
+    rdfs:label "input" ;
+    rdfs:comment "A named input the subject accepts — an endpoint, one of its ik:Action nodes, or an ik:Process (its declared parameters, so a stored plan describes itself exactly as an endpoint does and the manifold can offer it). The value is a skolemized ArgSpec node carrying ik:inputName, ik:source, ik:required, and optionally ik:summary, ik:class, ik:default, and ik:oneOf. No domain: emitted on all three." .
+
+ik:inputName a rdf:Property ;
+    rdfs:range xsd:string ;
+    rdfs:label "inputName" ;
+    rdfs:comment "The name of an input parameter." .
+
+ik:source a rdf:Property ;
+    rdfs:range xsd:string ;
+    rdfs:label "source" ;
+    rdfs:comment "How an input arrives: \"argument\" (by value) or \"binding\" (captured from the resource identifier)." .
+
+ik:required a rdf:Property ;
+    rdfs:range xsd:boolean ;
+    rdfs:label "required" ;
+    rdfs:comment "Whether an input is required." .
+
+ik:transreptsFrom a rdf:Property ;
+    rdfs:domain ik:Transreptor ;
+    rdfs:range xsd:string ;
+    rdfs:label "transreptsFrom" ;
+    rdfs:comment "A media type this transreptor can read (convert from)." .
+
+ik:transreptsTo a rdf:Property ;
+    rdfs:domain ik:Transreptor ;
+    rdfs:range xsd:string ;
+    rdfs:label "transreptsTo" ;
+    rdfs:comment "A media type this transreptor can produce (convert to)." .
+
+ik:class a rdf:Property ;
+    rdfs:range rdfs:Resource ;
+    rdfs:label "class" ;
+    rdfs:comment "The RDF class or XSD datatype an input's value is expected to be (an IRI), on an input node — rdfs:Class for entity-valued inputs, xsd datatype for scalars. Drives type-based action selection: an endpoint whose required inputs' classes are present can be offered for those entities." .
+
+ik:ActionMatch a rdfs:Class ;
+    rdfs:label "ActionMatch" ;
+    rdfs:comment "One result of an action selection (urn:kernel:actions): the subject is the matched ik:Action node, joining the selection back to the full contract in the catalog graph. The selection is a resource — cacheable per capability, auditable, SPARQL-able." .
+
+ik:endpoint a rdf:Property ;
+    rdfs:domain ik:ActionMatch ;
+    rdfs:range rdfs:Resource ;
+    rdfs:label "endpoint" ;
+    rdfs:comment "The resolvable IRI of the matched endpoint — what you invoke." .
+
+ik:template a rdf:Property ;
+    rdfs:domain ik:ActionMatch ;
+    rdfs:range xsd:string ;
+    rdfs:label "template" ;
+    rdfs:comment "The URI-template pattern (RFC 6570 level 1, e.g. urn:file:{path}) of a matched endpoint bound by a template grammar — substitute each {var} with its Binding-source argument to form the invokable IRI. Carried in place of ik:endpoint, which names a directly resolvable IRI; a template pattern is not an IRI, so it is a literal." .
+
+ik:missingOptional a rdf:Property ;
+    rdfs:domain ik:ActionMatch ;
+    rdfs:range xsd:integer ;
+    rdfs:label "missingOptional" ;
+    rdfs:comment "How many optional typed inputs the present classes could not fill — the selection's fit ranking (fewer is better-fitted)." .
+
+ik:default a rdf:Property ;
+    rdfs:range xsd:string ;
+    rdfs:label "default" ;
+    rdfs:comment "The value an input assumes when omitted." .
+
+ik:oneOf a rdf:Property ;
+    rdfs:range xsd:string ;
+    rdfs:label "oneOf" ;
+    rdfs:comment "One accepted value of an enumerated input (repeated per value); absent = open-valued." .
+
+ik:requires a rdf:Property ;
+    rdfs:range rdfs:Resource ;
+    rdfs:label "requires" ;
+    rdfs:comment "A capability scope the subject requires to be invoked — an endpoint, one of its ik:Action nodes, or an ik:Process (the union over its steps, which the plan validator checks before any step runs). A capability IRI such as urn:cap:personal:calendar:write, or the wildcard form urn:cap:net:* (\"holds some grant under this prefix\"). Declared = enforced: the kernel refuses a dispatch whose capability does not satisfy it (ikigai-core 0.1.49+), selection projects a capability-scoped catalog from it, and urn:kernel:validate pre-flights against it — one predicate, three uses. A legacy descriptive label (\"cap:net\") is still emitted, as a literal; it joins nothing." .
+
+# ---- events (the calendar/agenda event graph) --------------------------------
+# Events themselves are typed with the iCalendar vocabulary
+# (http://www.w3.org/2002/12/cal/ical# — ical:Vevent, ical:uid, ical:summary,
+# ical:dtstart/dtend, ical:location); these terms carry what iCal doesn't.
+
+ik:calendar a rdf:Property ;
+    rdfs:range xsd:string ;
+    rdfs:label "calendar" ;
+    rdfs:comment "The source a calendar event came from — a native calendar's title (\"Bosatsu\") or an org file's short name (\"calendar.org\"). Provenance for consolidated views." .
+
+ik:allDay a rdf:Property ;
+    rdfs:range xsd:boolean ;
+    rdfs:label "allDay" ;
+    rdfs:comment "Whether an event is all-day (date-valued rather than timed)." .
+
+ik:passcode a rdf:Property ;
+    rdfs:range xsd:string ;
+    rdfs:label "passcode" ;
+    rdfs:comment "The conference passcode a participant TYPES to join — the human-readable code, distinct from the join URL that already carries a form of it. No well-known term holds it: RFC 7986's CONFERENCE is a URI-valued property, so an iCalendar generator can only bury the code inside the URI and never state it as a field, and a Zoom join URL's pwd= is an encrypted token rather than the code. A string, never a number: leading zeros are significant and providers issue alphanumeric codes. No domain — the subject is an ical:Vevent, an external class, and this vocabulary declares only its own (see ik:annotates)." .
+
+# ---- LLM backends (the urn:llm trait graph) -----------------------------------
+
+ik:LlmBackend a rdfs:Class ;
+    rdfs:label "LlmBackend" ;
+    rdfs:comment "A configured LLM inference backend (one urn:llm:<provider>:ask), described by its trait profile so selection can be capability-based (\"a vision model with ≥32k context, not from this vendor\") rather than by name." .
+
+ik:model a rdf:Property ;
+    rdfs:range xsd:string ;
+    rdfs:label "model" ;
+    rdfs:comment "A model identity. On an ik:LlmBackend: the backend's configured default model id, e.g. \"llama3.2:3b\". On an ik:Explanation or an ik:Review: the model that derived it — the resolved identity also folded into its ik:versionTag. The domain is deliberately open; the property crosses all three graphs." .
+
+ik:context a rdf:Property ;
+    rdfs:domain ik:LlmBackend ;
+    rdfs:range xsd:integer ;
+    rdfs:label "context" ;
+    rdfs:comment "The model's context window, in tokens." .
+
+ik:modality a rdf:Property ;
+    rdfs:domain ik:LlmBackend ;
+    rdfs:range xsd:string ;
+    rdfs:label "modality" ;
+    rdfs:comment "An input modality the model supports: \"text\", \"vision\", \"audio\"." .
+
+ik:tools a rdf:Property ;
+    rdfs:domain ik:LlmBackend ;
+    rdfs:range xsd:boolean ;
+    rdfs:label "tools" ;
+    rdfs:comment "Whether the model supports tool / function calling." .
+
+ik:jsonMode a rdf:Property ;
+    rdfs:domain ik:LlmBackend ;
+    rdfs:range xsd:boolean ;
+    rdfs:label "jsonMode" ;
+    rdfs:comment "Whether the model supports a structured-output (JSON) mode." .
+
+ik:cost a rdf:Property ;
+    rdfs:domain ik:LlmBackend ;
+    rdfs:range xsd:string ;
+    rdfs:label "cost" ;
+    rdfs:comment "The backend's cost tier: \"local\" < \"cheap\" < \"premium\". Selection policy is cheapest-that-fits." .
+
+ik:vendor a rdf:Property ;
+    rdfs:domain ik:LlmBackend ;
+    rdfs:range xsd:string ;
+    rdfs:label "vendor" ;
+    rdfs:comment "The service behind the endpoint (\"ollama\", \"openai\", \"anthropic\", \"mlx\") — the governance axis: a vendor!= requirement excludes it, and an undeclared vendor cannot pass the exclusion." .
+
+ik:params a rdf:Property ;
+    rdfs:domain ik:LlmBackend ;
+    rdfs:range xsd:string ;
+    rdfs:label "params" ;
+    rdfs:comment "Display-only parameter count, e.g. \"3B\", \"70B\"." .
+
+ik:batchAt a rdf:Property ;
+    rdfs:domain ik:LlmBackend ;
+    rdfs:range xsd:positiveInteger ;
+    rdfs:label "batchAt" ;
+    rdfs:comment "The backend's LOAD SHAPE: the number of concurrent in-flight requests at or above which it is the throughput winner — a continuous-batching server declares the width at which batching starts paying, a serializing backend declares nothing. A routing trait, and the axis on which local backends most differ; no caller can express it by naming a model, so a fan-out asks for it (needs=batchAt<=W). Declared-only and deliberately without a default: no OpenAI-compatible endpoint advertises whether it batches (/v1/models has no field for it, /api/show never mentions it), so there is nothing to discover and nothing to correct a wrong guess with — an operator states a measurement, per provider. Absent means UNKNOWN, and unknown satisfies no batchAt<= requirement: a backend that never claimed to batch must not be handed a fan-out on the strength of its silence. Positive because a declared 0 is a configuration error, not \"batches from nothing\"." .
+
+ik:routesTo a rdf:Property ;
+    rdfs:range rdfs:Resource ;
+    rdfs:label "routesTo" ;
+    rdfs:comment "Where a facade resolves by default — e.g. urn:llm:ask routesTo the configured default backend." .
+
+ik:alert a rdf:Property ;
+    rdfs:range xsd:integer ;
+    rdfs:label "alert" ;
+    rdfs:comment "An alarm on an event: minutes before the start (multi-valued — an event may alert at 60 and 1440). Sourced from an org :ALERT: property (\"1h 1d\") or a calendar alarm; changes flow through view derivation like any other edit." .
+
+# ---- HTTP routing (the urn:web:routes edge route table) ----------------------
+# A route table is a graph of ik:Route nodes the inbound HTTP face (ikigai-web)
+# consults: a request path is matched against ik:match patterns in ik:order; the
+# first hit resolves ik:target (an IRI template, {var} captures substituted in) and
+# applies the route's optional ik:cap, ik:cors, ik:csp, and ik:shape. A path
+# matching no route falls through to the mechanical /noun/partition/key -> urn:.
+
+ik:Route a rdfs:Class ;
+    rdfs:label "Route" ;
+    rdfs:comment "An inbound-HTTP routing rule: a path pattern (ik:match) mapped to a target IRI template (ik:target), with optional per-route capability (ik:cap), CORS (ik:cors), Content-Security-Policy (ik:csp), request-validation shape (ik:shape), and identity bindings (ik:bind). Ordered by ik:order; first match wins." .
+
+ik:match a rdf:Property ;
+    rdfs:domain ik:Route ;
+    rdfs:range xsd:string ;
+    rdfs:label "match" ;
+    rdfs:comment "A route's path pattern, e.g. \"/book/{host}\". A {var} segment captures one path segment; a literal segment must match exactly." .
+
+ik:target a rdf:Property ;
+    rdfs:domain ik:Route ;
+    rdfs:range xsd:string ;
+    rdfs:label "target" ;
+    rdfs:comment "The IRI template a route resolves to, e.g. \"urn:schedule:{host}\". Each {var} captured by ik:match (or supplied by an ik:bind) is substituted in." .
+
+ik:order a rdf:Property ;
+    rdfs:range xsd:integer ;
+    rdfs:label "order" ;
+    rdfs:comment "A position in an ordered set, ascending — what makes an order deterministic in an unordered graph. On an ik:Route: its match priority (routes are tried in ascending order and the first match wins). On an ik:Step that is a branch of an ik:Fork: the branch's position in the join. No domain: the property is the same fact on both." .
+
+ik:cap a rdf:Property ;
+    rdfs:domain ik:Route ;
+    rdfs:range xsd:string ;
+    rdfs:label "cap" ;
+    rdfs:comment "A capability scope the route resolves its request under — the per-route ceiling (the multi-tenant seam: a public server with a route granting a specific authority). Multi-valued. Absent means the server's default capability applies." .
+
+ik:cors a rdf:Property ;
+    rdfs:domain ik:Route ;
+    rdfs:range ik:CorsPolicy ;
+    rdfs:label "cors" ;
+    rdfs:comment "The route's cross-origin policy. Absent means the server default (closed)." .
+
+ik:csp a rdf:Property ;
+    rdfs:domain ik:Route ;
+    rdfs:range xsd:string ;
+    rdfs:label "csp" ;
+    rdfs:comment "A Content-Security-Policy the route emits instead of the server default — e.g. a looser policy for an HTML / code-on-demand face." .
+
+ik:shape a rdf:Property ;
+    rdfs:domain ik:Route ;
+    rdfs:range rdfs:Resource ;
+    rdfs:label "shape" ;
+    rdfs:comment "A SHACL NodeShape validating a route's resolved request (its captured bindings plus the authenticated principal, as an ik:RouteRequest) before dispatch — a pre-flight gate against IRI injection and unauthorized object references (IDOR). Run through urn:kernel:validate; failure rejects the request." .
+
+ik:bind a rdf:Property ;
+    rdfs:domain ik:Route ;
+    rdfs:range ik:Binding ;
+    rdfs:label "bind" ;
+    rdfs:comment "Binds a template variable in ik:target from a source other than the path — chiefly the authenticated principal — so an identity-owned id is never client-supplied (the structural IDOR fix: /account/me -> urn:account:id:{sub})." .
+
+ik:Binding a rdfs:Class ;
+    rdfs:label "Binding" ;
+    rdfs:comment "A template-variable binding: ik:var names the {var} it fills, ik:from names its source." .
+
+ik:var a rdf:Property ;
+    rdfs:domain ik:Binding ;
+    rdfs:range xsd:string ;
+    rdfs:label "var" ;
+    rdfs:comment "The template variable name this binding fills (without braces)." .
+
+ik:from a rdf:Property ;
+    rdfs:domain ik:Binding ;
+    rdfs:range xsd:string ;
+    rdfs:label "from" ;
+    rdfs:comment "The source of a bound variable: \"principal\" (the credential's subject IRI) or \"principalId\" (its bare id)." .
+
+ik:RouteRequest a rdfs:Class ;
+    rdfs:label "RouteRequest" ;
+    rdfs:comment "The resolved request a route produced: a skolemized node carrying each captured path variable (as ik:<var>) plus ik:principal / ik:principalId from the credential. The target of a route's ik:shape validation." .
+
+ik:CorsPolicy a rdfs:Class ;
+    rdfs:label "CorsPolicy" ;
+    rdfs:comment "A CORS policy: the origins (ik:corsOrigin), methods (ik:corsMethod), and request headers (ik:corsHeader) allowed cross-origin, whether credentials are permitted (ik:corsCredentials), and the preflight cache lifetime (ik:corsMaxAge)." .
+
+ik:corsOrigin a rdf:Property ;
+    rdfs:domain ik:CorsPolicy ;
+    rdfs:range xsd:string ;
+    rdfs:label "corsOrigin" ;
+    rdfs:comment "An allowed origin, e.g. \"https://app.example.com\", or \"*\" for any (avoid with credentials). Multi-valued; empty means closed." .
+
+ik:corsMethod a rdf:Property ;
+    rdfs:domain ik:CorsPolicy ;
+    rdfs:range xsd:string ;
+    rdfs:label "corsMethod" ;
+    rdfs:comment "A method advertised on preflight. Multi-valued; empty means the matched resource's own Allow list." .
+
+ik:corsHeader a rdf:Property ;
+    rdfs:domain ik:CorsPolicy ;
+    rdfs:range xsd:string ;
+    rdfs:label "corsHeader" ;
+    rdfs:comment "A request header allowed on preflight. Multi-valued; empty means echo the requested headers." .
+
+ik:corsCredentials a rdf:Property ;
+    rdfs:domain ik:CorsPolicy ;
+    rdfs:range xsd:boolean ;
+    rdfs:label "corsCredentials" ;
+    rdfs:comment "Whether to send Access-Control-Allow-Credentials: true (with a wildcard origin, the concrete origin is echoed per the Fetch spec)." .
+
+ik:corsMaxAge a rdf:Property ;
+    rdfs:domain ik:CorsPolicy ;
+    rdfs:range xsd:integer ;
+    rdfs:label "corsMaxAge" ;
+    rdfs:comment "Access-Control-Max-Age — how long (seconds) a preflight result may be cached; 0 means omit." .
+
+# ---- repository browsing (the urn:repo:* tree graph) -------------------------
+# The browse module's Turtle face (ikigai-browse): a directory listing is a
+# skolemized graph of ik:Directory / ik:File / ik:Symlink nodes under stable
+# urn:repo:{repo}:tree[:{path}] / urn:repo:{repo}:file:{path} IRIs — every node
+# also RESOLVES, so the graph is diffable, SPARQL-able, and navigable.
+
+ik:Directory a rdfs:Class ;
+    rdfs:label "Directory" ;
+    rdfs:comment "A directory within a configured browse root, named by its resolvable urn:repo:{repo}:tree[:{path}] IRI. Its ik:entry links list the children." .
+
+ik:File a rdfs:Class ;
+    rdfs:label "File" ;
+    rdfs:comment "A file within a configured browse root, named by its resolvable urn:repo:{repo}:file:{path} IRI (which serves the content)." .
+
+ik:Symlink a rdfs:Class ;
+    rdfs:label "Symlink" ;
+    rdfs:comment "A symbolic link within a configured browse root. Listed as itself, never followed in the listing; resolving through one is jailed to the canonical root." .
+
+ik:entry a rdf:Property ;
+    rdfs:domain ik:Directory ;
+    rdfs:range rdfs:Resource ;
+    rdfs:label "entry" ;
+    rdfs:comment "Links a directory to a child's resolvable IRI — a tree: IRI for a subdirectory, a file: IRI for a file or link. Multi-valued." .
+
+ik:fileName a rdf:Property ;
+    rdfs:range xsd:string ;
+    rdfs:label "fileName" ;
+    rdfs:comment "An entry's bare name within its directory — no path separators; ik:path carries the root-relative location." .
+
+ik:path a rdf:Property ;
+    rdfs:range xsd:string ;
+    rdfs:label "path" ;
+    rdfs:comment "The root-relative path of a browse node, as decoded text (\"src/lib.rs\") — the IRI carries its percent-encoded form. Absent on a root directory (the root is path-less). Also stamped on archive entries (ik:Explanation, ik:Review, oa:Annotation) so they stay queryable by path after the content moves on." .
+
+ik:repo a rdf:Property ;
+    rdfs:range xsd:string ;
+    rdfs:label "repo" ;
+    rdfs:comment "The configured browse root a node belongs to — the {repo} segment of its urn:repo: IRI. Also stamped on archive entries." .
+
+ik:byteSize a rdf:Property ;
+    rdfs:domain ik:File ;
+    rdfs:range xsd:integer ;
+    rdfs:label "byteSize" ;
+    rdfs:comment "A file's size in bytes. Files only — a directory's disk size is not its meaning." .
+
+# ---- explanation archive (urn:repo:*:explain) --------------------------------
+# LLM-derived orientation explanations, ARCHIVED rather than cached: derived
+# once per (path, content-hash, version-tag) and kept addressable forever —
+# prior versions stay resolvable, so derivation is citable.
+
+ik:Explanation a rdfs:Class ;
+    rdfs:label "Explanation" ;
+    rdfs:comment "One archived LLM-derived orientation explanation of a browse resource, keyed by (path, content hash, version tag) under a stable urn:ikigai:browse:explain:… IRI. The archive outlives the content: a re-derivation adds an entry, never replaces one." .
+
+ik:about a rdf:Property ;
+    rdfs:domain ik:Explanation ;
+    rdfs:range rdfs:Resource ;
+    rdfs:label "about" ;
+    rdfs:comment "The browse resource an explanation is about — the resolvable urn:repo: IRI it was derived from. The subject link of the archive: every entry for a resource is found by matching this." .
+
+ik:contentHash a rdf:Property ;
+    rdfs:range xsd:string ;
+    rdfs:label "contentHash" ;
+    rdfs:comment "The content version an entry was derived against — sha256:<hex> of a file's bytes, or the merkle construction over a directory's entries. Half of an explanation's or a review's archive key; on an annotation, the drift detector (a differing current hash triggers re-anchoring)." .
+
+ik:versionTag a rdf:Property ;
+    rdfs:range xsd:string ;
+    rdfs:label "versionTag" ;
+    rdfs:comment "The derivation-identity half of the archive key: {prompt-version}@{model-label}, e.g. \"code-v1@qwen3-coder:30b\" (canned binary stubs involve no model, so no @). A prompt edit or model swap re-keys the archive; old tags stay addressable via version=. No domain: the review archive keys its ik:Review entries the same way, and `rdfs:domain ik:Explanation` made every one of them an ik:Explanation under RDFS entailment." .
+
+ik:promptKind a rdf:Property ;
+    rdfs:domain ik:Explanation ;
+    rdfs:range xsd:string ;
+    rdfs:label "promptKind" ;
+    rdfs:comment "Which grain's prompt derived the explanation: \"code\", \"note\", \"skill\", \"text\", \"binary\", or \"directory\"." .
+
+ik:explanation a rdf:Property ;
+    rdfs:domain ik:Explanation ;
+    rdfs:range xsd:string ;
+    rdfs:label "explanation" ;
+    rdfs:comment "The explanation text itself — plain prose. Its presence is what makes an archive entry complete; a subject without it is a miss." .
+
+ik:derivedAt a rdf:Property ;
+    rdfs:range xsd:dateTime ;
+    rdfs:label "derivedAt" ;
+    rdfs:comment "When an archived derivation ran (UTC). Orders the explain-versions listing, newest first. No domain: stamped on ik:Review entries too, and `rdfs:domain ik:Explanation` typed every one of them an ik:Explanation." .
+
+# ---- annotation drift (what the oa: model lacks) -----------------------------
+# Browse annotations are W3C Web Annotations (oa:) under the house skolemization
+# (stable IRIs, no blank nodes; ik:annotates flattens oa:hasTarget away). The
+# oa: model has no vocabulary for anchor drift, so the two flags below are
+# deliberately ours. Both are stored only when true.
+
+ik:annotates a rdf:Property ;
+    rdfs:range rdfs:Resource ;
+    rdfs:label "annotates" ;
+    rdfs:comment "The browse resource an oa:Annotation is on — its resolvable urn:repo: IRI. Deliberately flattens the W3C oa:hasTarget intermediate node away (the house skolemization: the target IS the resource). The domain is left open — oa:Annotation is an external class, and this vocabulary declares only its own." .
+
+ik:reanchored a rdf:Property ;
+    rdfs:range xsd:boolean ;
+    rdfs:label "reanchored" ;
+    rdfs:comment "The annotation's selectors were re-derived after its target's content drifted: the quote was found in the new content, and the selectors and recorded ik:contentHash were updated to match. Stored only when true — absent means never re-anchored." .
+
+ik:orphaned a rdf:Property ;
+    rdfs:range xsd:boolean ;
+    rdfs:label "orphaned" ;
+    rdfs:comment "The annotation's quote is gone from its target's current content (or the target itself is gone or binary): it still renders, flagged, against its recorded positions — never silently dropped — and is re-searched on later reads, since content may come back." .
+
+# ---- review passes (urn:repo:*:review, urn:repo:pr:*:review) -----------------
+# An LLM review pass over a file or a pull-request diff, archived like the
+# explanation archive above and sharing its keys (ik:contentHash + ik:versionTag)
+# and its stamps (ik:repo, ik:path, ik:model, ik:derivedAt). What a pass adds is
+# its findings — oa:Annotation nodes it prov:generated against the resource it
+# prov:used — and the honesty numbers below.
+
+ik:Review a rdfs:Class ;
+    rdfs:label "Review" ;
+    rdfs:comment "One archived LLM review pass over a browse resource or a pull-request diff, keyed like ik:Explanation by (path, content hash, version tag) under a stable urn:ikigai:browse:review:… IRI. Its findings are the oa:Annotation nodes it prov:generated; the resource it read is its prov:used. Like the explanation archive it is a record rather than a cache: a re-review adds an entry and never replaces one, so a pass stays citable after the content moves on." .
+
+ik:orphanedItems a rdf:Property ;
+    rdfs:domain ik:Review ;
+    rdfs:range xsd:nonNegativeInteger ;
+    rdfs:label "orphanedItems" ;
+    rdfs:comment "How many of a pass's findings could not be anchored: the model quoted something that is not in the reviewed content character-for-character, so the finding was DROPPED rather than minted against a guessed position. The pass's honesty number — zero is the healthy case and a large one says the model is paraphrasing its source. Counted at mint time, which is what distinguishes it from ik:orphaned: that flags one annotation whose quote went missing LATER, as the content drifted under it." .
+
+ik:findingCount a rdf:Property ;
+    rdfs:range xsd:nonNegativeInteger ;
+    rdfs:label "findingCount" ;
+    rdfs:comment "How many findings a COMPLETED pass produced — an assertion that the pass ran and reached this number, which is the whole point: zero MEANS reviewed and clean. Counting prov:generated cannot say that, because a pass that found nothing and a pass that produced nothing look identical (no links either way), so absence of a triple ends up doing the work of a claim nobody made. Any calibration query over a corpus of passes has to tell a clean file from a failed one before it can say anything about either. No domain: \"I checked and found n\" is a claim any checker makes — a SHACL validation summary, a conformance run, a gate — and rdfs:domain ik:Review would type every one of them an LLM review pass over a browse resource. Cf. ik:orphanedItems, which does declare a domain because it names a mechanism (quote anchoring) that only such a pass has." .
+
+ik:droppedItems a rdf:Property ;
+    rdfs:range xsd:nonNegativeInteger ;
+    rdfs:label "droppedItems" ;
+    rdfs:comment "How many candidate findings a pass discarded to hold its own volume budget. A limit a prompt merely asks for is not a limit (measured at ~5 suggestions against a request for 3), and enforcing it after parsing destroys the discarded text at the instant it is generated unless the count survives — so this term is the precondition for enforcing one at all, exactly as ik:orphanedItems is what lets an unanchorable finding be dropped rather than guessed at. It is also the only evidence a prompt revision can be judged by: whether the bound binds, and how hard. Distinct from ik:suppressedItems on purpose. No domain, for the reason stated on ik:findingCount." .
+
+ik:suppressedItems a rdf:Property ;
+    rdfs:range xsd:nonNegativeInteger ;
+    rdfs:label "suppressedItems" ;
+    rdfs:comment "How many candidate findings a pass withheld because the claim had already been judged and set aside — a human's earlier decline, a recorded waiver, a conformance opt-out. Suppression is how declines accumulate into knowledge rather than being re-litigated: a decline that matches only an identical id is per-instance, so any unrelated edit resurfaces a known false positive under a new id and spends the human gate again. ⚠ Withholding without recording is the failure ik:orphanedItems already avoids one step earlier, and a filter nobody can count is a filter nobody can audit. Deliberately NOT merged with ik:droppedItems: \"the model was verbose\" and \"we already answered this\" are different facts with opposite remedies, they co-occur in one pass, and one number covering both is useful for neither. No domain, for the reason stated on ik:findingCount." .
+
+ik:reviewedBytes a rdf:Property ;
+    rdfs:range xsd:nonNegativeInteger ;
+    rdfs:label "reviewedBytes" ;
+    rdfs:comment "How many bytes of the input a derivation actually fed the model — less than ik:totalBytes when the prompt budget truncated it. Recorded so a pass over a large input cannot silently read as a pass over the whole of it; absent on entries archived before the pair existed, which is not the same as zero. No domain: a truncated prompt is a fact about any LLM-derived entry rather than a review in particular — the explanation archive truncates through the same code and would record the same pair, and a domain here would type its entries ik:Review." .
+
+ik:totalBytes a rdf:Property ;
+    rdfs:range xsd:nonNegativeInteger ;
+    rdfs:label "totalBytes" ;
+    rdfs:comment "The full size in bytes of the input a derivation was asked about — the denominator to ik:reviewedBytes, and equal to it when nothing was truncated. Distinct from ik:byteSize, which is a file's size on disk: an input may be a diff or a rendered section that no file holds. No domain, for the reason stated on ik:reviewedBytes." .
+
+# ---- review findings (urn:iki:finding:*) -------------------------------------
+# The PENDING QUEUE an ik:Review writes into, and the human act that empties it.
+# A finding is deliberately NOT an oa:Annotation: a pass mints claims, and
+# publishing one is a separate act that is always a person's. The two families
+# therefore have to stay tellable apart in the graph, by construction.
+#
+# ⚠ Which is why these three terms are ours rather than the W3C's. oa:bodyValue
+# and oa:motivatedBy both carry `rdfs:domain oa:Annotation`, so writing either
+# onto a finding types it INTO the annotation family under any reasoner —
+# silently undoing the one separation the design exists to create, with no code
+# path that would ever show it. Borrowing a term borrows its domain.
+#
+# ★ The same reasoning runs the other way for what is declared below: read every
+# `No domain` here as an argued position, not an omission. A domain is an
+# assertion about every subject that ever carries the predicate, including
+# subjects that do not exist yet — and this neighbourhood has already paid for
+# that once (ik:versionTag and ik:derivedAt were `rdfs:domain ik:Explanation`
+# until 0.1.69, which typed every review-archive entry an explanation as well).
+
+ik:Finding a rdfs:Class ;
+    rdfs:subClassOf prov:Entity ;
+    rdfs:label "Finding" ;
+    rdfs:comment "One PENDING review finding: a machine's anchored claim about a resource, minted by an ik:Review pass and awaiting a human decision. It is not an annotation and never becomes one — publishing mints a SEPARATE oa:Annotation and links it back with prov:wasDerivedFrom, so the machine's claim and the note a human vouched for stay one hop apart and both survive. Declining is a record too rather than a deletion: the finding remains, with the reason if one was given, which is what lets declines accumulate into knowledge instead of churn. A subclass of prov:Entity — the thing a pass prov:generated and a decision prov:used — stated here so a face can type the node once and a PROV-aware reader still sees the entity." .
+
+ik:severity a rdf:Property ;
+    rdfs:range rdfs:Resource ;
+    rdfs:label "severity" ;
+    rdfs:comment "How urgent an assessment result is, as an IRI naming one severity (urn:iki:severity:critical … urn:iki:severity:praise). TRIAGE and never permission: it orders what to look at first and gates nothing. ⚠ NO DOMAIN, and here that is forced rather than merely cautious — three different node classes carry it today, one hop apart: the ik:Finding, where it is the model's PROPOSAL and is never rewritten; the prov:Activity decision node, where it is the human's FINAL rating; and the oa:Annotation a publication mints, which copies that rating in. Any domain would type two of those three as the third and collapse the very distinction that makes \"is this reviewer calibrated?\" a query rather than an impression. Replaces the sh:resultSeverity a module had to borrow — legal, since SHACL admits severities beyond its own three, but it says \"SHACL validation result\" to every reader who knows SHACL, and a review finding is not one. The value set is deliberately NOT enumerated here: it is a closed list in the code that serves it, checked there against the prompt and the menu it also feeds, and a second copy in a vocabulary that can only change through a publish is a copy that will disagree." .
+
+ik:outcome a rdf:Property ;
+    rdfs:range rdfs:Resource ;
+    rdfs:label "outcome" ;
+    rdfs:comment "How a completed act came out, as an IRI from a closed set the act's own family defines — for the decision on a review finding, urn:iki:finding:outcome:published or urn:iki:finding:outcome:declined. The value's IRI space says which family the outcome belongs to, so the property does not have to. Replaces a dcterms:type carrying an IRI, which is legal and says only \"the nature of the resource\", leaving a reader to infer that this particular type is a verdict. No domain, for two reasons that agree: the subject today is a prov:Activity, an external class, and this vocabulary declares only its own (the ik:annotates and ik:passcode precedent); and concluding is what acts do generally, so a domain would be an assertion about acts that have not been designed yet." .
+
+ik:AccessibilityConfig a rdfs:Class ;
+    rdfs:label "AccessibilityConfig" ;
+    rdfs:comment "The EFFECTIVE accessibility settings one application resolves — the built-in defaults with the config home's a11y.toml and {app}.a11y.toml folded in key-wise. Not any single file's contents: a subject of this class is the answer, and its ik:sharedLayer / ik:appLayer say which files produced it." .
+
+ik:app a rdf:Property ;
+    rdfs:domain ik:AccessibilityConfig ;
+    rdfs:range xsd:string ;
+    rdfs:label "app" ;
+    rdfs:comment "The application whose override layer applies — the PROCESS's name (cms-web, dev-server, web), never a module's. Absent on the shared configuration, which belongs to no one application." .
+
+ik:themeLight a rdf:Property ;
+    rdfs:domain ik:AccessibilityConfig ;
+    rdfs:range xsd:string ;
+    rdfs:label "themeLight" ;
+    rdfs:comment "The syntax theme for the light colour scheme, as an embedded theme's identifier (InspiredGithub, CatppuccinLatte). One theme per scheme: both are always stated, because a page is rendered by whichever the reader's system asks for." .
+
+ik:themeDark a rdf:Property ;
+    rdfs:domain ik:AccessibilityConfig ;
+    rdfs:range xsd:string ;
+    rdfs:label "themeDark" ;
+    rdfs:comment "The syntax theme for the dark colour scheme (Base16OceanDark, Nord). See ik:themeLight — the two are a pair, and a generated stylesheet confines each to its own prefers-color-scheme block so neither can outrank the other by selector specificity." .
+
+ik:contrastMin a rdf:Property ;
+    rdfs:domain ik:AccessibilityConfig ;
+    rdfs:range xsd:decimal ;
+    rdfs:label "contrastMin" ;
+    rdfs:comment "The minimum WCAG contrast ratio required of BODY text against its background — 4.5 is AA. A generated stylesheet lifts any rule below this floor to the theme's own foreground, which is high-contrast against that theme's ground by construction and so repairs in-palette without inventing a colour." .
+
+ik:contrastMinLarge a rdf:Property ;
+    rdfs:domain ik:AccessibilityConfig ;
+    rdfs:range xsd:decimal ;
+    rdfs:label "contrastMinLarge" ;
+    rdfs:comment "The minimum WCAG contrast ratio for LARGE text (at least 18pt, or 14pt bold) and for UI components — 3.0 is AA. Distinct from ik:contrastMin on purpose: WCAG has no single number, and one floor either over-constrains headings and chrome or quietly drops body text below AA." .
+
+ik:reduceMotion a rdf:Property ;
+    rdfs:domain ik:AccessibilityConfig ;
+    rdfs:range xsd:boolean ;
+    rdfs:label "reduceMotion" ;
+    rdfs:comment "Animation should be suppressed. THREE-VALUED in effect: absent means UNSTATED, which is not the same as false — an unstated preference defers to the reader's own prefers-reduced-motion setting, while false asserts that motion is wanted and overrides it." .
+
+ik:textScale a rdf:Property ;
+    rdfs:domain ik:AccessibilityConfig ;
+    rdfs:range xsd:decimal ;
+    rdfs:label "textScale" ;
+    rdfs:comment "A multiplier applied to body text size; 1.0 is the design default. A layout that claims to honour this must survive the whole configured range rather than only degrade gracefully at the top of it." .
+
+ik:underlineLinks a rdf:Property ;
+    rdfs:domain ik:AccessibilityConfig ;
+    rdfs:range xsd:boolean ;
+    rdfs:label "underlineLinks" ;
+    rdfs:comment "Links carry an underline rather than relying on colour alone to distinguish them — the redundant-encoding rule, which matters most to readers who cannot separate the link colour from the surrounding text." .
+
+ik:sharedLayer a rdf:Property ;
+    rdfs:subPropertyOf prov:wasDerivedFrom ;
+    rdfs:domain ik:AccessibilityConfig ;
+    rdfs:range rdfs:Resource ;
+    rdfs:label "sharedLayer" ;
+    rdfs:comment "The machine-wide a11y.toml that contributed, by its urn:file: IRI — the LOWER precedence layer. A sub-property of prov:wasDerivedFrom, which states the same fact for a reader that knows PROV and not this vocabulary; the specific property exists because RDF triples are unordered and precedence cannot otherwise be recovered from the graph." .
+
+ik:appLayer a rdf:Property ;
+    rdfs:subPropertyOf prov:wasDerivedFrom ;
+    rdfs:domain ik:AccessibilityConfig ;
+    rdfs:range rdfs:Resource ;
+    rdfs:label "appLayer" ;
+    rdfs:comment "The {app}.a11y.toml override that contributed, by its urn:file: IRI — the HIGHER precedence layer, so where both name a key this one won. Determined by the file's NAME, never by position: only files that exist are recorded, so an app override sits at index 0 whenever the shared file is absent." .
+
+# ---- processes (a plan as a graph) -------------------------------------------
+# A plan is a DAG of requests with single-assignment names: each ik:Step issues one
+# verb against one IRI with named ik:Argument nodes; the edges are pipe (ik:pipeFrom),
+# map (ik:mapOver), fork (ik:forkOf + ik:order under an ik:Fork) and the fork's join.
+# A bound name (ik:binds) is a plan-local resource, urn:plan:{id}:var:{name}, and an
+# argument references it by ik:ref. The plan's own parameters are ik:input ArgSpec
+# nodes — the same nodes an endpoint declares — so a stored plan describes itself like
+# any endpoint, the manifold offers it, and a plan can call a plan. Deliberately not
+# Turing complete: no conditional, no loop, no "now" — a conditional in a plan is a
+# missing resource, and the environment (capability, clock, host) comes from the kernel
+# at run time, never from the plan, which is what keeps a plan portable and signable.
+# The SHACL shapes that say this formally are in shapes.ttl (`ikigai_vocab::SHAPES`);
+# the text face is the REPL grammar plus names (`x = source a | b`, `@x`).
+
+ik:Process a rdfs:Class ;
+    rdfs:label "Process" ;
+    rdfs:comment "A plan: a DAG of ik:Step requests with declared ik:input parameters, the ik:requires union its steps need, and exactly one ik:result. Named urn:plan:{plan-id}; its steps, names and forks are skolemized under that IRI. A resource in its own right — stored, diffed, signed, transrepted, and validated before any step runs." .
+
+ik:Step a rdfs:Class ;
+    rdfs:label "Step" ;
+    rdfs:comment "One request in a plan: exactly one ik:verb against exactly one ik:resolves IRI, with ik:argument nodes, fed by at most one of ik:pipeFrom / ik:mapOver (or by the ik:Fork it is a branch of), and optionally binding its representation to a name with ik:binds. Named urn:plan:{plan-id}:step:{n}." .
+
+ik:Argument a rdfs:Class ;
+    rdfs:label "Argument" ;
+    rdfs:comment "A named argument of a step: ik:inputName plus exactly one of ik:value (by value, a literal) or ik:ref (by reference, an IRI — a bound name of the same plan, or any resource). Named urn:plan:{plan-id}:step:{n}:arg:{name}." .
+
+ik:Fork a rdfs:Class ;
+    rdfs:label "Fork" ;
+    rdfs:comment "A set of branches run over one ik:upstream representation and joined in ik:order, as the text face's `( a ; b )`. The branches are the ik:Step nodes whose ik:forkOf names this fork; each carries its ik:order. Named urn:plan:{plan-id}:fork:{n}. A fork can stand where a step can: as a ik:pipeFrom / ik:mapOver upstream, or as the plan's ik:result." .
+
+ik:step a rdf:Property ;
+    rdfs:domain ik:Process ;
+    rdfs:range ik:Step ;
+    rdfs:label "step" ;
+    rdfs:comment "Links a process to one of its steps (one triple per step). Steps are unordered here; the evaluation order is the dependency order the edges define, and the {n} in a step's IRI is only its position in the text face." .
+
+ik:result a rdf:Property ;
+    rdfs:domain ik:Process ;
+    rdfs:range rdfs:Resource ;
+    rdfs:label "result" ;
+    rdfs:comment "The step (or fork) whose representation is the plan's answer — exactly one per process. Sourcing the stored plan returns this node's representation; the process's ik:output states its media type." .
+
+ik:resolves a rdf:Property ;
+    rdfs:domain ik:Step ;
+    rdfs:range rdfs:Resource ;
+    rdfs:label "resolves" ;
+    rdfs:comment "The IRI a step issues its verb against — exactly one per step, and always an IRI, never a name (a target is a resource the catalog binds, which is what lets a validator check every step before any runs). Not ik:target, which is a Route's IRI template with {var} captures." .
+
+ik:argument a rdf:Property ;
+    rdfs:domain ik:Step ;
+    rdfs:range ik:Argument ;
+    rdfs:label "argument" ;
+    rdfs:comment "Links a step to one of its named arguments (the `key=value` and `key=@name` words of the text face). The piped or mapped input is not an argument; it arrives as the request's content through ik:pipeFrom / ik:mapOver." .
+
+ik:binds a rdf:Property ;
+    rdfs:domain ik:Step ;
+    rdfs:range xsd:string ;
+    rdfs:label "binds" ;
+    rdfs:comment "The single-assignment name a step's representation is bound to (`name = …` in the text face); at most one per step, and each name bound at most once per plan — across steps and the plan's own ik:input parameters, which are names too. The bound value is the plan-local resource urn:plan:{plan-id}:var:{name}, which is what an ik:ref cites. Optional: an unnamed step is consumed only through pipe, map, or fork edges." .
+
+ik:pipeFrom a rdf:Property ;
+    rdfs:domain ik:Step ;
+    rdfs:range rdfs:Resource ;
+    rdfs:label "pipeFrom" ;
+    rdfs:comment "The step or fork of the same plan whose whole representation is this step's piped input (the text face's `|`). At most one per step, and exclusive with ik:mapOver." .
+
+ik:mapOver a rdf:Property ;
+    rdfs:domain ik:Step ;
+    rdfs:range rdfs:Resource ;
+    rdfs:label "mapOver" ;
+    rdfs:comment "The step or fork of the same plan whose representation this step is mapped over (the text face's `..`): the step runs once per newline-separated item, each item as its input, and the per-item outputs are rejoined with newlines — the kernel's list convention. At most one per step, and exclusive with ik:pipeFrom." .
+
+ik:forkOf a rdf:Property ;
+    rdfs:domain ik:Step ;
+    rdfs:range ik:Fork ;
+    rdfs:label "forkOf" ;
+    rdfs:comment "The fork this step is a branch of; the step then carries ik:order and takes the fork's ik:upstream representation as its input. A branch that is itself a pipeline is the chain of steps whose head carries ik:forkOf; the chain's last step is what the fork joins." .
+
+ik:value a rdf:Property ;
+    rdfs:domain ik:Argument ;
+    rdfs:range rdfs:Literal ;
+    rdfs:label "value" ;
+    rdfs:comment "An argument's value, by value: a literal, typed if the receiving ArgSpec's ik:class is an XSD datatype. Exclusive with ik:ref." .
+
+ik:ref a rdf:Property ;
+    rdfs:domain ik:Argument ;
+    rdfs:range rdfs:Resource ;
+    rdfs:label "ref" ;
+    rdfs:comment "An argument's value, by reference: the plan-local IRI of a bound name (urn:plan:{plan-id}:var:{name}, `@name` in the text face — a step's ik:binds or a parameter's ik:inputName of the SAME plan) or any resource IRI, whose representation is passed. Exclusive with ik:value." .
+
+ik:upstream a rdf:Property ;
+    rdfs:domain ik:Fork ;
+    rdfs:range rdfs:Resource ;
+    rdfs:label "upstream" ;
+    rdfs:comment "The step or fork of the same plan whose representation every branch receives as its input. At most one; absent when the fork is the plan's first stage and its branches take no input." .
+
+ik:join a rdf:Property ;
+    rdfs:domain ik:Fork ;
+    rdfs:range xsd:string ;
+    rdfs:label "join" ;
+    rdfs:comment "How the branches' representations become the fork's: \"newline\" — concatenated in ascending ik:order with a newline between them — is the only join the engine performs today, and the default when absent. Other joins (a multipart body, one named graph per branch) are the room this property leaves open; a validator refuses a value it does not know." .
