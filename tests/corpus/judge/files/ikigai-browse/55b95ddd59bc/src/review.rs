@@ -1,0 +1,5644 @@
+//! `urn:repo:{repo}:review:{path}` — the **machine review layer** (S4):
+//! region-grain LLM commentary on a file, minted as REAL annotations. The
+//! explain family answers "what is this file?"; the review pass answers "what
+//! would a careful reviewer say about these lines?" — and its findings live in
+//! the same `urn:iki:annotation:` family as human notes, distinguished by
+//! provenance, queryable on one axis.
+//!
+//! ## Derive-once, mint-once
+//!
+//! Source asks the review model for findings — each an EXACT quote from the
+//! file plus a note — anchors every quote, mints each anchored finding as an
+//! annotation via the S2 machinery, and ARCHIVES the pass keyed
+//! `(path, content-hash, review-v{N}@model)` with the minted IRIs recorded in
+//! the pass entry. Re-sourcing unchanged content is an archive hit that mints
+//! NOTHING: idempotency comes from the key, and the recorded IRIs are what the
+//! hit serves. Changed content is a fresh pass; the previous pass's
+//! annotations re-anchor or orphan exactly like human ones — that drift IS the
+//! review-history story.
+//!
+//! ## The whole file, one region at a time
+//!
+//! ★ A pass covers EVERY byte of the file. Anything larger than one prompt
+//! (`max_prompt_bytes`) is split into line-aligned regions and each is reviewed
+//! by its own model call, the findings unioned into one pass — because the
+//! alternative, feeding a 16 KiB prefix, reported in exactly the shape of a
+//! complete review and made 62% of this ecosystem's source files silent false
+//! all-clears. `ik:reviewedBytes == ik:totalBytes` is an INVARIANT here, not a
+//! disclosure: either the pass covered the file or every face says it did not.
+//!
+//! Three consequences worth stating where they cannot be missed:
+//!
+//! * **Clean is a UNION, not a per-region property.** A pass is clean only when
+//!   EVERY region said so; one region's findings make the file not clean, and a
+//!   region whose answer collapsed is not counted as reviewed at all.
+//! * **A failed region leaves the pass incomplete but RECORDED.** Six good
+//!   regions are not thrown away because the seventh timed out; the entry
+//!   carries the coverage it earned.
+//! * **⚠ A defect that SPANS two regions is invisible to both.** Two sources of
+//!   truth, an invariant set in one region and violated in another, an error
+//!   path nothing calls — the cross-region class is the serious class, and
+//!   chunking trades a coverage hole for a severity hole. The prompt stops a
+//!   region from reporting an absence it cannot check; the real answer is a
+//!   structural outline pass over the whole file, which is its own arc.
+//!
+//! ## The region memo: a pass re-derives only the regions whose bytes moved
+//!
+//! ★ The archive is keyed twice. The PASS is keyed by the file's content hash,
+//! as it always was. Beside it, every region a pass derived is memoized under
+//! `(repo, path, sha256 of the REGION'S bytes, tag)` — `urn:ikigai:browse:
+//! review-region:…` — with the findings that call produced. A pass over a file
+//! whose hash is new then walks its regions and, for each one whose bytes are
+//! already on record under this tag, CARRIES THE EXISTING FINDINGS FORWARD
+//! instead of asking; only the regions whose bytes moved are derived.
+//!
+//! Why: a whole-file pass re-derives every region at every new content hash, so
+//! queue volume scales with FILE SIZE × COMMIT COUNT rather than with the diff.
+//! Measured 2026-09-21 (ledger #481): one commit adding 108 lines of doc comment
+//! to this 181 KB file produced 57 findings, nearly all on code the commit did
+//! not touch, and a file-hash throttle can never fire on that — the hash did
+//! change. "Substantial change" is made exact here: substantial = the region's
+//! bytes moved. No heuristic, no timer, nothing to tune.
+//!
+//! ★★ **A carried-forward finding KEEPS ITS ID.** This is the constraint that
+//! decides whether the memo helps the queue at all. A finding id is
+//! `sha256(pass ‖ char_start ‖ exact)` and the pass IRI carries the file hash, so
+//! re-minting a carried region's findings under the new pass would give every
+//! one of them a NEW id — the memo would save the model call and save NOTHING in
+//! the queue, which is the thing that hurts. So the existing finding records
+//! stay the findings: same id, same state (pending, declined, published), same
+//! `prov:wasGeneratedBy` (the pass that actually derived them), re-anchored to
+//! their new offsets by the SAME drift reconciliation every annotation gets
+//! (`annotate::refresh`) — never a second re-anchor path. A declined finding on
+//! an unchanged region stays declined. A pending one stays pending, once. The
+//! new pass records them as `prov:used <region memo>` → `prov:hadMember
+//! <finding>`, and claims `prov:generated` only for what it minted itself.
+//!
+//! ★ **The tiling SNAPS to remembered regions, and it has to.** Regions are cut
+//! by a fixed-size line-aligned rule, and each window starts where the previous
+//! region ended — so an insertion of s bytes shifts EVERY later cut point by s,
+//! and the blank-line preference cannot re-synchronize because the window's
+//! slack (a quarter of the chunk) is smaller than an ordinary doc comment. A
+//! memo keyed on region content over that tiling would miss on every region
+//! after the edit, which on the ledger's own case (a doc comment near the top
+//! of this file) is all of them. So [`tile`] checks, at every region start,
+//! whether a remembered region's bytes sit exactly there and takes it whole if
+//! so; a fresh region is cut by the rule as before, but never past the point
+//! where the next remembered region's bytes begin. An insertion then costs the
+//! region it lands in (split by the rule if it grew past one prompt) and
+//! nothing else; a deletion likewise; a boundary never moves under unchanged
+//! bytes. Hash the CONTENT, never `(offset, content)`.
+//!
+//! What a region memo deliberately does NOT do: it does not re-derive a changed
+//! region's neighbours to chase a cross-region defect (that is the outline pass,
+//! a separate arc — widening the memo would be chasing it with the wrong tool);
+//! it does not memoize a region whose every quote misquoted (an empty memo
+//! would carry "nothing here" forward as a claim the model never made); and
+//! `debug=raw` ignores it, deriving every region by the rule alone, so a probe
+//! stays a measurement of the model rather than of the archive.
+//!
+//! ## A decline is remembered: the recurring claim arrives marked
+//!
+//! The memo covers an UNCHANGED region: a declined finding there is carried,
+//! still declined, and never re-minted. What it cannot cover is a fresh
+//! derivation — a changed region, or every region of a file's first pass
+//! after an upgrade re-keys the tag — and that is where a declined claim
+//! returns under a new id, because the id carries the pass and the pass
+//! carries the hash (ledger #475). Measured 2026-09-22: a prose-only commit to
+//! a manifest minted 17 findings, 8 of them verbatim re-raises of findings a
+//! human had declined the day before on lines the commit did not touch, and
+//! the only thing that stopped them was that human reading each one twice.
+//!
+//! So at MINT time — beside the place a misquote is discarded and counted —
+//! a fresh finding is checked against the DECLINED findings on the same file
+//! with the same `exact` (`annotate::declined_twins`, keyed `(target, exact)`
+//! after the anchor's own normalization, never on position, hash or pass):
+//!
+//! * **by default it is MINTED MARKED.** It enters the queue carrying the
+//!   declined twin's decision (`prov:wasInfluencedBy` the decision node;
+//!   `prior_decision` on the json row; "a like claim on this line was
+//!   declined {date}: {reason}" on the card), so a human declines it again in
+//!   one click — or sees that it is a different claim, which suppression could
+//!   never show. Two different findings can quote one line, and a line whose
+//!   endianness claim was declined may attract a correct claim later;
+//! * **only an EXACT repeat is WITHHELD, and it is COUNTED**: same quote,
+//!   same proposed severity, a byte-identical note. `ik:suppressedItems` on
+//!   the pass, "(N withheld as exact repeats)" in the statement — kept apart
+//!   from `ik:orphanedItems` because "we already answered this" and "the
+//!   model misquoted" are different facts. Its memo member is the twin, so an
+//!   unchanged region whose items were all withheld is not re-asked next
+//!   pass. ⚠ Deliberately narrow, and measured before shipping: of the 458
+//!   declines on file on 2026-09-22, 98 pairs shared a line and NONE shared a
+//!   byte-identical note, so this fires seldom by construction. Do not widen
+//!   it to "same severity" (78 of those 98) without measuring what a true
+//!   finding on a declined line looks like — a review that silently withholds
+//!   a true finding is worse than one that repeats a false one.
+//!
+//! Declines on a DIFFERENT file are not consulted. The same misreading recurs
+//! across files (Cargo caret semantics on every manifest, rdfs2 on every
+//! vocabulary) and that is a knowledge gap in the model, not a key this mark
+//! could carry. The findings face reports the file grain instead
+//! (`summary=declined`: how many declines this file carries, by the quote
+//! they declined), because that is the grain the recurrence actually has.
+//!
+//! ## Choosing the backend per request
+//!
+//! `provider={iri}` derives THIS pass against a backend the caller names
+//! rather than the configured review tier, on the explain family's terms (see
+//! that module's header): the selectable set is the operator's — every
+//! configured tier plus [`crate::ExplainConfig::allow_provider`] — and
+//! anything else is `Denied` before any work, never a silent fall back.
+//!
+//! ★ IT IS A SECOND PASS, NOT A REPLACEMENT. The archive key folds the model
+//! identity, so a second backend serving a different model derives and mints
+//! its OWN pass over the same content, alongside the first: two reviewers'
+//! margins on one file, both queryable on the annotation axis. Two backends
+//! serving the SAME model share the key, so the second is an archive hit that
+//! asks nothing and mints nothing — the same rule the explain menu is built
+//! on, and the reason the operator's `review_model_label` applies only while
+//! `provider` IS the configured one (a label written for one model must never
+//! key another model's pass).
+//!
+//! ## The affordance: a CALLER, never a second implementation
+//!
+//! The file HTML face carries a `review` button and a "review with…" menu
+//! ([`review_button_html`], [`menu_html`]), whose rows come from
+//! `urn:repo:{repo}:review-options:{path}` — this host's own `provider=`
+//! allowlist, grouped by model, never a hard-coded list.
+//!
+//! ★ BOTH EMIT EXACTLY `urn:repo:{repo}:review:{path}` (the menu adding
+//! `provider=`), which is precisely the call a git-event trigger makes: same
+//! resource, same arguments, same capability check, same archive key, same
+//! minted annotations. The markup chooses the FACE and nothing else. Nothing
+//! here assembles a prompt, post-processes a finding, or writes an annotation
+//! by another path — a UI that did any of those would produce results a
+//! trigger could never reproduce, and the two would then diverge silently.
+//! The only legitimate difference between a clicked review and a triggered one
+//! is what caused it.
+//!
+//! ⚠ The reverse reading is the useful one: whatever the button needs, a
+//! headless trigger needs too, WITHOUT a human present — the net grant, the
+//! annotate grant, the browse read, and an answer to what bounds the spend.
+//!
+//! ## Manual review is the human annotation affordance, unchanged
+//!
+//! There is no second path for a human note. The file face's annotations panel
+//! renders machine findings and human notes in one reading order, machine ones
+//! prefixed by their model, and ends with the create form that Sinks
+//! `urn:iki:annotation` — so a reviewer answers a finding beside it rather
+//! than in another view, over the resource that already existed.
+//!
+//! ## Provenance — standard terms only, no vocab publish
+//!
+//! A machine annotation carries `dcterms:creator` (the model identity),
+//! `oa:motivatedBy oa:assessing` (the human Sink stamps `oa:commenting`), and
+//! `prov:wasGeneratedBy` pointing at the pass entry; the pass entry records
+//! its minted set as `prov:generated` and the reviewed file as `prov:used`.
+//! Faces render the two kinds distinguishably: hollow line markers and a
+//! model-identity line for machine cards, `machine`/`creator`/`motivation` in
+//! the JSON rows.
+//!
+//! ## Failure containment
+//!
+//! A finding whose quote does not anchor (the model misquoted) mints nothing
+//! and is COUNTED (`orphaned_items` in the entry and the json face) — one bad
+//! item must not kill the pass. But a pass in which NOTHING parses or NOTHING
+//! anchors is an error and is not archived: silently serving an empty review
+//! under a key that will never re-derive would poison the archive.
+//!
+//! ## Capabilities
+//!
+//! The pass reads (browse), calls a model (net), and WRITES annotations —
+//! `requires` all three (`urn:cap:browse:read:*`, `urn:cap:net:*`,
+//! `urn:cap:annotate`); declared = enforced by the kernel baseline, and the
+//! per-root grant check covers the target.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use ikigai_core::{
+    ArgRef, ArgSpec, Description, Endpoint, EndpointSpace, Error, Invocation, Representation,
+    Request, Result, Verb,
+};
+use oxigraph::model::{Literal, NamedNode, Quad, Term};
+
+use crate::annotate::{self, Included, PROV};
+use crate::archive::Archive;
+use crate::explain::{
+    command_safe, ik, iso8601, menu_options, parse_iri, provider_label, resolve_model, MenuTier,
+    ModelOption, CAP_NET, IK,
+};
+// ★ `truncate`/`truncated_len` are deliberately NOT imported here any more. The
+// review pass no longer truncates anything: it chunks. The explain family still
+// imports them, because an explanation of a file's first 16 KiB is a weaker but
+// coherent answer, while a REVIEW of the first 16 KiB is a false all-clear.
+use crate::finding::{
+    join_words, PRAISE_SEVERITY, SERIOUS_SEVERITIES, SEVERITIES, SEVERITY_MEANINGS,
+};
+use crate::hash::hash_iri;
+use crate::{
+    crumbs_html, esc, file_iri, granted, iri_encode, path_binding, repo_root, repr, repr_utf8,
+    resolve, ttl_str, ExplainConfig, Roots, CAP_WILDCARD,
+};
+
+// --- the prompt (versioned; edit ⇒ bump) -------------------------------------
+
+/// Version of the review prompt pair, folded into the archive key. A prompt
+/// edit bumps this; earlier passes stay recorded under their old tag.
+/// v2: the format contract is RESTATED after the content — with a large
+/// input, a contract stated only up top loses to the content and the model
+/// answers label-free (the pr-review-v2 live failure: quote-and-commentary
+/// prose, zero `QUOTE:`/`NOTE:` lines, nothing parseable).
+/// v3: every finding now carries a `SEVERITY:` line, constrained to
+/// [`crate::finding::SEVERITIES`] — and the findings are PENDING, so a pass's
+/// output is no longer what a v2 pass's output was. The tag change is what
+/// keeps a v2 archive entry (whose `prov:generated` names annotations) readable
+/// beside a v3 one (whose `prov:generated` names findings) instead of
+/// colliding on one key.
+/// v4: the QUOTA became a THRESHOLD. "your 3 to 6 most useful findings" was one
+/// rule over two classes with opposite loss functions — it CAPPED serious
+/// findings at six and FLOORED suggestions at three, so a file with one real
+/// defect still had to yield two more of something. v4 drops the floor, leaves
+/// the serious half explicitly uncapped, bounds the suggestions below it at
+/// [`SUGGESTION_LIMIT`], stops ASKING for praise, forbids decorating the quote,
+/// and adds the [`NOTHING_ABOVE_THRESHOLD`] answer so a clean file is a
+/// statement rather than an empty result. A v4 pass is therefore a different
+/// population from a v3 one, and the tag keeps the 53-finding v3 corpus
+/// readable beside it on identical inputs instead of being overwritten.
+///
+/// ⚠⚠ THE ONE THING v4 DELIBERATELY DOES NOT SAY, and why. The obvious wording
+/// for a threshold is "report every problem you would rate critical or major" —
+/// and it was measured, on qwen3-coder:30b at temperature 0.2, 24 passes over
+/// the same four files per variant:
+///
+/// | prompt                                   | serious/pass | serious share |
+/// |------------------------------------------|--------------|---------------|
+/// | v3 (the 3–6 quota)                       |          1.2 |           27% |
+/// | "report EVERY problem you would rate …"  |          3.8 |           62% |
+/// | the same, plus prose telling it to hold the bar high | 6.4 |      91% |
+/// | v4 as shipped (severity is not the gate) |          1.1 |           18% |
+///
+/// Nothing about the CODE changed between those runs. Of the findings the
+/// severity-keyed wording called serious, 43% were findings v3 also produced
+/// and rated `minor` or `info` — so the rate rose by RE-LABELLING, not by
+/// finding more. ★ The rule underneath: a self-reported severity cannot be both
+/// the triage signal and the reporting gate. Tell a model that rating something
+/// `major` is how a finding gets reported and `major` is what it writes. v4
+/// therefore gates on "worth a colleague's attention", states that the serious
+/// half is never capped, and leaves the rating purely descriptive — which is
+/// also what [`crate::finding::SEVERITIES`] is for.
+/// v5: the pass reviews the WHOLE FILE. v4 and every version before it fed
+/// `truncate(&text, max_prompt_bytes)` — 16 KiB by default — and then reported
+/// in exactly the shape of a complete review. Measured 2026-09-19 over 140
+/// `*/src/*.rs` files: 88 of them (62%) exceed that ceiling, median 23 KiB, p90
+/// 90 KiB, ~3.1 MB of source no pass has ever seen; this very file is 129 KiB,
+/// so a review of the reviewer saw about 15% of it and said nothing about the
+/// other 85%. ★ Truncation is therefore replaced by CHUNKING: the file is split
+/// into line-aligned regions of at most `max_prompt_bytes` and each is reviewed
+/// by its own call, the findings unioned into one pass. `ik:reviewedBytes ==
+/// ik:totalBytes` stops being a disclosure and becomes an INVARIANT a test can
+/// pin — either the pass covered the file or it says it did not.
+/// A v5 pass is a different population from a v4 one on every file over the
+/// chunk size, and the tag keeps the v4 corpus readable beside it.
+///
+/// ⚠⚠ THE BLIND SPOT v5 BUYS WITH THAT COVERAGE, stated plainly because the
+/// report cannot: a defect that SPANS two regions is invisible to both. Two
+/// sources of truth, an invariant established in one region and violated in
+/// another, an error path nothing calls — the cross-region class is precisely
+/// the class most worth reporting. The prompt tells each region not to report
+/// something as missing when it may live elsewhere (which removes the loudest
+/// false positive of chunking, not the blind spot), and the designed answer is
+/// a structural outline pass over the whole file, which is a separate arc.
+///
+/// ⚠⚠ THERE IS NO v6, AND THAT IS A RESULT RATHER THAN AN OMISSION — the
+/// defect it would have answered is real, measured, and still here.
+///
+/// THE DEFECT (ledger #483, measured 2026-09-21 on `ikigai-devtools`'s
+/// `claude/CLAUDE.md`, a 44 KB document that is almost entirely a catalogue of
+/// traps): every critical and major a v5 pass produced was the reviewer
+/// RESTATING A HAZARD THE DOCUMENT EXISTS TO WARN ABOUT. The `critical` was the
+/// `launchctl bootout` trap, whose own text explains that the pair fails
+/// silently. Stated generally: a reviewer holding the file but not the file's
+/// PURPOSE cannot tell "this text DESCRIBES a hazard" from "this text IS one",
+/// so the severity scales with how honest the document is. The better the
+/// disclosure, the worse the review.
+///
+/// TWO PROMPT LINES WERE MEASURED AGAINST IT AND BOTH FAILED. Six `debug=raw`
+/// passes per arm over that file (the archive-bypass arm — a repeat run through
+/// the ordinary path is an archive hit and answers 100% agreement to any
+/// question), `qwen3-coder:30b` at the configured temperature, findings counted
+/// after the anchor check so they are the ones a pass would mint:
+///
+/// | prompt                                          | findings/pass | serious/pass | critical/pass |
+/// |-------------------------------------------------|---------------|--------------|---------------|
+/// | v5 as shipped                                   |  11.5 (±3.8)  |  6.0 (±2.5)  |  1.5 (±0.55)  |
+/// | + "if the anchored text already states the problem, or warns against it, that is not a finding" | 13.2 (±1.7) | 8.5 (±1.1) | 2.2 (±0.75) |
+/// | + a four-sentence CONTRAST (a documented hazard is not the hazard; a claim the code contradicts is) | 10.3 (±2.3) | 6.0 (±1.7) | 0.5 (±0.84) |
+///
+/// ★ The one-sentence form — the obvious one, and the one the ledger item
+/// proposed — made it WORSE on every axis: naming "the problem the text states"
+/// gives the model a place to look for problems, and it found more of them.
+///
+/// ★ The contrast form did not fix it either, and the way it fails is the
+/// useful part. The serious rate is EXACTLY FLAT (6.0 per pass, both arms);
+/// only the `critical` count moved. That is relabelling rather than
+/// discrimination, and the control says so: the same downward shift landed on
+/// nine fixtures carrying planted comment-vs-code contradictions
+/// (`tests/corpus/disclosure/`, whose README states each plant and these rates).
+/// Detections barely moved — 24 of 54 → 26 of 54 — while the ratings on the
+/// REAL defects fell with everything else: `critical` on the path-traversal
+/// fixture 6 → 2, on the panicking-accessor fixture 6 → 2, on the
+/// forged-digest fixture 9 → 2. A rule that lowers severity everywhere is not
+/// telling disclosure from defect; it is turning the volume down, and the loss
+/// function here is asymmetric.
+///
+/// ⚠ AND THE CONTRAST FORM'S REMAINING SERIOUS FINDINGS CHANGED KIND RATHER
+/// THAN GOING AWAY. Told that a claim the file does not keep IS worth
+/// reporting, the model dressed the same restatements as self-contradiction —
+/// "the text states X but then contradicts this by saying Y", where X and Y are
+/// two halves of one warning — plus a new genre, "this rule is not enforced by
+/// any automated check", which several of those passages say about themselves.
+/// That is #452's finding in a new place: explaining a bar to this model gives
+/// it better vocabulary for clearing the bar.
+///
+/// ⚠ The one thing it bought, recorded because it says where a real fix might
+/// live: the pin fixture — a comment arguing a version FLOOR beside a `^0.12`
+/// that is also a ceiling — went 0/6 to 4/6. Naming the class made ONE
+/// contradiction reportable that the baseline never saw. It did not make the
+/// other four (a promised capability check that is absent, a "five scopes"
+/// list of six, a documented 1-based line number returned 0-based, a header
+/// forbidding the pipe the code below it writes) reportable at all: the
+/// baseline and both variants find a contradiction only when the contradicting
+/// behaviour is EXECUTABLE CODE THEY CAN QUOTE. #449's "absence has no anchor",
+/// narrowed to this class.
+///
+/// ★ So the shape of the fix is NOT a sentence in this prompt. What the reviewer
+/// is missing is the file's PURPOSE, which is not in the file — and the two
+/// candidates that remain both cost more than a prompt line: a role the caller
+/// declares (an operator's claim, not the model's guess), or a second pass that
+/// judges a finding against the passage it anchors in rather than the model
+/// judging its own output. Whoever tries again should re-measure the two rows
+/// above before assuming a third wording is different; the corpus and the
+/// archive-bypass harness (`examples/review-probe.rs`) are committed so that
+/// costs an afternoon rather than a week.
+///
+/// ⚠ THE REGION MEMO (0.8.0) IS NOT A PROMPT CHANGE AND DOES NOT MOVE THIS TAG.
+/// The prompt a fresh region is shown is byte-identical to a v5 pass's; what
+/// changed is which regions are ASKED. Re-keying every pass for a memo would
+/// defeat the memo — its first hit is a region derived under this very tag.
+const REVIEW_PROMPT_VERSION: &str = "review-v5";
+
+/// How many SUGGESTIONS — the tier between [`crate::finding::SERIOUS_SEVERITIES`]
+/// and [`crate::finding::PRAISE_SEVERITY`] — a pass is asked to carry at most.
+///
+/// ★ The asymmetry is the design, and it is deliberate that only this half has
+/// a number. A missed serious problem is expensive and silent, so recall is
+/// what matters there and nothing caps it; a rejected suggestion costs one
+/// click, so precision and VOLUME matter and a bound is the right tool. One
+/// number covering both classes optimizes neither.
+///
+/// ⚠ It is a REQUEST, not a bound: measured at ~5 suggestions per pass against
+/// this limit of 3. A bound the prompt merely asks for is not a bound, and the
+/// honest fix is to enforce it after parsing — which needs somewhere to record
+/// what was dropped, the way `orphaned_items` records what did not anchor, or
+/// the discarded text is destroyed at the moment it is generated.
+///
+/// ⚠⚠ AND CHUNKING MULTIPLIES A REQUEST BY N. A per-call limit of 3 over the
+/// seven regions of a 109 KiB file asks for 21 suggestions, which is the v4
+/// volume problem (6.4 findings per pass, 53% `info`) made seven times worse.
+/// Until there is somewhere to record a drop, v5 does the one thing it can do
+/// without destroying evidence: it DIVIDES this number across the regions
+/// ([`region_suggestion_budget`]), so the whole-file ask is bounded by
+/// `max(SUGGESTION_LIMIT, regions)` rather than by their product — 9 instead of
+/// 27 for this file. That is still a request. Enforcing it needs somewhere to
+/// record the drop — `ik:droppedItems` exists as of `ikigai-vocab` 0.1.71 and
+/// nothing here writes it yet; that is its own arc, and it is deliberately not
+/// `ik:suppressedItems` (a withheld repeat of a decline is a different fact).
+const SUGGESTION_LIMIT: usize = 3;
+
+/// How many suggestions ONE region is asked for, given how many regions the
+/// file was split into — [`SUGGESTION_LIMIT`] shared out, never below one.
+///
+/// A single-region file gets exactly [`SUGGESTION_LIMIT`], which is what makes
+/// a small file's v5 prompt byte-identical to its v4 prompt: the only thing
+/// that changed for files under the chunk size is the tag.
+fn region_suggestion_budget(regions: usize) -> usize {
+    SUGGESTION_LIMIT.div_ceil(regions.max(1)).max(1)
+}
+
+/// The whole answer a model returns when nothing in the file met the
+/// threshold — and it is a REQUIRED utterance, not an optional courtesy.
+///
+/// ⚠ Dropping the floor makes a clean file a normal outcome, and a normal
+/// outcome that arrives as an empty answer is indistinguishable from a denied
+/// capability, a collapsed format, or a model that failed. The sentinel is what
+/// lets the endpoint tell "reviewed, nothing to say" from "this pass broke":
+/// the first archives as a pass that happened, the second is still an error
+/// that archives nothing and re-derives.
+const NOTHING_ABOVE_THRESHOLD: &str = "NOTHING ABOVE THRESHOLD";
+
+/// The reviewer persona: a defect-finder first, a commentator second.
+///
+/// ★ v3 asked for "the kind of margin notes a thoughtful human reviewer
+/// leaves" and spent a slot on "one genuine strength when you see it", which
+/// put praise in COMPETITION with findings for a fixed quota. v4 keeps the
+/// judgment and drops the solicitation: `praise` stays in the severity set so
+/// triage can tell a compliment from a note, but the prompt no longer asks for
+/// one. The last sentence is the other half of the threshold — a model that is
+/// never told an empty answer is acceptable will find something to say.
+const REVIEW_SYSTEM_PROMPT: &str =
+    "You are an experienced engineer reviewing a colleague's file. Your first \
+     duty is to find real problems: defects that will bite in production, risks \
+     the author has not seen, design decisions that will not hold, and names or \
+     comments that no longer tell the truth. You argue a serious finding rather \
+     than asserting it, and you rate honestly — calling something serious when \
+     it is not costs the reader as much as missing it. You never restate what \
+     the code plainly does, never nitpick formatting, and never invent problems \
+     to fill space: a file with nothing wrong in it is an ordinary outcome, and \
+     you say so plainly instead of manufacturing observations.";
+
+/// The per-file instruction. Two things are rigid here and for different
+/// reasons: the three-line finding format is the MACHINE CONTRACT (each finding
+/// anchors by its verbatim quote, and a finding that does not anchor mints
+/// nothing), and the threshold is the REPORTING RULE.
+///
+/// ★ It is built rather than written down: every severity word, every
+/// definition and the tier split come from [`crate::finding::SEVERITIES`],
+/// [`crate::finding::SEVERITY_MEANINGS`] and the two partition indices, so the
+/// prompt, the Sink's `one_of` and the triage menu cannot drift apart. There is
+/// no fourth copy of the list to forget.
+///
+/// ⚠ "Copy the characters and nothing else: no backticks…" earns its place with
+/// a number. Asked to argue its findings, the model reaches for markdown and
+/// wraps the quote in backticks — which cannot anchor, so the finding mints
+/// nothing and is counted as an orphan. Measured on the same four files: 12% of
+/// everything produced orphaned without that clause, 1–5% with it, and one file
+/// of dense CSS-in-Rust went from a 100% anchoring collapse (0 findings minted
+/// across 6 passes) to normal. It is the cheapest line in this prompt.
+fn review_prompt(suggestion_budget: usize, ask_for_praise: bool) -> String {
+    let serious = join_words(&SEVERITIES[..SERIOUS_SEVERITIES], "or");
+    let suggestions = join_words(&SEVERITIES[SERIOUS_SEVERITIES..PRAISE_SEVERITY], "or");
+    let praise = join_words(&SEVERITIES[PRAISE_SEVERITY..], "or");
+    // ⚠ One praise per REGION would be one per call, so a seven-region file
+    // would ask for seven compliments on a prompt that stopped soliciting them.
+    // Only the first region is asked.
+    let praise_clause = match ask_for_praise {
+        true => format!(", and add at most one rated {praise},"),
+        false => String::from(","),
+    };
+    let ladder: Vec<String> = SEVERITIES
+        .iter()
+        .zip(SEVERITY_MEANINGS)
+        .map(|(word, meaning)| format!("{word} for {meaning}"))
+        .collect();
+    let ladder = join_words(
+        &ladder.iter().map(String::as_str).collect::<Vec<_>>(),
+        "and",
+    );
+    format!(
+        "Review this file. Read all of it before you answer.\n\
+         Report only what is worth a colleague's attention. There is no minimum and no \
+         quota to fill: a typical review of one file is one or two findings, and a file \
+         with nothing worth reporting is a complete review.\n\
+         Never leave a real problem out because you have already reported others: a \
+         defect is worth reporting however many findings you already have. Keep the \
+         {suggestions} ones to {suggestion_budget} at most{praise_clause} and only if \
+         they would earn the reader's time.\n\
+         Rate each finding honestly. The rating is a triage signal for a human reader, \
+         not the reason a finding is reported: calling a style preference or a doc \
+         comment {serious} costs that reader exactly as much as missing a real defect \
+         does.\n\
+         If nothing in this file is worth reporting, answer with exactly this one line and \
+         nothing else:\n\
+         {NOTHING_ABOVE_THRESHOLD}\n\
+         Otherwise format each finding as exactly three lines and nothing else:\n\
+         QUOTE: <a short snippet copied character-for-character from one line of \
+         the file - under 80 characters, distinctive enough to occur only once. Copy the \
+         characters and nothing else: no backticks, no quotation marks, no markdown, no \
+         ellipsis>\n\
+         SEVERITY: <exactly one of: {}>\n\
+         NOTE: <one to four sentences of review commentary on that region, arguing the \
+         finding rather than asserting it>\n\
+         Use {ladder}. Use no other word for SEVERITY.\n\
+         Do not number the findings. Do not add headings, preamble, or closing \
+         remarks. The QUOTE must appear verbatim in the file or the finding is \
+         discarded.",
+        SEVERITIES.join(", "),
+    )
+}
+
+/// The format contract again, appended AFTER the content: the last words the
+/// model reads must be the format, or a long file crowds the contract out of
+/// its answer (measured on qwen3-coder:30b — a 16 KiB prompt with the
+/// contract only up top yielded label-free findings; restated, 6/6 labeled).
+///
+/// ⚠ v4 restates the THRESHOLD here too, for the same reason and with the same
+/// evidence behind it: the stopping rule is as easy for a long file to crowd
+/// out as the format is, and a model that has forgotten it falls back on the
+/// habit the quota trained.
+fn review_reminder(suggestion_budget: usize) -> String {
+    let serious = join_words(&SEVERITIES[..SERIOUS_SEVERITIES], "or");
+    let suggestions = join_words(&SEVERITIES[SERIOUS_SEVERITIES..PRAISE_SEVERITY], "or");
+    format!(
+        "Now give the findings. Remember the format contract: each finding is \
+         exactly three lines - the first starts `QUOTE: ` followed by a short \
+         snippet copied character-for-character from one line of the file above, \
+         the second starts `SEVERITY: ` followed by exactly one of {}, the third \
+         starts `NOTE: ` with your commentary. No headings, no numbering, nothing \
+         else, and nothing around the quote - no backticks and no quotation marks, \
+         or it will not match the file and the finding is discarded. Report every \
+         {serious} problem you found, however many that is, but only what truly \
+         meets that bar; keep the {suggestions} ones to {suggestion_budget} at most. \
+         If nothing met the bar, the entire answer is the single line \
+         {NOTHING_ABOVE_THRESHOLD}.",
+        join_words(&SEVERITIES, "or"),
+    )
+}
+
+/// Whether the model made the affirmative clean-file statement.
+///
+/// ⚠ Tolerant of a model that emphasizes or punctuates the line (`**NOTHING
+/// ABOVE THRESHOLD**`, a trailing period) because they all do, but it must be
+/// a LINE OF ITS OWN: a `contains` over the whole answer would read a model
+/// musing about the threshold as a clean bill of health, and a false all-clear
+/// is worse than no report because it is trusted.
+fn says_nothing_above_threshold(answer: &str) -> bool {
+    answer.lines().any(|line| {
+        line.trim()
+            .trim_matches(|c: char| c == '*' || c == '`' || c == '#' || c == '.' || c == ' ')
+            .eq_ignore_ascii_case(NOTHING_ABOVE_THRESHOLD)
+    })
+}
+
+// --- chunking: the whole file, one region at a time ---------------------------
+
+/// One region of a file offered to ONE model call: a byte range into the full
+/// text plus the 1-based line it starts on.
+///
+/// ★ The range indexes the FULL text and never a copy, which is what keeps the
+/// anchor check untouched: quotes have always been anchored against the whole
+/// file regardless of what was fed, so a finding from region 3 validates exactly
+/// as one from region 1 does. Chunking is cheap precisely because it changes
+/// only what the model SEES, never what a quote is checked against.
+#[derive(Debug, PartialEq, Eq)]
+struct Region {
+    start: usize,
+    end: usize,
+    first_line: usize,
+}
+
+impl Region {
+    fn len(&self) -> usize {
+        self.end - self.start
+    }
+
+    /// The last line this region carries — for the header that tells the model
+    /// where in the file it is standing.
+    fn last_line(&self, text: &str) -> usize {
+        let newlines = text[self.start..self.end].matches('\n').count();
+        // A region ending exactly on a newline ends the line before it.
+        match text[self.start..self.end].ends_with('\n') {
+            true => self.first_line + newlines.saturating_sub(1),
+            false => self.first_line + newlines,
+        }
+    }
+}
+
+/// Split `text` into at most `max_regions` consecutive regions of at most
+/// `chunk_bytes` each, cut at line boundaries.
+///
+/// ## Where the cut falls, and why not at item boundaries
+///
+/// A byte offset cuts through the middle of a function; an item boundary
+/// (`fn`/`impl`/`class`/`def`) is the right review unit but needs a parser, and
+/// this module is language-agnostic on purpose — it reviews Markdown and TOML
+/// with the same code path. The cheap middle, and what this does: inside the
+/// last quarter of each window, prefer a BLANK LINE, else a COLUMN-0 line start
+/// (in every language this module sees, an unindented line opens a top-level
+/// item), else any line boundary, else a character-safe byte cut for a file with
+/// no newline in a whole window.
+///
+/// ★ The invariant a test pins: the regions TILE the text — contiguous, in
+/// order, no gap and no overlap — so concatenating them reproduces the file
+/// exactly. `reviewed_bytes` is then a sum of region lengths rather than an
+/// estimate, and `reviewed_bytes == total_bytes` means what it says.
+///
+/// ⚠ The regions do NOT overlap. Overlap was the other candidate countermeasure
+/// for the cross-region blind spot, and it is not free: it re-reads the overlap
+/// on every pass and produces duplicate findings. It also does not fix the
+/// class — a defect relating byte 900 to byte 90000 spans no boundary a small
+/// overlap would bridge. The outline pass is the answer to that, and it is a
+/// separate arc.
+///
+/// This is [`tile`] with nothing remembered — the rule alone, which is what
+/// `debug=raw` and the first pass over a file get. Kept as the name the
+/// tiling tests pin the rule under.
+#[cfg(test)]
+fn split_into_regions(text: &str, chunk_bytes: usize, max_regions: usize) -> Vec<Region> {
+    tile(text, chunk_bytes, max_regions, &[])
+        .into_iter()
+        .map(|t| t.region)
+        .collect()
+}
+
+/// Where the region starting at `start` ends: the best boundary at or below
+/// `start + chunk_bytes`, preferring a blank line, then a column-0 line start,
+/// then any line start — all within the last quarter of the window so a lucky
+/// early blank line cannot produce a tiny region.
+fn region_end(text: &str, start: usize, chunk_bytes: usize) -> usize {
+    if text.len() - start <= chunk_bytes {
+        return text.len();
+    }
+    let mut hard = start + chunk_bytes;
+    while hard > start && !text.is_char_boundary(hard) {
+        hard -= 1;
+    }
+    if hard <= start {
+        // One character wider than the budget: a single char larger than
+        // `chunk_bytes` still has to make progress or the walk never ends.
+        let mut end = start + 1;
+        while end < text.len() && !text.is_char_boundary(end) {
+            end += 1;
+        }
+        return end;
+    }
+    let floor = start + (chunk_bytes - chunk_bytes / 4);
+    let bytes = text.as_bytes();
+    let (mut blank, mut column0, mut any) = (None, None, None);
+    for (offset, byte) in text[start..hard].bytes().enumerate() {
+        if byte != b'\n' {
+            continue;
+        }
+        let boundary = start + offset + 1;
+        if boundary <= floor {
+            continue;
+        }
+        any = Some(boundary);
+        match bytes.get(boundary) {
+            Some(b' ' | b'\t') | None => {}
+            Some(_) => column0 = Some(boundary),
+        }
+        if boundary >= 2 && bytes[boundary - 2] == b'\n' {
+            blank = Some(boundary);
+        }
+    }
+    blank.or(column0).or(any).unwrap_or(hard)
+}
+
+/// What a region's prompt says about where it is — empty for a file that fits
+/// in one call, so a small file's v5 prompt is byte-identical to its v4 one.
+///
+/// ⚠ The second sentence is not politeness. A model shown region 2 of 7 will
+/// report "this file never validates its input" about validation that lives in
+/// region 5 — the loudest and most confident false positive chunking creates,
+/// and the one that would train a reader to distrust the whole pass. It does
+/// NOT fix the cross-region blind spot; nothing in a per-region prompt can.
+fn region_header(region: &Region, index: usize, total: usize, text: &str) -> String {
+    if total == 1 {
+        return String::new();
+    }
+    format!(
+        "\nRegion: part {} of {total}, lines {} to {} of this file\n\
+         You are reviewing THIS REGION ONLY. The other parts are reviewed separately and \
+         the findings are merged, so report only what is visible here, and never report \
+         something as missing from the file when it may appear in another region.",
+        index + 1,
+        region.first_line,
+        region.last_line(text),
+    )
+}
+
+// --- the region memo ---------------------------------------------------------
+
+/// `urn:ikigai:browse:review-region:{repo}:{hash}:{tag}:{path}` — the subject
+/// under which one region's derivation is remembered. A SIBLING of the pass
+/// prefix rather than a segment under it: a one-region file's region hash IS
+/// its file hash, and nesting would have made the two entries one IRI.
+pub(crate) const REGION_PREFIX: &str = "urn:ikigai:browse:review-region:";
+
+/// The memo key. `hash` is the sha256 of the REGION's bytes — content, never
+/// `(offset, content)`, so unchanged bytes keep their key wherever an insertion
+/// above them moved their offset to.
+pub(crate) fn region_iri(repo: &str, rel: &str, hash: &str, tag: &str) -> String {
+    format!(
+        "{REGION_PREFIX}{repo}:{hash}:{}:{}",
+        iri_encode(tag),
+        iri_encode(rel)
+    )
+}
+
+/// One remembered region: what a model call over exactly these bytes produced.
+///
+/// ```turtle
+/// <urn:ikigai:browse:review-region:{repo}:{hash}:{tag}:{path}> a prov:Collection ;
+///     ik:repo "demo" ; ik:path "src/lib.rs" ;
+///     ik:contentHash "sha256:…" ;               # of the region's bytes
+///     ik:versionTag "review-v5@qwen3-coder:30b" ; ik:model "qwen3-coder:30b" ;
+///     ik:reviewedBytes "16384"^^xsd:nonNegativeInteger ;   # the region's length
+///     prov:wasGeneratedBy <urn:ikigai:browse:review:{repo}:{file-hash}:{tag}:{path}> ;
+///     prov:hadMember <urn:iki:finding:…> , … .
+/// ```
+///
+/// `a prov:Collection` because that is what it is — the set of finding records
+/// the call over these bytes produced, empty for a region the model called
+/// clean — and because every term on it is already published: `ik:reviewedBytes`
+/// is "the bytes a derivation fed the model", which for a region entry is
+/// exactly its length, and the vocabulary states it carries no domain for this
+/// reason. ⚠ It is deliberately NOT `a ik:Review`: that class means a pass over a
+/// file keyed by the file's hash, and typing a region so would make every
+/// tally of passes (the root-move migration counts `ik:Review` subjects) count
+/// each region as one. A class of its own and a count of memo hits on the pass
+/// (`ik:memoRegions`, say) are vocabulary needs REPORTED rather than invented
+/// here; the count is derivable from the links meanwhile.
+///
+/// The findings are the SAME records the pass that derived them minted —
+/// `prov:hadMember`, a membership, never a second `prov:generated`: an entity
+/// has one generating activity, and it is the pass named by
+/// `prov:wasGeneratedBy` here.
+pub(crate) struct RegionEntry {
+    pub(crate) iri: String,
+    pub(crate) tag: String,
+    /// `sha256:{hex}` of the region's bytes.
+    pub(crate) hash: String,
+    /// The region's length in bytes — what lets [`tile`] find its bytes again
+    /// without storing them.
+    pub(crate) len: u64,
+    /// The finding IRIs the call over these bytes minted, sorted.
+    pub(crate) findings: Vec<String>,
+    /// The pass that derived it.
+    pub(crate) generated_by: Option<String>,
+}
+
+pub(crate) fn store_region(
+    archive: &Archive,
+    entry: &RegionEntry,
+    repo: &str,
+    rel: &str,
+    model: &str,
+) -> Result<()> {
+    use oxigraph::model::vocab::{rdf, xsd};
+    let subject = NamedNode::new(&entry.iri).map_err(store_err)?;
+    let g = archive.graph().clone();
+    let mut quads: Vec<Quad> = vec![
+        Quad::new(subject.clone(), rdf::TYPE, prov("Collection"), g.clone()),
+        Quad::new(
+            subject.clone(),
+            ik("repo"),
+            Literal::new_simple_literal(repo),
+            g.clone(),
+        ),
+        Quad::new(
+            subject.clone(),
+            ik("path"),
+            Literal::new_simple_literal(rel),
+            g.clone(),
+        ),
+        Quad::new(
+            subject.clone(),
+            ik("contentHash"),
+            Literal::new_simple_literal(&entry.hash),
+            g.clone(),
+        ),
+        Quad::new(
+            subject.clone(),
+            ik("versionTag"),
+            Literal::new_simple_literal(&entry.tag),
+            g.clone(),
+        ),
+        Quad::new(
+            subject.clone(),
+            ik("model"),
+            Literal::new_simple_literal(model),
+            g.clone(),
+        ),
+        Quad::new(
+            subject.clone(),
+            ik("reviewedBytes"),
+            Literal::new_typed_literal(entry.len.to_string(), xsd::NON_NEGATIVE_INTEGER),
+            g.clone(),
+        ),
+    ];
+    if let Some(pass) = &entry.generated_by {
+        quads.push(Quad::new(
+            subject.clone(),
+            prov("wasGeneratedBy"),
+            NamedNode::new(pass).map_err(store_err)?,
+            g.clone(),
+        ));
+    }
+    for iri in &entry.findings {
+        quads.push(Quad::new(
+            subject.clone(),
+            prov("hadMember"),
+            NamedNode::new(iri).map_err(store_err)?,
+            g.clone(),
+        ));
+    }
+    for quad in &quads {
+        archive.insert(quad).map_err(store_err)?;
+    }
+    Ok(())
+}
+
+/// Load one region memo by its key — `None` on a miss (no `ik:versionTag`
+/// under that subject).
+pub(crate) fn load_region(archive: &Archive, iri: &str) -> Result<Option<RegionEntry>> {
+    let subject = match NamedNode::new(iri) {
+        Ok(node) => node,
+        Err(_) => return Ok(None),
+    };
+    let mut entry = RegionEntry {
+        iri: iri.to_string(),
+        tag: String::new(),
+        hash: String::new(),
+        len: 0,
+        findings: Vec::new(),
+        generated_by: None,
+    };
+    let mut found = false;
+    for quad in archive.quads_for_pattern(Some(subject.as_ref().into()), None, None) {
+        let quad = quad.map_err(store_err)?;
+        let literal = |term: &Term| match term {
+            Term::Literal(l) => l.value().to_string(),
+            other => other.to_string(),
+        };
+        let predicate = quad.predicate.as_str();
+        match predicate.strip_prefix(IK) {
+            Some("versionTag") => {
+                entry.tag = literal(&quad.object);
+                found = true;
+            }
+            Some("contentHash") => entry.hash = literal(&quad.object),
+            Some("reviewedBytes") => entry.len = literal(&quad.object).parse().unwrap_or(0),
+            _ => match predicate {
+                PROV_HAD_MEMBER => {
+                    if let Term::NamedNode(node) = &quad.object {
+                        entry.findings.push(node.as_str().to_string());
+                    }
+                }
+                PROV_WAS_GENERATED_BY => {
+                    if let Term::NamedNode(node) = &quad.object {
+                        entry.generated_by = Some(node.as_str().to_string());
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+    entry.findings.sort();
+    entry.findings.dedup();
+    Ok(found.then_some(entry))
+}
+
+/// Every region memo on record for this path under this tag — what [`tile`]
+/// snaps to. Enumerated through the `ik:path` literal (one indexed pattern; the
+/// path's annotations and passes come back too and are filtered by prefix),
+/// then each loaded. Sorted by key, so the tiling is deterministic.
+///
+/// The set GROWS by one entry per freshly derived region, across passes, and is
+/// never pruned: an older region's bytes can come back (a revert) and hit
+/// again. The cost of a large set is bounded by the prefilter in [`memo_at`].
+pub(crate) fn known_regions(
+    archive: &Archive,
+    repo: &str,
+    rel: &str,
+    tag: &str,
+) -> Result<Vec<RegionEntry>> {
+    let prefix = format!("{REGION_PREFIX}{repo}:");
+    let path = Literal::new_simple_literal(rel);
+    let mut iris = std::collections::BTreeSet::new();
+    for quad in
+        archive.quads_for_pattern(None, Some(ik("path").as_ref()), Some(path.as_ref().into()))
+    {
+        let quad = quad.map_err(store_err)?;
+        if let oxigraph::model::NamedOrBlankNode::NamedNode(subject) = &quad.subject {
+            if subject.as_str().starts_with(&prefix) {
+                iris.insert(subject.as_str().to_string());
+            }
+        }
+    }
+    let mut known = Vec::new();
+    for iri in iris {
+        if let Some(entry) = load_region(archive, &iri)? {
+            if entry.tag == tag && entry.len > 0 {
+                known.push(entry);
+            }
+        }
+    }
+    Ok(known)
+}
+
+/// One region of the pass and, when its bytes are already on record, the memo
+/// that stands in for the model call.
+struct Tile<'a> {
+    region: Region,
+    memo: Option<&'a RegionEntry>,
+}
+
+/// Split `text` into regions as [`split_into_regions`] does, but SNAP to the
+/// remembered ones: at every region start, a memo whose bytes sit exactly there
+/// is taken whole; otherwise the region is cut by the rule, and never past the
+/// first later line where a remembered region's bytes begin.
+///
+/// ★ What a boundary move costs, stated because the fixed-size rule hides it:
+/// the rule's window starts where the previous region ended, so on its own an
+/// insertion moves EVERY later cut point and re-keys every later region. With
+/// the snap, an insertion inside region k makes k fresh (cut by the rule into
+/// as many regions as it now needs) and leaves k+1 onward exactly where their
+/// bytes are. A deletion is the same story. The only edit that re-keys a
+/// neighbour is one that touches the neighbour's bytes.
+///
+/// ⚠ A fresh region can therefore be TINY — one inserted line between two
+/// remembered regions is a one-line region and a one-line call. That is the
+/// diff's size, which is the point; the alternative (widening into a neighbour
+/// for context) re-keys the neighbour, which is the cost this exists to avoid.
+///
+/// The tiling invariant is unchanged: the tiles are contiguous, in order, with
+/// no gap and no overlap, and concatenate back to the text.
+fn tile<'a>(
+    text: &str,
+    chunk_bytes: usize,
+    max_regions: usize,
+    known: &'a [RegionEntry],
+) -> Vec<Tile<'a>> {
+    let chunk_bytes = chunk_bytes.max(1);
+    let max_regions = max_regions.max(1);
+    let mut tiles = Vec::new();
+    let mut start = 0usize;
+    let mut line = 1usize;
+    while start < text.len() && tiles.len() < max_regions {
+        let (end, memo) = match memo_at(text, start, known) {
+            Some(memo) => (start + memo.len as usize, Some(memo)),
+            None => {
+                let rule_end = region_end(text, start, chunk_bytes);
+                (
+                    next_memo_start(text, start, rule_end, known).unwrap_or(rule_end),
+                    None,
+                )
+            }
+        };
+        debug_assert!(end > start, "a region must make progress");
+        tiles.push(Tile {
+            region: Region {
+                start,
+                end,
+                first_line: line,
+            },
+            memo,
+        });
+        line += text[start..end].matches('\n').count();
+        start = end;
+    }
+    tiles
+}
+
+/// The remembered region whose bytes sit exactly at `at` — the longest, when
+/// more than one does (two passes cut here differently). A memo qualifies only
+/// where its bytes would end on a line boundary or at the end of the file,
+/// which is what every line-aligned region does and is the cheap test that
+/// keeps this from hashing a chunk per candidate: a remembered length whose
+/// end lands mid-line is rejected before any hashing.
+fn memo_at<'a>(text: &str, at: usize, known: &'a [RegionEntry]) -> Option<&'a RegionEntry> {
+    let bytes = text.as_bytes();
+    let mut best: Option<&RegionEntry> = None;
+    for entry in known {
+        let len = usize::try_from(entry.len).unwrap_or(usize::MAX);
+        let Some(end) = at.checked_add(len) else {
+            continue;
+        };
+        if len == 0 || end > text.len() {
+            continue;
+        }
+        if end != text.len() && bytes[end - 1] != b'\n' {
+            continue;
+        }
+        if best.is_some_and(|b| b.len >= entry.len) {
+            continue;
+        }
+        if annotate::content_hash(&bytes[at..end]) == entry.hash {
+            best = Some(entry);
+        }
+    }
+    best
+}
+
+/// The first line start in `(start, limit]` at which a remembered region's
+/// bytes begin — where a fresh region has to stop so the next one can snap.
+fn next_memo_start(text: &str, start: usize, limit: usize, known: &[RegionEntry]) -> Option<usize> {
+    if known.is_empty() {
+        return None;
+    }
+    text[start..limit]
+        .match_indices('\n')
+        .map(|(i, _)| start + i + 1)
+        .find(|&p| p < limit && memo_at(text, p, known).is_some())
+}
+
+// --- the archive entry (RDF in the shared store) ------------------------------
+
+/// One archived review pass, skolemized like the explanation archive:
+///
+/// ```turtle
+/// <urn:ikigai:browse:review:{repo}:{hash}:{tag}:{path}> a ik:Review ;
+///     ik:repo "demo" ; ik:path "src/lib.rs" ;
+///     prov:used <urn:repo:demo:file:src/lib.rs> ;
+///     ik:contentHash "sha256:…" ; ik:versionTag "review-v1@qwen3-coder:30b" ;
+///     ik:model "qwen3-coder:30b" ;
+///     prov:generated <urn:iki:annotation:{id}> , … ;
+///     prov:used <urn:ikigai:browse:review-region:…> , … ;   # the memos it carried forward
+///     ik:orphanedItems "1"^^xsd:nonNegativeInteger ;
+///     ik:suppressedItems "0"^^xsd:nonNegativeInteger ;     # exact repeats of declines withheld
+///     ik:derivedAt "2026-08-09T17:00:00.000Z"^^xsd:dateTime .
+/// ```
+///
+/// `prov:generated` names ONLY what this pass minted. The findings it carried
+/// forward from unchanged regions were generated by the pass that derived them
+/// and are reached through `prov:used <region memo>` → `prov:hadMember`; the
+/// region memos this pass wrote point back with `prov:wasGeneratedBy`.
+///
+/// Every `ik:` term here is published: `ikigai-vocab` 0.1.69 added `ik:Review`,
+/// `ik:orphanedItems`, `ik:reviewedBytes` and `ik:totalBytes`, which is what put
+/// this face under the conformance walk's `VOCABULARY` check, and 0.1.71 added
+/// `ik:suppressedItems`. Every provenance link is standard PROV / DC / OA.
+///
+/// ⚠ `ik:versionTag` and `ik:derivedAt` are shared with the EXPLANATION archive
+/// and deliberately carry NO `rdfs:domain`. It was `ik:Explanation` until 0.1.69,
+/// which under entailment typed every entry here as an explanation as well —
+/// giving either term a domain again re-breaks this graph.
+pub(crate) struct PassEntry {
+    pub(crate) iri: String,
+    pub(crate) repo: String,
+    pub(crate) rel: String,
+    pub(crate) target_iri: String,
+    pub(crate) hash: String,
+    pub(crate) tag: String,
+    pub(crate) model: String,
+    /// The findings THIS pass minted (`prov:generated`), sorted.
+    pub(crate) minted: Vec<String>,
+    /// The findings carried forward from region memos — records an EARLIER
+    /// pass minted, kept as they are (id, state, provenance) and re-anchored
+    /// on read. Sorted; the union with `minted` is [`PassEntry::findings`].
+    pub(crate) carried: Vec<String>,
+    /// The region memos this pass reused instead of asking (`prov:used`), in
+    /// key order.
+    pub(crate) reused_regions: Vec<String>,
+    /// The region memos this pass wrote (they carry `prov:wasGeneratedBy`
+    /// this pass), in key order. A collapsed region and a region whose every
+    /// quote misquoted write none.
+    pub(crate) derived_regions: Vec<String>,
+    pub(crate) orphaned_items: u64,
+    /// How many of the model's items were WITHHELD as exact repeats of a
+    /// finding a human had already declined on the same line of this file —
+    /// same quote, same proposed severity, byte-identical note (ledger #475,
+    /// `annotate::Prior`). `ik:suppressedItems`, kept apart from
+    /// `orphaned_items` on purpose: "we already answered this" and "the model
+    /// misquoted" are different facts with different remedies. A suppression
+    /// nobody can count is a filter nobody can audit. Zero on entries
+    /// archived before the term existed, which is also the true value: no
+    /// pass withheld anything before it could.
+    pub(crate) suppressed_items: u64,
+    /// How much of the input the model actually saw vs. its full size.
+    ///
+    /// ★ Since v5 these are an INVARIANT rather than a disclosure: the pass
+    /// chunks the file and reviews every region, so `reviewed_bytes ==
+    /// total_bytes` unless the pass SAYS otherwise — a region whose answer
+    /// collapsed, or a file past [`crate::ExplainConfig::review_max_chunks`].
+    /// Before v5 the gap was the ordinary case (62% of this ecosystem's source
+    /// files), which is why prose about honest reporting was not enough and a
+    /// test now pins the equality.
+    ///
+    /// `None` on entries archived before these fields existed.
+    pub(crate) reviewed_bytes: Option<u64>,
+    pub(crate) total_bytes: Option<u64>,
+    pub(crate) derived_at: Option<String>,
+    /// How many UNDECIDED findings on this file are superseded while this
+    /// pass is part of the file's current reading — the earlier findings the
+    /// pass's arrival retired from the pending queue (ledger #504).
+    ///
+    /// ★ COMPUTED ON READ, NEVER STORED, like the state itself (see
+    /// [`crate::supersede`]): the review endpoint sets it before rendering,
+    /// every loader and the PR pass leave it 0, and nothing writes it — a
+    /// stored count would go stale the first time a human decided one of
+    /// them, or a revert made an older pass current again.
+    pub(crate) superseded: usize,
+}
+
+impl PassEntry {
+    /// The notice the plain and html faces append when the pass saw less than
+    /// the whole input — silence would misrepresent it.
+    ///
+    /// ⚠ The words changed in v5 and the change is the point. Before v5 a short
+    /// reading meant TRUNCATION, which was policy: the majority of files were
+    /// fed a 16 KiB prefix on purpose. v5 reviews every region, so a short
+    /// reading now means a region that did not come back — a collapsed answer
+    /// or a file past the region cap. The entry carries two numbers and cannot
+    /// tell those two apart after a reload, so it claims only what it knows.
+    pub(crate) fn coverage_note(&self) -> Option<String> {
+        match (self.reviewed_bytes, self.total_bytes) {
+            (Some(reviewed), Some(total)) if reviewed < total => Some(format!(
+                " · reviewed {reviewed} of {total} bytes (coverage incomplete)"
+            )),
+            _ => None,
+        }
+    }
+
+    /// What this pass FOUND and over how much of the input — the headline of
+    /// the plain and html faces.
+    ///
+    /// ★ Zero findings is a STATEMENT here, never an absence a reader has to
+    /// interpret. With the quota gone a clean file is an ordinary outcome, and
+    /// "0 finding(s)" reads exactly like a denied capability, a collapsed
+    /// answer or an outage — the failure mode is that the first quiet week is
+    /// indistinguishable from a broken pipeline.
+    ///
+    /// ⚠ And COVERAGE is the second half of the claim, not a footnote. "Nothing
+    /// above threshold" over the whole file and the same words over 15% of it
+    /// are different assertions, and the weaker one is a FALSE ALL-CLEAR if it
+    /// renders like the stronger. `reviewed_bytes`/`total_bytes` already carry
+    /// the difference; this is where it reaches a reader. Since v5 the whole-file
+    /// form is the ordinary one and the short form is the exception — the
+    /// reverse of every version before it.
+    pub(crate) fn statement(&self) -> String {
+        // ⚠ "Nothing above threshold" is the MODEL's claim, and a pass whose
+        // every item was withheld as an exact repeat of a decline is not one
+        // where the model made it — it found the same things again and the
+        // pass declined to re-raise them. That reads as "nothing new".
+        let head = match (self.findings().len(), self.suppressed_items) {
+            (0, 0) => "nothing above threshold".to_string(),
+            (0, _) => "nothing new".to_string(),
+            (1, _) => "1 finding".to_string(),
+            (n, _) => format!("{n} findings"),
+        };
+        // The carried share is named so a reader can tell "this pass found 3"
+        // from "3 are on file, 1 of them new" — the queue only grew by the
+        // difference. The withheld count is named beside it, because a
+        // suppression nobody can see is the failure `ik:suppressedItems`
+        // exists to prevent.
+        let mut clauses = Vec::new();
+        match self.carried.len() {
+            0 => {}
+            n => clauses.push(format!("{n} carried forward")),
+        }
+        // The other half of what the queue did: findings from earlier passes
+        // on this file that this reading does not carry, retired from
+        // pending without anyone's judgment on them.
+        match self.superseded {
+            0 => {}
+            1 => clauses.push("1 earlier finding superseded".to_string()),
+            n => clauses.push(format!("{n} earlier findings superseded")),
+        }
+        match self.suppressed_items {
+            0 => {}
+            1 => clauses.push("1 withheld as an exact repeat".to_string()),
+            n => clauses.push(format!("{n} withheld as exact repeats")),
+        }
+        let head = match clauses.is_empty() {
+            true => head,
+            false => format!("{head} ({})", clauses.join(", ")),
+        };
+        let coverage = match self.coverage_note() {
+            Some(note) => format!("{head}{note}"),
+            None => match self.total_bytes {
+                Some(total) => format!("{head} · reviewed the whole file ({total} bytes)"),
+                None => head,
+            },
+        };
+        // How much of the file was unchanged since a pass under this tag last
+        // read it — the memo's own number. The denominator is the regions on
+        // record (reused + derived); a collapsed region is in neither and is
+        // already declared by the coverage note.
+        match self.reused_regions.len() {
+            0 => coverage,
+            reused => format!(
+                "{coverage} · {reused} of {} regions unchanged",
+                reused + self.derived_regions.len()
+            ),
+        }
+    }
+
+    /// Every finding on file for this pass's reading of the file — minted and
+    /// carried forward alike, sorted and deduplicated. What the faces render.
+    pub(crate) fn findings(&self) -> Vec<String> {
+        let mut all = self.minted.clone();
+        all.extend(self.carried.iter().cloned());
+        all.sort();
+        all.dedup();
+        all
+    }
+}
+
+/// A one-line, length-capped excerpt of a raw model answer — carried by the
+/// parse-failure errors so a collapsed answer is diagnosable from the error
+/// itself (the full answer is one `debug=raw` re-source away).
+pub(crate) fn answer_excerpt(answer: &str) -> String {
+    const MAX_BYTES: usize = 240;
+    let flat = answer.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.len() <= MAX_BYTES {
+        return flat;
+    }
+    let mut end = MAX_BYTES;
+    while end > 0 && !flat.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &flat[..end])
+}
+
+/// Every review pass IRI begins here — `{PASS_PREFIX}{repo}:{hash}:{tag}:{path}`.
+/// ⚠ The colon is load-bearing: [`REGION_PREFIX`] shares the stem up to
+/// `review`, and only the `:` tells a pass from a region memo.
+pub(crate) const PASS_PREFIX: &str = "urn:ikigai:browse:review:";
+
+pub(crate) fn pass_iri(repo: &str, rel: &str, hash: &str, tag: &str) -> String {
+    format!(
+        "{PASS_PREFIX}{repo}:{hash}:{}:{}",
+        iri_encode(tag),
+        iri_encode(rel)
+    )
+}
+
+fn store_err(e: impl std::fmt::Display) -> Error {
+    Error::Endpoint(format!("browse: review archive: {e}"))
+}
+
+const PROV_USED: &str = "http://www.w3.org/ns/prov#used";
+const PROV_GENERATED: &str = "http://www.w3.org/ns/prov#generated";
+const PROV_HAD_MEMBER: &str = "http://www.w3.org/ns/prov#hadMember";
+const PROV_WAS_GENERATED_BY: &str = "http://www.w3.org/ns/prov#wasGeneratedBy";
+
+fn prov(term: &str) -> NamedNode {
+    NamedNode::new(format!("{PROV}{term}")).expect("prov terms are valid IRIs")
+}
+
+pub(crate) fn store_pass(archive: &Archive, entry: &PassEntry) -> Result<()> {
+    use oxigraph::model::vocab::{rdf, xsd};
+    let subject = NamedNode::new(&entry.iri).map_err(store_err)?;
+    let target = NamedNode::new(&entry.target_iri).map_err(store_err)?;
+    let g = archive.graph().clone();
+    let mut quads: Vec<Quad> = vec![
+        Quad::new(subject.clone(), rdf::TYPE, ik("Review"), g.clone()),
+        Quad::new(
+            subject.clone(),
+            ik("repo"),
+            Literal::new_simple_literal(&entry.repo),
+            g.clone(),
+        ),
+        Quad::new(
+            subject.clone(),
+            ik("path"),
+            Literal::new_simple_literal(&entry.rel),
+            g.clone(),
+        ),
+        Quad::new(subject.clone(), prov("used"), target, g.clone()),
+        Quad::new(
+            subject.clone(),
+            ik("contentHash"),
+            Literal::new_simple_literal(&entry.hash),
+            g.clone(),
+        ),
+        Quad::new(
+            subject.clone(),
+            ik("versionTag"),
+            Literal::new_simple_literal(&entry.tag),
+            g.clone(),
+        ),
+        Quad::new(
+            subject.clone(),
+            ik("model"),
+            Literal::new_simple_literal(&entry.model),
+            g.clone(),
+        ),
+        Quad::new(
+            subject.clone(),
+            ik("orphanedItems"),
+            Literal::new_typed_literal(entry.orphaned_items.to_string(), xsd::NON_NEGATIVE_INTEGER),
+            g.clone(),
+        ),
+        // Always written, zero included: an absent count and a zero count
+        // must not read alike, for the same reason `ik:findingCount` exists.
+        Quad::new(
+            subject.clone(),
+            ik("suppressedItems"),
+            Literal::new_typed_literal(
+                entry.suppressed_items.to_string(),
+                xsd::NON_NEGATIVE_INTEGER,
+            ),
+            g.clone(),
+        ),
+    ];
+    for (term, value) in [
+        ("reviewedBytes", entry.reviewed_bytes),
+        ("totalBytes", entry.total_bytes),
+    ] {
+        if let Some(value) = value {
+            quads.push(Quad::new(
+                subject.clone(),
+                ik(term),
+                Literal::new_typed_literal(value.to_string(), xsd::NON_NEGATIVE_INTEGER),
+                g.clone(),
+            ));
+        }
+    }
+    for iri in &entry.minted {
+        quads.push(Quad::new(
+            subject.clone(),
+            prov("generated"),
+            NamedNode::new(iri).map_err(store_err)?,
+            g.clone(),
+        ));
+    }
+    // The memos carried forward: `prov:used`, beside the file — the pass
+    // utilized them exactly as it utilized the file, and `load_pass` tells the
+    // two apart by prefix. Never `prov:generated`: their findings have their
+    // generating pass already.
+    for iri in &entry.reused_regions {
+        quads.push(Quad::new(
+            subject.clone(),
+            prov("used"),
+            NamedNode::new(iri).map_err(store_err)?,
+            g.clone(),
+        ));
+    }
+    if let Some(at) = &entry.derived_at {
+        quads.push(Quad::new(
+            subject,
+            ik("derivedAt"),
+            Literal::new_typed_literal(at, xsd::DATE_TIME),
+            g,
+        ));
+    }
+    for quad in &quads {
+        archive.insert(quad).map_err(store_err)?;
+    }
+    Ok(())
+}
+
+/// Load one archived pass by its key IRI — `None` on a miss (no
+/// `ik:versionTag` under that subject).
+pub(crate) fn load_pass(archive: &Archive, iri: &str) -> Result<Option<PassEntry>> {
+    let subject = match NamedNode::new(iri) {
+        Ok(node) => node,
+        Err(_) => return Ok(None),
+    };
+    let mut entry = PassEntry {
+        iri: iri.to_string(),
+        repo: String::new(),
+        rel: String::new(),
+        target_iri: String::new(),
+        hash: String::new(),
+        tag: String::new(),
+        model: String::new(),
+        minted: Vec::new(),
+        carried: Vec::new(),
+        reused_regions: Vec::new(),
+        derived_regions: Vec::new(),
+        orphaned_items: 0,
+        suppressed_items: 0,
+        reviewed_bytes: None,
+        total_bytes: None,
+        derived_at: None,
+        superseded: 0,
+    };
+    let mut found = false;
+    for quad in archive.quads_for_pattern(Some(subject.as_ref().into()), None, None) {
+        let quad = quad.map_err(store_err)?;
+        let literal = |term: &Term| match term {
+            Term::Literal(l) => l.value().to_string(),
+            other => other.to_string(),
+        };
+        let predicate = quad.predicate.as_str();
+        match predicate.strip_prefix(IK) {
+            Some("versionTag") => {
+                entry.tag = literal(&quad.object);
+                found = true;
+            }
+            Some("repo") => entry.repo = literal(&quad.object),
+            Some("path") => entry.rel = literal(&quad.object),
+            Some("contentHash") => entry.hash = literal(&quad.object),
+            Some("model") => entry.model = literal(&quad.object),
+            Some("orphanedItems") => {
+                entry.orphaned_items = literal(&quad.object).parse().unwrap_or(0);
+            }
+            Some("suppressedItems") => {
+                entry.suppressed_items = literal(&quad.object).parse().unwrap_or(0);
+            }
+            Some("reviewedBytes") => {
+                entry.reviewed_bytes = literal(&quad.object).parse().ok();
+            }
+            Some("totalBytes") => {
+                entry.total_bytes = literal(&quad.object).parse().ok();
+            }
+            Some("derivedAt") => entry.derived_at = Some(literal(&quad.object)),
+            _ => match predicate {
+                PROV_USED => {
+                    if let Term::NamedNode(node) = &quad.object {
+                        // The file the pass read, or a region memo it carried
+                        // forward — one predicate, told apart by the prefix
+                        // browse itself mints.
+                        match node.as_str().starts_with(REGION_PREFIX) {
+                            true => entry.reused_regions.push(node.as_str().to_string()),
+                            false => entry.target_iri = node.as_str().to_string(),
+                        }
+                    }
+                }
+                PROV_GENERATED => {
+                    if let Term::NamedNode(node) = &quad.object {
+                        entry.minted.push(node.as_str().to_string());
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+    if !found {
+        return Ok(None);
+    }
+    // A stable reading of the minted set (insertion order from the store is
+    // arbitrary; the face rows re-sort by position anyway).
+    entry.minted.sort();
+    entry.reused_regions.sort();
+    // The carried findings are the reused memos' members — read from the
+    // memos, never copied onto the pass, so one record stays one record.
+    for iri in &entry.reused_regions {
+        if let Some(region) = load_region(archive, iri)? {
+            entry.carried.extend(region.findings);
+        }
+    }
+    entry.carried.sort();
+    entry.carried.dedup();
+    // The memos this pass wrote point at it; the findings it minted point the
+    // same way, which is why the prefix filter is not optional.
+    for quad in archive.quads_for_pattern(
+        None,
+        Some(prov("wasGeneratedBy").as_ref()),
+        Some(subject.as_ref().into()),
+    ) {
+        let quad = quad.map_err(store_err)?;
+        if let oxigraph::model::NamedOrBlankNode::NamedNode(node) = &quad.subject {
+            if node.as_str().starts_with(REGION_PREFIX) {
+                entry.derived_regions.push(node.as_str().to_string());
+            }
+        }
+    }
+    entry.derived_regions.sort();
+    Ok(Some(entry))
+}
+
+// --- parsing the model's findings --------------------------------------------
+
+pub(crate) struct Finding {
+    pub(crate) quote: String,
+    pub(crate) note: String,
+    /// The model's proposed severity, constrained to
+    /// [`crate::finding::SEVERITIES`].
+    ///
+    /// ⚠ `None` means the model gave no `SEVERITY:` line or invented a word
+    /// outside the set — and the finding is KEPT unrated rather than dropped
+    /// or silently defaulted. The failure-containment rule applies to the
+    /// rating exactly as it applies to the quote: one bad item must not kill
+    /// the pass, and a fabricated `info` would be indistinguishable from a
+    /// rating the model actually made.
+    pub(crate) severity: Option<String>,
+}
+
+/// Parse `QUOTE:`/`NOTE:` pairs out of the model's answer. Returns the
+/// well-formed findings plus the count of malformed items (a `QUOTE:` that
+/// never got a note, or a stray `NOTE:`) — counted alongside unanchorable
+/// quotes rather than killing the pass. Bare lines after a `NOTE:` continue
+/// the note (models wrap); anything before the first `QUOTE:` is preamble and
+/// is ignored.
+pub(crate) fn parse_findings(answer: &str) -> (Vec<Finding>, u64) {
+    let mut findings = Vec::new();
+    let mut malformed = 0u64;
+    let mut quote: Option<String> = None;
+    let mut severity: Option<String> = None;
+    let mut note = String::new();
+    let mut flush = |quote: &mut Option<String>,
+                     severity: &mut Option<String>,
+                     note: &mut String,
+                     malformed: &mut u64| {
+        let severity = severity.take();
+        match quote.take() {
+            Some(q) if !q.is_empty() && !note.trim().is_empty() => findings.push(Finding {
+                quote: q,
+                note: note.trim().to_string(),
+                severity,
+            }),
+            Some(_) => *malformed += 1,
+            None => {}
+        }
+        note.clear();
+    };
+    for line in answer.lines() {
+        let trimmed = line.trim();
+        if let Some(q) = trimmed.strip_prefix("QUOTE:") {
+            flush(&mut quote, &mut severity, &mut note, &mut malformed);
+            quote = Some(q.trim().to_string());
+        } else if let Some(s) = trimmed.strip_prefix("SEVERITY:") {
+            // Lower-cased and trimmed, then checked against the ONE set. A
+            // word outside it is dropped, not mapped: the model and the menu
+            // must offer the same five words or the two disagree the first
+            // time it invents a sixth.
+            let word = s.trim().trim_end_matches('.').to_ascii_lowercase();
+            severity = crate::finding::is_severity(&word).then_some(word);
+        } else if let Some(n) = trimmed.strip_prefix("NOTE:") {
+            if quote.is_none() {
+                // A stray NOTE with no quote to anchor it.
+                malformed += 1;
+                continue;
+            }
+            if !note.is_empty() {
+                note.push(' ');
+            }
+            note.push_str(n.trim());
+        } else if quote.is_some() && !note.is_empty() && !trimmed.is_empty() {
+            note.push(' ');
+            note.push_str(trimmed);
+        }
+    }
+    flush(&mut quote, &mut severity, &mut note, &mut malformed);
+    (findings, malformed)
+}
+
+// --- binding -----------------------------------------------------------------
+
+pub(crate) fn bind(
+    space: EndpointSpace,
+    roots: &Roots,
+    config: &Arc<ExplainConfig>,
+) -> EndpointSpace {
+    let review: Arc<dyn Endpoint> = Arc::new(ReviewEndpoint {
+        roots: Arc::clone(roots),
+        config: Arc::clone(config),
+    });
+    let space = crate::bind_family(space, roots, review, None, Some("review:{path}"));
+    let options: Arc<dyn Endpoint> = Arc::new(OptionsEndpoint {
+        roots: Arc::clone(roots),
+        config: Arc::clone(config),
+    });
+    crate::bind_family(space, roots, options, None, Some("review-options:{path}"))
+}
+
+/// `urn:repo:{repo}:review:{path}` — the pass a Review button asks for, and
+/// the same IRI #261's git-event trigger will ask for.
+pub(crate) fn review_iri(repo: &str, rel: &str) -> String {
+    format!("urn:repo:{repo}:review:{}", iri_encode(rel))
+}
+
+/// `urn:repo:{repo}:review-options:{path}` — the menu's own resource.
+fn options_iri(repo: &str, rel: &str) -> String {
+    format!("urn:repo:{repo}:review-options:{}", iri_encode(rel))
+}
+
+/// The review affordance on a file face: a button that asks for the pass with
+/// the host's CONFIGURED backend — `urn:repo:{repo}:review:{path}` with no
+/// arguments at all beyond the face, which is exactly the call a headless
+/// trigger makes.
+///
+/// ★ IT ADDS NOTHING OF ITS OWN. No prompt, no post-processing, no second
+/// annotation path: the button is a caller of one resource, so a trigger can
+/// reuse this IRI verbatim with a different cause and get the same archive key
+/// and the same minted annotations. The only thing the markup decides is the
+/// FACE (`as=text/html`, because a browser is asking).
+pub(crate) fn review_button_html(repo: &str, rel: &str) -> String {
+    format!(
+        "<button class=\"browse-review-link\" title=\"review this file — one model call, \
+         findings minted as annotations\" hx-get=\"/k/source {iri} as=text/html\" \
+         hx-target=\"#browse\" hx-swap=\"innerHTML\">review</button>",
+        iri = review_iri(repo, rel),
+    )
+}
+
+/// The closed "review with…" disclosure: markup only, no resolution. Its body
+/// is a SEPARATE resolution of this path's `review-options … as=text/html`,
+/// fetched on the `toggle` event — so a file view costs nothing for the menu
+/// until a human opens it, and opening it costs ONE sub-request (the model
+/// inventory) however many backends the host has.
+///
+/// `<details>`/`<summary>` for the same reasons explain's menu gives: keyboard
+/// operable with no CSS and no JavaScript of ours, announced as a disclosure,
+/// never hover-only, and block-level so it lays out at any width.
+pub(crate) fn menu_html(repo: &str, rel: &str) -> String {
+    format!(
+        "<details class=\"browse-review-menu\"><summary>review with…</summary>\
+         <div class=\"browse-review-menu-body\" hx-get=\"/k/source {iri} as=text/html\" \
+         hx-trigger=\"toggle once from:closest details\" hx-target=\"this\" \
+         hx-swap=\"innerHTML\"><p>loading options…</p></div></details>",
+        iri = options_iri(repo, rel),
+    )
+}
+
+struct ReviewEndpoint {
+    roots: Roots,
+    config: Arc<ExplainConfig>,
+}
+
+#[async_trait]
+impl Endpoint for ReviewEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        if inv.request.verb != Verb::Source {
+            return Err(Error::Endpoint(format!(
+                "browse-review does not support the {:?} verb",
+                inv.request.verb
+            )));
+        }
+        let (repo, root) = repo_root(inv, &self.roots)?;
+        granted(inv, repo)?;
+        let rel = path_binding(inv)?;
+        if rel.is_empty() {
+            return Err(Error::MissingArgument("path".to_string()));
+        }
+        let target = resolve(root, &rel)?;
+        if target.is_dir() {
+            return Err(Error::NotFound(format!(
+                "browse: `{rel}` is a directory — the review pass is file-grain (annotations \
+                 anchor in text)"
+            )));
+        }
+        let config = &self.config;
+
+        // The caller's backend choice, validated BEFORE any work — explain's
+        // rule, verbatim: an unknown or non-allowed provider is a refusal that
+        // names what was asked for and what is on offer, never a silent fall
+        // back to the configured one. A caller who asked for one model, got
+        // another, and had the pass archived (and annotations MINTED) under
+        // that other model's identity has been lied to durably — the entry and
+        // its findings are thereafter indistinguishable from legitimate ones.
+        //
+        // Review has no `version=`: nothing here addresses an archived pass
+        // without deriving one, so unlike explain's there is no argument for
+        // this one to be exclusive with.
+        let provider = match inv.inline_str("provider") {
+            Ok(requested) => {
+                let selectable = config.selectable();
+                if !selectable.contains(requested) {
+                    return Err(Error::Denied(format!(
+                        "browse: `{requested}` is not a provider this host offers to review \
+                         with; selectable here: {}",
+                        selectable.into_iter().collect::<Vec<_>>().join(", ")
+                    )));
+                }
+                requested.to_string()
+            }
+            Err(_) => config.review_provider.clone(),
+        };
+
+        // The archive key's backbone, THROUGH the kernel (dependency-recorded)
+        // — same construction as explain.
+        let hash_repr = inv.source(&parse_iri(&hash_iri(repo, &rel))?).await?;
+        let hash = String::from_utf8_lossy(&hash_repr.bytes).trim().to_string();
+
+        // The content, also through the kernel: the anchor surface, and since
+        // v5 also the whole of what the model is shown — one region per call.
+        // Quotes have always anchored against everything here, which is what
+        // lets a region's finding validate exactly like a whole file's.
+        let content = inv.source(&parse_iri(&file_iri(repo, &rel))?).await?;
+        let Ok(text) = String::from_utf8(content.bytes.clone()) else {
+            return Err(Error::InvalidArgument {
+                name: "path".to_string(),
+                detail: format!("`{rel}` is binary — there is nothing to review"),
+            });
+        };
+        // ⚠ An EMPTY file has no regions, and since v5 that is a real branch
+        // rather than a curiosity: the walk below would make zero calls and then
+        // report that no region produced findings, which reads like a model
+        // failure. It is refused here for the same reason a directory is — and
+        // NOT archived as a clean pass, because "nothing above threshold" would
+        // attribute to the model a judgment it was never asked to make.
+        if text.is_empty() {
+            return Err(Error::InvalidArgument {
+                name: "path".to_string(),
+                detail: format!("`{rel}` is empty — there is nothing to review"),
+            });
+        }
+
+        // The model identity for the tag: explicit config label → the
+        // provider's resolved `:model` identity → the provider-IRI heuristic.
+        //
+        // ★ THE LABEL DESCRIBES THE OPERATOR'S BACKEND, so it is keyed to the
+        // provider and not to the pass: a request that selects a different
+        // backend resolves THAT backend's own identity instead of inheriting a
+        // label written for another model. Stamping `review_model_label` onto
+        // a model it does not describe would write a wrong identity into the
+        // archive KEY and onto every annotation's `dcterms:creator`.
+        let explicit = match provider == config.review_provider {
+            true => config.review_model_label.as_ref(),
+            false => None,
+        };
+        let model = match explicit {
+            Some(label) => label.clone(),
+            None => resolve_model(inv, &provider)
+                .await
+                .unwrap_or_else(|| provider_label(&provider)),
+        };
+        let tag = format!("{REVIEW_PROMPT_VERSION}@{model}");
+
+        // `debug=raw` is the diagnosis face: derive one fresh answer and
+        // return it UNPARSED — nothing minted, nothing archived, the archive
+        // neither consulted nor written (a probe must never poison a key).
+        let debug_raw = match inv.inline_str("debug") {
+            Ok("raw") => true,
+            Ok(other) => {
+                return Err(Error::InvalidArgument {
+                    name: "debug".to_string(),
+                    detail: format!("unknown debug face `{other}` (the one face is `raw`)"),
+                })
+            }
+            Err(_) => false,
+        };
+
+        let iri = pass_iri(repo, &rel, &hash, &tag);
+        if !debug_raw {
+            if let Some(mut entry) = load_pass(&config.archive, &iri)? {
+                entry.superseded =
+                    crate::supersede::superseded_on(&config.archive, repo, &rel, &hash)?;
+                // The hit path: mints NOTHING. The recorded annotations are
+                // drift-reconciled against the very content in hand.
+                let included = annotate::included_for_ids(&config.archive, &entry.minted, &text)?;
+                return face(inv, repo, &rel, &entry, false, &included);
+            }
+        }
+
+        // Miss: derive one pass over EVERY region of the file. Ask, parse,
+        // anchor, mint, archive — the same five steps as v4, N times, unioned.
+        //
+        // ★ Except that a region whose bytes are already on record under this
+        // tag is CARRIED FORWARD rather than asked: its memo's findings are the
+        // findings, unchanged. `debug=raw` sees no memos, so a probe derives
+        // every region by the rule alone and measures the model, not the store.
+        let known = match debug_raw {
+            true => Vec::new(),
+            false => known_regions(&config.archive, repo, &rel, &tag)?,
+        };
+        let tiles = tile(
+            &text,
+            config.max_prompt_bytes,
+            config.review_max_chunks,
+            &known,
+        );
+        let budget = region_suggestion_budget(tiles.len());
+        let offered: usize = tiles.iter().map(|t| t.region.len()).sum();
+        let mut raw_answers = Vec::new();
+        // Each region whose derivation was USABLE — a clean statement or
+        // parsed findings — with what it parsed, by tile index: these become
+        // the memos, once their findings are minted.
+        let mut fresh: Vec<(usize, Vec<Finding>)> = Vec::new();
+        let mut carried: Vec<String> = Vec::new();
+        let mut reused_regions: Vec<String> = Vec::new();
+        let mut malformed = 0u64;
+        let mut reviewed = 0usize;
+        let mut collapsed: Vec<String> = Vec::new();
+        let mut first_error: Option<Error> = None;
+        for (index, tile) in tiles.iter().enumerate() {
+            let region = &tile.region;
+            if let Some(memo) = tile.memo {
+                // The memo hit: these exact bytes were reviewed under this tag
+                // and the records of what was said are on file. Reviewed, by
+                // that earlier call — the coverage sum counts them, and the
+                // findings keep their ids.
+                reviewed += region.len();
+                carried.extend(memo.findings.iter().cloned());
+                reused_regions.push(memo.iri.clone());
+                continue;
+            }
+            let prompt = format!(
+                "{}\n\nRepository: {repo}\nPath: {rel}{}\n\n```\n{}\n```\n\n{}",
+                review_prompt(budget, index == 0),
+                region_header(region, index, tiles.len(), &text),
+                &text[region.start..region.end],
+                review_reminder(budget),
+            );
+            let request = Request::new(Verb::Source, parse_iri(&provider)?)
+                .with_arg("prompt", ArgRef::Inline(prompt.into_bytes()))
+                .with_arg(
+                    "system",
+                    ArgRef::Inline(REVIEW_SYSTEM_PROMPT.as_bytes().to_vec()),
+                )
+                .with_arg(
+                    "temperature",
+                    ArgRef::Inline(config.temperature.clone().into_bytes()),
+                )
+                .with_arg(
+                    "max_tokens",
+                    ArgRef::Inline(config.review_max_tokens.to_string().into_bytes()),
+                );
+            // ★ PARTIAL FAILURE IS RECORDED, NOT DISCARDED. Region 4 of 7 failing
+            // must not throw away six regions of real work: the pass keeps what
+            // it has and declares its coverage, which is exactly the invariant
+            // `reviewed_bytes`/`total_bytes` now carry. Discarding would also
+            // re-spend all seven calls on the next ask.
+            //
+            // ⚠ A DENIAL is the one error that short-circuits. It is a property
+            // of the caller's capability, identical for every region, so
+            // grinding through sixteen of them would turn one refusal into
+            // sixteen and bury the reason.
+            let answer = match inv.issue(request).await {
+                Ok(answer) => String::from_utf8_lossy(&answer.bytes).to_string(),
+                Err(e @ Error::Denied(_)) => return Err(e),
+                Err(e) => {
+                    collapsed.push(format!("region {}: {e}", index + 1));
+                    first_error.get_or_insert(e);
+                    continue;
+                }
+            };
+            if debug_raw {
+                raw_answers.push(match tiles.len() {
+                    1 => answer,
+                    n => format!(
+                        "--- region {} of {n} (bytes {}–{}) ---\n{answer}",
+                        index + 1,
+                        region.start,
+                        region.end
+                    ),
+                });
+                continue;
+            }
+            let (region_findings, region_malformed) = parse_findings(&answer);
+            match region_findings.is_empty() {
+                // ★ A REGION IS CLEAN ONLY ON ITS OWN SAY-SO, and the pass is
+                // clean only if every region was. The naive union — "no findings
+                // anywhere, so the file is clean" — would let one collapsed
+                // answer produce a FALSE ALL-CLEAR under a key that never
+                // re-derives. A region that neither found anything nor said so
+                // is a region that was not reviewed, and its bytes are not
+                // counted — and it gets no memo, so the next pass asks again.
+                true if region_malformed == 0 && says_nothing_above_threshold(&answer) => {
+                    reviewed += region.len();
+                    fresh.push((index, Vec::new()));
+                }
+                true => {
+                    collapsed.push(format!(
+                        "region {}: \"{}\"",
+                        index + 1,
+                        answer_excerpt(&answer)
+                    ));
+                }
+                false => {
+                    reviewed += region.len();
+                    malformed += region_malformed;
+                    fresh.push((index, region_findings));
+                }
+            }
+        }
+        if debug_raw {
+            // ⚠ A probe that answered NOTHING must not read as an empty answer.
+            // Every region failing leaves `raw_answers` empty, and returning
+            // that would show a diagnosis face reporting a blank model reply
+            // — which is one of the very collapses it exists to tell apart.
+            match (raw_answers.is_empty(), first_error) {
+                (true, Some(e)) => return Err(e),
+                _ => return Ok(repr_utf8("text/plain", raw_answers.join("\n\n"))),
+            }
+        }
+        // ⚠ Every region failing is the old whole-pass failure and stays one:
+        // nothing was reviewed, so there is nothing honest to archive and the
+        // key must stay re-derivable. A transport error is reported as itself.
+        if reviewed == 0 {
+            if let Some(e) = first_error {
+                return Err(e);
+            }
+            // Nothing parseable and no clean statement either IS a failure —
+            // erroring (and archiving nothing) keeps the key re-derivable
+            // instead of poisoning it with an empty pass. The error carries each
+            // answer's opening so the collapse is diagnosable (a label-free
+            // format, a refusal, an empty ceiling-starved reply all read
+            // differently).
+            let scope = match tiles.len() {
+                1 => String::new(),
+                n => format!(" in any of its {n} regions"),
+            };
+            return Err(Error::Endpoint(format!(
+                "browse: `{provider}` returned no parseable QUOTE:/NOTE: findings for \
+                 `{rel}`{scope}, and did not report `{NOTHING_ABOVE_THRESHOLD}` either \
+                 (max_tokens {}); nothing archived. The answer began: {} — re-source with \
+                 debug=raw for the full unparsed answer",
+                config.review_max_tokens,
+                collapsed.join("; "),
+            )));
+        }
+        let created = inv.now().map(|t| iso8601(t.as_millis()));
+        // ★ The regions TILE the file, so this is a sum and not an estimate, and
+        // `reviewed == text.len()` is the invariant rather than a hope. Exactly
+        // two things can break the equality, and both are the pass saying so: a
+        // region whose answer collapsed, and a file past `review_max_chunks`
+        // whose tail was never offered to any call.
+        let reviewed_bytes = Some(reviewed as u64);
+        let total_bytes = Some(text.len() as u64);
+        debug_assert!(
+            reviewed <= offered && offered <= text.len(),
+            "regions must tile a prefix of the file"
+        );
+
+        // Mint, region by region, so each memo records exactly what its call
+        // produced — attribution is by the CALL that quoted, not by where the
+        // quote anchored: a region-7 quote that also occurs in region 1 anchors
+        // in region 1 (first occurrence), but it is region 7's memo, so a later
+        // change to region 7 re-derives it rather than carrying it beside a
+        // fresh duplicate.
+        let mut minted = Vec::new();
+        let mut orphaned_items = malformed;
+        let mut suppressed_items = 0u64;
+        let mut memos: Vec<RegionEntry> = Vec::new();
+        let parsed: usize = fresh.iter().map(|(_, f)| f.len()).sum();
+        for (index, findings) in &fresh {
+            let mut region_minted = Vec::new();
+            // What the memo records for these bytes: the findings this call
+            // minted, plus — for every item WITHHELD as an exact repeat — the
+            // declined twin that already answers it. Without the twin, an
+            // unchanged region whose every item was withheld would get no
+            // memo and be re-asked at every new file hash, only to be
+            // withheld again: a model call per commit for bytes that never
+            // moved, which is the cost the memo exists to remove.
+            let mut region_members = Vec::new();
+            for finding in findings {
+                match annotate::mint_pending_finding(
+                    &config.archive,
+                    &file_iri(repo, &rel),
+                    repo,
+                    &rel,
+                    &text,
+                    &hash,
+                    &finding.quote,
+                    &finding.note,
+                    finding.severity.as_deref(),
+                    &model,
+                    &iri,
+                    created.clone(),
+                    annotate::Surface::File,
+                )? {
+                    annotate::Mint::Minted(finding_iri) => {
+                        region_members.push(finding_iri.clone());
+                        region_minted.push(finding_iri);
+                    }
+                    // The model misquoted: mint nothing for this item, count it.
+                    annotate::Mint::Orphaned => orphaned_items += 1,
+                    // An exact repeat of a decline (ledger #475): mint
+                    // nothing, count it, and let the twin stand for it.
+                    annotate::Mint::Withheld(twin) => {
+                        suppressed_items += 1;
+                        region_members.push(twin);
+                    }
+                }
+            }
+            region_minted.sort();
+            region_minted.dedup();
+            region_members.sort();
+            region_members.dedup();
+            // ⚠ A region whose EVERY quote misquoted gets no memo. The model
+            // said something about these bytes and none of it anchored; an
+            // empty memo would carry "nothing here" forward as a clean claim
+            // the model never made, permanently. Its bytes still count as
+            // reviewed on this pass (the old rule, unchanged), and the next
+            // pass asks about them again. A region whose items were all
+            // withheld is NOT that case: its members are the declines that
+            // answered them.
+            if findings.is_empty() || !region_members.is_empty() {
+                let region = &tiles[*index].region;
+                let region_hash =
+                    annotate::content_hash(&text.as_bytes()[region.start..region.end]);
+                memos.push(RegionEntry {
+                    iri: region_iri(repo, &rel, &region_hash, &tag),
+                    tag: tag.clone(),
+                    hash: region_hash,
+                    len: region.len() as u64,
+                    findings: region_members,
+                    generated_by: Some(iri.clone()),
+                });
+            }
+            minted.extend(region_minted);
+        }
+        // The same stable order a later load reconstructs (the store keeps no
+        // insertion order); the face rows re-sort by anchor position anyway.
+        //
+        // ⚠ And DEDUPED, which regions made necessary. A finding id is
+        // `sha256(pass ‖ char_start ‖ exact)`, so two regions quoting the same
+        // line mint ONE finding and `mint_pending_finding` hands back the same
+        // IRI twice — without this the pass would claim `prov:generated` of a
+        // set with a repeat in it and every face would count the finding twice.
+        minted.sort();
+        minted.dedup();
+        // ⚠ Withheld is not orphaned: a pass whose every item was an exact
+        // repeat of a decline DID review the file and found only what a human
+        // had already answered. That is a pass to archive, with its count.
+        if parsed > 0 && minted.is_empty() && suppressed_items == 0 {
+            return Err(Error::Endpoint(format!(
+                "browse: none of the {parsed} finding(s) for `{rel}` anchored (every quote \
+                 was misquoted); nothing archived"
+            )));
+        }
+        carried.sort();
+        carried.dedup();
+        memos.sort_by(|a, b| a.iri.cmp(&b.iri));
+        memos.dedup_by(|a, b| a.iri == b.iri);
+        reused_regions.sort();
+        reused_regions.dedup();
+
+        // ★ THE CLEAN PASS — and with regions it is a UNION, which is the one
+        // place the naive implementation is wrong. `minted` and `carried` both
+        // empty means every region that was reviewed said in words that
+        // nothing met the threshold (or carried a memo that did): a region with
+        // findings never produces that, and a region that collapsed never
+        // counted its bytes, so a clean statement is always paired with the
+        // coverage that earned it. This is a pass that HAPPENED: archived,
+        // dated, attributed to the model, and an archive hit the next time, so
+        // a quiet file costs its calls once rather than once per commit — and
+        // with the memo, a quiet REGION does too.
+        let entry = PassEntry {
+            iri,
+            repo: repo.to_string(),
+            rel: rel.clone(),
+            target_iri: file_iri(repo, &rel),
+            hash,
+            tag,
+            model,
+            minted,
+            carried,
+            reused_regions,
+            derived_regions: memos.iter().map(|m| m.iri.clone()).collect(),
+            orphaned_items,
+            suppressed_items,
+            reviewed_bytes,
+            total_bytes,
+            derived_at: created,
+            superseded: 0,
+        };
+        store_pass(&config.archive, &entry)?;
+        for memo in &memos {
+            store_region(&config.archive, memo, repo, &rel, &entry.model)?;
+        }
+        // Carried findings re-anchor here, on read, by the one drift path —
+        // their offsets move with the insertion above them, their ids do not.
+        let included = annotate::included_for_ids(&config.archive, &entry.findings(), &text)?;
+        let mut entry = entry;
+        entry.superseded =
+            crate::supersede::superseded_on(&config.archive, repo, &rel, &entry.hash)?;
+        face(inv, repo, &rel, &entry, true, &included)
+    }
+
+    fn name(&self) -> &str {
+        "browse-review"
+    }
+
+    fn describe(&self) -> Description {
+        review_description(&self.config)
+    }
+}
+
+// --- faces -------------------------------------------------------------------
+
+fn face(
+    inv: &Invocation<'_>,
+    repo: &str,
+    rel: &str,
+    entry: &PassEntry,
+    derived: bool,
+    included: &Included,
+) -> Result<Representation> {
+    match inv.inline_str("as").unwrap_or("text/plain") {
+        t if t.starts_with("application/json") => {
+            let json = serde_json::json!({
+                "about": entry.target_iri,
+                "content_hash": entry.hash,
+                "version_tag": entry.tag,
+                "model": entry.model,
+                "derived": derived,
+                // The affirmative statement, for a machine consumer that would
+                // otherwise have to infer a clean pass from an empty array —
+                // the same inference a broken pipeline invites.
+                "statement": entry.statement(),
+                "minted": entry.minted,
+                // The memo's half: findings on file from unchanged regions
+                // (same ids an earlier pass minted), and how many regions were
+                // carried forward against how many this pass derived.
+                "carried": entry.carried,
+                "memo_regions": entry.reused_regions.len(),
+                "derived_regions": entry.derived_regions.len(),
+                "orphaned_items": entry.orphaned_items,
+                // Exact repeats of declined findings this pass withheld
+                // (ledger #475) — counted here so the rate is observable;
+                // the marked ones are in `annotations`, each carrying its
+                // `prior_decision`.
+                "suppressed_items": entry.suppressed_items,
+                // Undecided findings on this file that this reading does not
+                // carry (ledger #504) — computed on read, never stored.
+                "superseded_items": entry.superseded,
+                "reviewed_bytes": entry.reviewed_bytes,
+                "total_bytes": entry.total_bytes,
+                "derived_at": entry.derived_at,
+                "annotations": included.json(),
+            });
+            Ok(repr("application/json", json.to_string()))
+        }
+        t if t.starts_with("text/html") => Ok(repr_utf8(
+            "text/html",
+            review_html(repo, rel, entry, derived, included),
+        )),
+        t if t.starts_with("text/turtle") => Ok(repr("text/turtle", pass_turtle(entry))),
+        _ => {
+            let mut out = format!(
+                "review by {} · {} · {}",
+                entry.model,
+                entry.tag,
+                entry.statement()
+            );
+            if entry.orphaned_items > 0 {
+                out.push_str(&format!(
+                    " · {} item(s) did not anchor",
+                    entry.orphaned_items
+                ));
+            }
+            out.push('\n');
+            out.push_str(&included.margin_text());
+            Ok(repr_utf8("text/plain", out))
+        }
+    }
+}
+
+/// The S0 page style: crumbs, a backlink to the reviewed file, the pass's
+/// annotation cards (the same machine-marked markup every annotation face
+/// renders — no create form, this is the model's margin, not an authoring
+/// surface), and the provenance line.
+fn review_html(
+    repo: &str,
+    rel: &str,
+    entry: &PassEntry,
+    derived: bool,
+    included: &Included,
+) -> String {
+    let mut out = String::from("<div class=\"browse\">");
+    out.push_str(&crumbs_html(repo, rel));
+    out.push_str(&format!(
+        "<nav class=\"browse-actions\"><button class=\"browse-view-link\" \
+         hx-get=\"/k/source {} as=text/html\" hx-target=\"#browse\" \
+         hx-swap=\"innerHTML\">view file</button></nav>",
+        entry.target_iri,
+    ));
+    // ⚠ A clean pass renders an EMPTY annotation panel, and an empty panel is
+    // the shape of every other way this page can fail. The statement goes
+    // above it, in the page body rather than the provenance footnote, because
+    // it is the page's content when there are no cards.
+    if entry.findings().is_empty() {
+        out.push_str(&format!(
+            "<p class=\"browse-review-clean\">This file was reviewed: {}.</p>",
+            esc(&entry.statement()),
+        ));
+    }
+    out.push_str(&included.panel_html(None));
+    let hash_short: String = entry.hash.chars().take(19).collect(); // "sha256:" + 12 hex
+    let mut provenance = format!(
+        "reviewed by {} · {} · {}… · {} · {}",
+        esc(&entry.model),
+        esc(&entry.tag),
+        esc(&hash_short),
+        if derived {
+            "derived now"
+        } else {
+            "from the archive"
+        },
+        esc(&entry.statement()),
+    );
+    if entry.orphaned_items > 0 {
+        provenance.push_str(&format!(
+            " · {} item(s) did not anchor",
+            entry.orphaned_items
+        ));
+    }
+    out.push_str(&format!(
+        "<p class=\"browse-provenance\">{provenance}</p></div>"
+    ));
+    out
+}
+
+/// The pass entry as Turtle — the same skolemized shape the store holds. The
+/// minted annotations are addressable at their own IRIs (and the listing's
+/// turtle face serves their full graphs); this face is the pass's record.
+pub(crate) fn pass_turtle(entry: &PassEntry) -> String {
+    let mut props = vec![
+        "a ik:Review".to_string(),
+        format!("ik:repo {}", ttl_str(&entry.repo)),
+        format!("ik:path {}", ttl_str(&entry.rel)),
+        format!("prov:used <{}>", entry.target_iri),
+        format!("ik:contentHash {}", ttl_str(&entry.hash)),
+        format!("ik:versionTag {}", ttl_str(&entry.tag)),
+        format!("ik:model {}", ttl_str(&entry.model)),
+        format!(
+            "ik:orphanedItems \"{}\"^^xsd:nonNegativeInteger",
+            entry.orphaned_items
+        ),
+        format!(
+            "ik:suppressedItems \"{}\"^^xsd:nonNegativeInteger",
+            entry.suppressed_items
+        ),
+    ];
+    for (term, value) in [
+        ("reviewedBytes", entry.reviewed_bytes),
+        ("totalBytes", entry.total_bytes),
+    ] {
+        if let Some(value) = value {
+            props.push(format!("ik:{term} \"{value}\"^^xsd:nonNegativeInteger"));
+        }
+    }
+    if !entry.minted.is_empty() {
+        let refs: Vec<String> = entry.minted.iter().map(|iri| format!("<{iri}>")).collect();
+        props.push(format!("prov:generated {}", refs.join(", ")));
+    }
+    if !entry.reused_regions.is_empty() {
+        let refs: Vec<String> = entry
+            .reused_regions
+            .iter()
+            .map(|iri| format!("<{iri}>"))
+            .collect();
+        props.push(format!("prov:used {}", refs.join(", ")));
+    }
+    if let Some(at) = &entry.derived_at {
+        props.push(format!("ik:derivedAt \"{at}\"^^xsd:dateTime"));
+    }
+    format!(
+        "@prefix ik: <{IK}> .\n@prefix prov: <{PROV}> .\n@prefix xsd: \
+         <http://www.w3.org/2001/XMLSchema#> .\n\n<{}> {} .\n",
+        entry.iri,
+        props.join(" ;\n    ")
+    )
+}
+
+/// `repo` is not an ArgSpec: every advertised row fixes the root in its
+/// pattern (see `crate::bind_family`); the binding is grammar-injected.
+/// Takes the config because the `provider` argument's `one_of` IS this host's
+/// allowlist ([`ExplainConfig::selectable`]) — the manifold must state which
+/// backends a caller may actually name, not a hard-coded guess, so that
+/// `urn:kernel:validate` can reject a bad one before dispatch and a UI can
+/// build its "review with" menu from the description alone.
+fn review_description(config: &ExplainConfig) -> Description {
+    Description::new("browse-review")
+        .title("Machine review pass (annotations minted by a model)")
+        .summary(
+            "A region-grain machine review of one file — urn:repo:{repo}:review:{path}. \
+             Source asks the review model for findings (each an exact quote, a proposed \
+             severity and a reviewer's note) and mints every anchored finding as a PENDING \
+             urn:iki:finding: — NOT an annotation. ⚠ Nothing a pass produces reaches the \
+             urn:iki:annotation: family on its own: Sink urn:iki:finding:{id} \
+             decision=publish is the only path in, and it needs urn:cap:annotate, which \
+             this pass deliberately does not. Provenance on a finding: dcterms:creator = \
+             the model, sh:resultSeverity = its PROPOSED severity, prov:wasGeneratedBy = \
+             this pass. The pass is ARCHIVED by (path, content-hash, review-tag) — \
+             re-sourcing unchanged content is an archive hit that mints nothing, and a \
+             re-derivation re-mints the SAME finding IRIs, so a human decision survives \
+             it. Changed content is a fresh pass — but ★ only the REGIONS whose bytes \
+             moved are asked: every region a pass derives is memoized by the sha256 of \
+             its own bytes, and a later pass carries an unchanged region's existing \
+             findings forward (same ids, same pending/declined state, re-anchored) \
+             instead of re-minting them, so the queue grows with the diff rather than \
+             with the file. Findings from changed regions are minted fresh; earlier \
+             findings on those bytes re-anchor or orphan like annotations. The json face \
+             says which is which: minted (this pass's), carried (from memos), \
+             memo_regions and derived_regions. ★ A DECLINE IS REMEMBERED: a fresh finding \
+             whose exact quote matches a finding a human DECLINED on the same file is \
+             minted carrying that prior decision (prov:wasInfluencedBy the decision node; \
+             `prior_decision` on the row: the declined finding, its date and reason), so \
+             the second decision is one click and a different claim on the same line \
+             stays visible; only an EXACT repeat — same quote, same proposed severity, a \
+             byte-identical note — is withheld, and every withheld one is counted \
+             (suppressed_items, ik:suppressedItems). Declines on other files are not \
+             consulted. Quotes that do not anchor are counted (orphaned_items), \
+             never fatal; a missing or invented SEVERITY leaves the finding unrated \
+             rather than dropping it. ★ The pass reports against a THRESHOLD, not a \
+             quota: every problem the model rates critical or major, however many or \
+             few, plus a few minor/info suggestions and at most one praise. ★ And it \
+             covers the WHOLE FILE: a file larger than one prompt is split into \
+             line-aligned regions, each reviewed by its own call, the findings unioned \
+             — so reviewed_bytes == total_bytes unless the pass says otherwise, and a \
+             clean report means every region was clean and not that one of them \
+             collapsed. A region that fails leaves the pass INCOMPLETE BUT RECORDED, \
+             declaring its coverage, rather than discarding the regions that \
+             succeeded. ⚠ A defect spanning two regions is visible to neither; \
+             per-region findings are not one reviewer's reading of the whole file. A \
+             file with nothing above the bar is an ARCHIVED PASS with zero findings \
+             whose every face says so affirmatively, together with how much of the \
+             input was actually read — an empty answer with no such statement is still \
+             an error that archives nothing. provider= derives this pass \
+             against a different (host-allowed) backend, keyed by that backend's own \
+             model identity, so a second model is a second coexisting pass rather than a \
+             replacement. text/plain (default) is the \
+             margin-notes digest; as=application/json adds {minted, orphaned_items, \
+             findings}; as=text/html the card page, each finding with its publish/decline \
+             affordance; as=text/turtle the pass's \
+             provenance graph.",
+        )
+        .verb(Verb::Source)
+        .verb(Verb::Meta)
+        .requires(CAP_WILDCARD)
+        // ⚠ NO `urn:cap:annotate` — and its absence is the point, not an
+        // oversight. A pass writes PENDING FINDINGS and cannot reach the
+        // annotation family at all, so the authority it used to demand is
+        // required only by `Sink urn:iki:finding:{id} decision=publish`.
+        // ★ That is the safety interlock: a git-event trigger can run
+        // headlessly with browse+net and still publish nothing. Declared =
+        // enforced in both directions — declaring the annotate cap here would
+        // be an over-offer the pass no longer honours.
+        .requires(CAP_NET)
+        .input(
+            ArgSpec::new("path")
+                .binding()
+                .class(crate::XSD_STRING)
+                .summary("file path within the root, percent-encoded"),
+        )
+        .input(
+            ArgSpec::new("provider")
+                // The value is an endpoint IRI, not free text — the class says
+                // so, so type-based selection can offer it a resource rather
+                // than a string. Spelled exactly as explain's, deliberately:
+                // one argument name for one concept across the module.
+                .class("http://www.w3.org/2001/XMLSchema#anyURI")
+                .optional()
+                .summary(
+                    "the LLM provider IRI that derives THIS review pass, instead of the \
+                     configured review tier; one_of is what this host allows. That backend's \
+                     own model identity keys the archive entry, so a second model yields a \
+                     second pass COEXISTING with the first — its own findings, minted as its \
+                     own annotations, alongside rather than instead. A backend serving the \
+                     same model as an existing pass keys that same entry: an archive hit \
+                     that asks nothing and mints nothing. Unlike explain there is no \
+                     version= here — no argument addresses an archived pass — so this one \
+                     is exclusive with nothing.",
+                )
+                .one_of(config.selectable()),
+        )
+        .input(
+            ArgSpec::new("as")
+                .optional()
+                .class(crate::XSD_STRING)
+                .summary("the face to render")
+                .one_of(["text/plain", "application/json", "text/html", "text/turtle"])
+                .default_value("text/plain"),
+        )
+        .input(
+            ArgSpec::new("debug")
+                .optional()
+                .class(crate::XSD_STRING)
+                .summary(
+                    "raw: derive and return the model's unparsed answer (text/plain) — \
+                     nothing parsed, minted, or archived; the parse-failure diagnosis \
+                     face. ⚠ It derives EVERY region, so on a large file it costs the \
+                     whole pass's calls and returns them concatenated under region \
+                     headers",
+                )
+                .one_of(["raw"]),
+        )
+        .output("text/plain;charset=utf-8")
+        .output("application/json")
+        .output("text/html;charset=utf-8")
+        .output("text/turtle")
+}
+
+// --- the "review with…" menu -------------------------------------------------
+
+/// `urn:repo:{repo}:review-options:{path}` — **which backends this host will
+/// review with**, grouped by the model each serves, and nothing else.
+///
+/// ## What it is not
+///
+/// ⚠ It is NOT a listing of archived passes, and there deliberately is none.
+/// `urn:repo:{repo}:annotations:{path} as=application/json` already carries
+/// `creator` (the model) and `generated_by` (the pass) on every row, so "which
+/// models have reviewed this file" is a group-by over a listing the file face
+/// already renders. A parallel listing would duplicate a join the data answers.
+/// This resource answers the other question — what COULD review it — which
+/// nothing else does in a form a menu can render.
+///
+/// ## Why it is its own resource rather than part of the file face
+///
+/// Two reasons, both about cost and authority:
+///
+/// * **Cost.** Grouping by model needs `urn:llm:models`. Folding that read
+///   into the file face would spend it on every file view, whether or not
+///   anyone wants a menu — and on a host with a DISCOVERING backend that read
+///   probes, so the file face would inherit a network round trip on the hot
+///   path. A separate resource fetched on the disclosure's `toggle` costs
+///   nothing at all until a human opens the menu.
+/// * **Authority.** It could not live on `browse-review`: that endpoint
+///   DECLARES `urn:cap:net:*` and `urn:cap:annotate` because it spends and
+///   mints, so a browse-only session would be refused its own menu. This one
+///   requires the browse grant alone — reading what is on offer is not
+///   spending — which is the same split `explain-versions` makes.
+struct OptionsEndpoint {
+    roots: Roots,
+    config: Arc<ExplainConfig>,
+}
+
+#[async_trait]
+impl Endpoint for OptionsEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        if inv.request.verb != Verb::Source {
+            return Err(Error::Endpoint(format!(
+                "browse-review-options does not support the {:?} verb",
+                inv.request.verb
+            )));
+        }
+        let (repo, _root) = repo_root(inv, &self.roots)?;
+        granted(inv, repo)?;
+        let rel = path_binding(inv)?;
+        if rel.is_empty() {
+            return Err(Error::MissingArgument("path".to_string()));
+        }
+        // No filesystem touch and no archive read: the choices are a property
+        // of the HOST, not of the path. The path only names what a chosen row
+        // would review, so this answers for a path that has since been
+        // deleted exactly as it answers for one that has not — and a menu that
+        // 404s the moment a file moves would be worse than one that does not.
+        //
+        // ★ THE ONE SUB-REQUEST. `menu_options` resolves `urn:llm:models`,
+        // once, best-effort: no llm module bound (or an unreachable one)
+        // degrades the menu to provider IRIs rather than failing it. It never
+        // asks a model anything — opening a menu must not cost what the menu
+        // exists to let you decide about.
+        let options = menu_options(inv, &self.config, &review_tiers(&self.config)).await;
+        match inv.inline_str("as").unwrap_or("text/plain") {
+            t if t.starts_with("application/json") => {
+                let rows: Vec<serde_json::Value> = options
+                    .iter()
+                    .map(|o| {
+                        serde_json::json!({
+                            "label": o.label(),
+                            "model": o.model(),
+                            "provider": o.provider(),
+                            "providers": o.providers(),
+                            "default_for": o.default_for(),
+                        })
+                    })
+                    .collect();
+                Ok(repr(
+                    "application/json",
+                    serde_json::Value::Array(rows).to_string(),
+                ))
+            }
+            t if t.starts_with("text/html") => Ok(repr_utf8(
+                "text/html",
+                options_panel_html(repo, &rel, &options),
+            )),
+            _ => {
+                let lines: Vec<String> = options
+                    .iter()
+                    .map(|o| {
+                        format!(
+                            "{}\t{}\t{}",
+                            o.label(),
+                            o.providers().join(","),
+                            o.default_for().unwrap_or("-")
+                        )
+                    })
+                    .collect();
+                Ok(repr_utf8("text/plain", lines.join("\n")))
+            }
+        }
+    }
+
+    fn name(&self) -> &str {
+        "browse-review-options"
+    }
+
+    fn describe(&self) -> Description {
+        options_description()
+    }
+}
+
+/// The tier a REVIEW menu marks against: the one configured `review_provider`.
+/// Explain has two grains and therefore two tiers; review is file-grain only,
+/// so exactly one row can ever be "what a plain review click already does".
+fn review_tiers(config: &ExplainConfig) -> [MenuTier<'_>; 1] {
+    [MenuTier {
+        provider: config.review_provider.as_str(),
+        label: "review",
+    }]
+}
+
+/// The menu panel: one row per MODEL, each button sending
+/// `provider={iri}` to the very resource the plain button asks for.
+///
+/// ★ ONE ROW PER MODEL, NOT PER BACKEND — the same rule the explain menu is
+/// built on, for the same reason: the archive tag folds model identity, so two
+/// backends serving one model key ONE pass. A menu of backends would offer a
+/// second review it cannot produce, and its no-op would read as a bug.
+fn options_panel_html(repo: &str, rel: &str, options: &[ModelOption]) -> String {
+    let review = review_iri(repo, rel);
+    let mut out = String::from("<div class=\"browse-review-menu-panel\">");
+    out.push_str(
+        "<p class=\"browse-review-menu-heading\">review with \
+         <span class=\"browse-size\">derives — one model call, findings minted as \
+         annotations</span></p>",
+    );
+    if options.is_empty() {
+        // Unreachable while `selectable()` always holds the configured tiers,
+        // but a menu that renders an empty list with no word for it is the
+        // kind of blank a reader blames on the fetch.
+        out.push_str(
+            "<p class=\"browse-review-menu-empty\">this host offers no review backend.</p>",
+        );
+    }
+    out.push_str("<ul class=\"browse-entries browse-review-choices\">");
+    for option in options {
+        let mut notes: Vec<String> = Vec::new();
+        if let Some(tier) = option.default_for() {
+            notes.push(format!("default for {tier}"));
+        }
+        if option.providers().len() > 1 {
+            notes.push(format!(
+                "served by {}",
+                option
+                    .providers()
+                    .iter()
+                    .map(|p| provider_label(p))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if option.model().is_none() {
+            notes.push("backend reports no model id".to_string());
+        }
+        let detail = if notes.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " <span class=\"browse-size\">{}</span>",
+                esc(&notes.join(" · "))
+            )
+        };
+        let label = option.label();
+        if command_safe(option.provider()) {
+            out.push_str(&format!(
+                "<li><button class=\"browse-review-link\" hx-get=\"/k/source {review} \
+                 as=text/html provider={provider}\" hx-target=\"#browse\" \
+                 hx-swap=\"innerHTML\">{label}</button>{detail}</li>",
+                provider = esc(option.provider()),
+                label = esc(&label),
+            ));
+        } else {
+            out.push_str(&format!(
+                "<li><span class=\"browse-review-inert\">{}</span>{detail}</li>",
+                esc(&label),
+            ));
+        }
+    }
+    out.push_str("</ul>");
+    out.push_str(
+        "<p class=\"browse-review-menu-note\"><span class=\"browse-size\">One row per model, \
+         not per backend: a pass is archived by the model and the prompt that made it, so two \
+         backends serving one model give one review — the second request is an archive hit \
+         that mints nothing. A second MODEL is a second pass alongside the first, not a \
+         replacement: both sets of findings stay on the file.</span></p>",
+    );
+    out.push_str("</div>");
+    out
+}
+
+/// `repo` is not an ArgSpec — see [`review_description`]'s note.
+fn options_description() -> Description {
+    Description::new("browse-review-options")
+        .title("Backends this host will review with")
+        .summary(
+            "Which providers a review of this path may name — \
+             urn:repo:{repo}:review-options:{path}: this host's `provider=` allowlist \
+             grouped by the MODEL each backend serves, because the review archive keys on \
+             the model and two backends serving one model key ONE pass. Derives nothing, \
+             asks no model, needs no network grant, and reads neither the working tree nor \
+             the archive: the rows are a property of the host, so a deleted path still \
+             answers. It is NOT a listing of archived passes — \
+             urn:repo:{repo}:annotations:{path} as=application/json already carries creator \
+             and generated_by per finding, which is the same question answered by data that \
+             already exists. text/plain (default) is label<TAB>providers<TAB>defaultFor \
+             lines; as=application/json the structured rows; as=text/html the option menu \
+             the file face opens beside its review button, each row sending provider= to \
+             urn:repo:{repo}:review:{path}. The html and json faces read urn:llm:models \
+             once, best-effort: without it the menu degrades to provider IRIs rather than \
+             failing.",
+        )
+        .verb(Verb::Source)
+        .verb(Verb::Meta)
+        .requires(CAP_WILDCARD)
+        .input(
+            ArgSpec::new("path")
+                .binding()
+                .class(crate::XSD_STRING)
+                .summary("file path within the root, percent-encoded"),
+        )
+        .input(
+            ArgSpec::new("as")
+                .optional()
+                .class(crate::XSD_STRING)
+                .summary("application/json for the structured rows, text/html for the option menu")
+                .one_of(["text/plain", "application/json", "text/html"])
+                .default_value("text/plain"),
+        )
+        .output("text/plain;charset=utf-8")
+        .output("application/json")
+        .output("text/html;charset=utf-8")
+}
+
+// --- tests -------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::annotate::CAP_ANNOTATE;
+    use futures::executor::block_on;
+    use ikigai_core::{Capability, Exact, Fallback, FnEndpoint, Iri, Kernel};
+    use oxigraph::store::Store;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Mutex;
+
+    fn temp_dir() -> PathBuf {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "ikigai-browse-review-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The review provider the default config asks.
+    const PROVIDER: &str = "urn:llm:coder:ask";
+
+    #[derive(Default)]
+    struct Log {
+        asks: Mutex<Vec<(String, String, String)>>, // (prompt, system, max_tokens)
+    }
+
+    impl Log {
+        fn count(&self) -> usize {
+            self.asks.lock().unwrap().len()
+        }
+        fn last(&self) -> (String, String, String) {
+            self.asks.lock().unwrap().last().unwrap().clone()
+        }
+    }
+
+    /// A deterministic fake review model: every ask is recorded and answered
+    /// with the canned `reply`. Declares the net wildcard like the real module.
+    fn llm_space(log: &Arc<Log>, reply: &str) -> EndpointSpace {
+        let log = Arc::clone(log);
+        let reply = reply.to_string();
+        EndpointSpace::new().bind(
+            Exact::new(PROVIDER),
+            FnEndpoint::new("fake-review-llm", move |inv: &Invocation<'_>| {
+                log.asks.lock().unwrap().push((
+                    inv.inline_str("prompt").unwrap_or("").to_string(),
+                    inv.inline_str("system").unwrap_or("").to_string(),
+                    inv.inline_str("max_tokens").unwrap_or("").to_string(),
+                ));
+                Ok(repr_utf8("text/plain", reply.clone()))
+            })
+            .with_description(
+                Description::new("fake-review-llm")
+                    .verb(Verb::Source)
+                    .requires(CAP_NET),
+            ),
+        )
+    }
+
+    fn kernel_with(
+        root: &std::path::Path,
+        store: &Arc<Store>,
+        log: &Arc<Log>,
+        reply: &str,
+    ) -> Kernel {
+        let cfg = ExplainConfig::new(Arc::clone(store)).review_model_label("r1");
+        let browse = crate::space_with_explain(vec![("demo".to_string(), root.to_path_buf())], cfg);
+        Kernel::new(Arc::new(Fallback::new(vec![
+            Arc::new(browse),
+            Arc::new(llm_space(log, reply)),
+        ])))
+    }
+
+    /// A second bound backend, for the `provider=` tests. No `:model`
+    /// resource answers for it, so its tag label is the provider heuristic
+    /// (`alt`) — which is also the point: it is NOT `r1`, the label the
+    /// operator wrote for the configured backend.
+    const ALT_PROVIDER: &str = "urn:llm:alt:ask";
+    const ALT_FINDINGS: &str =
+        "QUOTE: fn gamma() {}\nNOTE: The third entry point has no caller in this file.\n";
+
+    fn alt_llm_space(log: &Arc<Log>, reply: &str) -> EndpointSpace {
+        let log = Arc::clone(log);
+        let reply = reply.to_string();
+        EndpointSpace::new().bind(
+            Exact::new(ALT_PROVIDER),
+            FnEndpoint::new("fake-alt-llm", move |inv: &Invocation<'_>| {
+                log.asks.lock().unwrap().push((
+                    inv.inline_str("prompt").unwrap_or("").to_string(),
+                    inv.inline_str("system").unwrap_or("").to_string(),
+                    inv.inline_str("max_tokens").unwrap_or("").to_string(),
+                ));
+                Ok(repr_utf8("text/plain", reply.clone()))
+            })
+            .with_description(
+                Description::new("fake-alt-llm")
+                    .verb(Verb::Source)
+                    .requires(CAP_NET),
+            ),
+        )
+    }
+
+    /// Both backends bound, with the host config in the test's hands — the
+    /// shape every `provider=` case needs.
+    fn kernel_with_alt(
+        root: &std::path::Path,
+        store: &Arc<Store>,
+        log: &Arc<Log>,
+        alt_log: &Arc<Log>,
+        config: impl FnOnce(ExplainConfig) -> ExplainConfig,
+    ) -> Kernel {
+        let cfg = config(ExplainConfig::new(Arc::clone(store)).review_model_label("r1"));
+        let browse = crate::space_with_explain(vec![("demo".to_string(), root.to_path_buf())], cfg);
+        Kernel::new(Arc::new(Fallback::new(vec![
+            Arc::new(browse),
+            Arc::new(llm_space(log, TWO_FINDINGS)),
+            Arc::new(alt_llm_space(alt_log, ALT_FINDINGS)),
+        ])))
+    }
+
+    /// A fake review model whose answers are SCRIPTED, one per call in order —
+    /// the shape every region test needs (a clean region beside a region with
+    /// a finding beside a region whose answer collapses). A reply of `ERROR`
+    /// fails that call instead of answering it; `DENIED` refuses it.
+    fn scripted_llm_space(log: &Arc<Log>, replies: &[&str]) -> EndpointSpace {
+        let log = Arc::clone(log);
+        let replies: Vec<String> = replies.iter().map(|r| (*r).to_string()).collect();
+        EndpointSpace::new().bind(
+            Exact::new(PROVIDER),
+            FnEndpoint::new("scripted-review-llm", move |inv: &Invocation<'_>| {
+                let mut asks = log.asks.lock().unwrap();
+                asks.push((
+                    inv.inline_str("prompt").unwrap_or("").to_string(),
+                    inv.inline_str("system").unwrap_or("").to_string(),
+                    inv.inline_str("max_tokens").unwrap_or("").to_string(),
+                ));
+                let reply = replies
+                    .get(asks.len() - 1)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("the model was asked {} times", asks.len()));
+                match reply.as_str() {
+                    "ERROR" => Err(Error::Endpoint("the backend dropped the call".to_string())),
+                    "DENIED" => Err(Error::Denied("no net grant".to_string())),
+                    _ => Ok(repr_utf8("text/plain", reply)),
+                }
+            })
+            .with_description(
+                Description::new("scripted-review-llm")
+                    .verb(Verb::Source)
+                    .requires(CAP_NET),
+            ),
+        )
+    }
+
+    /// A kernel over `SIX_LINES` whose model answers the scripted replies, at
+    /// `bytes` of content per call.
+    fn scripted_kernel(
+        root: &std::path::Path,
+        store: &Arc<Store>,
+        log: &Arc<Log>,
+        bytes: usize,
+        chunks: usize,
+        replies: &[&str],
+    ) -> Kernel {
+        let cfg = ExplainConfig::new(Arc::clone(store))
+            .review_model_label("r1")
+            .max_prompt_bytes(bytes)
+            .review_max_chunks(chunks);
+        let browse = crate::space_with_explain(vec![("demo".to_string(), root.to_path_buf())], cfg);
+        Kernel::new(Arc::new(Fallback::new(vec![
+            Arc::new(browse),
+            Arc::new(scripted_llm_space(log, replies)),
+        ])))
+    }
+
+    fn cap() -> Capability {
+        Capability::scoped([
+            "urn:cap:browse:read:demo",
+            "urn:cap:net:localhost",
+            CAP_ANNOTATE,
+        ])
+    }
+
+    fn issue(
+        kernel: &Kernel,
+        verb: Verb,
+        iri: &str,
+        args: &[(&str, &str)],
+        cap: &Capability,
+    ) -> Result<Representation> {
+        let mut request = Request::new(verb, Iri::parse(iri).unwrap());
+        for (k, v) in args {
+            request = request.with_arg(*k, ArgRef::Inline(v.as_bytes().to_vec()));
+        }
+        block_on(kernel.issue(request, cap))
+    }
+
+    fn body(repr: &Representation) -> String {
+        String::from_utf8_lossy(&repr.bytes).into_owned()
+    }
+
+    fn json(kernel: &Kernel, iri: &str, extra: &[(&str, &str)]) -> serde_json::Value {
+        let mut args = vec![("as", "application/json")];
+        args.extend_from_slice(extra);
+        serde_json::from_str(&body(
+            &issue(kernel, Verb::Source, iri, &args, &cap()).unwrap(),
+        ))
+        .unwrap()
+    }
+
+    const CONTENT: &str = "fn alpha() {}\nfn beta() {}\nfn gamma() {}\n";
+    /// Two well-formed v3 findings: one rated `praise`, one rated `minor` —
+    /// so every count below is also a check that the `SEVERITY:` line parsed
+    /// and reached the stored proposal.
+    const TWO_FINDINGS: &str = "QUOTE: fn alpha() {}\nSEVERITY: praise\nNOTE: A clear entry \
+         point; the naming makes the call order obvious.\nQUOTE: fn beta() {}\nSEVERITY: \
+         minor\nNOTE: Consider a doc comment - the role of this helper is not evident.\n";
+
+    fn demo_root() -> PathBuf {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), CONTENT).unwrap();
+        root
+    }
+
+    /// Six lines of exactly 14 bytes each — 84 bytes, so a region size in
+    /// bytes is a region size in lines and every count below is readable.
+    /// At 28 bytes a call that is three regions of two lines.
+    const SIX_LINES: &str = "fn one__() {}\nfn two__() {}\nfn three() {}\nfn four_() {}\n\
+                             fn five_() {}\nfn six__() {}\n";
+    const REGION_BYTES: usize = 28;
+
+    fn six_line_root() -> PathBuf {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), SIX_LINES).unwrap();
+        root
+    }
+
+    fn finding_on(line: &str) -> String {
+        format!("QUOTE: {line}\nSEVERITY: minor\nNOTE: This one deserves a second look.\n")
+    }
+
+    const CLEAN: &str = NOTHING_ABOVE_THRESHOLD;
+
+    #[test]
+    fn a_review_derives_once_and_mints_once() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, TWO_FINDINGS);
+
+        let first = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(first["derived"], true);
+        assert_eq!(first["version_tag"], "review-v5@r1");
+        assert_eq!(first["model"], "r1");
+        assert_eq!(first["orphaned_items"], 0);
+        // Nothing was truncated, and the face says exactly what was seen.
+        assert_eq!(first["reviewed_bytes"], CONTENT.len());
+        assert_eq!(first["total_bytes"], CONTENT.len());
+        assert_eq!(first["minted"].as_array().unwrap().len(), 2);
+        assert_eq!(first["annotations"].as_array().unwrap().len(), 2);
+        assert_eq!(log.count(), 1);
+
+        // ★★ THE PASS MINTS NOTHING INTO THE ANNOTATION FAMILY. This is the
+        // whole of ledger #444 in one assertion: the model produced two
+        // findings, they are addressable and rated, and the family every
+        // existing reader and query looks at is EMPTY until a human acts.
+        let annotations = json(&k, "urn:repo:demo:annotations:a.rs", &[]);
+        assert_eq!(
+            annotations.as_array().unwrap().len(),
+            0,
+            "a review pass must not publish anything: {annotations}"
+        );
+        for iri in first["minted"].as_array().unwrap() {
+            let iri = iri.as_str().unwrap();
+            assert!(iri.starts_with("urn:iki:finding:"), "{iri}");
+        }
+
+        // They are in the PENDING QUEUE instead, rated by the model, in
+        // triage order (minor before praise).
+        let queue = json(&k, "urn:repo:demo:findings:a.rs", &[]);
+        let rows = queue.as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["exact"], "fn beta() {}");
+        assert_eq!(rows[0]["severity"], "minor");
+        assert_eq!(rows[0]["state"], "pending");
+        assert_eq!(rows[0]["machine"], true);
+        assert_eq!(rows[0]["creator"], "r1");
+        assert_eq!(rows[0]["decision"], serde_json::Value::Null);
+        assert_eq!(rows[1]["exact"], "fn alpha() {}");
+        assert_eq!(rows[1]["severity"], "praise");
+        assert_eq!(rows[1]["line"], 1);
+
+        // Re-source on unchanged content: an archive hit that MINTS NOTHING —
+        // no new ask, no new findings, the same recorded set.
+        let second = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(second["derived"], false);
+        assert_eq!(second["minted"], first["minted"]);
+        assert_eq!(log.count(), 1, "the hit must not re-ask");
+        let queue = json(&k, "urn:repo:demo:findings:a.rs", &[]);
+        assert_eq!(queue.as_array().unwrap().len(), 2, "mint-once");
+
+        // The prompt fed the model the file and the format contract — and the
+        // contract is RESTATED after the content (long inputs crowd a
+        // top-only contract out of the answer).
+        let (prompt, system, max_tokens) = log.last();
+        assert!(prompt.contains("QUOTE:"), "{prompt}");
+        assert!(prompt.contains("fn beta()"), "{prompt}");
+        assert!(
+            prompt.rfind("format contract").unwrap() > prompt.rfind("fn gamma()").unwrap(),
+            "the reminder must follow the content: {prompt}"
+        );
+        assert!(system.contains("reviewing a colleague's file"), "{system}");
+        assert_eq!(max_tokens, "800");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★ The v4 instruction is a THRESHOLD, and the threshold's words are
+    /// SLICES of the declared severity list rather than a fourth copy of it.
+    /// A quota and a threshold are one word apart in the prompt and a different
+    /// population in the archive, so the halves are pinned here: the counting
+    /// language is gone, the serious class is stated to be uncapped, and every
+    /// severity word the model is handed traces back to `finding::SEVERITIES`.
+    ///
+    /// ⚠ The negative assertion is the load-bearing one. "Report every problem
+    /// you would rate {serious}" is the obvious phrasing, it is what the design
+    /// note asked for, and it MEASURED as a 2.6× rise in the serious rate with
+    /// no change to the code — the model relabels rather than reports more. See
+    /// [`REVIEW_PROMPT_VERSION`] for the table. Anyone restoring that sentence
+    /// is undoing an experiment, so this fails first.
+    /// ★ THE PROPERTY EVERYTHING ELSE RESTS ON: the regions TILE the file.
+    /// Contiguous, in order, no gap and no overlap — so `reviewed_bytes` is a
+    /// sum of region lengths rather than an estimate, and `reviewed_bytes ==
+    /// total_bytes` means every byte was offered to some call. A splitter that
+    /// dropped a byte between two regions would make the invariant a lie that
+    /// still passed every face.
+    #[test]
+    fn the_regions_tile_the_file_and_cut_at_line_boundaries() {
+        for (text, bytes) in [
+            (SIX_LINES, REGION_BYTES),
+            (SIX_LINES, 1),
+            (SIX_LINES, 10_000),
+            (CONTENT, 20),
+            ("no trailing newline at all, and one long line", 12),
+            ("", 16),
+            ("\n\n\n\n", 2),
+        ] {
+            let regions = split_into_regions(text, bytes, 1_000);
+            let mut at = 0;
+            for region in &regions {
+                assert_eq!(region.start, at, "a gap or an overlap in {text:?}");
+                assert!(region.end > region.start, "an empty region in {text:?}");
+                at = region.end;
+            }
+            assert_eq!(at, text.len(), "the regions must reach the end of {text:?}");
+            let rejoined: String = regions
+                .iter()
+                .map(|r| &text[r.start..r.end])
+                .collect::<Vec<_>>()
+                .concat();
+            assert_eq!(rejoined, text);
+        }
+
+        // Six 14-byte lines at 28 bytes a call: three regions of two lines,
+        // each cut at a line boundary and each knowing where it starts.
+        let regions = split_into_regions(SIX_LINES, REGION_BYTES, 1_000);
+        assert_eq!(regions.len(), 3);
+        assert_eq!(
+            regions.iter().map(|r| r.first_line).collect::<Vec<_>>(),
+            vec![1, 3, 5]
+        );
+        for region in &regions {
+            assert!(
+                SIX_LINES[region.start..region.end].ends_with('\n'),
+                "region {region:?} cut mid-line"
+            );
+        }
+        assert_eq!(regions[0].last_line(SIX_LINES), 2);
+        assert_eq!(regions[2].last_line(SIX_LINES), 6);
+    }
+
+    /// The cap is what bounds a pass's spend. A file past it is reviewed up to
+    /// the cap and the entry SAYS its coverage is short — the one case left
+    /// where a review does not see the whole file.
+    #[test]
+    fn the_region_cap_bounds_what_one_pass_offers() {
+        let regions = split_into_regions(SIX_LINES, REGION_BYTES, 2);
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions.iter().map(Region::len).sum::<usize>(), 56);
+        assert!(regions.last().unwrap().end < SIX_LINES.len());
+    }
+
+    /// The suggestion budget is DIVIDED across the regions, not repeated in
+    /// each of them: a per-call limit of three over seven regions asks for 21.
+    /// A one-region file keeps the whole limit, which is what makes a small
+    /// file's v5 prompt byte-identical to its v4 one.
+    #[test]
+    fn the_suggestion_budget_is_shared_out_across_the_regions() {
+        assert_eq!(region_suggestion_budget(1), SUGGESTION_LIMIT);
+        assert_eq!(region_suggestion_budget(2), 2);
+        assert_eq!(region_suggestion_budget(3), 1);
+        assert_eq!(region_suggestion_budget(7), 1);
+
+        // Only the first region is asked for praise; seven regions asking for
+        // "at most one" each would ask for seven.
+        let first = review_prompt(region_suggestion_budget(7), true);
+        let later = review_prompt(region_suggestion_budget(7), false);
+        assert!(first.contains("at most one rated praise"), "{first}");
+        assert!(!later.contains("at most one rated praise"), "{later}");
+        for text in [&first, &later] {
+            assert!(text.contains("info ones to 1 at most"), "{text}");
+        }
+    }
+
+    /// ★ THE HEADLINE INVARIANT. A file larger than one prompt is reviewed in
+    /// several calls and the pass covers ALL of it — `reviewed_bytes ==
+    /// total_bytes`, every face saying so in words. Before v5 this file would
+    /// have been a 28-byte review reported in the shape of a complete one.
+    #[test]
+    fn a_file_larger_than_one_prompt_is_reviewed_whole() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &[
+                &finding_on("fn one__() {}"),
+                &finding_on("fn three() {}"),
+                &finding_on("fn six__() {}"),
+            ],
+        );
+
+        let pass = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 3, "one call per region");
+        assert_eq!(pass["minted"].as_array().unwrap().len(), 3);
+        assert_eq!(pass["reviewed_bytes"], SIX_LINES.len());
+        assert_eq!(pass["total_bytes"], SIX_LINES.len());
+        assert_eq!(
+            pass["statement"],
+            format!(
+                "3 findings · reviewed the whole file ({} bytes)",
+                SIX_LINES.len()
+            )
+        );
+        assert_eq!(pass["version_tag"], "review-v5@r1");
+
+        // ★ The anchor surface never changed: a quote from the LAST region
+        // anchors against the whole file exactly as one from the first does.
+        let quotes: Vec<String> = pass["annotations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["exact"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(quotes.iter().any(|q| q == "fn six__() {}"), "{quotes:?}");
+
+        // Every region was told where it stands, and told not to report an
+        // absence it cannot check.
+        let prompts = log.asks.lock().unwrap().clone();
+        assert!(prompts[0].0.contains("Region: part 1 of 3, lines 1 to 2"));
+        assert!(prompts[2].0.contains("Region: part 3 of 3, lines 5 to 6"));
+        for (prompt, _, _) in &prompts {
+            assert!(
+                prompt.contains("never report something as missing from the file"),
+                "{prompt}"
+            );
+            assert!(!prompt.contains("(content truncated)"), "{prompt}");
+        }
+
+        // And it is one archived pass, so the next ask spends nothing.
+        let hit = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(hit["derived"], false);
+        assert_eq!(log.count(), 3);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A single-region file asks exactly once and its prompt carries no region
+    /// header at all — so the only thing that changed for a file under the
+    /// chunk size is the version tag.
+    #[test]
+    fn a_small_file_is_one_call_with_no_region_header() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, TWO_FINDINGS);
+
+        let pass = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 1);
+        let (prompt, _, _) = log.last();
+        assert!(!prompt.contains("Region:"), "{prompt}");
+        assert!(
+            prompt.contains(CONTENT),
+            "the whole file is in one call: {prompt}"
+        );
+        assert_eq!(pass["reviewed_bytes"], CONTENT.len());
+        assert_eq!(pass["total_bytes"], CONTENT.len());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ⚠ THE UNION RULE, AND THE NAIVE IMPLEMENTATION GETS IT WRONG. One region
+    /// saying `NOTHING ABOVE THRESHOLD` while another reports a finding is NOT
+    /// a clean file. Reporting it as one would be a false all-clear under a key
+    /// that never re-derives — the worst outcome available here, because it is
+    /// trusted and it is permanent.
+    #[test]
+    fn a_clean_pass_needs_every_region_to_be_clean() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &[CLEAN, &finding_on("fn four_() {}"), CLEAN],
+        );
+
+        let pass = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 3);
+        assert_eq!(pass["minted"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            pass["statement"],
+            format!(
+                "1 finding · reviewed the whole file ({} bytes)",
+                SIX_LINES.len()
+            )
+        );
+        assert!(
+            !pass["statement"]
+                .as_str()
+                .unwrap()
+                .contains("nothing above threshold"),
+            "two clean regions and one finding is not a clean file: {pass}"
+        );
+        // Coverage is still complete: the clean regions were reviewed too.
+        assert_eq!(pass["reviewed_bytes"], SIX_LINES.len());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Every region clean IS a clean file — an archived pass that says so, with
+    /// the coverage that earned the claim.
+    #[test]
+    fn a_file_clean_in_every_region_is_a_clean_pass_over_the_whole_file() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &[CLEAN, CLEAN, CLEAN],
+        );
+
+        let pass = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 3);
+        assert!(pass["minted"].as_array().unwrap().is_empty());
+        assert_eq!(
+            pass["statement"],
+            format!(
+                "nothing above threshold · reviewed the whole file ({} bytes)",
+                SIX_LINES.len()
+            )
+        );
+        let hit = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(
+            hit["derived"], false,
+            "a clean pass is archived like any other"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★ PARTIAL FAILURE IS RECORDED, NOT DISCARDED. Region 2 of 3 collapsing
+    /// must not throw away the two regions that worked — and the entry declares
+    /// exactly how much it covered, which is what makes the shortfall legible
+    /// instead of silent.
+    #[test]
+    fn a_collapsed_region_leaves_the_pass_incomplete_but_recorded() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &[
+                &finding_on("fn one__() {}"),
+                "I am afraid I cannot help with that.",
+                &finding_on("fn six__() {}"),
+            ],
+        );
+
+        let pass = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 3, "a failed region does not stop the walk");
+        assert_eq!(pass["minted"].as_array().unwrap().len(), 2);
+        assert_eq!(pass["reviewed_bytes"], 56);
+        assert_eq!(pass["total_bytes"], SIX_LINES.len());
+        assert_eq!(
+            pass["statement"],
+            format!(
+                "2 findings · reviewed 56 of {} bytes (coverage incomplete)",
+                SIX_LINES.len()
+            )
+        );
+        // Recorded means ARCHIVED: the two good regions are not re-spent.
+        let hit = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(hit["derived"], false);
+        assert_eq!(log.count(), 3);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ⚠⚠ THE SHARPEST CASE. Two regions say the file is clean and the third
+    /// collapses. The pass is clean — and it is ONLY clean about 56 of 84 bytes.
+    /// A collapsed region must never be counted as a quiet one, or "nothing
+    /// above threshold" would cover a region nobody read.
+    #[test]
+    fn a_collapsed_region_is_never_counted_as_a_clean_one() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(&root, &store, &log, REGION_BYTES, 16, &[CLEAN, "", CLEAN]);
+
+        let pass = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert!(pass["minted"].as_array().unwrap().is_empty());
+        assert_eq!(pass["reviewed_bytes"], 56);
+        assert_eq!(
+            pass["statement"],
+            format!(
+                "nothing above threshold · reviewed 56 of {} bytes (coverage incomplete)",
+                SIX_LINES.len()
+            )
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A transport failure mid-walk is the same story as a collapsed answer:
+    /// keep what was reviewed, declare the shortfall.
+    #[test]
+    fn a_region_the_backend_dropped_is_the_same_story() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &[&finding_on("fn one__() {}"), "ERROR", CLEAN],
+        );
+
+        let pass = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 3);
+        assert_eq!(pass["minted"].as_array().unwrap().len(), 1);
+        assert_eq!(pass["reviewed_bytes"], 56);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Every region failing is the OLD whole-pass failure and stays one:
+    /// nothing was reviewed, so there is nothing honest to archive and the key
+    /// must stay re-derivable rather than serve an empty pass forever.
+    #[test]
+    fn every_region_failing_is_an_error_and_archives_nothing() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &["nope", "nope", "nope", "nope", "nope", "nope"],
+        );
+
+        let err = issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("in any of its 3 regions"), "{text}");
+        assert!(text.contains(NOTHING_ABOVE_THRESHOLD), "{text}");
+        // Nothing archived: the next ask derives again rather than serving a
+        // poisoned key.
+        assert!(issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).is_err());
+        assert_eq!(log.count(), 6);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ⚠ A DENIAL short-circuits. It is a property of the caller's capability,
+    /// identical for every region, so grinding through sixteen of them would
+    /// turn one refusal into sixteen and bury the reason.
+    #[test]
+    fn a_denial_stops_at_the_first_region() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &["DENIED", "DENIED", "DENIED"],
+        );
+
+        assert!(issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).is_err());
+        assert_eq!(log.count(), 1, "one refusal, not one per region");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Two regions quoting the same line mint ONE finding: the id is
+    /// `sha256(pass ‖ char_start ‖ exact)`, so the second mint returns the
+    /// first's IRI and an undeduped `minted` would count it twice.
+    #[test]
+    fn the_same_quote_from_two_regions_mints_one_finding() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let quote = finding_on("fn one__() {}");
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &[&quote, &quote, &quote],
+        );
+
+        let pass = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 3);
+        assert_eq!(pass["minted"].as_array().unwrap().len(), 1, "{pass}");
+        assert_eq!(pass["annotations"].as_array().unwrap().len(), 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★★ THE ACCEPTANCE TEST FOR THE REGION MEMO, AND IT IS A QUEUE-VOLUME
+    /// TEST, NOT AN LLM-COST TEST. A change confined to one region of a
+    /// three-region file: the next pass asks about THAT region only, mints
+    /// findings only there, and the findings on the two unchanged regions are
+    /// neither duplicated nor dropped — same ids, same state. A finding a human
+    /// DECLINED on an unchanged region does not come back as pending.
+    ///
+    /// ⚠ The id half is the load-bearing half. A memo that saved the call and
+    /// re-minted the carried findings under the new pass would give every one
+    /// of them a new id (`sha256(pass ‖ char_start ‖ exact)`, and the pass IRI
+    /// carries the file hash) — the queue would grow exactly as it did before,
+    /// and the test would fail on `rows.len()`.
+    #[test]
+    fn a_change_confined_to_one_region_re_derives_only_that_region() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &[
+                &finding_on("fn one__() {}"),
+                &finding_on("fn three() {}"),
+                &finding_on("fn six__() {}"),
+                // The one call the second pass makes: region 3, edited.
+                &finding_on("fn six_2() {}"),
+            ],
+        );
+
+        let first = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 3);
+        assert_eq!(first["minted"].as_array().unwrap().len(), 3);
+        assert_eq!(first["carried"].as_array().unwrap().len(), 0);
+        assert_eq!(first["memo_regions"], 0);
+        assert_eq!(first["derived_regions"], 3, "{first}");
+        assert!(
+            !first["statement"].as_str().unwrap().contains("unchanged"),
+            "a first pass has nothing to carry: {first}"
+        );
+
+        // A human declines the finding on region 2.
+        let queue = json(&k, "urn:repo:demo:findings:a.rs", &[]);
+        let three = queue
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["exact"] == "fn three() {}")
+            .map(|r| r["iri"].as_str().unwrap().to_string())
+            .expect("the region-2 finding is pending");
+        issue(&k, Verb::Sink, &three, &[("decision", "decline")], &cap()).unwrap();
+
+        // Region 3 changes, byte-for-byte the same length: regions 1 and 2 are
+        // the same bytes at the same offsets, region 3 is new bytes.
+        std::fs::write(
+            root.join("a.rs"),
+            SIX_LINES.replace("fn six__() {}", "fn six_2() {}"),
+        )
+        .unwrap();
+        let second = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(second["derived"], true);
+        assert_eq!(log.count(), 4, "ONE call: the region whose bytes moved");
+        let (prompt, _, _) = log.last();
+        assert!(
+            prompt.contains("Region: part 3 of 3, lines 5 to 6"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("fn six_2() {}"), "{prompt}");
+        assert!(!prompt.contains("fn one__() {}"), "{prompt}");
+        assert_eq!(second["memo_regions"], 2, "{second}");
+        assert_eq!(second["derived_regions"], 1, "{second}");
+        assert_eq!(second["reviewed_bytes"], SIX_LINES.len());
+        assert_eq!(second["total_bytes"], SIX_LINES.len());
+        assert_eq!(
+            second["statement"],
+            // ★ The region-3 finding of the first pass is not carried (its
+            // bytes moved) and was undecided, so this pass's arrival retired it
+            // from pending — and the statement says so (ledger #504).
+            format!(
+                "3 findings (2 carried forward, 1 earlier finding superseded) · reviewed the \
+                 whole file ({} bytes) · 2 of 3 regions unchanged",
+                SIX_LINES.len()
+            )
+        );
+
+        // ★ Minted: ONE finding, on the changed region. Carried: the two
+        // records the first pass minted, BY THE SAME IRIS — including the
+        // declined one, because a decision is a property of the record and
+        // the record is what was carried.
+        let minted: Vec<&str> = second["minted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(minted.len(), 1, "{second}");
+        let carried: Vec<&str> = second["carried"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(carried.len(), 2, "{second}");
+        let first_minted: Vec<&str> = first["minted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        for iri in &carried {
+            assert!(
+                first_minted.contains(iri),
+                "carried {iri} is not a first-pass id"
+            );
+        }
+        assert!(
+            carried.contains(&three.as_str()),
+            "the declined one is carried too"
+        );
+        assert!(
+            !first_minted.contains(&minted[0]),
+            "the new region's finding is new"
+        );
+        // The face renders all three, carried and minted alike.
+        assert_eq!(second["annotations"].as_array().unwrap().len(), 3);
+
+        // ★★ THE QUEUE. Pending: region 1's finding (once — not duplicated)
+        // and region 3's new finding. NOT pending: the declined one — it did
+        // not come back — and the FIRST pass's region-3 finding, whose bytes
+        // moved: this pass does not carry it, so it is SUPERSEDED (ledger
+        // #504). Before 0.11.0 it stayed pending forever, orphaned, which is
+        // exactly the leak: one such row per changed region per commit.
+        let pending = json(&k, "urn:repo:demo:findings:a.rs", &[]);
+        let rows = pending.as_array().unwrap();
+        assert_eq!(rows.len(), 2, "{pending}");
+        let ones: Vec<&serde_json::Value> = rows
+            .iter()
+            .filter(|r| r["exact"] == "fn one__() {}")
+            .collect();
+        assert_eq!(ones.len(), 1, "carried, not duplicated: {pending}");
+        assert!(
+            first_minted.contains(&ones[0]["iri"].as_str().unwrap()),
+            "the pending one is the FIRST pass's record: {pending}"
+        );
+        assert!(
+            rows.iter().all(|r| r["exact"] != "fn three() {}"),
+            "{pending}"
+        );
+        assert!(
+            rows.iter().any(|r| r["exact"] == "fn six_2() {}"),
+            "{pending}"
+        );
+        // The retired one is still on file, still drift-reconciled (orphaned:
+        // its quote is gone), and names the pass that does not carry it.
+        let superseded = json(
+            &k,
+            "urn:repo:demo:findings:a.rs",
+            &[("state", "superseded")],
+        );
+        let superseded = superseded.as_array().unwrap();
+        assert_eq!(superseded.len(), 1, "{superseded:?}");
+        assert_eq!(superseded[0]["exact"], "fn six__() {}");
+        assert_eq!(superseded[0]["orphaned"], true);
+        let second_pass = rows
+            .iter()
+            .find(|r| r["exact"] == "fn six_2() {}")
+            .map(|r| r["generated_by"].clone())
+            .unwrap();
+        assert_eq!(superseded[0]["superseded_by"], second_pass);
+        let declined = json(&k, "urn:repo:demo:findings:a.rs", &[("state", "declined")]);
+        assert_eq!(declined.as_array().unwrap().len(), 1, "{declined}");
+        assert_eq!(declined[0]["iri"].as_str().unwrap(), three);
+
+        // The pass's own record says what it did and did not generate.
+        let ttl = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:review:a.rs",
+                &[("as", "text/turtle")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert!(ttl.contains("prov:used <urn:repo:demo:file:a.rs>"), "{ttl}");
+        assert!(
+            ttl.contains("prov:used <urn:ikigai:browse:review-region:demo:sha256:"),
+            "{ttl}"
+        );
+        assert!(
+            ttl.contains(&format!("prov:generated <{}>", minted[0])),
+            "{ttl}"
+        );
+        for iri in &carried {
+            assert!(!ttl.contains(&format!("prov:generated <{iri}>")), "{ttl}");
+        }
+        // And the carried findings still name the pass that DID generate them.
+        let all = json(&k, "urn:repo:demo:findings:a.rs", &[("state", "all")]);
+        let generated_by: std::collections::BTreeSet<&str> = all
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| carried.contains(&r["iri"].as_str().unwrap()))
+            .map(|r| r["generated_by"].as_str().unwrap())
+            .collect();
+        assert_eq!(generated_by.len(), 1);
+        assert_ne!(
+            generated_by.iter().next().unwrap(),
+            &second["about"].as_str().unwrap(),
+            "sanity: the file IRI is not a pass"
+        );
+        assert!(generated_by
+            .iter()
+            .next()
+            .unwrap()
+            .starts_with("urn:ikigai:browse:review:demo:"));
+
+        // The second pass is archived like any other: a hit, reconstructed
+        // from the store — carried set, memo count and statement alike.
+        let hit = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(hit["derived"], false);
+        assert_eq!(log.count(), 4);
+        assert_eq!(hit["carried"], second["carried"]);
+        assert_eq!(hit["minted"], second["minted"]);
+        assert_eq!(hit["memo_regions"], 2);
+        assert_eq!(hit["derived_regions"], 1);
+        assert_eq!(hit["statement"], second["statement"]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★ An insertion costs the region it lands in and nothing else — the
+    /// tiling snaps to remembered regions, so the bytes below the insertion
+    /// keep their key although every one of their offsets moved. A deletion
+    /// is the same story. Clean regions carry their clean statement forward:
+    /// the file stays "nothing above threshold" and says how much of it was
+    /// unchanged.
+    #[test]
+    fn an_insertion_moves_only_the_region_it_lands_in() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &[CLEAN, CLEAN, CLEAN, CLEAN, CLEAN],
+        );
+        let first = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 3);
+        assert_eq!(first["derived_regions"], 3);
+
+        // A line lands ABOVE everything: every old region's offset moves by
+        // 14 bytes, none of their bytes change.
+        let inserted = format!("fn zero_() {{}}\n{SIX_LINES}");
+        std::fs::write(root.join("a.rs"), &inserted).unwrap();
+        let second = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 4, "one call, for the one inserted line");
+        let (prompt, _, _) = log.last();
+        assert!(
+            prompt.contains("Region: part 1 of 4, lines 1 to 1"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("fn zero_() {}"), "{prompt}");
+        assert!(!prompt.contains("fn one__() {}"), "{prompt}");
+        assert_eq!(second["memo_regions"], 3, "{second}");
+        assert_eq!(second["derived_regions"], 1, "{second}");
+        assert_eq!(second["reviewed_bytes"], inserted.len());
+        assert_eq!(
+            second["statement"],
+            format!(
+                "nothing above threshold · reviewed the whole file ({} bytes) · 3 of 4 \
+                 regions unchanged",
+                inserted.len()
+            )
+        );
+        let html = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:review:a.rs",
+                &[("as", "text/html")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert!(html.contains("browse-review-clean"), "{html}");
+
+        // A line is DELETED from the middle: the region it was in is fresh
+        // (what is left of it), the regions on either side are unchanged.
+        let deleted = inserted.replace("fn three() {}\n", "");
+        std::fs::write(root.join("a.rs"), &deleted).unwrap();
+        let third = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 5, "one call, for the region the deletion left");
+        let (prompt, _, _) = log.last();
+        assert!(prompt.contains("fn four_() {}"), "{prompt}");
+        assert!(!prompt.contains("fn two__() {}"), "{prompt}");
+        assert!(!prompt.contains("fn five_() {}"), "{prompt}");
+        assert_eq!(third["memo_regions"], 3, "{third}");
+        assert_eq!(third["derived_regions"], 1, "{third}");
+        assert_eq!(third["reviewed_bytes"], deleted.len());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ⚠ A region whose EVERY quote misquoted is not memoized — an empty memo
+    /// would carry "nothing here" forward as a clean claim the model never
+    /// made — so the next pass asks about it again, alongside the region that
+    /// changed. Its bytes still count as reviewed on the pass that asked (the
+    /// old rule): the pass is honest through `orphaned_items`, the memo is
+    /// simply absent.
+    #[test]
+    fn a_region_whose_every_quote_misquoted_gets_no_memo() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &[
+                &finding_on("fn one__() {}"),
+                &finding_on("fn nope__() {}"),
+                &finding_on("fn six__() {}"),
+                // Pass two: region 2 again (it earned no memo), then region 3.
+                CLEAN,
+                &finding_on("fn six_2() {}"),
+            ],
+        );
+        let first = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 3);
+        assert_eq!(first["minted"].as_array().unwrap().len(), 2);
+        assert_eq!(first["orphaned_items"], 1);
+        assert_eq!(first["reviewed_bytes"], SIX_LINES.len());
+        assert_eq!(
+            first["derived_regions"], 2,
+            "no memo for the misquoted region"
+        );
+
+        std::fs::write(
+            root.join("a.rs"),
+            SIX_LINES.replace("fn six__() {}", "fn six_2() {}"),
+        )
+        .unwrap();
+        let second = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(
+            log.count(),
+            5,
+            "two calls: the unmemoized region and the changed one"
+        );
+        assert_eq!(second["memo_regions"], 1, "{second}");
+        assert_eq!(second["derived_regions"], 2, "{second}");
+        assert_eq!(second["minted"].as_array().unwrap().len(), 1);
+        assert_eq!(second["carried"].as_array().unwrap().len(), 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★★ A DECLINE IS REMEMBERED (ledger #475), both halves at once.
+    ///
+    /// Two findings are declined: one on region 2, one on region 3. Region 3
+    /// changes. The memo carries region 2's decline as it is — still declined,
+    /// never re-minted, unmarked. Region 3 is re-derived and the model raises
+    /// the declined claim twice: once byte-for-byte (WITHHELD and counted,
+    /// its memo member the declined twin) and once as a different claim on the
+    /// same line (MINTED, MARKED with the prior decision — its IRI, date and
+    /// reason — and pending). A fresh claim on a line nobody declined arrives
+    /// with no mark at all. The mark reaches every face: json, turtle, html,
+    /// plain; the count reaches the pass's json, turtle and statement, and
+    /// survives the archive hit.
+    #[test]
+    fn a_declined_claim_on_a_re_derived_region_returns_marked_and_an_exact_repeat_is_withheld() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &[
+                &finding_on("fn one__() {}"),
+                &finding_on("fn three() {}"),
+                &finding_on("fn five_() {}"),
+                // Pass two, region 3 only: the declined claim verbatim, a
+                // different claim on the same line, and a fresh line.
+                &format!(
+                    "{}QUOTE: fn five_() {{}}\nSEVERITY: minor\nNOTE: A different claim about \
+                     this line.\n{}",
+                    finding_on("fn five_() {}"),
+                    finding_on("fn six_2() {}"),
+                ),
+            ],
+        );
+        let first = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 3);
+        assert_eq!(first["suppressed_items"], 0, "{first}");
+        let queue = json(&k, "urn:repo:demo:findings:a.rs", &[]);
+        let iri_of = |exact: &str| {
+            queue
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["exact"] == exact)
+                .map(|r| r["iri"].as_str().unwrap().to_string())
+                .unwrap_or_else(|| panic!("no pending finding on {exact}: {queue}"))
+        };
+        let three = iri_of("fn three() {}");
+        let five = iri_of("fn five_() {}");
+        issue(&k, Verb::Sink, &three, &[("decision", "decline")], &cap()).unwrap();
+        issue(
+            &k,
+            Verb::Sink,
+            &five,
+            &[
+                ("decision", "decline"),
+                ("reason", "no-issue"),
+                ("content", "not a defect"),
+            ],
+            &cap(),
+        )
+        .unwrap();
+
+        std::fs::write(
+            root.join("a.rs"),
+            SIX_LINES.replace("fn six__() {}", "fn six_2() {}"),
+        )
+        .unwrap();
+        let second = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 4, "one call: the region whose bytes moved");
+        assert_eq!(second["derived"], true);
+        assert_eq!(second["suppressed_items"], 1, "{second}");
+        assert_eq!(second["minted"].as_array().unwrap().len(), 2, "{second}");
+        assert_eq!(second["carried"].as_array().unwrap().len(), 2, "{second}");
+        assert_eq!(
+            second["statement"],
+            format!(
+                "4 findings (2 carried forward, 1 withheld as an exact repeat) · reviewed the \
+                 whole file ({} bytes) · 2 of 3 regions unchanged",
+                SIX_LINES.len()
+            )
+        );
+
+        // The queue: region 1's pending finding (carried), the marked one on
+        // line 5, the fresh one on line 6, and — from the first pass —
+        // region 3's declined record is NOT pending and region 2's is NOT
+        // re-minted beside its carried self.
+        let pending = json(&k, "urn:repo:demo:findings:a.rs", &[]);
+        let rows = pending.as_array().unwrap();
+        assert_eq!(rows.len(), 3, "{pending}");
+        assert!(
+            rows.iter().all(|r| r["exact"] != "fn three() {}"),
+            "the carried decline is not re-minted: {pending}"
+        );
+        let fives: Vec<&serde_json::Value> = rows
+            .iter()
+            .filter(|r| r["exact"] == "fn five_() {}")
+            .collect();
+        assert_eq!(fives.len(), 1, "the repeat was withheld: {pending}");
+        let marked = fives[0];
+        assert_eq!(marked["state"], "pending");
+        assert_eq!(marked["body"], "A different claim about this line.");
+        assert_eq!(marked["decision"], serde_json::Value::Null);
+        assert_ne!(
+            marked["iri"].as_str().unwrap(),
+            five,
+            "a new id: the pass moved"
+        );
+        let prior = &marked["prior_decision"];
+        assert_eq!(prior["finding"], five, "{marked}");
+        assert_eq!(prior["iri"], format!("{five}:decision"));
+        assert_eq!(prior["outcome"], "declined");
+        assert_eq!(prior["severity"], "minor");
+        assert_eq!(prior["note"], "not a defect");
+        // The twin's reason WORD rides the mark too (0.10.0): the recurrence
+        // arrives saying why it was declined, not only when.
+        assert_eq!(prior["reason"], "no-issue", "{marked}");
+        // The date is the twin's decision date, carried as recorded (this
+        // kernel has no clock, so both are null — and equal).
+        assert_eq!(
+            prior["decided_at"],
+            json(&k, &five, &[])["decision"]["decided_at"],
+            "{marked}"
+        );
+        let fresh = rows
+            .iter()
+            .find(|r| r["exact"] == "fn six_2() {}")
+            .expect("the fresh line's finding");
+        assert_eq!(
+            fresh["prior_decision"],
+            serde_json::Value::Null,
+            "nobody declined anything on this line"
+        );
+        let one = rows.iter().find(|r| r["exact"] == "fn one__() {}").unwrap();
+        assert_eq!(one["prior_decision"], serde_json::Value::Null);
+
+        // The carried decline is unchanged: declined, unmarked, same id.
+        let declined = json(&k, "urn:repo:demo:findings:a.rs", &[("state", "declined")]);
+        let declined = declined.as_array().unwrap();
+        assert_eq!(declined.len(), 2, "{declined:?}");
+        for row in declined {
+            assert_eq!(row["prior_decision"], serde_json::Value::Null, "{row}");
+            assert!(
+                [three.as_str(), five.as_str()].contains(&row["iri"].as_str().unwrap()),
+                "{row}"
+            );
+        }
+
+        // The mark in the graph, and in words.
+        let ttl = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:findings:a.rs",
+                &[("as", "text/turtle")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert!(
+            ttl.contains(&format!("prov:wasInfluencedBy <{five}:decision>")),
+            "{ttl}"
+        );
+        assert_eq!(ttl.matches("prov:wasInfluencedBy").count(), 1, "{ttl}");
+        let html = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:findings:a.rs",
+                &[("as", "text/html")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert!(html.contains("browse-finding-prior"), "{html}");
+        assert!(
+            html.contains("a like claim on this line was declined"),
+            "{html}"
+        );
+        assert!(html.contains(": not a defect"), "{html}");
+        assert!(
+            html.contains("a like claim on this line was declined (no-issue)"),
+            "{html}"
+        );
+        assert!(
+            html.contains(&format!("hx-get=\"/k/source {five} as=text/html\"")),
+            "{html}"
+        );
+        let plain = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:findings:a.rs",
+                &[("as", "text/plain")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert!(
+            plain.contains("[a like claim on this line was declined"),
+            "{plain}"
+        );
+        assert!(
+            plain.contains(
+                "2 declined findings on this file, on 2 distinct quotes (no-issue 1, no reason 1)"
+            ),
+            "{plain}"
+        );
+
+        // The count in the pass's graph, and on the archive hit.
+        let ttl = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:review:a.rs",
+                &[("as", "text/turtle")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert!(
+            ttl.contains("ik:suppressedItems \"1\"^^xsd:nonNegativeInteger"),
+            "{ttl}"
+        );
+        let hit = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(hit["derived"], false);
+        assert_eq!(log.count(), 4);
+        assert_eq!(hit["suppressed_items"], 1);
+        assert_eq!(hit["statement"], second["statement"]);
+        assert!(hit["annotations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["prior_decision"]["finding"] == five));
+
+        // ★ The withheld item's memo member is its declined twin: region 3's
+        // new memo names the record that answers those bytes, so the next pass
+        // over them is a memo hit rather than a call that would be withheld
+        // again. Two memos name it — the first pass's region 3 and this one.
+        let twin = oxigraph::model::NamedNode::new(&five).unwrap();
+        let memos = store
+            .quads_for_pattern(
+                None,
+                Some(prov("hadMember").as_ref()),
+                Some(twin.as_ref().into()),
+                None,
+            )
+            .count();
+        assert_eq!(
+            memos, 2,
+            "the declined twin stands in for the withheld repeat"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The withhold rule is EXACT — the same note under a different proposed
+    /// severity is a different claim, minted marked and not withheld — and
+    /// declines on ANOTHER FILE are not consulted, even for a byte-identical
+    /// item: the key is the file and the line, never the words alone.
+    #[test]
+    fn the_withhold_rule_is_exact_and_stops_at_the_file() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &[
+                &finding_on("fn one__() {}"),
+                CLEAN,
+                CLEAN,
+                // Pass two, region 1 only: the same note, rated major.
+                "QUOTE: fn one__() {}\nSEVERITY: major\nNOTE: This one deserves a second look.\n",
+                // b.rs, whole file: the declined item byte for byte.
+                &finding_on("fn one__() {}"),
+                CLEAN,
+                CLEAN,
+            ],
+        );
+        json(&k, "urn:repo:demo:review:a.rs", &[]);
+        let queue = json(&k, "urn:repo:demo:findings:a.rs", &[]);
+        let one = queue[0]["iri"].as_str().unwrap().to_string();
+        issue(&k, Verb::Sink, &one, &[("decision", "decline")], &cap()).unwrap();
+
+        std::fs::write(
+            root.join("a.rs"),
+            SIX_LINES.replace("fn two__() {}", "fn two_2() {}"),
+        )
+        .unwrap();
+        let second = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 4);
+        assert_eq!(second["suppressed_items"], 0, "{second}");
+        assert_eq!(second["minted"].as_array().unwrap().len(), 1, "{second}");
+        let pending = json(&k, "urn:repo:demo:findings:a.rs", &[]);
+        let rows = pending.as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{pending}");
+        assert_eq!(rows[0]["severity"], "major");
+        assert_eq!(rows[0]["prior_decision"]["finding"], one, "{pending}");
+        assert_eq!(rows[0]["prior_decision"]["note"], serde_json::Value::Null);
+
+        // The same bytes under another path: nothing on file for THAT file.
+        std::fs::write(root.join("b.rs"), SIX_LINES).unwrap();
+        let other = json(&k, "urn:repo:demo:review:b.rs", &[]);
+        assert_eq!(log.count(), 7);
+        assert_eq!(other["suppressed_items"], 0, "{other}");
+        assert_eq!(other["minted"].as_array().unwrap().len(), 1, "{other}");
+        let pending = json(&k, "urn:repo:demo:findings:b.rs", &[]);
+        assert_eq!(pending.as_array().unwrap().len(), 1, "{pending}");
+        assert_eq!(
+            pending[0]["prior_decision"],
+            serde_json::Value::Null,
+            "a decline on a.rs says nothing about b.rs: {pending}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A pass whose EVERY item is an exact repeat of a decline is not an
+    /// error and not a clean pass: it is archived saying "nothing new" with
+    /// its count, mints nothing, and the queue does not grow. Its memo names
+    /// the declined twins, so unchanged bytes are a hit next time.
+    #[test]
+    fn a_wholly_withheld_pass_is_archived_as_nothing_new() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, TWO_FINDINGS);
+        let first = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        for iri in first["minted"].as_array().unwrap() {
+            issue(
+                &k,
+                Verb::Sink,
+                iri.as_str().unwrap(),
+                &[("decision", "decline")],
+                &cap(),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            json(&k, "urn:repo:demo:findings:a.rs", &[])
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+
+        // A new hash with the region's bytes changed INSIDE (an appended line
+        // would leave the old bytes at offset 0 for the memo to carry), both
+        // quotes still there, the same two items again.
+        let changed = CONTENT.replace("fn gamma() {}", "fn gamma2() {}");
+        std::fs::write(root.join("a.rs"), &changed).unwrap();
+        let second = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 2);
+        assert_eq!(second["derived"], true);
+        assert_eq!(second["memo_regions"], 0, "{second}");
+        assert_eq!(second["minted"].as_array().unwrap().len(), 0, "{second}");
+        assert_eq!(second["carried"].as_array().unwrap().len(), 0, "{second}");
+        assert_eq!(second["suppressed_items"], 2, "{second}");
+        assert_eq!(
+            second["statement"],
+            format!(
+                "nothing new (2 withheld as exact repeats) · reviewed the whole file ({} bytes)",
+                changed.len()
+            )
+        );
+        assert_eq!(
+            json(&k, "urn:repo:demo:findings:a.rs", &[])
+                .as_array()
+                .unwrap()
+                .len(),
+            0,
+            "the queue did not grow"
+        );
+        let html = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:review:a.rs",
+                &[("as", "text/html")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert!(
+            html.contains("This file was reviewed: nothing new (2 withheld"),
+            "{html}"
+        );
+        let plain =
+            body(&issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).unwrap());
+        assert!(
+            plain.contains("nothing new (2 withheld as exact repeats)"),
+            "{plain}"
+        );
+
+        // The hit reproduces the count; the memo makes the same bytes free.
+        let hit = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(hit["derived"], false);
+        assert_eq!(hit["suppressed_items"], 2);
+        assert_eq!(hit["derived_regions"], 1, "{hit}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The tiling with memos, on its own: it snaps to remembered regions,
+    /// stops a fresh region where the next remembered one begins, tiles the
+    /// text exactly (contiguous, no gap, no overlap), and with nothing
+    /// remembered is the rule alone. A remembered length whose end would land
+    /// mid-line is never even hashed.
+    #[test]
+    fn the_tiles_snap_to_remembered_regions_and_still_tile_the_file() {
+        let remembered = |text: &str, region: &Region, iri: &str| RegionEntry {
+            iri: iri.to_string(),
+            tag: "review-v5@r1".to_string(),
+            hash: annotate::content_hash(&text.as_bytes()[region.start..region.end]),
+            len: region.len() as u64,
+            findings: Vec::new(),
+            generated_by: None,
+        };
+        let rule = split_into_regions(SIX_LINES, REGION_BYTES, 16);
+        let known: Vec<RegionEntry> = rule
+            .iter()
+            .enumerate()
+            .map(|(i, r)| remembered(SIX_LINES, r, &format!("urn:memo:{i}")))
+            .collect();
+
+        // Unchanged: every region is a memo hit at its own offset.
+        let same = tile(SIX_LINES, REGION_BYTES, 16, &known);
+        assert_eq!(same.len(), 3);
+        assert!(same.iter().all(|t| t.memo.is_some()));
+
+        // A line above: one fresh tile, then the three memos at +14.
+        let inserted = format!("fn zero_() {{}}\n{SIX_LINES}");
+        let tiles = tile(&inserted, REGION_BYTES, 16, &known);
+        assert_eq!(
+            tiles
+                .iter()
+                .map(|t| t.memo.map(|m| m.iri.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                None,
+                Some("urn:memo:0"),
+                Some("urn:memo:1"),
+                Some("urn:memo:2")
+            ]
+        );
+        assert_eq!((tiles[0].region.start, tiles[0].region.end), (0, 14));
+        assert_eq!(tiles[1].region.first_line, 2);
+
+        // A line gone from the middle: the rest of that region is fresh, the
+        // memo after it snaps back into place.
+        let deleted = SIX_LINES.replace("fn two__() {}\n", "");
+        let tiles = tile(&deleted, REGION_BYTES, 16, &known);
+        assert_eq!(
+            tiles
+                .iter()
+                .map(|t| t.memo.map(|m| m.iri.as_str()))
+                .collect::<Vec<_>>(),
+            vec![None, Some("urn:memo:1"), Some("urn:memo:2")]
+        );
+        assert_eq!(
+            &deleted[tiles[0].region.start..tiles[0].region.end],
+            "fn one__() {}\n"
+        );
+
+        // Whatever is remembered, the tiles tile.
+        for text in [
+            SIX_LINES,
+            inserted.as_str(),
+            deleted.as_str(),
+            "",
+            "fn one__() {}",
+        ] {
+            let tiles = tile(text, REGION_BYTES, 16, &known);
+            let mut at = 0;
+            for t in &tiles {
+                assert_eq!(t.region.start, at, "gap or overlap in {text:?}");
+                assert!(t.region.end > t.region.start);
+                at = t.region.end;
+            }
+            assert_eq!(at, text.len(), "{text:?}");
+            let rejoined: String = tiles
+                .iter()
+                .map(|t| &text[t.region.start..t.region.end])
+                .collect::<Vec<_>>()
+                .concat();
+            assert_eq!(rejoined, text);
+        }
+
+        // Nothing remembered is the rule alone.
+        let bare = tile(SIX_LINES, REGION_BYTES, 16, &[]);
+        assert_eq!(
+            bare.iter().map(|t| t.region.end).collect::<Vec<_>>(),
+            vec![28, 56, 84]
+        );
+        assert!(bare.iter().all(|t| t.memo.is_none()));
+
+        // A remembered length that would end mid-line is rejected without
+        // hashing: the same bytes, one byte short, is not a region here.
+        let short = RegionEntry {
+            len: 27,
+            hash: annotate::content_hash(&SIX_LINES.as_bytes()[..27]),
+            ..remembered(SIX_LINES, &rule[0], "urn:memo:short")
+        };
+        assert!(memo_at(SIX_LINES, 0, std::slice::from_ref(&short)).is_none());
+        // The region cap counts memos and fresh tiles alike.
+        assert_eq!(tile(&inserted, REGION_BYTES, 2, &known).len(), 2);
+    }
+
+    /// `debug=raw` diagnoses the WHOLE pass, so on a chunked file it returns
+    /// every region's unparsed answer under a header naming the region — and
+    /// still archives nothing.
+    #[test]
+    fn debug_raw_returns_every_region_unparsed() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &["first answer", "second answer", "third answer"],
+        );
+
+        let raw = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:review:a.rs",
+                &[("debug", "raw")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(log.count(), 3);
+        for (n, answer) in ["first answer", "second answer", "third answer"]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(raw.contains(&format!("--- region {} of 3", n + 1)), "{raw}");
+            assert!(raw.contains(answer), "{raw}");
+        }
+        assert!(store.is_empty().unwrap(), "a probe archives nothing");
+
+        // ⚠ And a probe that answered nothing reports the FAILURE, never an
+        // empty answer — an empty diagnosis face is one of the collapses this
+        // face exists to tell apart.
+        let root2 = six_line_root();
+        let log2 = Arc::new(Log::default());
+        let k2 = scripted_kernel(
+            &root2,
+            &store,
+            &log2,
+            REGION_BYTES,
+            16,
+            &["ERROR", "ERROR", "ERROR"],
+        );
+        assert!(issue(
+            &k2,
+            Verb::Source,
+            "urn:repo:demo:review:a.rs",
+            &[("debug", "raw")],
+            &cap()
+        )
+        .is_err());
+        std::fs::remove_dir_all(&root2).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_prompt_asks_for_a_threshold_rather_than_a_quota() {
+        let prompt = review_prompt(SUGGESTION_LIMIT, true);
+        let reminder = review_reminder(SUGGESTION_LIMIT);
+
+        // The quota is gone from both halves — including the reminder, which
+        // is the last thing a long file lets the model read.
+        for text in [&prompt, &reminder] {
+            assert!(!text.contains("3 to 6"), "{text}");
+            assert!(!text.contains("most useful findings"), "{text}");
+        }
+        assert!(
+            prompt.contains("no minimum and no quota to fill"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Never leave a real problem out because you have already reported"),
+            "the serious half is explicitly uncapped: {prompt}"
+        );
+        assert!(
+            prompt.contains("not the reason a finding is reported"),
+            "the rating must not be the reporting gate: {prompt}"
+        );
+        for text in [&prompt, &reminder] {
+            assert!(
+                !text.contains("rate critical or major,"),
+                "severity-as-gate phrasing inflates the rating 2.6x - see \
+                 REVIEW_PROMPT_VERSION: {text}"
+            );
+        }
+        assert!(
+            prompt.contains(&format!(
+                "Keep the minor or info ones to {SUGGESTION_LIMIT} at most"
+            )),
+            "{prompt}"
+        );
+        assert!(prompt.contains("at most one rated praise"), "{prompt}");
+
+        // The anchor rule that took orphaned findings from 12% to 1-5%.
+        assert!(prompt.contains("no backticks"), "{prompt}");
+        assert!(reminder.contains("no backticks"), "{reminder}");
+
+        // Every declared severity is offered to the model, with its declared
+        // meaning, in both halves of the contract.
+        for (word, meaning) in SEVERITIES.iter().zip(SEVERITY_MEANINGS) {
+            assert!(
+                prompt.contains(&format!("{word} for {meaning}")),
+                "{prompt}"
+            );
+            assert!(reminder.contains(word), "{reminder}");
+        }
+
+        // And the clean answer is spelled out where the model will read it.
+        assert!(prompt.contains(NOTHING_ABOVE_THRESHOLD), "{prompt}");
+        assert!(reminder.contains(NOTHING_ABOVE_THRESHOLD), "{reminder}");
+
+        // The persona stopped SOLICITING praise; the severity keeps its bucket
+        // so triage can still tell a compliment from a note.
+        assert!(
+            !REVIEW_SYSTEM_PROMPT.contains("one genuine strength"),
+            "{REVIEW_SYSTEM_PROMPT}"
+        );
+        assert!(SEVERITIES.contains(&"praise"));
+    }
+
+    /// ⚠⚠ THE SECOND SENTENCE THIS PROMPT IS NOT ALLOWED TO GROW BACK, and for
+    /// the same reason as the first: it was measured, it failed, and a variant
+    /// that quietly restores it undoes the experiment rather than repeating it.
+    ///
+    /// The defect is real — a reviewer cannot tell a DISCLOSED hazard from a
+    /// PRESENT one, so a document full of ⚠ produces a queue full of criticals
+    /// (ledger #483). The two obvious answers both make it worse or move
+    /// nothing; [`REVIEW_PROMPT_VERSION`] carries the table and the arms.
+    /// Briefly: the one-line suppression ("if the anchored text already states
+    /// the problem … that is not a finding") took the serious rate from 6.0 to
+    /// 8.5 findings per pass on the file it was written for, and the
+    /// four-sentence contrast held it flat while deflating `critical` on a
+    /// control corpus of real comment-vs-code contradictions.
+    ///
+    /// ★ So this asserts ABSENCE, and it is deliberately blunt: any prompt
+    /// carrying either shape fails here, including a reworded one that happens
+    /// to reuse these words. The fix for a red here is to read the table, not
+    /// to reword around the assertion.
+    #[test]
+    fn the_prompt_does_not_tell_the_model_that_a_disclosed_hazard_is_not_a_finding() {
+        let prompt = review_prompt(SUGGESTION_LIMIT, true);
+        let reminder = review_reminder(SUGGESTION_LIMIT);
+        for text in [&prompt, &reminder] {
+            assert!(
+                !text.contains("that is not a finding"),
+                "the suppression line raised the serious rate 6.0 -> 8.5 per pass \
+                 (ledger #483) - see REVIEW_PROMPT_VERSION: {text}"
+            );
+            assert!(
+                !text.contains("not the hazard"),
+                "the contrast line only deflated severity, on real defects too \
+                 (ledger #483) - see REVIEW_PROMPT_VERSION: {text}"
+            );
+        }
+    }
+
+    /// ⚠ A clean file is now an ORDINARY outcome, and it must not look like an
+    /// outage. The pass is archived, dated, attributed and re-served from the
+    /// archive like any other, every face states it in words, and the
+    /// statement carries the COVERAGE — "nothing above threshold" over a
+    /// truncated input is a weaker claim than over a whole file and must not
+    /// render the same way.
+    #[test]
+    fn a_clean_file_is_an_archived_pass_that_says_so() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, "NOTHING ABOVE THRESHOLD\n");
+
+        let first = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(first["derived"], true);
+        assert_eq!(first["minted"].as_array().unwrap().len(), 0);
+        assert_eq!(first["orphaned_items"], 0);
+        assert_eq!(first["total_bytes"], CONTENT.len());
+        assert_eq!(first["version_tag"], "review-v5@r1");
+        assert_eq!(
+            first["statement"],
+            format!(
+                "nothing above threshold · reviewed the whole file ({} bytes)",
+                CONTENT.len()
+            )
+        );
+
+        // It is a PASS, so it is in the archive: the second source is a hit
+        // and asks nothing. A quiet file costs one call ever, not one a commit.
+        let second = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(second["derived"], false);
+        assert_eq!(second["statement"], first["statement"]);
+        assert_eq!(log.count(), 1, "the hit must not re-ask");
+
+        // Every face SAYS it rather than rendering an absence.
+        let text =
+            body(&issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).unwrap());
+        assert!(text.contains("nothing above threshold"), "{text}");
+        assert!(text.contains("reviewed the whole file"), "{text}");
+        let html = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:review:a.rs",
+                &[("as", "text/html")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert!(html.contains("browse-review-clean"), "{html}");
+        assert!(html.contains("This file was reviewed"), "{html}");
+
+        // Nothing was minted: the finding queue is empty, not merely quiet.
+        let queue = json(&k, "urn:repo:demo:findings:a.rs", &[]);
+        assert_eq!(queue.as_array().unwrap().len(), 0);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The coverage half, on its own. ★ THE CLAIM FLIPPED IN v5: this used to
+    /// pin that a clean answer over a TRUNCATED input must not make the same
+    /// claim as a clean answer over a whole file — and that was the MAJORITY
+    /// case, because `max_prompt_bytes` truncated 62% of this ecosystem's
+    /// source. Now a small chunk size means more CALLS, not less file, and the
+    /// clean statement covers all of it. The weaker claim still exists and is
+    /// still distinguishable (see the collapsed-region tests); it is now the
+    /// exception it always pretended to be.
+    #[test]
+    fn a_clean_pass_covers_the_whole_file_however_small_the_chunk() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            20,
+            16,
+            &[CLEAN, CLEAN, CLEAN, CLEAN, CLEAN],
+        );
+
+        let pass = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert!(
+            log.count() > 1,
+            "a 20-byte budget over 41 bytes is several calls"
+        );
+        assert_eq!(pass["reviewed_bytes"], CONTENT.len());
+        assert_eq!(pass["total_bytes"], CONTENT.len());
+        assert_eq!(
+            pass["statement"],
+            format!(
+                "nothing above threshold · reviewed the whole file ({} bytes)",
+                CONTENT.len()
+            )
+        );
+        let text =
+            body(&issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).unwrap());
+        assert!(text.contains("the whole file"), "{text}");
+        assert!(!text.contains("coverage incomplete"), "{text}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn machine_and_human_annotations_are_distinguishable_across_faces() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, TWO_FINDINGS);
+
+        // A human note next to the machine pass.
+        issue(
+            &k,
+            Verb::Sink,
+            "urn:iki:annotation:h1",
+            &[
+                ("target", "urn:repo:demo:file:a.rs"),
+                ("exact", "fn gamma() {}"),
+                ("body", "a human margin note"),
+            ],
+            &cap(),
+        )
+        .unwrap();
+        let pass = json(&k, "urn:repo:demo:review:a.rs", &[]);
+
+        // Only the human note is in the annotation family: the machine's two
+        // are pending. A human PUBLISHES one of them — the only way in.
+        let pending: Vec<String> = pass["minted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i.as_str().unwrap().to_string())
+            .collect();
+        let published = issue(
+            &k,
+            Verb::Sink,
+            &pending[0],
+            &[("decision", "publish")],
+            &cap(),
+        )
+        .unwrap();
+        let published = body(&published);
+        assert!(
+            published.starts_with("urn:iki:annotation:"),
+            "publishing answers with the annotation it minted: {published}"
+        );
+
+        // JSON: one axis, two kinds, provenance on every row — and the
+        // machine row is there because a person put it there.
+        let listing = json(&k, "urn:repo:demo:annotations:a.rs", &[]);
+        let rows = listing.as_array().unwrap();
+        assert_eq!(rows.len(), 2, "one published finding, one human note");
+        let machine: Vec<bool> = rows.iter().map(|r| r["machine"] == true).collect();
+        assert_eq!(machine, [true, false], "reading order: the quote, gamma");
+        assert_eq!(rows[1]["motivation"], "commenting");
+        assert_eq!(rows[1]["creator"], serde_json::Value::Null);
+        assert_eq!(rows[0]["motivation"], "assessing");
+        assert!(rows[0]["generated_by"]
+            .as_str()
+            .unwrap()
+            .starts_with("urn:ikigai:browse:review:demo:sha256:"));
+        // ★ The published annotation points back at the finding it was rated
+        // against, so the model's proposal is one hop from the published note.
+        assert_eq!(
+            rows[0]["derived_from"],
+            serde_json::Value::String(pending[0].clone())
+        );
+
+        // The file HTML face: hollow machine markers, solid human dot, the
+        // model identity on the machine cards.
+        let html = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:file:a.rs",
+                &[("as", "text/html")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert!(html.contains("browse-annotation-marker-machine"), "{html}");
+        assert!(html.contains("○"), "{html}");
+        assert!(html.contains("●"), "{html}");
+        assert!(html.contains("browse-annotation-machine"), "{html}");
+        assert!(html.contains("review by r1"), "{html}");
+
+        // The text margin labels the machine rows.
+        let text = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:file:a.rs",
+                &[("annotations", "include")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert!(text.contains("[review:r1]"), "{text}");
+        assert!(text.contains("a human margin note"), "{text}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_misquoted_finding_is_counted_not_fatal() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let with_bad = format!(
+            "{TWO_FINDINGS}QUOTE: fn missing() {{}}\nNOTE: this quote is not in the file.\n"
+        );
+        let k = kernel_with(&root, &store, &log, &with_bad);
+
+        let pass = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(pass["minted"].as_array().unwrap().len(), 2);
+        assert_eq!(pass["orphaned_items"], 1);
+        // The count survives into the archived entry (the hit serves it too).
+        let hit = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(hit["orphaned_items"], 1);
+        assert_eq!(log.count(), 1);
+        // And the plain face names it.
+        let text =
+            body(&issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).unwrap());
+        assert!(text.contains("1 item(s) did not anchor"), "{text}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_unusable_review_is_an_error_and_never_archived() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+
+        // Nothing parseable at all: error, nothing archived, retry re-asks —
+        // and the error CARRIES the answer's opening plus the debug=raw
+        // affordance (the collapse must be diagnosable from the error).
+        let k = kernel_with(&root, &store, &log, "I think this file is nice overall.");
+        let err = issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).unwrap_err();
+        assert!(format!("{err:?}").contains("no parseable"), "{err:?}");
+        assert!(
+            format!("{err:?}").contains("I think this file is nice overall."),
+            "{err:?}"
+        );
+        assert!(format!("{err:?}").contains("debug=raw"), "{err:?}");
+        let err = issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).unwrap_err();
+        assert!(format!("{err:?}").contains("no parseable"), "{err:?}");
+        assert_eq!(log.count(), 2, "an unarchived pass re-derives");
+        let listing = json(&k, "urn:repo:demo:findings:a.rs", &[]);
+        assert_eq!(listing.as_array().unwrap().len(), 0, "nothing minted");
+
+        // Every quote misquoted: likewise fatal, nothing minted or archived.
+        let store2 = Arc::new(Store::new().unwrap());
+        let k2 = kernel_with(
+            &root,
+            &store2,
+            &log,
+            "QUOTE: fn nowhere() {}\nNOTE: a ghost finding.\n",
+        );
+        let err = issue(&k2, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).unwrap_err();
+        assert!(format!("{err:?}").contains("anchored"), "{err:?}");
+        let listing = json(&k2, "urn:repo:demo:findings:a.rs", &[]);
+        assert_eq!(listing.as_array().unwrap().len(), 0);
+
+        // ⚠ A COLLAPSE WEARING A CLEAN ANSWER'S CLOTHES. The sentinel is here,
+        // but so is the wreckage of a finding the model started and never
+        // finished — so the answer is evidence that it had something to say,
+        // not that it had nothing. Archiving it would record a false all-clear
+        // under a key that never re-derives, which is the worst outcome
+        // available: wrong, durable, and trusted.
+        let store3 = Arc::new(Store::new().unwrap());
+        let k3 = kernel_with(
+            &root,
+            &store3,
+            &log,
+            "QUOTE: fn alpha() {}\nNOTHING ABOVE THRESHOLD\n",
+        );
+        let err = issue(&k3, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).unwrap_err();
+        assert!(format!("{err:?}").contains("no parseable"), "{err:?}");
+        assert!(
+            format!("{err:?}").contains(NOTHING_ABOVE_THRESHOLD),
+            "the error names the statement the answer failed to make: {err:?}"
+        );
+        assert!(
+            issue(&k3, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).is_err(),
+            "an unarchived pass re-derives"
+        );
+
+        // And a mere MENTION of the threshold in prose is not the statement:
+        // a lax match would read a model musing about the bar as a clean bill
+        // of health, and a false all-clear is worse than no report.
+        let store4 = Arc::new(Store::new().unwrap());
+        let k4 = kernel_with(
+            &root,
+            &store4,
+            &log,
+            "I considered whether anything here is NOTHING ABOVE THRESHOLD worthy.\n",
+        );
+        assert!(issue(&k4, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).is_err());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_changed_file_gets_a_fresh_pass_and_the_old_notes_drift() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, TWO_FINDINGS);
+        issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).unwrap();
+
+        // beta is edited away, a line lands above alpha: the next review is a
+        // fresh pass (new hash, new mints)…
+        std::fs::write(root.join("a.rs"), "// new\nfn alpha() {}\nfn gamma() {}\n").unwrap();
+        let fresh = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(fresh["derived"], true);
+        assert_eq!(log.count(), 2);
+
+        // …while the FIRST pass's findings re-anchor or orphan exactly like
+        // annotations do — the drift is the review history, kept visible.
+        // ★ A pending finding gets THE drift story, not a second one: a
+        // finding whose file has since changed is stale by construction, and
+        // the answer to that already existed.
+        //
+        // ★ `state=all`, because pass one's findings are no longer PENDING: the
+        // second pass is the file's current reading and carries neither of
+        // them, so both are superseded (ledger #504) — still listed, still
+        // drift-reconciled, still answerable, just out of the pending queue.
+        let listing = json(&k, "urn:repo:demo:findings:a.rs", &[("state", "all")]);
+        let rows = listing.as_array().unwrap();
+        assert_eq!(rows.len(), 3, "2 from pass one + 1 anchoring from pass two");
+        let pass_two = fresh["minted"].as_array().unwrap();
+        for row in rows {
+            match pass_two.contains(&row["iri"]) {
+                true => assert_eq!(row["state"], "pending", "{row}"),
+                false => assert_eq!(row["state"], "superseded", "{row}"),
+            }
+        }
+        assert_eq!(
+            json(&k, "urn:repo:demo:findings:a.rs", &[])
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "the pending queue is what the current review stands behind"
+        );
+        let alpha_old: Vec<&serde_json::Value> = rows
+            .iter()
+            .filter(|r| r["exact"] == "fn alpha() {}" && r["reanchored"] == true)
+            .collect();
+        assert_eq!(
+            alpha_old.len(),
+            1,
+            "pass one's alpha re-anchored: {listing}"
+        );
+        let beta: Vec<&serde_json::Value> = rows
+            .iter()
+            .filter(|r| r["exact"] == "fn beta() {}")
+            .collect();
+        assert_eq!(beta.len(), 1);
+        assert_eq!(beta[0]["orphaned"], true, "pass one's beta orphaned");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★★ **The safety interlock, in one test.** A review pass needs browse
+    /// and net and nothing else — so a headless git-event trigger can run
+    /// without the authority to publish anything — and publishing needs
+    /// `urn:cap:annotate`, which is the authority nobody has by accident.
+    #[test]
+    fn a_review_runs_unarmed_and_only_publishing_needs_annotate() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, TWO_FINDINGS);
+
+        for missing in [
+            // No net: the pass asks a model — denied at baseline.
+            Capability::scoped(["urn:cap:browse:read:demo", CAP_ANNOTATE]),
+            // No browse grant at all.
+            Capability::scoped(["urn:cap:net:localhost", CAP_ANNOTATE]),
+        ] {
+            let err =
+                issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &missing).unwrap_err();
+            assert!(matches!(err, Error::Denied(_)), "{err:?}");
+        }
+        // A browse grant on the WRONG root: past the baseline wildcard,
+        // denied by the per-root check.
+        let wrong = Capability::scoped([
+            "urn:cap:browse:read:other",
+            "urn:cap:net:localhost",
+            CAP_ANNOTATE,
+        ]);
+        let err = issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &wrong).unwrap_err();
+        assert!(matches!(err, Error::Denied(_)), "{err:?}");
+        assert_eq!(log.count(), 0, "no ask ever left");
+
+        // ★ THE TRIGGER'S GRANT: browse + net, no annotate. The pass runs,
+        // the findings land, and nothing is published.
+        let unarmed = Capability::scoped(["urn:cap:browse:read:demo", "urn:cap:net:localhost"]);
+        let pass = issue(
+            &k,
+            Verb::Source,
+            "urn:repo:demo:review:a.rs",
+            &[("as", "application/json")],
+            &unarmed,
+        )
+        .unwrap();
+        let pass: serde_json::Value = serde_json::from_str(&body(&pass)).unwrap();
+        let pending: Vec<String> = pass["minted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(log.count(), 1, "the unarmed pass really derived");
+
+        // …and that same grant cannot publish one of them.
+        let denied = issue(
+            &k,
+            Verb::Sink,
+            &pending[0],
+            &[("decision", "publish")],
+            &unarmed,
+        )
+        .unwrap_err();
+        assert!(matches!(denied, Error::Denied(_)), "{denied:?}");
+        let annotations = json(&k, "urn:repo:demo:annotations:a.rs", &[]);
+        assert_eq!(annotations.as_array().unwrap().len(), 0, "{annotations}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_turtle_faces_record_the_provenance() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, TWO_FINDINGS);
+
+        let out = issue(
+            &k,
+            Verb::Source,
+            "urn:repo:demo:review:a.rs",
+            &[("as", "text/turtle")],
+            &cap(),
+        )
+        .unwrap();
+        assert_eq!(out.repr_type.media_type, "text/turtle");
+        let triples: Vec<_> = oxttl::TurtleParser::new()
+            .for_slice(out.bytes.as_slice())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap_or_else(|e| panic!("turtle face must parse: {e}\n{}", body(&out)));
+        assert!(!triples.is_empty());
+        for t in &triples {
+            assert!(!t.subject.to_string().starts_with("_:"), "no blank nodes");
+        }
+        let ttl = body(&out);
+        assert!(ttl.contains("a ik:Review"), "{ttl}");
+        assert!(ttl.contains("prov:used <urn:repo:demo:file:a.rs>"), "{ttl}");
+        // ⚠ The pass generated FINDINGS, not annotations: the entry's
+        // `prov:generated` is the pending set a human has yet to answer.
+        assert!(ttl.contains("prov:generated <urn:iki:finding:"), "{ttl}");
+        assert!(!ttl.contains("urn:iki:annotation:"), "{ttl}");
+        assert!(ttl.contains("ik:versionTag \"review-v5@r1\""), "{ttl}");
+        assert!(
+            ttl.contains("ik:orphanedItems \"0\"^^xsd:nonNegativeInteger"),
+            "{ttl}"
+        );
+        assert!(
+            ttl.contains(&format!(
+                "ik:totalBytes \"{}\"^^xsd:nonNegativeInteger",
+                CONTENT.len()
+            )),
+            "{ttl}"
+        );
+
+        // The minted findings' own turtle carries the standard provenance —
+        // and NOT `oa:Annotation`, nor any `oa:` term whose domain would
+        // entail it.
+        let ttl = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:findings:a.rs",
+                &[("as", "text/turtle")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert!(ttl.contains("dcterms:creator \"r1\""), "{ttl}");
+        assert!(ttl.contains("a prov:Entity"), "{ttl}");
+        assert!(
+            ttl.contains("sh:resultSeverity <urn:iki:severity:"),
+            "{ttl}"
+        );
+        assert!(!ttl.contains("a oa:Annotation"), "{ttl}");
+        assert!(!ttl.contains("oa:bodyValue"), "{ttl}");
+        assert!(!ttl.contains("oa:motivatedBy"), "{ttl}");
+        assert!(
+            ttl.contains("prov:wasGeneratedBy <urn:ikigai:browse:review:"),
+            "{ttl}"
+        );
+        let triples: Vec<_> = oxttl::TurtleParser::new()
+            .for_slice(ttl.as_bytes())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap_or_else(|e| panic!("annotation turtle must parse: {e}\n{ttl}"));
+        assert!(!triples.is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_empty_file_is_refused_rather_than_reported_clean() {
+        let root = temp_dir();
+        std::fs::write(root.join("empty.rs"), "").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, TWO_FINDINGS);
+
+        let err = issue(
+            &k,
+            Verb::Source,
+            "urn:repo:demo:review:empty.rs",
+            &[],
+            &cap(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument { .. }), "{err:?}");
+        assert_eq!(log.count(), 0, "an empty file costs no model call");
+        assert!(store.is_empty().unwrap(), "and archives no clean pass");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn directories_and_binaries_are_not_reviewable() {
+        let root = demo_root();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("img.png"), [0x89, 0x50, 0x4E, 0x47, 0x00, 0xFF]).unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, TWO_FINDINGS);
+
+        let err = issue(&k, Verb::Source, "urn:repo:demo:review:sub", &[], &cap()).unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+        let err = issue(
+            &k,
+            Verb::Source,
+            "urn:repo:demo:review:img.png",
+            &[],
+            &cap(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument { .. }), "{err:?}");
+        assert_eq!(log.count(), 0);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn describe_declares_the_capability_contract() {
+        let roots: Roots = Arc::new(std::collections::BTreeMap::from([(
+            "demo".to_string(),
+            PathBuf::from("/tmp"),
+        )]));
+        let config = Arc::new(ExplainConfig::new(Arc::new(Store::new().unwrap())));
+        let endpoint = ReviewEndpoint { roots, config };
+        let description = endpoint.describe();
+        for cap in [CAP_WILDCARD, CAP_NET] {
+            assert!(
+                description.requires.contains(&cap.to_string()),
+                "missing {cap}"
+            );
+        }
+        // ★ And NOT annotate. Declared = enforced in both directions: a pass
+        // that cannot reach the annotation family must not demand the
+        // authority to, or every trigger has to be armed to run at all.
+        assert!(
+            !description.requires.contains(&CAP_ANNOTATE.to_string()),
+            "the pass mints pending findings; publishing is the only annotate act"
+        );
+        // No `repo` ArgSpec: rows fix the root; the binding is
+        // grammar-injected.
+        let names: Vec<&str> = description.inputs.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["path", "provider", "as", "debug"]);
+
+        // The manifold publishes the allowlist: `provider`'s one_of IS what
+        // this host permits, so validate can reject before dispatch and a UI
+        // can build its "review with" menu from the description alone. On a
+        // default config every tier points at one of two backends, so the set
+        // is the same two explain offers — no new reach.
+        let provider_spec = description
+            .inputs
+            .iter()
+            .find(|i| i.name == "provider")
+            .unwrap();
+        assert_eq!(provider_spec.one_of, ["urn:llm:ask", "urn:llm:coder:ask"]);
+    }
+
+    #[test]
+    fn debug_raw_returns_the_unparsed_answer_and_touches_nothing() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, TWO_FINDINGS);
+
+        // An archived pass first — the probe must bypass it, not serve it.
+        issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).unwrap();
+        assert_eq!(log.count(), 1);
+
+        let raw = issue(
+            &k,
+            Verb::Source,
+            "urn:repo:demo:review:a.rs",
+            &[("debug", "raw")],
+            &cap(),
+        )
+        .unwrap();
+        assert_eq!(raw.repr_type.media_type, "text/plain");
+        assert_eq!(body(&raw), TWO_FINDINGS, "the answer verbatim, unparsed");
+        assert_eq!(log.count(), 2, "a fresh ask, not the archive hit");
+        // Nothing new minted by the probe.
+        let listing = json(&k, "urn:repo:demo:findings:a.rs", &[]);
+        assert_eq!(listing.as_array().unwrap().len(), 2);
+
+        // The probe works where the normal pass FAILS — the whole point.
+        let store2 = Arc::new(Store::new().unwrap());
+        let log2 = Arc::new(Log::default());
+        let k2 = kernel_with(&root, &store2, &log2, "label-free musings about the file");
+        let raw = issue(
+            &k2,
+            Verb::Source,
+            "urn:repo:demo:review:a.rs",
+            &[("debug", "raw")],
+            &cap(),
+        )
+        .unwrap();
+        assert_eq!(body(&raw), "label-free musings about the file");
+        let listing = json(&k2, "urn:repo:demo:findings:a.rs", &[]);
+        assert_eq!(listing.as_array().unwrap().len(), 0, "nothing minted");
+
+        // An unknown debug face is a typed argument error, no ask spent.
+        let err = issue(
+            &k2,
+            Verb::Source,
+            "urn:repo:demo:review:a.rs",
+            &[("debug", "verbose")],
+            &cap(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument { .. }), "{err:?}");
+        assert_eq!(log2.count(), 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★ WHAT THIS TEST USED TO PIN IS NOW THE DEFECT. It was
+    /// `a_truncated_input_is_reported_honestly`: a 20-byte ceiling over a
+    /// 41-byte file, the model shown a prefix, the faces honest about it. v5
+    /// keeps the honesty and removes the need for it — the same ceiling is now
+    /// a region size, every line reaches some call, and the pass covers the
+    /// file. The property that made truncation survivable is the property that
+    /// makes chunking cheap, and it is asserted here: a quote is anchored
+    /// against the WHOLE text, never against what one call was shown.
+    #[test]
+    fn a_file_split_across_regions_anchors_against_the_whole_text() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        // Every region answers with the SAME two findings, one of which quotes
+        // a line no region but the first can see. All of them anchor, and the
+        // repeats collapse to two findings rather than 2× the region count.
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            20,
+            16,
+            &[TWO_FINDINGS, TWO_FINDINGS, TWO_FINDINGS, TWO_FINDINGS],
+        );
+
+        let pass = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(pass["reviewed_bytes"], CONTENT.len());
+        assert_eq!(pass["total_bytes"], CONTENT.len());
+        assert_eq!(pass["minted"].as_array().unwrap().len(), 2, "{pass}");
+        // No call was ever handed a truncation marker: there is no truncation.
+        for (prompt, _, _) in log.asks.lock().unwrap().iter() {
+            assert!(!prompt.contains("(content truncated)"), "{prompt}");
+        }
+
+        let calls = log.count();
+        let hit = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(hit["derived"], false);
+        assert_eq!(log.count(), calls, "the hit spends nothing");
+        let text =
+            body(&issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).unwrap());
+        assert!(
+            text.contains(&format!(
+                "reviewed the whole file ({} bytes)",
+                CONTENT.len()
+            )),
+            "{text}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn parse_findings_is_tolerant_of_model_wrapping() {
+        // Preamble ignored, wrapped notes joined, stray NOTE counted, a
+        // QUOTE without a note counted.
+        let answer = "Here are my findings:\n\
+             NOTE: stray with no quote\n\
+             QUOTE: fn alpha() {}\n\
+             NOTE: first line\n\
+             wrapped second line\n\
+             QUOTE: fn beta() {}\n\
+             NOTE: fine\n\
+             QUOTE: fn gamma() {}\n";
+        let (findings, malformed) = parse_findings(answer);
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[0].quote, "fn alpha() {}");
+        assert_eq!(findings[0].note, "first line wrapped second line");
+        assert_eq!(findings[1].note, "fine");
+        assert_eq!(malformed, 2, "the stray NOTE and the noteless QUOTE");
+    }
+
+    /// ★ Since 0.8.0 this also pins the TAG half of the region memo's key: the
+    /// alt backend reviews the very bytes `r1` just memoized, and it must still
+    /// ask (`alt_log.count() == 1` below) — a memo keyed on content alone would
+    /// hand `r1`'s findings to a pass attributed to `alt`.
+    #[test]
+    fn a_second_provider_derives_a_second_coexisting_pass() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let alt_log = Arc::new(Log::default());
+        let k = kernel_with_alt(&root, &store, &log, &alt_log, |c| {
+            c.allow_provider(ALT_PROVIDER)
+        });
+
+        // The configured backend first.
+        let first = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(first["derived"], true);
+        assert_eq!(first["version_tag"], "review-v5@r1");
+        assert_eq!(first["minted"].as_array().unwrap().len(), 2);
+        assert_eq!((log.count(), alt_log.count()), (1, 0));
+
+        // The second backend over the SAME content: a different model
+        // identity is a different key, so this derives rather than hitting —
+        // and the operator's `review_model_label` does not follow it.
+        let second = json(
+            &k,
+            "urn:repo:demo:review:a.rs",
+            &[("provider", ALT_PROVIDER)],
+        );
+        assert_eq!(second["derived"], true);
+        assert_eq!(second["version_tag"], "review-v5@alt");
+        assert_eq!(second["model"], "alt");
+        assert_eq!(second["minted"].as_array().unwrap().len(), 1);
+        assert_eq!((log.count(), alt_log.count()), (1, 1));
+        assert_ne!(first["minted"], second["minted"]);
+
+        // ★ COEXISTING, not replacing: the first pass is still there, still a
+        // hit, still its own findings — and the file's one QUEUE now carries
+        // both reviewers' margins, each awaiting the same human.
+        let again = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(again["derived"], false, "the first pass was overwritten");
+        assert_eq!(again["version_tag"], "review-v5@r1");
+        assert_eq!(again["minted"], first["minted"]);
+        let alt_again = json(
+            &k,
+            "urn:repo:demo:review:a.rs",
+            &[("provider", ALT_PROVIDER)],
+        );
+        assert_eq!(alt_again["derived"], false);
+        assert_eq!(alt_again["minted"], second["minted"]);
+        assert_eq!(
+            (log.count(), alt_log.count()),
+            (1, 1),
+            "neither hit may re-ask"
+        );
+
+        let listing = json(&k, "urn:repo:demo:findings:a.rs", &[]);
+        let rows = listing.as_array().unwrap();
+        assert_eq!(rows.len(), 3, "two passes' findings on one axis: {rows:?}");
+        let creators: Vec<&str> = rows
+            .iter()
+            .map(|r| r["creator"].as_str().unwrap())
+            .collect();
+        // ⚠ TRIAGE order, not reading order — the queue's whole job. r1's
+        // beta is `minor`, alt gave no SEVERITY at all (so it sorts with
+        // `info`), r1's alpha is `praise`.
+        assert_eq!(creators, ["r1", "alt", "r1"], "{rows:?}");
+        let severities: Vec<&serde_json::Value> = rows.iter().map(|r| &r["severity"]).collect();
+        assert_eq!(
+            severities,
+            [
+                &serde_json::Value::String("minor".into()),
+                &serde_json::Value::Null,
+                &serde_json::Value::String("praise".into())
+            ],
+            "an unrated finding is kept unrated, never defaulted: {rows:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_provider_this_host_does_not_offer_is_refused_before_any_ask() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let alt_log = Arc::new(Log::default());
+        // Bound, but NOT in the operator's selectable set.
+        let k = kernel_with_alt(&root, &store, &log, &alt_log, |c| c);
+
+        let err = issue(
+            &k,
+            Verb::Source,
+            "urn:repo:demo:review:a.rs",
+            &[("provider", ALT_PROVIDER)],
+            &cap(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Denied(_)), "{err:?}");
+        let message = err.to_string();
+        assert!(message.contains(ALT_PROVIDER), "{message}");
+        assert!(
+            message.contains(PROVIDER),
+            "names what IS on offer: {message}"
+        );
+        assert_eq!(
+            (log.count(), alt_log.count()),
+            (0, 0),
+            "refused before any work"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_distinct_review_tier_is_selectable_as_itself() {
+        // ★ THE TRAP THIS ARC CLOSED. `selectable()` held the two explain
+        // tiers only, so on a host whose review tier is a DIFFERENT backend,
+        // `provider=<the review default>` — the manifold naming exactly what
+        // the server does when asked nothing — came back Denied. It never
+        // showed on our host because there the review tier equals the file
+        // tier.
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let alt_log = Arc::new(Log::default());
+        let k = kernel_with_alt(&root, &store, &log, &alt_log, |c| {
+            c.review_provider(ALT_PROVIDER)
+        });
+
+        let pass = json(
+            &k,
+            "urn:repo:demo:review:a.rs",
+            &[("provider", ALT_PROVIDER)],
+        );
+        assert_eq!(pass["derived"], true);
+        assert_eq!(
+            pass["version_tag"], "review-v5@r1",
+            "the configured tier keeps its label"
+        );
+        assert_eq!((log.count(), alt_log.count()), (0, 1));
+
+        // And the manifold says so: the one_of a UI builds its menu from.
+        let description = review_description(
+            &ExplainConfig::new(Arc::clone(&store)).review_provider(ALT_PROVIDER),
+        );
+        let provider = description
+            .inputs
+            .iter()
+            .find(|a| a.name == "provider")
+            .expect("review declares provider");
+        assert!(
+            provider.one_of.iter().any(|v| v == ALT_PROVIDER),
+            "{:?}",
+            provider.one_of
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // --- the review affordance and its "review with…" menu ------------------
+
+    /// Two backends on ONE model (`coder` — the configured review tier — and
+    /// `alt` both serve `same:1b`), a third on its own that the bare
+    /// `urn:llm:ask` facade routes to.
+    const INVENTORY: &str = r#"{
+        "default": "gp",
+        "models": {
+            "coder": {"backend": "urn:llm:coder:ask", "model": "same:1b"},
+            "alt":   {"backend": "urn:llm:alt:ask",   "model": "same:1b"},
+            "gp":    {"backend": "urn:llm:gp:ask",    "model": "big:70b"}
+        }
+    }"#;
+
+    /// A fake `urn:llm:models` over a literal inventory, COUNTING resolves —
+    /// the counter is how these tests observe that rendering a file costs no
+    /// inventory read and opening its menu costs exactly one.
+    fn fake_models_space(body: &str, calls: &Arc<AtomicU32>) -> EndpointSpace {
+        let text = body.to_string();
+        let counter = Arc::clone(calls);
+        EndpointSpace::new().bind(
+            Exact::new("urn:llm:models"),
+            FnEndpoint::new("fake-llm-models", move |_inv: &Invocation<'_>| {
+                counter.fetch_add(1, Ordering::Relaxed);
+                Ok(repr("application/json", text.clone()))
+            })
+            .with_description(Description::new("fake-llm-models").verb(Verb::Source)),
+        )
+    }
+
+    /// A counted backend at an arbitrary provider IRI — the menu may offer any
+    /// selectable one, and the "everything offered is accepted" test actually
+    /// clicks them.
+    fn fake_llm_at(iri: &str, log: &Arc<Log>, reply: &str) -> EndpointSpace {
+        let log = Arc::clone(log);
+        let reply = reply.to_string();
+        EndpointSpace::new().bind(
+            Exact::new(iri),
+            FnEndpoint::new("fake-any-llm", move |inv: &Invocation<'_>| {
+                log.asks.lock().unwrap().push((
+                    inv.inline_str("prompt").unwrap_or("").to_string(),
+                    inv.inline_str("system").unwrap_or("").to_string(),
+                    inv.inline_str("max_tokens").unwrap_or("").to_string(),
+                ));
+                Ok(repr_utf8("text/plain", reply.clone()))
+            })
+            .with_description(
+                Description::new("fake-any-llm")
+                    .verb(Verb::Source)
+                    .requires(CAP_NET),
+            ),
+        )
+    }
+
+    /// Browse, the inventory, and every backend the inventory names.
+    fn kernel_with_menu(
+        root: &std::path::Path,
+        store: &Arc<Store>,
+        log: &Arc<Log>,
+        calls: &Arc<AtomicU32>,
+        config: impl FnOnce(ExplainConfig) -> ExplainConfig,
+    ) -> Kernel {
+        let cfg = config(ExplainConfig::new(Arc::clone(store)));
+        let browse = crate::space_with_explain(vec![("demo".to_string(), root.to_path_buf())], cfg);
+        Kernel::new(Arc::new(Fallback::new(vec![
+            Arc::new(browse),
+            Arc::new(fake_models_space(INVENTORY, calls)),
+            Arc::new(fake_llm_at(PROVIDER, log, TWO_FINDINGS)),
+            Arc::new(fake_llm_at(ALT_PROVIDER, log, ALT_FINDINGS)),
+            Arc::new(fake_llm_at("urn:llm:ask", log, TWO_FINDINGS)),
+        ])))
+    }
+
+    fn html_face(kernel: &Kernel, iri: &str) -> String {
+        body(&issue(kernel, Verb::Source, iri, &[("as", "text/html")], &cap()).unwrap())
+    }
+
+    /// Every `provider=` a menu emits, in order.
+    fn offered_providers(html: &str) -> Vec<String> {
+        html.match_indices("provider=")
+            .map(|(i, _)| {
+                html[i + "provider=".len()..]
+                    .split(['"', ' '])
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// ★ THE COST DISCIPLINE, which is the good part of the explain menu and
+    /// is preserved here: a file view pays NOTHING for the menu, and opening
+    /// it pays one inventory read — never a probe per backend, and never an
+    /// inference call. Opening a menu must not cost what the menu exists to
+    /// let you decide about.
+    #[test]
+    fn opening_the_review_menu_costs_one_inventory_read_and_no_model_call() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let calls = Arc::new(AtomicU32::new(0));
+        let k = kernel_with_menu(&root, &store, &log, &calls, |c| {
+            c.allow_provider(ALT_PROVIDER)
+        });
+
+        // Rendering the file: the button and the closed disclosure, and not a
+        // single sub-request for either.
+        let page = html_face(&k, "urn:repo:demo:file:a.rs");
+        assert_eq!(page.matches("browse-review-link").count(), 1, "{page}");
+        assert_eq!(page.matches("browse-review-menu\"").count(), 1, "{page}");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "a file view must not fan out"
+        );
+        assert_eq!(log.count(), 0);
+
+        // Opening it: one inventory read, no ask.
+        let menu = html_face(&k, "urn:repo:demo:review-options:a.rs");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(log.count(), 0, "a menu never derives");
+        assert!(menu.contains("same:1b"), "{menu}");
+
+        // And a second open is a second read, not a fan-out: the count tracks
+        // opens, so the assertion above is about the menu and not about a
+        // cache that happens to be warm.
+        html_face(&k, "urn:repo:demo:review-options:a.rs");
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(log.count(), 0);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★ ONE ROW PER MODEL, because the review archive keys on the model: two
+    /// backends serving one model key ONE pass, so a second row would offer a
+    /// review it cannot produce and its no-op would read as a bug.
+    #[test]
+    fn two_backends_serving_one_model_are_one_review_row() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let calls = Arc::new(AtomicU32::new(0));
+        let k = kernel_with_menu(&root, &store, &log, &calls, |c| {
+            c.allow_provider(ALT_PROVIDER)
+        });
+
+        let menu = html_face(&k, "urn:repo:demo:review-options:a.rs");
+        // {coder, alt} serve same:1b; the bare facade serves big:70b. Three
+        // selectable providers, TWO rows.
+        assert_eq!(menu.matches("same:1b").count(), 1, "{menu}");
+        let offered = offered_providers(&menu);
+        assert_eq!(offered.len(), 2, "{menu}");
+        // The backends are named as a fact beside the row, never offered as a
+        // second button.
+        assert!(menu.contains("served by coder, alt"), "{menu}");
+        // The row's button names the CONFIGURED review tier, not the
+        // alphabetically first of the pair: which backend answers cannot
+        // change the archive key, but it does decide which machine spends the
+        // time on a miss.
+        assert!(offered.contains(&PROVIDER.to_string()), "{menu}");
+        assert!(!offered.contains(&ALT_PROVIDER.to_string()), "{menu}");
+        // The row a plain `review` click already takes is marked as such.
+        assert!(menu.contains("default for review"), "{menu}");
+        // And the panel says why there is one row, in the markup itself.
+        assert!(
+            menu.contains("One row per model, not per backend"),
+            "{menu}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The menu is the host's allowlist, never a hard-coded list — so it can
+    /// never render a click that comes back `Denied`, and never omits one the
+    /// operator allowed.
+    #[test]
+    fn the_menu_offers_exactly_what_review_accepts_and_never_more() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let calls = Arc::new(AtomicU32::new(0));
+        let k = kernel_with_menu(&root, &store, &log, &calls, |c| {
+            c.allow_provider(ALT_PROVIDER)
+        });
+
+        let menu = html_face(&k, "urn:repo:demo:review-options:a.rs");
+        for provider in offered_providers(&menu) {
+            assert!(
+                issue(
+                    &k,
+                    Verb::Source,
+                    "urn:repo:demo:review:a.rs",
+                    &[("provider", &provider)],
+                    &cap(),
+                )
+                .is_ok(),
+                "the menu offered `{provider}`, which review refused"
+            );
+        }
+        // A backend the inventory names and the operator did NOT allow is
+        // absent — the manifold's one_of and the menu are the same set.
+        assert!(!menu.contains("urn:llm:gp:ask"), "{menu}");
+        assert!(!menu.contains("big:70b\n"), "{menu}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Reading what is on offer is not spending, so the menu asks for the
+    /// browse grant alone. It could not have lived on `browse-review`, which
+    /// DECLARES net and annotate because it spends and mints — a browse-only
+    /// session would have been refused its own menu.
+    #[test]
+    fn the_menu_needs_neither_a_net_nor_an_annotate_grant() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let calls = Arc::new(AtomicU32::new(0));
+        let k = kernel_with_menu(&root, &store, &log, &calls, |c| c);
+        let browse_only = Capability::scoped(["urn:cap:browse:read:demo"]);
+
+        let menu = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:review-options:a.rs",
+                &[("as", "text/html")],
+                &browse_only,
+            )
+            .expect("a browse grant reads what is on offer"),
+        );
+        assert!(menu.contains("browse-review-menu-panel"), "{menu}");
+        // The pass itself stays refused under the same capability — the menu
+        // shows the door, it does not open it.
+        let denied = issue(
+            &k,
+            Verb::Source,
+            "urn:repo:demo:review:a.rs",
+            &[],
+            &browse_only,
+        );
+        assert!(matches!(denied, Err(Error::Denied(_))), "{denied:?}");
+        assert_eq!(log.count(), 0);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★ THE INVARIANT: the button is a CALLER, not a second implementation.
+    ///
+    /// Everything the affordance emits names `urn:repo:{repo}:review:{path}`
+    /// and adds nothing but a FACE (and, from a menu row, the `provider=` the
+    /// manifold already declares). So a git-event trigger firing the same IRI
+    /// with a different cause lands on the same archive key and serves the
+    /// same minted annotations — which is what the second half asserts: the
+    /// button's exact call derives, and the trigger's exact call is a HIT on
+    /// it, same tag, same minted set.
+    #[test]
+    fn the_button_and_a_trigger_are_one_call_with_two_causes() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let calls = Arc::new(AtomicU32::new(0));
+        let k = kernel_with_menu(&root, &store, &log, &calls, |c| {
+            c.allow_provider(ALT_PROVIDER)
+        });
+
+        // What the markup asks for, read off the page rather than from the
+        // helper that wrote it.
+        let page = html_face(&k, "urn:repo:demo:file:a.rs");
+        assert!(
+            page.contains(
+                "hx-get=\"/k/source urn:repo:demo:review:a.rs as=text/html\" \
+                 hx-target=\"#browse\""
+            ),
+            "the plain button must add nothing but the face: {page}"
+        );
+        let menu = html_face(&k, "urn:repo:demo:review-options:a.rs");
+        assert!(
+            menu.contains(&format!(
+                "hx-get=\"/k/source urn:repo:demo:review:a.rs as=text/html provider={PROVIDER}\""
+            )),
+            "a menu row must add nothing but the face and provider=: {menu}"
+        );
+        // Nothing else is reachable from either: no second annotation path, no
+        // prompt of the UI's own.
+        assert!(!page.contains("urn:iki:annotation:mint"), "{page}");
+
+        // The button's call, verbatim.
+        let clicked = issue(
+            &k,
+            Verb::Source,
+            "urn:repo:demo:review:a.rs",
+            &[("as", "text/html")],
+            &cap(),
+        )
+        .unwrap();
+        assert!(body(&clicked).contains("review by"), "{}", body(&clicked));
+        assert_eq!(log.count(), 1, "the click derived");
+
+        // A trigger's call, verbatim — same IRI, no provider, a machine's
+        // face. It is an archive HIT on what the click derived: same tag, and
+        // the same minted annotations, not a second pass.
+        let triggered = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(triggered["derived"], false, "a trigger must not re-derive");
+        // The tag folds `urn:llm:{p}:model`, which this fixture does not bind,
+        // so it falls back to the provider heuristic — the documented
+        // asymmetry between what a MENU can learn (the cheap inventory) and
+        // what a TAG resolves (the per-provider identity). What matters here
+        // is that both causes land on the ONE tag, whichever it is.
+        assert_eq!(triggered["version_tag"], "review-v5@coder");
+        assert_eq!(log.count(), 1, "the trigger paid nothing");
+        assert_eq!(
+            triggered["minted"].as_array().unwrap().len(),
+            2,
+            "the trigger serves the click's findings"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The menu renders on a host with no llm module bound at all: the
+    /// configured tier is still offered, labelled by the same provider
+    /// heuristic its version tag falls back to.
+    #[test]
+    fn the_review_menu_renders_with_no_inventory_bound() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let browse = crate::space_with_explain(
+            vec![("demo".to_string(), root.clone())],
+            ExplainConfig::new(Arc::clone(&store)),
+        );
+        let k = Kernel::new(Arc::new(browse));
+
+        let menu = html_face(&k, "urn:repo:demo:review-options:a.rs");
+        let offered = offered_providers(&menu);
+        assert!(offered.contains(&PROVIDER.to_string()), "{menu}");
+        assert!(menu.contains(">coder</button>"), "{menu}");
+        assert!(menu.contains("backend reports no model id"), "{menu}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A directory has no review affordance, because it has no review: the
+    /// pass is file-grain (findings anchor in text), so a tree-level button
+    /// would be an affordance whose only possible answer is a refusal.
+    #[test]
+    fn a_directory_offers_no_review_and_the_pass_refuses_one() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let calls = Arc::new(AtomicU32::new(0));
+        let k = kernel_with_menu(&root, &store, &log, &calls, |c| c);
+
+        let tree = html_face(&k, "urn:repo:demo:tree");
+        assert!(!tree.contains("browse-review-link"), "{tree}");
+        assert!(!tree.contains("browse-review-menu"), "{tree}");
+        // And the resource agrees, for the reason the markup encodes.
+        let refused = issue(&k, Verb::Source, "urn:repo:demo:review:", &[], &cap());
+        assert!(refused.is_err(), "{refused:?}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+}

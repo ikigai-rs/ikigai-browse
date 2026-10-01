@@ -1,0 +1,147 @@
+[package]
+name = "ikigai-embedded"
+description = "In-process transport: composes a kernel directly in the host process."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# The durable RDF store (`urn:iki:store:*`) and, riding on it, the work ledger. Opt-in
+# twice over: this feature has to be on for the code to exist, and a `store = true` line
+# in the config home has to name THIS instance for a dataset to be opened. See
+# `src/store.rs` for why the second switch exists (one writer per directory).
+#
+# ⚠ There is no `required-features` target behind this — it is a `cfg(feature)` path
+# inside a LIBRARY, which `--all-targets` cannot see and `ci-drift`'s check cannot
+# report. What covers it is the caller's `features: "*"` input in `.github/workflows/
+# ci.yml`, which runs clippy and test under `--all-features` on Linux and macOS. Removing
+# that input silently stops linting and testing everything below.
+#
+# ⚠ ONE feature for BOTH crates, not two. The ledger owns no bytes: every read it makes is
+# a scoped SPARQL query at `urn:iki:store:graph-select` and every write a scoped UPDATE at
+# `urn:iki:store:graph-update`, so a ledger space bound without a store space beside it is
+# a set of resources that resolve and then fail. A `ledger` feature that could be enabled
+# without `store` would be a switch whose only reachable off-nominal state is a host that
+# is broken in a way no test of either crate alone can see.
+store = ["dep:ikigai-store", "dep:ikigai-ledger"]
+
+[dependencies]
+ikigai-core = { workspace = true }
+# `clock_gettime` on the two clock pairs that measure machine sleep (see `HostSleepClock`).
+libc = { workspace = true }
+ikigai-vocab = { workspace = true }
+ikigai-fn = { workspace = true }
+ikigai-personal = { workspace = true }
+ikigai-org = { workspace = true }
+# The consolidated-view (Brian-Busy) derivation, lifted out of this host crate into
+# its own focused, independently-tested crate. This host merely binds its endpoints
+# (urn:view:derive[:tick], urn:view:ingest), passing the resolved calendar config.
+ikigai-view = { workspace = true }
+ikigai-text = { workspace = true }
+ikigai-cms = { workspace = true }
+ikigai-repo = { workspace = true }
+# Steel-backed Lisp evaluator (urn:lisp:eval) — bound into the embedded/native
+# host space only (it evaluates arbitrary code), cap-gated by urn:cap:lisp.
+ikigai-lisp = { workspace = true }
+# The Timeout interception overlay fronting urn:lisp:eval on every SERVED surface
+# (wire-eval L1's wall-clock compute governor).
+ikigai-throttle = { workspace = true }
+# mDNS announce/browse. The one sibling this host names by path rather than through
+# `[workspace.dependencies]`; the version is the LOCKSTEP version, not a floor (see the root
+# manifest for why, and `crates/ikigai-cli/tests/lockstep_pins.rs` for the check).
+ikigai-discovery = { path = "../ikigai-discovery", version = "0.1.26" }
+ikigai-fs = { workspace = true }
+ikigai-http = { workspace = true }
+ikigai-runbook = { workspace = true }
+ikigai-rdf = { workspace = true }
+ikigai-sparql = { workspace = true }
+# Repository browsing + the persistent explanation/annotation archive, opt-in via
+# `browse.root` config lines (see src/browse.rs for the config grammar).
+ikigai-browse = { workspace = true }
+# The persistence switch for the browse/sparql shared store: ikigai-browse and
+# ikigai-sparql both keep oxigraph at default-features = false (wasm-clean, no
+# storage engine), and THIS host enables rocksdb — feature unification turns
+# `Store::open` on for the one shared Store type (re-exported as
+# ikigai_sparql::Store, which is what src/browse.rs names). Not imported directly.
+oxigraph = { version = "0.5", default-features = false, features = ["rocksdb"] }
+ikigai-sniff = { workspace = true }
+ikigai-sexpr = { workspace = true }
+ikigai-sign = { workspace = true }
+# Public-key encryption (urn:encrypt:encrypt/decrypt, age/X25519) — dual of sign, embedded-only.
+ikigai-encrypt = { workspace = true }
+# Timezone conversion (urn:tz:convert) + zoned clock (urn:tz:now) — pure, bound in base_space.
+ikigai-tz = { workspace = true }
+ikigai-intray = { workspace = true }
+ikigai-email = { workspace = true }
+ikigai-intake = { workspace = true }
+ikigai-passkey = { workspace = true }
+# serde derive for the small passkey-credentials.json store.
+serde = { workspace = true }
+ikigai-secret = { workspace = true }
+ikigai-xslt = { workspace = true }
+ikigai-jsonld = { workspace = true }
+ikigai-shacl = { workspace = true }
+# LLM inference (urn:llm:ask + urn:llm:<provider>:ask), on the native ureq transport.
+ikigai-llm = { workspace = true }
+# Video-conference scheduling (urn:meeting:schedule + urn:meeting:zoom:schedule), on the same
+# native transport; reads the Zoom creds from the keystore via a SecretReader (below).
+ikigai-meeting = { workspace = true }
+# Parse the LLM annotation graph (IKIGAI_LLM_ANNOTATIONS, Turtle) into the
+# (subject, predicate, object) facts Registry::apply_annotations consumes. The
+# same pure-Rust Oxigraph crates ikigai-rdf already pulls into this tree.
+oxrdf = "0.3"
+oxrdfio = "0.2"
+# The durable dataset behind `urn:iki:store:*`, opened from a path this host holds for
+# the life of the process. Optional: see `[features]` above and `src/store.rs`.
+ikigai-store = { workspace = true, optional = true }
+# The work ledger riding on that dataset (`urn:iki:ledger:*`). Bound in the same
+# `Fallback` as the store and behind the same feature — see `src/store.rs`.
+ikigai-ledger = { workspace = true, optional = true }
+ikigai-scheduler = { workspace = true }
+# The time transport (urn:time:schedule/cancel/jobs): fires a kernel resource-request
+# on a timer. Bound in root_space; its kernel handle is installed in watched_kernel.
+ikigai-time = { workspace = true }
+# Needed to coerce the built kernel to `dyn Resolver` when installing it on the time
+# registry (ikigai-core doesn't re-export the Resolver trait).
+ikigai-resolve = { workspace = true }
+serde_json = { workspace = true }
+# OS randomness for minting a client link token.
+getrandom = "0.2"
+# Ed25519 over standard PKCS8/SPKI keys — the decide-link token. Same crate and key formats
+# ikigai-sign uses, so a `urn:secret:generate type=ed25519` key loads in both.
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "pkcs8", "pem"] }
+# URL-safe base64 for the token (it rides in a query string).
+base64 = "0.22"
+# Local time (OS timezone) for urn:time:now (the nav/REPL clock). `clock` feature =
+# Local::now; default-features off to skip the unused parsing/serde surface.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# Filesystem watching — the first external golden-thread freshness source: an
+# out-of-band change to a workspace file cuts its thread so cached reads recompute.
+notify = "6"
+# Native HTTP client backing the ikigai-http transport (blocking, runtime-free, so
+# it works under the CLI's `futures::block_on` without pulling Tokio).
+ureq = { workspace = true }
+async-trait = "0.1"
+
+[dev-dependencies]
+futures = { workspace = true }
+# What "done" means for a module, as one test — run here over the two kernels this crate
+# COMPOSES (`kernel()` and `kernel_for()`), not over a module's own space. See
+# `tests/conformance.rs` for what that changes: the walk fires endpoints under root, and a
+# composing host binds subprocess, network, inference, mail and platform seams.
+#
+# 0.2.0, not 0.1: DECLARATIONS audits the suite's OWN declarations, and a composing host is
+# where that matters most — ONE `Suite` over TWO manifolds carried declarations that could
+# not apply to whichever kernel was being walked. `tests/conformance.rs` is three suites now.
+ikigai-conformance = "0.2.0"
+# The conformance fixture SEEDS the two edge verifying keys and one signing key, so the
+# decision faces are walked over real state instead of reporting "did not resolve". Same
+# version and features as the library dependency above: the fixture must write exactly the
+# encodings `verifying_key_at` / `parse_signing_key` read (SPKI PEM and PKCS8 PEM).
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "pkcs8", "pem"] }
+# The passkey endpoint tests play the authenticator: a fixed P-256 key signs assertions.
+p256 = { version = "0.13", features = ["ecdsa", "pem"] }
+sha2 = "0.10"

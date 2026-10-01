@@ -216,149 +216,7 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # count of carried regions on the pass (derivable from `prov:used` links
 # meanwhile). No new capability, no resource name moved, `provider=` and the
 # PR pass untouched (a diff pass has no regions).
-#
-# 0.9.0 — MINOR: A DECLINE IS REMEMBERED (ledger #475). A finding's id carries
-# the pass and the pass carries the content hash, so any edit to a file could
-# resurface a claim a human had declined, under a new id, presented as new —
-# measured 2026-09-22: a prose-only commit to a manifest minted 17 findings, 8
-# of them verbatim re-raises of the previous day's declines on lines the commit
-# did not touch. Now, at mint time, a fresh finding is checked against the
-# DECLINED findings on the same file with the same `exact` (after the anchor's
-# own decoration strip): it is minted CARRYING the prior decision — a
-# `prov:wasInfluencedBy` link to the declined twin's decision node, and on the
-# json row a `prior_decision` object {finding, iri, outcome, severity,
-# decided_at, note} — so the second decision is one click and a different claim
-# on the same line stays visible; only an EXACT repeat (same quote, same
-# proposed severity, byte-identical note) is withheld, and every withheld one
-# is counted (`suppressed_items` on the pass's json face, `ik:suppressedItems`
-# in its graph, "(N withheld as exact repeats)" in its statement). ★ Why a
-# minor: the finding's faces gained a field, the pass's faces gained a count
-# and a statement clause, a pass whose every item was withheld is now an
-# ARCHIVED pass saying "nothing new" where before the same answer would have
-# been "none anchored" and an error, and `urn:repo:{repo}:findings:{path}`
-# gained `summary=declined`, which widens its json face from the rows array to
-# an object carrying the file-grain count of declines by quote — all
-# observable, all additive, none of it a patch. The default json face of the
-# findings listing is byte-identical without the argument, deliberately: gonk
-# reads it as an array. gonk pins `"0.8.0"` and `^0.8.0` is `<0.9.0`, so it
-# cannot see any of this until its pin moves — the hub's wave, as for every
-# minor before it — and the mark is what its queue row should render next
-# (the exact field names are in the release report). ⚠ The withhold rule was
-# measured on the 458 declines on file before it shipped: 98 pairs shared a
-# line, 78 shared a severity, NONE shared a byte-identical note — so it fires
-# seldom by construction, and the mark carries the weight. Declines on other
-# files are not consulted (the cross-file recurrence is a knowledge gap in the
-# model, which the file-grain count makes visible and no key could fix). One
-# vocabulary need REPORTED, not invented: a dedicated `ik:priorDecision` in
-# place of the generic PROV influence. The `ikigai-vocab` dev-dependency floor
-# moves to 0.1.71, where `ik:suppressedItems` landed.
-#
-# 0.10.0 — MINOR: A DECLINE SAYS WHY IN ONE WORD, AND THE WORD IS THE CONTRACT'S.
-# Only 14 of 458 declines on file carried a reason, so 0.9.0's mark showed a
-# date and nothing else on 97% of rows. The finding Sink gains an optional
-# `reason` input whose `one_of` is five words in picker order — `misread`,
-# `restates`, `no-issue`, `wont-fix`, `duplicate` — declared beside
-# `SEVERITIES` (`finding::DECLINE_REASONS`, meanings in the ArgSpec summary),
-# because gonk never spells a word a contract owns and reads its menus from
-# the Meta face. A word beside `decision=publish` is refused BY NAME, a word
-# outside the set is refused naming the set, and omitted stays valid (an
-# empty value is omitted, so a form's unselected picker is never refused).
-# Stored as a TERM on the decision node — `dcterms:subject
-# <urn:iki:decline-reason:{word}>`, an interim predicate (not `dcterms:type`,
-# which carries the outcome); `ik:declineReason` is REPORTED for core's vocab
-# batch, not invented. Read back exactly: an unknown term is `reason: null`.
-# ★ Why a minor: a new argument on a public Sink, a new `reason` field on the
-# json `decision` and `prior_decision` objects, words on the plain and html
-# faces, a reason picker on browse's own decision form, and a `reasons` list
-# in `summary=declined` — all observable, all additive. A repeat that states a
-# DIFFERENT reason than the one on file is now refused (by `reason`), which is
-# the record rule applied to a new field, not a behaviour change for any call
-# a 0.9.0 caller could make. gonk pins `"0.9.0"` and `^0.9.0` is `<0.10.0`, so
-# it sees none of this until the hub moves its pin — and the picker is gonk's
-# follow-up, reading `reason`'s `one_of` from the contract.
-#
-# 0.11.0 — MINOR: A RE-REVIEW RETIRES WHAT IT REPLACED (ledger #504). Nothing
-# moved a finding out of `pending` but a human, so a changed region's old
-# findings stayed pending forever and the queue grew with COMMIT COUNT: 561 of
-# 1697 pending on 2026-09-24 were in no standing set of their file's newest
-# pass. An undecided file finding is now `superseded` when its file's current
-# reading — every pass over the current content hash, else the passes on the
-# hash of the most recently derived one — neither minted nor carried it. It is
-# COMPUTED ON READ AND STORED NOWHERE (`crate::supersede`): no migration, no
-# drift, and a revert makes the older pass current again. ★ Why a minor, and
-# not a patch: `superseded` joins the findings face's public `state` one_of, and
-# `state=pending` — the DEFAULT, and what gonk's badge counts — CHANGES what it
-# returns for a call a 0.10.0 caller already makes (the retired rows leave it).
-# Also observable, all additive: `superseded_by` on every json row,
-# `summary=states` (counts per root and per file), a line on a pending
-# listing's plain and html faces, `superseded_items` and "N earlier findings
-# superseded" on the review face, and the file page's `proposals=` no longer
-# drawing superseded findings. Decided findings never change state, PR-page
-# findings are never superseded, and superseded never feeds the declined-twin
-# mark. Measured on a copy of the live graph (`examples/findings-read-probe.rs`):
-# the badge read over gonk's seven roots went ~120 ms → ~106 ms — the current
-# content hash is the one the drift pass already fetches, and fewer rows are
-# reconciled. gonk pins `"0.10.0"` and `^0.10.0` is `<0.11.0`, so the hub moves
-# its pin; its state nav gains the tab from the contract with no other change.
-#
-# 0.12.0 — MINOR: THE MACHINE PROPOSES A GROUP, A HUMAN DECIDES IT ONCE (ledger
-# #506). The bounded queue still held ~1100 undecided findings, decided one row
-# at a time; an auto-decline was refused on principle (a decline is a HUMAN
-# judgment, and 0.9.0's mark reads every decline as a prior "no"). The findings
-# face gains `group=` — a `one_of` of four kinds in picker order, `recurrence`
-# (the mark computed backwards: pending findings on a line whose like claim was
-# already declined, one group per declined twin, the twin's word suggested),
-# `near-duplicate` (same file, current line and severity; the oldest is `kept`
-# and is not a member; `duplicate` suggested), `comment-shape` (a quote that is
-# a comment or doc line — the `restates` shape, a MIXED set to read) and `file`
-# — each group `{kind, key, label, repo, path, annotates, reason, twin, kept,
-# members}`, members in the exact row shape the json face already serves, and
-# `kinds` counting every kind per read. Groups are over PENDING only (never
-# superseded, published or declined), a suggested word is read from the
-# Sink's `reason` one_of and never applied, and there is NO batch Sink: gonk
-# fans a batch out to the finding Sink, one call per member, so a batch
-# decline is an ordinary decision node per member and the mark reads it
-# exactly like a single one. It rides the existing face rather than a sibling
-# IRI (one binding, one capability, one supersession pass), refused beside
-# any `state` but pending, beside `summary=`, and on the turtle face. ★ Why a
-# minor: a new public argument and a new json shape — additive; every call a
-# 0.11.0 caller makes is byte-identical. Also folded in, ledger #507: a STORED
-# review pass now renders minted ∪ carried, as a fresh derivation always did
-# (it rendered only its mints, short by the carried count its own statement
-# included). Measured on a copy of the live graph (63,005 triples, gonk's
-# seven roots, `examples/findings-read-probe.rs`): a grouped read costs what
-# the pending read costs (11–29 ms per root, within a millisecond of it), and
-# the levers over 1185 pending are recurrence 78 groups / 79 findings (44 of
-# them unmarked), near-duplicate 6 / 6, comment-shape 36 / 255, file 66 /
-# 1185. gonk pins `"0.11.0"` and `^0.11.0` is `<0.12.0`, so the hub moves its
-# pin before the batch view can read any of it.
-#
-# 0.13.0 — MINOR: A LENS IS A DIMENSION OF THE ARCHIVE KEY (ledger #455, #456).
-# The review face gains `lens=` — a `one_of` over the lenses that exist, `intent`
-# the first: the constitution's four authority questions (declared = enforced,
-# the confused deputy, the tenancy boundary, a verb that lies) between the
-# per-file instruction and the file, the format contract and the reminder
-# untouched. The tag becomes `review-v5+intent@{model}`, so a lensed pass and
-# the plain pass COEXIST on one file at one hash — own findings, own region
-# memos, own dated entry — and the lens-less tag is byte-identical to 0.12.0's,
-# so nothing existing re-pays the cold-pass tax (#481). The json face gains
-# `lens` (null for the general pass) and every statement of a lensed pass says
-# "through the intent lens", because a lensed all-clear is the narrower claim.
-# ★ Shipped on a measurement, not a menu (tests/corpus/intent/README.md): on
-# six real pre-fix intent defects the general pass found 0 of 6 in two runs
-# each, the lens 2 of 6, losing nothing — against the general pass's own
-# run-to-run floor of 0.43 Jaccard on anchor lines. And shipped with what it
-# costs on record: it re-labels rather than narrows (serious share 42% → 69%,
-# 32 findings a pass either way), its first question invents "declares X but
-# never checks X" on requires the kernel enforces, and it is 1.23× the wall
-# clock — a lens to SELECT for a file that carries authority, never to arm on
-# the trigger. Also: `ExplainConfig::review_guidance`, the probe seam a
-# CANDIDATE lens is measured through (outside the key, so refused unless
-# `debug=raw`). ★ Why a minor: a new public argument and a new json field —
-# additive; every call a 0.12.0 caller makes is byte-identical. gonk pins
-# `"0.12.0"` and `^0.12.0` is `<0.13.0`, so the hub moves its pin before a
-# queue row can carry a lens.
-version = "0.15.0"
+version = "0.8.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -366,11 +224,6 @@ repository = "https://github.com/ikigai-rs/ikigai-browse"
 readme = "README.md"
 keywords = ["ikigai", "roc", "resolution", "module", "capability"]
 categories = ["development-tools", "filesystem"]
-# The judge eval set is an instrument for this repo's measurement runs, not part
-# of the crate: about 5 MB of other repos' file versions (the bytes each review
-# finding was minted against). Its check in `tests/corpus.rs` requires it inside
-# a git checkout and returns without it outside one.
-exclude = ["tests/corpus/judge/"]
 
 [features]
 # The one-shot store migration (`migrate-annotation-ns`). It is the ONLY thing
@@ -488,13 +341,12 @@ ikigai-conformance = "0.2.0"
 # The suite's `VOCABULARY` check reads `ikigai_vocab::VOCABULARY` as its oracle,
 # and the suite's own pin (`^0.1.66`) is the floor for the SUITE's API, not for
 # this module's terms. The review face uses `ik:Review`, `ik:orphanedItems`,
-# `ik:reviewedBytes` and `ik:totalBytes`, which landed in 0.1.69, and
-# `ik:suppressedItems`, which landed in **0.1.71** — below it
-# `tests/conformance.rs` goes red with an "invented term" finding that is
+# `ik:reviewedBytes` and `ik:totalBytes`, which landed in **0.1.69** — below it
+# `tests/conformance.rs` goes red with four "invented term" findings that are
 # really "the registry index is stale". Cargo unifies to the greater of the two
 # requirements, so saying it here raises the floor without touching the suite.
 # Dev-dependencies do not propagate, so no consumer of this crate pays for it.
-ikigai-vocab = "0.1.71"
+ikigai-vocab = "0.1.69"
 futures = "0.3"
 # Validates the Turtle face in tests — the graph must actually parse.
 oxttl = "0.2"

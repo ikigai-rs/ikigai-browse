@@ -1,0 +1,765 @@
+# ikigai-browse
+
+Repository browsing as [ikigai](https://github.com/ikigai-rs) resources — the
+foundation of the repository-browsing family. A host mounts
+[`space`](src/lib.rs) over a set of named **roots** (`(name, directory)`
+pairs), and each root answers these resource families:
+
+| resource | what it is |
+|----------|------------|
+| `urn:repo:{repo}:tree` / `urn:repo:{repo}:tree:{path}` | a directory listing — `text/plain` (default; `name`⇥`kind`⇥`size` per line), `as=text/html` (htmx-navigable; with the explanation family mounted, an explain link for the directory and one per entry), `as=text/turtle` (the skolemized graph) |
+| `urn:repo:{repo}:file:{path}` | file content — raw bytes under an extension-mapped media type; `as=text/html` for a syntax-highlighted, line-numbered view with `#L{n}` anchors, inline markers at annotated lines, and (explanations mounted) an explain link; `annotations=include` (store mounted) serves the text plus a compact, drift-reconciled margin-notes section — content and human annotations in one resolution |
+| `urn:repo:{repo}:state` | the **freshness oracle** — HEAD sha + `clean`/`dirty:{n}` on one line; `as=application/json` for `{head, dirty: [paths]}` |
+| `urn:repo:{repo}:hash[:{path}]` | the **content hash** (S1) — `sha256:{hex}` of a file's bytes, or the **merkle** construction over a directory's entries (ignore-filtered), so one edit re-keys exactly the path to the root |
+| `urn:repo:{repo}:explain[:{path}]` | an **LLM-derived orientation explanation** (S1), archived by `(path, content-hash, version-tag)` — derived once per content version, reused forever; `as=application/json` adds `{content_hash, version_tag, derived}`, `as=text/html` the page face with provenance and a backlink to the explained resource, `as=text/turtle` the archive entry's graph; `version=` addresses an older tag; `provider=` derives this one against a different host-allowed backend (keyed by that backend's own model identity, so two models coexist); `annotations=include` (S3) folds the target's annotations in — the json face gains an `annotations` array, the text face appends margin notes, the html face renders the annotation cards, and a directory rollup folds its subtree's |
+| `urn:repo:{repo}:explain-versions[:{path}]` | what the archive holds for a path — one row per entry (tag, hash, model, derived-at), across content versions and tags; derives nothing and needs no net capability; `as=text/html` is the **option menu** the faces open beside their explain button — the entries the current content can reopen (free) above the models this host will derive a new one with, one row per MODEL |
+| `urn:iki:annotation[:{id}]` | a **W3C Web Annotation** (S2) on a file — Sink creates/updates (anchoring the quoted text; the bare `urn:iki:annotation` mints a uuid id), Source reads with drift **re-anchoring**, Delete removes; faces: `text/plain` (the body), `as=application/json`, `as=text/turtle` |
+| `urn:repo:{repo}:annotations[:{path}]` | every annotation on one file (or the whole repo, path omitted) in reading order, drift-reconciled on each read; faces: `application/json` (default), `as=text/html` (panel fragment), `as=text/turtle` |
+| `urn:iki:finding:{id}` | one **pending review finding** — a `prov:Entity`, **not** an `oa:Annotation`. Source reads it (drift-reconciled like an annotation); Sink is the human's answer: `decision=publish` mints the annotation (needs `urn:cap:annotate`) and `decision=decline` keeps the finding as a record that someone looked and said no. `severity=` is the human's FINAL rating from a closed `one_of`; the model's proposal is never overwritten, and a piped value is the human's reason. A recorded decision is not changed (an identical repeat is a no-op) |
+| `urn:repo:{repo}:findings[:{path}]` | the **review queue** — every finding on one file or the whole repo, in TRIAGE order (severity, then position), `state=` one of `pending` (default) / `published` / `declined` / `all`; faces: `application/json` (default), `as=text/html` (the queue page, each pending card carrying its publish/decline form), `as=text/plain`, `as=text/turtle`. ⚠ A queue, not a gate: nothing here blocks a commit, a push or a merge |
+| `urn:repo:{repo}:review:{path}` | the **machine review pass** (S4) — region-grain LLM commentary minted as **pending findings, never annotations** (each with the model's PROPOSED severity), the pass archived by `(path, content-hash, review-tag)` so re-sourcing unchanged content mints nothing. It reports against a **threshold, not a quota**: every problem the model rates `critical` or `major`, however many or few, then at most three `minor`/`info` suggestions and at most one `praise` — a missed serious problem is silent and expensive, a rejected suggestion costs one click, so only the second half is bounded. ⚠ A file with nothing above the bar is an **archived pass with zero findings whose every face says so in words, with how much of the input was actually read** (`statement`); an empty answer that makes no such statement is still an error that archives nothing, because a quiet week and an outage must not look alike. Faces: `text/plain` (the margin digest), `as=application/json` (`{statement, minted, orphaned_items, reviewed_bytes, total_bytes, annotations, …}`), `as=text/html` (the card page), `as=text/turtle` (the pass's provenance graph); `debug=raw` derives and returns the model's **unparsed answer** (nothing minted or archived) — the parse-failure diagnosis face; `provider={iri}` derives against a host-allowed backend, keyed by its own model identity (a second model is a second coexisting pass) |
+| `urn:repo:{repo}:review-options:{path}` | **which backends this host will review with** — its `provider=` allowlist grouped by the MODEL each serves, because the review archive keys on the model and two backends serving one model key ONE pass; derives nothing, asks no model, needs no net grant, and reads neither the working tree nor the archive (the rows are a property of the host, so a deleted path still answers); `text/plain` (default) is `label`⇥`providers`⇥`defaultFor` lines, `as=application/json` the structured rows, `as=text/html` the **option menu** the file face opens beside its review button, each row sending `provider=` to `urn:repo:{repo}:review:{path}`. ⚠ It is NOT a listing of archived passes: `urn:repo:{repo}:annotations:{path} as=application/json` already carries `creator` and `generated_by` on every finding, which is the same question answered by data that already exists |
+| `urn:repo:style` | the **theme stylesheet** the classed highlight faces bind to — `text/css`, root-independent, cacheable: each theme inside its OWN `@media (prefers-color-scheme: …)` block, above an unconditional `.hl-code` floor, all targeting the `hl-` classes the HTML faces emit, with the themes and the contrast floor read from the layered `a11y.toml` (see the host contract below) |
+| `urn:repo:style:layout` | the **layout stylesheet** for the `browse-*` classes the HTML faces emit — `text/css`, root-independent, cacheable, a build constant (no configuration, no golden thread): crumbs, entry lists, the action strip, the explain and review disclosure menus, annotation cards and the create form, the pull-request listings. A door links it BESIDE `urn:repo:style` — that one is the syntax theme inside a file view, this one is the page furniture. It styles **only what this crate emits** (no bare `body`/`button`/`pre` rules), so a host can link it inside its own chrome; `data-browse-posture="read-only"` on any ancestor hides the annotate form |
+| `urn:repo:{repo}:prs` | the root's **pull requests** — ikigai-repo's `urn:repo:pr:list` facade resolved through the kernel with `dir=` the root's directory; `state=` (`open`/`closed`/`merged`/`all`) and `limit=` forward to the facade (ikigai-repo ≥ 0.1.4 — omitted, the facade's defaults apply); `text/plain` (default) is `number`⇥`title`⇥`branch`⇥`updated`⇥`state` per line (empty = no matching PRs), `as=application/json` the facade's structured rows, `as=text/html` the listing with each PR linking its page (`chrome=embed` for the rows-only fragment other faces fold in) |
+| `urn:repo:{repo}:prs:{path}` | the **contextual listing** — the PRs that touched anything at or under a path, newest first: open PRs from `urn:repo:pr:list` intersected per-PR with `urn:repo:pr:files` (ikigai-repo ≥ 0.1.5; bounded to the 20 most recently updated open PRs), merged PRs mined from the path-scoped log (`urn:repo:log path=`, last 100 path-touching commits) by the squash-merge **convention** that a subject ends `(#N)` — a merge-commit repo yields fewer rows, never wrong ones; the path is a *history* scope (a deleted directory still lists; no history = empty listing); open rows first, then merged, deduped by number; `state=` (`open`/`merged`/`all`, default `all`) and `limit=` cap the synthesized listing; faces mirror `prs` (`as=application/json` is the synthesized `{number, title, state, branch, updated}` rows; the html face labels its scope) |
+| `urn:repo:{repo}:pr:{n}` | the **PR page** — metadata (`urn:repo:pr:view` json: author object, `headRefOid`) + the unified diff (`urn:repo:pr:diff`); the DIFF TEXT is an annotation surface (annotations target the PR IRI and quote diff lines, drifting like file annotations); `as=text/html` renders the highlighted, line-anchored diff with markers and the annotations panel; `annotations=include` folds the margin into the plain/json faces |
+| `urn:repo:{repo}:pr:{n}:explain` | a **review-shaped PR explanation** — what the change does and what a reviewer would look at — archived by `(repo, pr, headRefOid, version-tag)`: new commits derive fresh, prior entries stay addressable (`version=`) |
+| `urn:repo:{repo}:pr:{n}:review` | the **machine review pass over the diff** — findings minted as PENDING findings targeting the PR IRI (published only by a human, exactly like the file pass), the pass archived by `(repo, pr, headRefOid, review-tag)` so an unchanged head mints nothing; `reviewed_bytes`/`total_bytes` on the json face say how much of a big diff the model actually saw, and `debug=raw` returns the unparsed answer |
+
+**Resolution is the access model.** A `{repo}` that is not a configured root is
+a clean resolution *miss* (the grammar refuses to match; other mounted spaces
+may still answer), never an error from here. Paths are **jailed** to their
+root: `..` and absolute segments are rejected lexically, and the canonicalized
+target must stay inside the canonicalized root, so a symlink cannot escape.
+Paths in IRIs are percent-encoded (`hello%20world.txt`); bindings are decoded
+before they touch the filesystem.
+
+**Manifold citizenship.** Roots are known at bind time, so the space
+enumerates **per-configured-root rows**: for each root, the concrete resources
+(`urn:repo:{name}:tree`, `:state`, `:hash`, `:explain`, …) and the
+`{path}`-templated ones (`urn:repo:{name}:file:{path}`, …) are separate
+entries. The catalog and the capability-scoped action manifold
+(`urn:kernel:actions`) therefore advertise exactly the repos an agent can
+actually browse, and every templated row survives the kernel's
+probe-expansion. `urn:iki:annotation:{id}` is the annotation family's row; the
+bare `urn:iki:annotation` (Sink mints a uuid id) stays resolvable but unlisted.
+
+**Capabilities.** Every action declares `urn:cap:browse:read:*` — the wildcard
+*offering* form ("holds some grant under this prefix"). A **grant** names
+roots: `urn:cap:browse:read:{repo}` grants one root; the literal
+`urn:cap:browse:read:*` scope grants them all. Declared = enforced: the kernel
+baseline-checks the wildcard before dispatch, and the endpoint checks the
+target's root against the grant.
+
+**The explanation archive (S1).** `space_with_explain` takes an
+`ExplainConfig` around a host-injected Oxigraph store handle (`Arc<Store>`) —
+ONE shared store; later stages (annotations) join it. Since 0.4.0 a host can
+also name the **graph** within that store (`Mount::graph` /
+`ExplainConfig::graph`); unset, everything is in the default graph as before,
+and reads are confined to whichever graph is in force. See
+[Moving a store into a named graph](#moving-a-store-into-a-named-graph-040) and
+the ★ note on `Mount::graph` about what opting in costs a host that shares the
+dataset with a graph-scoped store. Explanations are derived
+THROUGH the kernel (`urn:repo:…:hash`, `:file`/`:tree`, the children's own
+`:explain`, and `urn:llm:{provider}:ask` are all sub-requests) and persist as
+skolemized RDF (`ik:Explanation` entries keyed by content hash + version tag).
+Directory explanations synthesize their children's — the merkle hash cascade
+means one edit re-derives exactly the path to the root, and everything else is
+an archive hit. Model tiers are config: file grain defaults to
+`urn:llm:coder:ask` (400-token ceiling), rollups to `urn:llm:ask` (600),
+`temperature=0.2` — per-call `max_tokens` ceilings are mandatory, and an empty
+model answer is an error, never archived. Prompts are type-aware (code /
+note / skill-or-agent definition / plain text, by extension + path heuristics)
+and individually versioned: a prompt edit bumps its version constant, which
+lazily re-derives while old tags stay addressable via `version=`.
+
+**Choosing the backend per request.** `provider={iri}` derives THIS
+explanation against a backend the caller names instead of the tier default.
+The selectable set is the operator's, and it is ONE host-level allowlist for
+every `provider=` in the module: every configured tier provider (file,
+directory, review, pull-request) plus whatever `ExplainConfig::allow_provider`
+adds — anything else is `Denied`,
+naming what was asked for and what is on offer, never a silent fall back. The
+set is published as the `provider` ArgSpec's `one_of`, so `urn:kernel:validate`
+can reject a bad one before dispatch and a UI can build its menu from
+`describe()` alone. The reason the allowlist exists is that `explain` declares
+one capability (`urn:cap:net:*`) and an `ActionSpec` cannot express a
+capability that varies by argument value — the cap means "may derive", not
+"may derive against the metered vendor". Two further rules: the model label
+follows the backend that ANSWERED (a request-selected provider never inherits
+`file_model_label`, which would write a wrong model identity into the archive
+key), and the tag folds MODEL identity rather than backend identity, so two
+providers serving the same model id share one archive entry — deliberate,
+since the explanation is a function of the model and the prompt, not of the
+serving layer. On a directory rollup the argument applies to the rollup only;
+the children keep their own tier and tags. `provider=` and `version=` are
+mutually exclusive.
+
+**Live, uncacheable reads.** The browsing families are live reads — cheap by
+design; the hash is the probe the archive keys on. `ExplainConfig` model
+labels (`file_model_label` / `dir_model_label`) should name the real model ids
+so a model swap re-keys the archive.
+
+**Non-git roots work.** `state` answers `not a git repository` (JSON:
+`{"head": null, "dirty": []}`) while `tree` and `file` are unaffected — future
+roots (memory dirs, skills dirs) need not be repositories.
+
+**Native-only by nature** — it reads the roots' filesystem directly and spawns
+`git` for the state oracle (an argument vector, never a shell string). It is
+to source trees what `ikigai-repo` is to dev tooling. No wasm face.
+
+**The PR family needs the pr facades mounted.** Browse does NOT depend on the
+`ikigai-repo` crate — the PR resources resolve `urn:repo:pr:list` / `:view` /
+`:diff` THROUGH THE KERNEL at runtime, passing `dir=` so they run in the
+root's directory. A composition without those facades answers a typed
+`NotFound` naming the gap (the rest of browse is untouched), and the facades
+enforce their own capability (`urn:cap:exec:gh`) on dispatch — attenuation
+means a caller of the PR rows must hold it too.
+
+```rust
+use ikigai_core::Kernel;
+use std::sync::Arc;
+
+let kernel = Kernel::new(Arc::new(ikigai_browse::space([
+    ("core".to_string(), "/path/to/ikigai-core".into()),
+    ("cli".to_string(), "/path/to/ikigai-cli".into()),
+])));
+// source urn:repo:core:tree            (under a urn:cap:browse:read:core grant)
+// source urn:repo:core:file:src/lib.rs as=text/html
+// source urn:repo:core:state as=application/json
+```
+
+Run `cargo run --example browse-demo` to watch it browse its own repository,
+and `cargo run --example explain-demo` (needs a local Ollama with
+`qwen3-coder:30b` and `llama3.3` pulled) to watch it explain itself with real
+models — the second pass serves every explanation from the archive in
+milliseconds.
+
+## The HTML face (house style)
+
+The `text/html` faces are htmx **fragments**, not pages — ikigai-runbook's
+server-driven house style. Entries and breadcrumbs `hx-get`
+`/k/source <iri> as=text/html` into a `#browse` container the host provides;
+the host's adapter maps `/k/<command>` onto its engine.
+
+**The host contract, in full.** Beyond `#browse` and the `/k/` adapter, every
+crumb strip opens with a **home affordance**: `<a class="browse-home-link"
+href="/">⌂</a>`. It is a plain anchor to the host's index — in ikigai-web `/`
+is the index so it works untouched; any other host either styles/rebinds
+`.browse-home-link` (its page, its rules — e.g. `hx-boost`, or rewriting the
+`href`) or ships it harmlessly unstyled. The PR pages carry a real ancestor
+trail (repo → `prs` → `#n` → `explain`/`review`), every ancestor a live crumb.
+Every **tree page** additionally renders a lazy pull-requests block
+(`browse-recent-prs`), swapping into itself with `hx-trigger="load"`: the
+root loads the repo-wide listing (`hx-get="/k/source urn:repo:{repo}:prs
+state=all limit=10 chrome=embed as=text/html"`), and each subdirectory loads
+its own **contextual** listing (`urn:repo:{repo}:prs:{path} limit=10`) — every
+directory page shows the PRs that touched *it*. The tree face itself never consults the pr facades — it
+renders instantly, and when the facades are not mounted the lazy fetch answers
+the typed 404-with-guidance, which the host renders per its own error
+handling (a host that shows kernel errors inline needs nothing extra).
+
+**Two stylesheets, and a door links both.** `urn:repo:style:layout` is the
+**layout** sheet for the `browse-*` classes every face here emits — crumbs,
+entry lists, the action strip, the explain and review disclosure menus,
+annotation cards and the create form, the pull-request listings. Until it
+existed those rules lived as a `const &str` inside `ikigai-web`'s binary, which made
+this family's premise false: browse emits the affordance, any host with a `/k/`
+route serves it — but the affordance arrived unstyled on every door but that
+one, and that binary is being retired. A door links it exactly as it links the
+theme:
+
+```html
+<link rel="stylesheet" href="/k/source urn:repo:style">
+<link rel="stylesheet" href="/k/source urn:repo:style:layout">
+```
+
+★ **It styles only what this crate emits.** No bare `body`, `button`, `pre`,
+`code`, `ul` or `h*` rules — element selectors appear only below a `browse-*`
+class — so a host can link it inside its own chrome without this sheet reaching
+the host's own markup. Its one door-level footprint is the `--browse-*` custom
+properties on `:root`, which paint nothing and exist so a door can override the
+palette. Light and dark come from a top-level block plus a
+`@media (prefers-color-scheme: dark)` override rather than `light-dark()`,
+because `light-dark()` silently resolves light unless the door has declared
+`color-scheme`.
+
+⚠ **One rule in it is behavioural, and the door states the fact it needs.**
+`ikigai-web` computed `.browse-annotate{display:none}` per request from the
+caller's posture, so a read-only caller was not offered a create form the
+annotation Sink would refuse. The sheet keeps that rule, keyed on an attribute
+a door sets on `<html>`, `<body>` or the container it swaps faces into:
+
+```html
+<html data-browse-posture="read-only">
+```
+
+A door that sets nothing shows the form, which is **safe**: the Sink is
+capability-gated by `urn:cap:annotate` regardless, so the worst case is a
+visible button whose submission is refused. Hiding it was only ever honesty of
+presentation, never the boundary.
+
+`cargo run --example page-preview` writes a standalone HTML file with the real
+tree, file, annotation and review-menu faces dressed by both sheets — the check
+a test suite cannot make.
+
+**Highlighting is class-based; the host includes the stylesheet.** The file
+and PR-diff faces emit syntect *classed* spans — `hl-`-prefixed scope-atom
+classes (`class="hl-comment hl-line hl-rust"`), never inline styles — and the
+`<pre>` carries `browse-code hl-code` (`hl-code` is the base
+foreground/background rule). The colors live in **`urn:repo:style`**
+(`text/css`, cacheable), **each theme inside its own `@media
+(prefers-color-scheme: …)` block** — one stylesheet, both schemes, so pages read
+correctly on light and dark hosts with no light islands. The confinement is
+load-bearing rather than tidy: a media query contributes no specificity, so
+while the light rules sat at top level the two themes shared one cascade and the
+more specific selector won whatever the active scheme — which rendered function
+parameters at 1.03:1 on the dark ground until 0.2.11. Only an unconditional
+`.hl-code` floor sits outside a block, so a client matching neither scheme still
+gets a legible ground. A host either links it through its `/k/` adapter
+(`<link rel="stylesheet" href="/k/source urn:repo:style">`, however its
+adapter spells that) or resolves `urn:repo:style` once server-side and
+inlines the CSS into its page shell; a host that ships neither gets
+readable-but-monochrome code in the page's own colors, never wrong ones.
+
+**The themes and the contrast floor are configuration, and the repair is
+derived.** Since 0.2.12 `urn:repo:style` reads
+[ikigai-a11y](https://crates.io/crates/ikigai-a11y)'s layered config —
+`$XDG_CONFIG_HOME/ikigai/a11y.toml` overridden key-wise by
+`{app}.a11y.toml` — for which light theme, which dark theme, and which
+contrast floor (defaults: `InspiredGithub`, `Base16OceanDark`, `4.5`, exactly
+what this crate used to hard-code, so a machine with no `a11y.toml` sees no
+change in the themes). Every colour in each generated sheet that misses the
+floor against that theme's own ground is then lifted to **that theme's own
+default foreground** — the one colour a theme guarantees is legible on its own
+ground, so the repair invents no hue. That replaces the hand-written
+`.hl-variable.hl-parameter` supplement 0.2.11 added after parameters were found
+at 3.23:1 on `Base16OceanDark`: the same `#c0c5ce`, now derived, along with 12
+other dark rules and 27 light ones. A rule that repaints its own background and
+still misses the floor is **left alone and reported** rather than churned —
+repairing a colour pair would mean inventing one.
+
+`{app}` is the **process's** name (`dev-server`, `web`), so it comes from the
+host at mount time: `Mount::new(roots).app("dev-server").space()`. A host that
+names none reads the shared `a11y.toml` only.
+
+The config **home** those layers sit in comes from the host too. By default it
+is this machine's (`$XDG_CONFIG_HOME/ikigai`, else `$HOME/.config/ikigai`),
+resolved **once at mount** rather than at every resolution — a fact about the
+process, established where the host builds its mount. Since 0.2.15 a host may
+state one instead: `Mount::new(roots).config_home(Some(dir))`, and
+`.config_home(None)` states that this process has **no** config home at all —
+a legal answer (built-in themes, the default floor, no candidate files and so
+nothing to watch), not an error. It exists for the reason `ikigai-a11y`'s
+`A11yHandle` does: a test that reads the ambient home is asserting about the
+machine it happens to run on, so it either goes red the day a developer sets a
+theme or quietly asserts nothing. What the mount holds is the **home**, never a
+parsed config — the golden threads below promise that cutting one recomputes
+the sheet, and a mount that parsed its config at startup would serve that
+config forever.
+
+The stylesheet stays
+`.cacheable()` and declares a **golden thread per candidate config file**,
+including files that do not exist yet, so creating an override invalidates it on
+a host that watches the config home. That is not decoration: effective expiry
+propagates from dependencies, so treating the config as
+uncacheable-because-it-reads-a-file would have turned a 2µs cached read into a
+~450µs generation on every page — measured by `cargo run --release --example
+style_cache`.
+
+**Since 0.3.2 the crate supplies that watch.** A declared thread is a promise
+that something cuts it, and until now nothing did — an edited `a11y.toml` was
+served stale until the process restarted. The failure is exact: an edit with no
+cut is stale, and `kernel.cut()` on those names is what recomputes it.
+`Mount::space_watched()` returns the space **and** a `StyleWatch` from the same
+resolution of the config home; once the kernel exists the host starts it:
+
+```rust,ignore
+let (space, style) = Mount::new(roots).app("dev-server").space_watched();
+let kernel = Arc::new(Kernel::new(Arc::new(space)));
+if let Err(e) = style.spawn(Arc::clone(&kernel)) {
+    eprintln!("urn:repo:style will not follow a11y.toml edits: {e}");
+}
+```
+
+The watch is the platform's (FSEvents / inotify) over the config home
+DIRECTORY, non-recursive, matching candidate file NAMES — so an editor's atomic
+save and an override created after mount both land, and the platform's
+canonical spelling of the path (`/private/var` for `/var`) cannot make it cut a
+thread nothing declared. It cuts **by name**: the kernel is neither restarted
+nor rebuilt, and only the stylesheet (and anything a host composed over it,
+such as `ikigai-a11y`'s own `urn:a11y:config`, which declares the same names)
+recomputes on its next read. `Mount::space()` is `space_watched()` with the
+watch dropped — the pre-0.3.2 behaviour, still legal. A missing config home is
+a named `WatchError`, never a quiet no-watch: the one symptom of a watch that
+is not running is an edit that does not land, and that is silent.
+
+Syntax coverage is [two-face](https://crates.io/crates/two-face)'s extended
+set (~100 formats the stock syntect set misses — TOML, TypeScript,
+Dockerfile, …) under the pure-Rust fancy-regex engine, plus an embedded house
+Turtle/TriG definition ([assets/](assets/)) so the graph faces highlight too;
+unknown formats degrade to escaped plain text, and extensionless well-known
+names (`Dockerfile`) match by file name. File views wrap each
+line in `<span id="L{n}">` with a self-linking gutter number, so `#L42`
+deep-links a line — the anchor surface annotations target. With the
+annotation store mounted, the file view marks annotated lines
+(`browse-line-annotated`), renders an inline marker per anchored annotation
+between the gutter number and the code (`browse-annotation-marker` — an
+anchor down to the annotation's card whose native `title` tooltip reveals
+the note; hosts may style it as a margin dot), and appends an annotations
+panel: one card per annotation at its `#L{n}` anchor (orphans visually
+flagged, listed without a marker) plus a create form that `hx-post`s a Sink
+of `urn:iki:annotation` through the host's `/k/` adapter (form fields become
+sink args — htmx only, no scripts). With the explanation family mounted,
+the tree and file faces carry explain links (`browse-explain-link` — the
+tree face one per entry plus the directory's own under a
+`browse-actions` nav), and the explain face backlinks its target
+(`browse-view-link`) and folds the annotation cards in under
+`annotations=include`. The **file** face additionally carries a review link
+(`browse-review-link`) in the same nav; the tree face does not, because the
+review pass is file-grain (findings anchor in text), so a directory button
+would be an affordance whose only possible answer is a refusal.
+
+**The option menu.** Beside each face's explain button sits a
+`<details class="browse-explain-menu">` disclosure — native, so it is
+focusable and operable from the keyboard, never hover-only, and block-level so
+its panel lays out on a phone with no CSS of ours. It renders CLOSED and
+empty: the panel is a separate resolution of this path's
+`explain-versions … as=text/html`, `hx-get`ed on the disclosure's `toggle`
+event. A listing therefore carries ONE menu (the directory's own; the per-row
+`?` stays a direct explain), and a thousand entries cost a thousand
+`<details>` tags and not one sub-request. Opening one costs an archive read,
+the path's content hash, and a single resolve of `urn:llm:models` — the
+inventory, not `urn:llm:{p}:model`, which probes its backend and would be one
+network call per provider.
+
+**One row per model, not per backend.** The menu's primary axis is the model,
+because the archive's is: two providers serving one model id share a version
+tag and therefore a key, so a second row would promise an explanation that
+cannot exist and would return the first one's text instantly. Where several
+selectable providers serve one model they are one row, which names the
+operator's configured tier as its `provider=` (any of them keys the same
+entry, but on a MISS one of them actually runs) and states the others beside
+it as a fact. A provider whose model nothing reports — no llm module, or,
+since ikigai-llm 0.12, a provider that pins no model and discovers it from an
+unreachable backend — gets its OWN row, labelled by the same provider
+heuristic its version tag will fall back to and marked as unidentified: two
+unknowns are two rows, because they may well be two models.
+
+**The review button is a CALLER, not a second implementation.** The file
+face's `review` button `hx-get`s `urn:repo:{repo}:review:{path}` and adds
+nothing but the face; its `<details class="browse-review-menu">` twin fetches
+`review-options … as=text/html` on `toggle` and each row adds only the
+`provider=` the manifold already declares. That is exactly the call a
+git-event trigger makes — same resource, same arguments, same capability
+check, same archive key, same pending findings — so the two cannot diverge;
+the only legitimate difference is the cause. Nothing in the UI path assembles
+a prompt, post-processes a finding, or writes an annotation another way.
+★ And since the pass now produces **pending findings under both causes**, the
+invariant holds by construction rather than by care: publication is a third
+act, and it is always a human's. ⚠ The reverse reading is still the useful
+one: whatever a click needs (the net grant, the browse read, and an answer to
+what bounds the spend) a headless trigger needs too, with no human present —
+but **not** `urn:cap:annotate`, which the pass no longer declares, so a
+trigger can run complete and deliberately unable to publish anything. The
+review menu follows the same model axis and the same cost discipline as
+explain's, minus the archive half — one `urn:llm:models` resolve when a human
+opens it, nothing before — and it requires the **browse grant alone**, because
+reading what is on offer is not spending. It could not have lived on `review`
+itself, which declares net, or a browse-only session would be refused its own
+menu.
+
+**Nothing gets published except by a human.** A review pass writes
+`urn:iki:finding:{id}` records — `prov:Entity`, never `oa:Annotation`, never
+under the `urn:iki:annotation:` prefix, and carrying no `oa:` term whose
+`rdfs:domain` would type them into that family under entailment
+(`oa:bodyValue` and `oa:motivatedBy` both would; the body is
+`dcterms:description` instead). The model proposes a severity from the closed
+set `critical · major · minor · info · praise`, declared as the Sink's
+`one_of` and handed to the model in the same words, so the menu and the
+prompt cannot drift apart. A human publishes (`decision=publish`, gated by
+`urn:cap:annotate`) or declines — and **both ratings survive**: the proposal
+stays on the finding, the final rating goes on
+`urn:iki:finding:{id}:decision`, so "is this reviewer calibrated?" is a query
+rather than an impression. A finding's id is derived from its POSITION
+(`sha256(pass ‖ anchor ‖ quote)`), so a re-derivation re-mints the same node
+and a decision survives it. Staleness is the annotation layer's answer, not a
+second one: findings re-anchor and orphan on every read.
+
+**Manual review is the existing human annotation affordance.** There is no
+second path and no new resource for it: the annotations panel under a file
+renders machine findings and human notes in one reading order (machine ones
+carrying their model identity) and ends with the create form that Sinks
+`urn:iki:annotation` — so a reviewer answers a finding beside it rather than
+in another view.
+
+## Annotations (S2)
+
+> **⚠ The namespace moved in 0.3.0** — `urn:annotation:` → `urn:iki:annotation:`,
+> part of the ecosystem-wide `urn:iki:` migration. A module crate's resource
+> names are its public interface, so this is a minor bump and not a patch: a
+> host that adopts it must install the alias in the SAME release, and needs
+> **two** rules, because a prefix rule does not match the bare minting IRI.
+>
+> ```text
+> prefix  urn:annotation:  urn:iki:annotation:
+> exact   urn:annotation   urn:iki:annotation
+> ```
+>
+> ⚠ The alias covers *resolution* and nothing else, and the two things it does
+> not cover fail in opposite directions:
+>
+> - **Mounts sit INSIDE it.** `with_aliases` wraps the root space, so the mount
+>   table sees the *canonical* name. A `mount = "prefer
+>   urn:annotation:=<sock>"` line stops matching the moment the alias fires —
+>   rewrite the line to `urn:iki:annotation:`; the alias will not save it.
+> - **HTTP route gates sit OUTSIDE it.** An allowlist that inspects the request
+>   path before the kernel (`ikigai-web`'s `POST /urn:annotation…` route) sees
+>   the name the *caller* wrote, so it must accept BOTH spellings for as long
+>   as the alias stands.
+>
+> Nothing in this crate installs an alias; binding authority is the host's.
+>
+> **An alias does not migrate the DATA.** It rewrites incoming names; the
+> stored subject IRIs stay where they were, and `list_annotations` strip-
+> prefixes the *new* prefix over the *stored* one — so every pre-0.3.0 row
+> returns `None`, the loop continues, and the annotation goes **invisible with
+> no error**. Empty panels, empty `annotations=include` folds, review passes
+> that lost their findings, and nothing anywhere reporting a failure. Existing
+> stores need the one-shot below.
+
+### Migrating a pre-0.3.0 store
+
+```text
+cargo build --release --features migrate --bin migrate-annotation-ns
+
+migrate-annotation-ns <store-path>            # DRY RUN — the default
+migrate-annotation-ns <store-path> --commit   # apply
+```
+
+A replace-subgraph in one transaction: every quad carrying an IRI under
+`urn:annotation:` in **any** position is removed and its rewritten twin
+inserted. It prints the four counts before and after —
+
+```text
+                         before    after
+oa:Annotation subjects   14        14
+old-prefix quads         168       0
+new-prefix quads         0         168
+dangling hasSelector     28        0
+total quads              169       169
+
+PASS: annotations equal · old -> 0 · new -> old's former count · dangling -> 0 · total equal
+```
+
+— and exits non-zero unless all of them hold. **`total quads` is the clause
+that is true of every transform**, including the ones the four columns above do
+not describe: a migration creates and destroys nothing, so a store that comes
+back one quad smaller is a FAIL even when nothing else moved.
+
+- ⚠ **Both positions or nothing.** `oa:hasSelector` and `prov:generated` point
+  *at* annotation IRIs; a subject-only rewrite leaves them aimed at IRIs that
+  no longer exist, which is a worse store than the one it started from — the
+  annotations are visible and their selectors are gone. The test suite
+  performs that ablation (`Scope::SubjectOnly`) and asserts the 28 dangling
+  references it produces, so the object half is pinned by a failure that was
+  actually observed rather than by a comment.
+- **Literal safety is structural.** The rewrite pattern-matches parsed
+  `NamedNode` terms; literals have no arm at all. `oa:exact`/`prefix`/`suffix`
+  hold source-code quotes, and an annotation on a line that mentions
+  `urn:annotation:` stores that string as data — a text substitution would
+  corrupt the anchor and orphan the annotation on the next read.
+- **Idempotent.** Selection is by the old prefix and `urn:iki:annotation:`
+  does not start with `urn:annotation:`, so a second run plans zero quads.
+- **It refuses a locked store**, naming the process that holds it: RocksDB's
+  lock is exclusive, so the server must be stopped first. It also refuses a
+  directory that is not already a store, rather than creating an empty one and
+  reporting a serene `0/0/0/0` PASS over data it never saw.
+- Back the store directory up before `--commit`.
+  `cargo run --features migrate --example migration-rehearsal -- <scratch-dir>`
+  builds a throwaway store in the pre-0.3.0 shape to rehearse against.
+
+### Moving a store into a named graph (0.4.0)
+
+`--graph <iri>` is the same tool doing the other move a browse store can need:
+every browse-owned quad into that named graph, which is what a host calling
+`Mount::graph` needs run once against its existing data.
+
+```text
+migrate-annotation-ns <store-path> --graph urn:iki:graph:browse            # dry run
+migrate-annotation-ns <store-path> --graph urn:iki:graph:browse --commit   # apply
+```
+
+It adds one column, `outside target graph`, which must reach 0, and it carries
+the namespace move with it — **one pass, one transaction, both moves**, so a
+pre-0.3.0 store opting into a graph is migrated once rather than twice in an
+order nothing would enforce.
+
+- **It selects browse's own subjects, not the default graph.** Browse writes no
+  quad about a subject it did not mint (`urn:iki:annotation:…` for annotations
+  and their selectors, `urn:ikigai:browse:…` for the explanation archive and
+  the review passes), so subject-selection is complete — and a quad someone
+  ELSE put in the shared default graph is left exactly where it is. Both halves
+  are pinned by tests, one against the real writers and one against a stranger
+  quad in the fixture.
+- **Skipping it fails silently, in the way the rename did.** Browse reads are
+  confined to its graph from 0.4.0, so unmigrated quads are still in the store
+  and no longer visible: empty panels, empty folds, no error.
+
+The `migrate` feature exists because this is the only thing here that opens a
+store on *disk*, and that needs oxigraph's RocksDB backend (and a C++
+toolchain). The transform itself is feature-free and tested against the
+in-memory store, so ordinary CI proves it.
+
+> ★ **The primitive this was a stopgap for has landed.** These paragraphs used
+> to say there was no writing verb in `urn:sparql:*` and that this binary should
+> be deleted when one arrived. One arrived: `ikigai-sparql` binds
+> `urn:sparql:update` (a `Sink` under `urn:cap:sparql:update`, one transaction,
+> all-or-nothing) and `ikigai-store` binds `urn:iki:store:update` /
+> `urn:iki:store:graph-update`. Both moves above are now expressible as one
+> `DELETE … INSERT … WHERE` against a host binding one of those over the browse
+> store, and this binary is a convenience that predates them. Retiring it is an
+> open option. The cross-store tool below is a different case, and says why.
+
+### Moving an archive into ANOTHER host's store (`migrate-archive-roots`)
+
+Two hosts can name the same directories differently — a dev server whose root
+names came from the path basename (`ikigai-core`) and a host that names each
+root explicitly (`core`). An archive keyed `(repo, path, content-hash,
+version-tag)` stays valid wherever it lives, so moving it is a data move, not a
+re-derivation — *provided the names in it become the names the new host asks
+with*.
+
+```text
+cargo build --release --features migrate --bin migrate-archive-roots
+
+migrate-archive-roots <source-store> <target-store> \
+    --root ikigai-core=core --root ikigai-cli=cli --drop folio \
+    --graph urn:iki:browse:graph:default            # DRY RUN — the default
+                                             ... --commit   # apply
+```
+
+⚠ **The root name is inside the data in four places, and a missed one is
+SILENT.** The quads land, SPARQL finds them, and every real read misses —
+because a read builds its IRI from the *target's* root name:
+
+| position | read that notices it is wrong |
+| --- | --- |
+| the subject IRI `urn:ikigai:browse:explain:{root}:…` | `urn:repo:{root}:explain:{path}` — it IS the archive key |
+| `ik:about` / `ik:annotates` / `prov:used` → `urn:repo:{root}:…` | `urn:repo:{root}:explain-versions:{path}`, which joins on it |
+| `prov:wasGeneratedBy` → `urn:ikigai:browse:review:{root}:…` | nothing, until a review pass is followed from its finding |
+| the `ik:repo` LITERAL | nothing that resolves — only the Turtle and HTML faces print it |
+
+`migrate::RootScope` keeps the two partial rewrites compiled as **ablations**,
+and the suite migrates a store with each one and asserts exactly which read
+breaks. The acceptance for this tool is a resolution, not a count:
+`the_migrated_archive_answers_the_target_hosts_own_iri_without_deriving` mounts
+browse over the migrated store under the target's root name and checks the
+explanation comes back with `derived: false` and **no LLM ask**, because a cache
+miss would derive a fresh one and look exactly like success.
+
+- **Every root must be DECIDED.** `--root <from>=<to>` carries one (identity,
+  `--root folio=folio`, is how you carry a root under its own name — the same
+  gesture as any other mapping, so it is always something someone typed);
+  `--drop <root>` leaves one behind. A root nobody decided is **refused**, with
+  the option lines that would fix it printed — so a first run with no `--root`
+  at all is the survey.
+- **The source is never written**, so it may stay live: it is opened read-only,
+  a holder is named as a warning, and because the transfer is idempotent a
+  re-run picks up anything written since. Only the TARGET must be stopped, and
+  only for `--commit`.
+- **Stale entries are kept.** An entry whose content hash no longer matches the
+  working tree is not garbage; it is what `explain-versions` shows.
+- `cargo run --release --features migrate --example root-migration-rehearsal`
+  does the whole thing into a throwaway store and then READS every entry it
+  carried, with **no LLM bound** so a miss cannot quietly derive a replacement.
+  It reports, per root, how many entries `explain-versions` lists, how many
+  still describe today's content, and how many are history.
+
+`space_with_annotations(roots, store)` mounts W3C Web Annotations over the
+same host-injected Oxigraph store the explanation archive uses
+(`space_with_explain` includes both families — ONE shared graph, queryable
+together). The shape is skolemized `oa:` — stable IRIs, no blank nodes, and
+the W3C target node flattened to `ik:annotates` — with BOTH selector kinds
+stored per annotation: `oa:TextQuoteSelector` (`oa:prefix`/`oa:exact`/
+`oa:suffix`, context derived from the anchored occurrence) and
+`oa:TextPositionSelector` (`oa:start`/`oa:end`, character offsets), keyed to
+the annotated content version by `ik:contentHash`.
+
+**Re-anchoring under drift.** Every read reconciles each annotation against
+the target's current content: hash unchanged → served as stored; content
+moved → the quote is re-searched (context-scored, first match wins ties)
+and BOTH selectors plus the recorded hash update in place (`ik:reanchored
+true`); quote gone → `ik:orphaned true`, still rendered and flagged, never
+silently dropped — and a later read that finds the quote again (an edit
+reverted) heals it. The store is only written when something changed.
+
+**Diff targets anchor marker-tolerantly.** A PR target's surface is its
+unified diff, and quotes — model or human — name the CODE, not the diff's
+leading `+`/`-`/space column. Anchoring against a diff therefore tries, in
+order, first hit wins: **(1)** the quote exactly as given, anywhere in the
+raw diff (context-scored — a marker-faithful quote anchors to its precise
+span); **(2)** the quote in the **marker-stripped shadow** of the diff (every
+line's leading marker removed — a quote of consecutive code lines matches
+across the interleaved markers); **(3)** the quote with its own single
+leading marker removed (a wrong or stale marker); **(4)** that stripped quote
+whitespace-trimmed (padded markers, dropped indentation). A stage-2/3/4 hit
+anchors the whole original diff line(s) and stores THAT original text as
+`oa:exact` — drift keeps comparing real diff content, never the stripped
+fiction the match was found through. The same discipline runs at Sink time,
+at review-mint time, and on every drift pass (so a `+` line that settles into
+context on a later head is followed, its stored exact rewritten to the new
+line).
+
+**Capabilities.** Per-verb `ActionSpec`s: Source requires
+`urn:cap:browse:read:*` (checked against the annotation's root, like every
+browse read); Sink and Delete require `urn:cap:annotate`; Sink also declares
+the browse wildcard because anchoring sources the target through the kernel —
+a capability that cannot read a file cannot annotate it.
+
+## The machine review pass (S4)
+
+`urn:repo:{repo}:review:{path}` (mounted by `space_with_explain`) is the
+review layer: Source asks the review model for findings — each an **exact
+quote** from the file plus a reviewer's note — anchors every quote, and mints
+each anchored finding as a real `urn:iki:annotation:` through the same machinery
+human notes use. Machine and human annotations live on ONE queryable axis,
+distinguished only by provenance (all standard terms — no vocab publish):
+
+- `dcterms:creator` — the model identity (its presence IS the machine
+  discriminator; the JSON rows also carry a `machine` boolean).
+- `oa:motivatedBy` — `oa:assessing` on review findings; the human Sink stamps
+  `oa:commenting` (absent on stores written before the review layer existed, so a
+  reader must tolerate it missing).
+- `prov:wasGeneratedBy` — the pass entry that minted the finding; the pass
+  records the inverse as `prov:generated` and the reviewed file as
+  `prov:used`.
+
+The pass is archived like an explanation — keyed
+`(path, content-hash, review-v{N}@model)`, the minted IRIs recorded in the
+entry — so **re-sourcing unchanged content is an archive hit that mints
+nothing**. Changed content is a fresh pass, and the earlier pass's annotations
+re-anchor or orphan exactly like human ones: the drift is the review-history
+story, kept visible. A finding whose quote does not anchor (the model
+misquoted) mints nothing and is counted (`orphaned_items`), never fatal; a
+pass in which nothing parses or nothing anchors is an error and is NOT
+archived (an empty pass must not poison a key that would never re-derive) —
+the parse-failure error carries the raw answer's opening, and `debug=raw`
+re-sources the resource into the model's full **unparsed** answer (nothing
+minted, nothing archived) so a collapsed answer is inspectable live.
+The PR pass (`pr:{n}:review`, prompt `pr-review-v3`) tells the model to quote
+diff lines *including* their leading `+`/`-`/space marker AND anchors with
+the marker-tolerant diff discipline (see S2) — belt and suspenders: a model
+that ignores the instruction still anchors, and a marker-faithful quote
+anchors precisely. Both review prompts (v2 file / v3 PR) restate the format
+contract *after* the content: on a big input, a contract stated only up top
+loses to the content and the model answers label-free (measured — the last
+words the model reads must be the format).
+Inputs larger than `max_prompt_bytes` (default 16 KiB) are truncated on the
+prompt side only — quotes anchor against the whole surface — and the pass
+says so honestly: `reviewed_bytes`/`total_bytes` on the json face and the
+archive entry, a `(input truncated)` notice on the text and html faces.
+Faces render the kinds distinguishably: hollow line markers (`○`,
+`browse-annotation-marker-machine`) against the solid human dot, a
+`review by {model}` identity line on machine cards
+(`browse-annotation-machine`), and a `[review:{model}]` label in margin text.
+
+The review action `requires` all three of `urn:cap:browse:read:*`,
+`urn:cap:net:*`, and `urn:cap:annotate` — it reads, asks a model, and writes.
+Knobs on `ExplainConfig`: `review_provider` (default `urn:llm:coder:ask`),
+`review_max_tokens` (default 800), `review_model_label` (the tag override,
+same precedence as the explain labels).
+
+`provider={iri}` picks the backend for THIS pass, on the same terms as
+explain's: validated against the host allowlist before any work, `Denied`
+otherwise, and the label never follows a backend it was not written for.
+Because the tag folds the MODEL, a second model is a **second coexisting
+pass** — its own findings, minted as its own annotations, alongside the first
+rather than instead of it, both on the one annotation axis. A backend serving
+a model some pass already used keys that same entry: an archive hit that asks
+nothing and mints nothing. Review has no `version=`, so unlike explain's the
+argument is exclusive with nothing.
+
+Because findings are ordinary annotations in the shared graph, one SPARQL axis
+answers review questions directly, e.g. every machine finding still anchored
+in the current content:
+
+```sparql
+PREFIX oa: <http://www.w3.org/ns/oa#>
+PREFIX dcterms: <http://purl.org/dc/terms/>
+PREFIX ik: <https://ikigai-rs.dev/ns#>
+SELECT ?file ?quote ?note ?model WHERE {
+  ?a a oa:Annotation ; dcterms:creator ?model ;
+     ik:annotates ?file ; oa:bodyValue ?note ;
+     oa:hasSelector [ oa:exact ?quote ] .
+  FILTER NOT EXISTS { ?a ik:orphaned true }
+}
+```
+
+— or only the human notes: `FILTER NOT EXISTS { ?a dcterms:creator ?m }`.
+
+## Vocabulary (Turtle face)
+
+The graph face skolemizes everything under the same `urn:repo:…` IRIs that
+resolve — directory children as `tree:` IRIs, files as `file:` IRIs — so the
+graph is diffable, SPARQL-able, *and navigable*. It uses these `ik:`
+(`https://ikigai-rs.dev/ns#`) terms: `ik:Directory`, `ik:File`, `ik:Symlink`,
+`ik:Explanation` (classes), `ik:entry`, `ik:fileName`, `ik:path`, `ik:repo`,
+`ik:byteSize`, `ik:about` (an explanation's subject), `ik:annotates` (an
+annotation's target), `ik:contentHash`, `ik:versionTag`, `ik:model`,
+`ik:promptKind`, `ik:explanation`, `ik:derivedAt`, and (S2) `ik:reanchored`,
+`ik:orphaned` (properties). **All nineteen are in the published vocabulary** —
+the `ikigai-conformance` walk checks every term of every Turtle face against
+`ikigai-vocab` and finds none of them invented. (This paragraph said they were
+"pending addition" long after they landed; the walk is what caught that, and is
+now what keeps it true.) Before 0.2.2 both families wrote
+`ik:target` for the subject/target link; that term belongs to the inbound-HTTP
+routing family, so browse retired it. Stores written by older versions read
+fine — both loaders and the versions listing accept the legacy predicate, all
+new writes (and any annotation rewrite) use the new terms, and lingering
+`ik:target` triples in an old archive are harmless. The annotation graphs additionally
+use the external `oa:` (`http://www.w3.org/ns/oa#`) terms `oa:Annotation`,
+`oa:TextQuoteSelector`, `oa:TextPositionSelector`, `oa:bodyValue`,
+`oa:hasSelector`, `oa:prefix`, `oa:exact`, `oa:suffix`, `oa:start`, `oa:end`,
+and `dcterms:created`. The review layer adds the standard provenance terms
+`dcterms:creator`, `oa:motivatedBy` (`oa:assessing` / `oa:commenting`), and
+`prov:` (`http://www.w3.org/ns/prov#`) `prov:wasGeneratedBy` /
+`prov:generated` / `prov:used`, plus four `ik:` terms of its own: `ik:Review`
+(the pass-entry class), `ik:orphanedItems` (the count of findings whose quotes
+did not anchor), `ik:reviewedBytes` and `ik:totalBytes` (how much of the file
+the pass actually read, when the prompt ceiling truncated it). **All four are in
+the published vocabulary since `ikigai-vocab` 0.1.69**, which is what took the
+review pass out of the conformance suite's opt-out list: `urn:repo:{repo}:review:
+{path}` is now walked like every other face, with `tests/conformance.rs` pinning
+its undefined-term set as EMPTY so a fifth invented term is still a failing test.
+That release also removed `rdfs:domain ik:Explanation` from `ik:versionTag` and
+`ik:derivedAt`, which the review entries carry too — under entailment the old
+domain typed every review as an explanation.
+
+## Conformance
+
+This crate **passes [`ikigai-conformance`](https://github.com/ikigai-rs/ikigai-conformance)**:
+one test (`tests/conformance.rs`) walks every endpoint the mount binds, fires
+every action it can, and holds all eight checks — ArgSpecs, declared-equals-
+enforced, skolemization, vocabulary, cacheability, pipeline citizenship,
+naming. It went from 40 findings to 0.
+
+Three things a reader of that test should know:
+
+* **The `oa:` namespace is registered.** The W3C Web Annotation Data Model is
+  not in the suite's well-known list, and the annotation overlay speaks it end
+  to end — eleven standard terms would otherwise read as invented, 31 findings
+  of noise.
+* **The pull-request family is opted out of the invoking checks**, because on a
+  real host those five endpoints resolve `urn:repo:pr:*` and shell out to `gh`.
+  The one check an opt-out should not drop — that each is refused with a typed
+  `Denied` under no grants, before anything is spawned — is asserted by hand.
+* **`urn:repo:{repo}:file:{path}`'s raw face is a pass-through**: with no `as=`
+  it serves the file's extension-mapped media type, which `Description::outputs`
+  (a closed list) has no way to say. The declaration is the three faces the
+  endpoint chooses for itself, and the extension contract is pinned separately.
+
+## License
+
+Licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT).
