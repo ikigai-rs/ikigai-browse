@@ -39,7 +39,8 @@
 //!   by [`space_with_explain`] — one shared store): quote + position selectors
 //!   that RE-ANCHOR when the target drifts and are orphan-flagged (never
 //!   dropped) when the quote is gone. The file HTML face gains an annotations
-//!   panel and marks annotated lines.
+//!   panel and marks annotated lines; a successful annotate from its form
+//!   returns to the same view with the new card focused (`focus={id}`).
 //! - `urn:repo:{repo}:review:{path}` + `:review-options:{path}` — the S4
 //!   **machine review pass** ([`space_with_explain`]): region-grain LLM
 //!   commentary minted as PENDING FINDINGS (provenance-distinguished —
@@ -1377,7 +1378,15 @@ fn file_endpoint(roots: &Roots, archive: Option<&Arc<Archive>>, explain: bool) -
             // store is mounted — `annotations=include` changes nothing there.
             t if t.starts_with("text/html") => Ok(repr_utf8(
                 "text/html",
-                file_html(repo, &rel, &bytes, archive.as_deref(), explain, &proposals)?,
+                file_html(
+                    repo,
+                    &rel,
+                    &bytes,
+                    archive.as_deref(),
+                    explain,
+                    &proposals,
+                    inv.inline_str("focus").ok(),
+                )?,
             )),
             _ if include || !proposals.is_empty() => {
                 // One resolution = content + human margin notes (the
@@ -1505,6 +1514,7 @@ fn file_description(has_store: bool, explain: bool) -> Description {
                 )
                 .default_value(""),
         );
+        description = description.input(focus_input());
     }
     description
         .input(
@@ -1517,6 +1527,21 @@ fn file_description(has_store: bool, explain: bool) -> Description {
         .output("application/octet-stream")
         .output("text/html;charset=utf-8")
         .output("text/plain;charset=utf-8")
+}
+
+/// The `focus` arg of the file and pull-request html faces (ledger #658): the
+/// id of an annotation on this target, whose card the face marks as just
+/// written and focuses (`autofocus`, which htmx honors after a swap). It is
+/// where the annotation Sink's html acknowledgement sends the reader back to.
+/// Presentation only: an id that names no card here marks nothing, and the
+/// other faces ignore it.
+pub(crate) fn focus_input() -> ArgSpec {
+    ArgSpec::new("focus")
+        .optional()
+        .class(XSD_STRING)
+        .summary(
+            "html face: the id of an annotation on this target, whose card is marked as just              written and focused — where a successful annotate returns the reader to",
+        )
 }
 
 /// The extension→media-type map for the raw face; unknown extensions fall back
@@ -1747,6 +1772,7 @@ fn file_html(
     archive: Option<&Archive>,
     explain: bool,
     proposals: &[String],
+    focus: Option<&str>,
 ) -> Result<String> {
     let mut out = String::from("<div class=\"browse\">");
     out.push_str(&crumbs_html(repo, rel));
@@ -1763,7 +1789,7 @@ fn file_html(
             // annotations panel with its create affordance. The drift pass
             // runs against the very content being rendered.
             let overlay = archive
-                .map(|archive| annotate::file_overlay(archive, repo, rel, text))
+                .map(|archive| annotate::file_overlay(archive, repo, rel, text, focus))
                 .transpose()?;
             let (mut marked, panel) = overlay.unwrap_or_default();
             // The `proposals=` overlay (ledger #496): the file's pending

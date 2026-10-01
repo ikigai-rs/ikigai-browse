@@ -1026,7 +1026,14 @@ impl Endpoint for PrEndpoint {
                 let overlay = self
                     .archive
                     .as_deref()
-                    .map(|archive| annotate::target_overlay(archive, &target, &diff))
+                    .map(|archive| {
+                        annotate::target_overlay(
+                            archive,
+                            &target,
+                            &diff,
+                            inv.inline_str("focus").ok(),
+                        )
+                    })
                     .transpose()?;
                 let (marked, panel) = overlay.unwrap_or_default();
                 Ok(repr_utf8(
@@ -1150,6 +1157,7 @@ fn pr_description(has_store: bool, explain: bool) -> Description {
                 .one_of(["include", "true", "false"])
                 .default_value("false"),
         );
+        description = description.input(crate::focus_input());
     }
     description
         .input(
@@ -2480,6 +2488,70 @@ mod tests {
         assert_eq!(row["body"], "the new entry point");
         assert_eq!(row["orphaned"], true, "the recorded flag, untouched");
         assert_eq!(row["line"], serde_json::Value::Null);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Ledger #658 on a pull request: the html acknowledgement sends the reader
+    /// back to the PR page, which `focus=` marks and focuses the new card on.
+    #[test]
+    fn annotating_a_pr_returns_to_the_pr_page_with_the_new_card_focused() {
+        let root = temp_dir();
+        let store = Arc::new(Store::new().unwrap());
+        let state = FakeRepo::new();
+        let k = pages_kernel(&root, &store, &state);
+        let ack = body(
+            &issue(
+                &k,
+                Verb::Sink,
+                "urn:iki:annotation:pr-note",
+                &[
+                    ("target", "urn:repo:demo:pr:3"),
+                    ("exact", "+fn beta() {}"),
+                    ("body", "the new entry point"),
+                    ("as", "text/html"),
+                ],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert!(
+            ack.contains(
+                "hx-get=\"/k/source urn:repo:demo:pr:3 as=text/html focus=pr-note\" \
+                 hx-trigger=\"load\""
+            ),
+            "{ack}"
+        );
+        assert!(ack.contains("back to the pull request"), "{ack}");
+        let page = body(
+            &source(
+                &k,
+                "urn:repo:demo:pr:3",
+                &[("as", "text/html"), ("focus", "pr-note")],
+            )
+            .unwrap(),
+        );
+        assert!(
+            page.contains(
+                "browse-annotation-new\" id=\"annotation-pr-note\" tabindex=\"-1\" autofocus>"
+            ),
+            "{page}"
+        );
+        // `focus` is declared where it is honored, so a host that refuses an
+        // undeclared argument (gonk's `/k/` adapter does) lets it through.
+        for iri in ["urn:repo:demo:pr:3", "urn:repo:demo:file:a.rs"] {
+            let description = k
+                .describe(&Iri::parse(iri.to_string()).unwrap())
+                .expect("bound");
+            let source = description
+                .action_specs()
+                .into_iter()
+                .find(|spec| spec.verb == Verb::Source)
+                .unwrap();
+            assert!(
+                source.inputs.iter().any(|input| input.name == "focus"),
+                "{iri} must declare focus"
+            );
+        }
         std::fs::remove_dir_all(&root).ok();
     }
 
