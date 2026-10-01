@@ -3195,6 +3195,23 @@ mod tests {
         assert!(matches!(style_css(&config), Err(Error::Endpoint(_))));
     }
 
+    /// The threads the stylesheet DECLARES — every thread on the answer but the
+    /// one the kernel hangs on the answer's own canonical target.
+    ///
+    /// ⚠ Since `ikigai-core` 0.1.73 the kernel hangs EVERY cacheable answer on
+    /// its own target's thread (`urn:repo:style` here), so the raw thread list
+    /// grew by one on CI's fresh resolve while a stale local lock still read
+    /// the old shape. That thread is the kernel's, not this endpoint's
+    /// declaration; filtering it keeps these tests about what browse declares
+    /// on either side of that release.
+    pub(crate) fn declared_threads(rep: &ikigai_core::Representation) -> Vec<String> {
+        rep.threads()
+            .iter()
+            .map(|t| t.to_string())
+            .filter(|t| t != STYLE_IRI)
+            .collect()
+    }
+
     /// The stylesheet stays CACHEABLE while depending on the config, and names
     /// every CANDIDATE config file as a golden thread — including one that does
     /// not exist, so an operator creating an override invalidates the sheet on a
@@ -3210,7 +3227,7 @@ mod tests {
         ))
         .expect("the stylesheet resolves");
         assert_eq!(rep.expiry, ikigai_core::Expiry::Never, "cacheable");
-        let threads: Vec<String> = rep.threads().iter().map(|t| t.to_string()).collect();
+        let threads = declared_threads(&rep);
         // The shared layer and the app one, in that order — under the home this
         // test STATED, so the exact files can be named. Neither exists in the
         // scratch home, and that is the assertion: an operator CREATING an
@@ -3246,7 +3263,7 @@ mod tests {
         .expect("the stylesheet resolves without a config home");
         assert_eq!(rep.expiry, ikigai_core::Expiry::Never, "still cacheable");
         assert!(
-            rep.threads().is_empty(),
+            declared_threads(&rep).is_empty(),
             "nothing to watch, nothing declared"
         );
         assert_eq!(String::from_utf8_lossy(&rep.bytes), default_css());
