@@ -609,7 +609,15 @@ fn the_style_sheet_is_the_only_threaded_representation_and_the_watch_names_its_t
     for target in probes {
         let repr = issue(&kernel, request(Verb::Source, target, &[]), &root)
             .unwrap_or_else(|e| panic!("`{target}` resolves in the scratch mount: {e}"));
-        let threads: Vec<String> = repr.threads().iter().map(|t| t.to_string()).collect();
+        // ⚠ The DECLARED threads: every one but the thread `ikigai-core`
+        // 0.1.73+ hangs on each cacheable answer's own canonical target, which
+        // is the kernel's and would make every cacheable face look threaded.
+        let threads: Vec<String> = repr
+            .threads()
+            .iter()
+            .map(|t| t.to_string())
+            .filter(|t| t != target)
+            .collect();
         if !threads.is_empty() {
             threaded.insert(target, threads);
         } else if repr.expiry != Expiry::Always && target != LAYOUT_IRI {

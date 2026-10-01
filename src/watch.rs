@@ -511,7 +511,7 @@ mod tests {
         let ra = block_on(a.issue(request(), &cap())).unwrap();
         let rb = block_on(b.issue(request(), &cap())).unwrap();
         assert_eq!(ra.bytes, rb.bytes);
-        let declared: Vec<String> = rb.threads().iter().map(|t| t.to_string()).collect();
+        let declared = crate::tests::declared_threads(&rb);
         let mut named = style.threads();
         named.sort();
         assert_eq!(declared, named, "the watch names what the sheet declared");
