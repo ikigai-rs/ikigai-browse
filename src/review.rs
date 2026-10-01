@@ -121,8 +121,15 @@
 //!   one click — or sees that it is a different claim, which suppression could
 //!   never show. Two different findings can quote one line, and a line whose
 //!   endianness claim was declined may attract a correct claim later;
-//! * **only an EXACT repeat is WITHHELD, and it is COUNTED**: same quote,
-//!   same proposed severity, a byte-identical note. `ik:suppressedItems` on
+//! * **only an EXACT repeat of a CONFIRMED decline is WITHHELD, and it is
+//!   COUNTED**: same quote, same proposed severity, a byte-identical note, and
+//!   the twin's current decision a decline `crate::revision` reads confirmed
+//!   (a reason word, made singly, or — no provenance on record — in no burst).
+//!   An exact repeat of an UNCONFIRMED decline (a wordless batch or burst)
+//!   mints pending, marked with that decline, so it is in the queue and in
+//!   `summary=unconfirmed` (ledger #659). And it is only ever prospective: a
+//!   repeat withheld before stays answered by its twin in the region memo
+//!   until that region's bytes move. `ik:suppressedItems` on
 //!   the pass, "(N withheld as exact repeats)" in the statement — kept apart
 //!   from `ik:orphanedItems` because "we already answered this" and "the
 //!   model misquoted" are different facts. Its memo member is the twin, so an
@@ -2439,8 +2446,10 @@ fn review_description(config: &ExplainConfig) -> Description {
              `prior_decision` on the row: the declined finding, its date and reason), so \
              the second decision is one click and a different claim on the same line \
              stays visible; only an EXACT repeat — same quote, same proposed severity, a \
-             byte-identical note — is withheld, and every withheld one is counted \
-             (suppressed_items, ik:suppressedItems). Declines on other files are not \
+             byte-identical note — of a CONFIRMED decline (a reason word, made singly, or \
+             in no burst) is withheld, and every withheld one is counted \
+             (suppressed_items, ik:suppressedItems); a repeat of an unconfirmed decline \
+             mints pending, marked with it. Declines on other files are not \
              consulted. Quotes that do not anchor are counted (orphaned_items), \
              never fatal; a missing or invented SEVERITY leaves the finding unrated \
              rather than dropping it. ★ The pass reports against a THRESHOLD, not a \
