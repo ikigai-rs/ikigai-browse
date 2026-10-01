@@ -549,8 +549,9 @@ impl Made {
 /// by default and the finding still enters the queue carrying the prior
 /// decision; a human declines it again in one click, or sees that it is a
 /// different claim — which suppression could never show. Only an EXACT repeat
-/// (same quote, same proposed severity, a byte-identical note) is withheld,
-/// and every withheld one is counted on the pass (`ik:suppressedItems`).
+/// (same quote, same proposed severity, a byte-identical note) of a CONFIRMED
+/// decline is withheld (ledger #659), and every withheld one is counted on the
+/// pass (`ik:suppressedItems`).
 #[derive(Clone, Debug)]
 pub(crate) struct Prior {
     /// The declined twin — `urn:iki:finding:{id}`.
@@ -3397,8 +3398,11 @@ fn proposal_card_html(finding: &Annotation, line: Option<u64>) -> String {
 /// match its declined twin — the DECLINED findings on the same target with the
 /// same `exact` are looked up ([`declined_twins`]). Then, by [`Prior`]'s rule:
 ///
-/// * **an exact repeat is WITHHELD and counted** — same `exact`, same proposed
-///   severity, and a note byte-identical to a declined twin's. Nothing is
+/// * **an exact repeat of a CONFIRMED decline is WITHHELD and counted** — same
+///   `exact`, same proposed severity, and a note byte-identical to a declined
+///   twin's whose current decision is a confirmed decline
+///   ([`crate::revision::confirmed`]: a reason word, made singly, or — with no
+///   provenance on record — in no burst). Nothing is
 ///   stored; the caller adds one to the pass's `ik:suppressedItems` and, for
 ///   the region memo, records the TWIN as the member that answers these bytes
 ///   (so an unchanged region is not re-asked next pass just to be withheld
@@ -3411,7 +3415,14 @@ fn proposal_card_html(finding: &Annotation, line: Option<u64>) -> String {
 ///   enters the queue with [`Annotation::prior`] set to the most recently
 ///   decided twin, so the row can say "a like claim on this line was declined
 ///   {date}: {reason}" and the second decision costs one click, or the
-///   difference is visible, which suppression could never show.
+///   difference is visible, which suppression could never show;
+/// * **an exact repeat of an UNCONFIRMED decline is minted marked too** (ledger
+///   #659; Brian, 2026-10-01: "Only confirmed declines should withhold
+///   repeats"), its mark naming THAT twin: a wordless decline made in a batch
+///   or a burst is not evidence a human meant it, so it may not hide a claim.
+///   The repeat is pending, in the queue and in the `summary=unconfirmed` walk
+///   under the decline that would have hidden it — and once that decline is
+///   confirmed, the next repeat is withheld.
 ///
 /// Declines on a DIFFERENT file are not consulted. The recurrence has a
 /// file-shaped grain (a manifest, a vocabulary) and a knowledge-gap grain (the
@@ -3460,14 +3471,27 @@ pub(crate) fn mint_pending_finding(
         return Ok(Mint::Minted(existing.iri()));
     }
     // The declined twins on this line, most recently decided first.
-    let twins = declined_twins(archive, target_iri, exact)?;
+    let mut twins = declined_twins(archive, target_iri, exact)?;
+    let repeats = |twin: &Annotation| twin.body == note && twin.severity.as_deref() == severity;
+    // Only a CONFIRMED decline withholds (ledger #659). `confirmed` is
+    // computed, and the loader's reading is pessimistic until the burst pass
+    // has run, so run it — only when an exact repeat is on file, which is
+    // seldom, because it reads every decline in the graph.
+    if twins.iter().any(repeats) {
+        crate::revision::mark(archive, &mut twins)?;
+    }
     if let Some(twin) = twins
         .iter()
-        .find(|twin| twin.body == note && twin.severity.as_deref() == severity)
+        .find(|twin| repeats(twin) && twin.decision.as_ref().is_some_and(|d| d.confirmed))
     {
         return Ok(Mint::Withheld(twin.iri()));
     }
-    let prior = twins.into_iter().next().map(|twin| Prior {
+    // Marked with the decline that answered THIS claim when there is one —
+    // an unconfirmed twin the repeat now mints past, so the
+    // `summary=unconfirmed` walk lists the repeat under the decline that would
+    // have hidden it — else the most recently decided twin on the line.
+    let marking = twins.iter().position(repeats).unwrap_or(0);
+    let prior = twins.get(marking).map(|twin| Prior {
         decision: twin.decision.clone(),
         finding: twin.iri(),
     });

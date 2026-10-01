@@ -18,6 +18,9 @@
 //! decision and every `prior_decision`, and `summary=unconfirmed` on the
 //! findings face. ★ Nothing is hidden or dropped by it — `confirmed` is
 //! information for a host's pre-tick rule and display, never a filter here.
+//! Its one other reader REVEALS rather than hides: the review mint withholds
+//! an exact repeat only behind a CONFIRMED decline (ledger #659), so an
+//! unconfirmed one lets the repeat into the queue.
 //!
 //! ## The rule
 //!
@@ -44,8 +47,9 @@
 //! a second is a double-submit (which the Sink already absorbs as a no-op) or
 //! one quick correction, while three is a loop or a fan-out. Both numbers
 //! are deliberately conservative in the direction that matters: a burst only
-//! WITHHOLDS evidence a host would otherwise pre-tick from, and nothing is
-//! discarded. A decision with a recorded provenance is never inferred, in
+//! WITHHOLDS evidence a host would otherwise pre-tick from, and lets an exact
+//! repeat its decline would have withheld into the queue — a wrongly inferred
+//! burst costs a click, never a hidden claim — and nothing is discarded. A decision with a recorded provenance is never inferred, in
 //! either direction — the record wins over the clock.
 
 use std::collections::{BTreeMap, BTreeSet};

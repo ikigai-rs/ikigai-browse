@@ -3870,4 +3870,223 @@ mod tests {
             );
         }
     }
+
+    // --- only a CONFIRMED decline withholds a repeat (ledger #659) ----------
+
+    /// Edit the file and run the FIRST pass's reply again, verbatim: each item
+    /// is an EXACT repeat of the first pass's claim on its line (same quote,
+    /// same proposed severity, byte-identical note) — the one shape the mint
+    /// may withhold. The pass's json, and the pending findings on alpha's line.
+    fn repeat(
+        root: &std::path::Path,
+        store: &Arc<Store>,
+    ) -> (Kernel, serde_json::Value, Vec<serde_json::Value>) {
+        std::fs::write(root.join("a.rs"), format!("{CONTENT}// edited\n")).unwrap();
+        let k = kernel(root, store);
+        let pass = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        let pending = json(&k, "urn:repo:demo:findings:a.rs", &[]);
+        let on_alpha = pending
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["exact"] == "fn alpha() {}")
+            .cloned()
+            .collect();
+        (k, pass, on_alpha)
+    }
+
+    /// ★ A CONFIRMED decline withholds its exact repeat: a decline with a
+    /// word, one recorded as made singly, and a wordless legacy decline in no
+    /// burst. Each withholds alpha's repeat, counted, and nothing on alpha's
+    /// line is pending.
+    #[test]
+    fn a_confirmed_decline_withholds_its_exact_repeat() {
+        type Decide = fn(&Kernel, &Store, &str);
+        let cases: [(&str, Decide); 3] = [
+            ("with a word", |k, _, alpha| {
+                sink(k, alpha, &[("decision", "decline"), ("reason", "misread")]).unwrap();
+            }),
+            ("made singly", |k, _, alpha| {
+                sink(k, alpha, &[("decision", "decline"), ("made", "single")]).unwrap();
+            }),
+            ("legacy, in no burst", |_, store, alpha| {
+                legacy_decline(
+                    store,
+                    &format!("{alpha}:decision"),
+                    alpha,
+                    "2026-09-23T02:42:38.125Z",
+                );
+            }),
+        ];
+        for (case, decide) in cases {
+            let root = demo_root();
+            let store = Arc::new(Store::new().unwrap());
+            let k = kernel(&root, &store);
+            let alpha = finding_on(&k, &pass(&k), "fn alpha() {}");
+            decide(&k, &store, &alpha);
+            assert_eq!(of(&k, &alpha)["decision"]["confirmed"], true, "{case}");
+            let (_, pass, on_alpha) = repeat(&root, &store);
+            assert_eq!(pass["suppressed_items"], 1, "{case}: {pass}");
+            assert!(
+                on_alpha.is_empty(),
+                "{case}: withheld, not pending: {on_alpha:?}"
+            );
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// ★★ An UNCONFIRMED decline withholds nothing (Brian, 2026-10-01: "Only
+    /// confirmed declines should withhold repeats"). A wordless decline made in
+    /// a batch, or — with no provenance on record — in a burst, lets the exact
+    /// repeat mint PENDING, marked with that decline as its `prior_decision`
+    /// (`confirmed: false`), so it is in the queue and in the
+    /// `summary=unconfirmed` walk, where a human confirms or retracts the
+    /// decline that would otherwise have hidden it.
+    #[test]
+    fn an_unconfirmed_decline_lets_its_exact_repeat_mint_pending_and_marked() {
+        type Decide = fn(&Kernel, &Store, &str);
+        let cases: [(&str, Decide); 2] = [
+            ("a wordless batch", |k, _, alpha| {
+                sink(
+                    k,
+                    alpha,
+                    &[
+                        ("decision", "decline"),
+                        ("made", "batch"),
+                        ("batch", "recurrence-1"),
+                    ],
+                )
+                .unwrap();
+            }),
+            ("a legacy burst", |_, store, alpha| {
+                legacy_decline(
+                    store,
+                    &format!("{alpha}:decision"),
+                    alpha,
+                    "2026-09-23T02:42:38.125Z",
+                );
+                for (n, at) in [
+                    ("one", "2026-09-23T02:42:38.400Z"),
+                    ("two", "2026-09-23T02:42:39.050Z"),
+                ] {
+                    legacy_decline(
+                        store,
+                        &format!("urn:iki:finding:{n}:decision"),
+                        &format!("urn:iki:finding:{n}"),
+                        at,
+                    );
+                }
+            }),
+        ];
+        for (case, decide) in cases {
+            let root = demo_root();
+            let store = Arc::new(Store::new().unwrap());
+            let k = kernel(&root, &store);
+            let alpha = finding_on(&k, &pass(&k), "fn alpha() {}");
+            decide(&k, &store, &alpha);
+            assert_eq!(of(&k, &alpha)["decision"]["confirmed"], false, "{case}");
+            let (k, pass, on_alpha) = repeat(&root, &store);
+            assert_eq!(pass["suppressed_items"], 0, "{case}: {pass}");
+            assert_eq!(on_alpha.len(), 1, "{case}: {on_alpha:?}");
+            let again = &on_alpha[0];
+            assert_eq!(again["state"], "pending", "{case}");
+            assert_eq!(again["body"], "no caller.", "{case}: the exact repeat");
+            assert_ne!(again["iri"], alpha.as_str(), "{case}: a new id");
+            let prior = &again["prior_decision"];
+            assert_eq!(prior["finding"], alpha.as_str(), "{case}: {again}");
+            assert_eq!(prior["confirmed"], false, "{case}: {again}");
+            let walk = json(&k, "urn:repo:demo:findings", &[("summary", "unconfirmed")]);
+            let steered: Vec<&serde_json::Value> = walk["unconfirmed"]["groups"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|g| g["declines"].as_array().unwrap())
+                .filter(|d| d["iri"] == alpha.as_str())
+                .flat_map(|d| d["pending"].as_array().unwrap())
+                .collect();
+            assert_eq!(steered, [&again["iri"]], "{case}: {walk}");
+
+            // Confirming the decline is what would have withheld it: the
+            // NEXT exact repeat is withheld again.
+            sink(
+                &k,
+                &alpha,
+                &[
+                    ("decision", "decline"),
+                    ("reason", "restates"),
+                    ("revises", &format!("{alpha}:decision")),
+                ],
+            )
+            .unwrap();
+            std::fs::write(root.join("a.rs"), format!("{CONTENT}// edited twice\n")).unwrap();
+            let pass = json(&kernel(&root, &store), "urn:repo:demo:review:a.rs", &[]);
+            assert_eq!(pass["suppressed_items"], 1, "{case}: {pass}");
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// A RETRACTED or REVERSED decline withholds nothing and marks nothing:
+    /// the twin's current decision is not a decline, so the repeat mints
+    /// pending with no `prior_decision` at all.
+    #[test]
+    fn a_retracted_or_reversed_decline_withholds_nothing() {
+        type Revise = fn(&Kernel, &str);
+        let cases: [(&str, Revise); 2] = [
+            ("retracted", |k, alpha| {
+                sink(
+                    k,
+                    alpha,
+                    &[
+                        ("decision", "retract"),
+                        ("revises", &format!("{alpha}:decision")),
+                    ],
+                )
+                .unwrap();
+            }),
+            ("reversed", |k, alpha| {
+                sink(
+                    k,
+                    alpha,
+                    &[
+                        ("decision", "publish"),
+                        ("severity", "minor"),
+                        ("revises", &format!("{alpha}:decision")),
+                    ],
+                )
+                .unwrap();
+            }),
+        ];
+        for (case, revise) in cases {
+            let root = demo_root();
+            let store = Arc::new(Store::new().unwrap());
+            let k = kernel(&root, &store);
+            let alpha = finding_on(&k, &pass(&k), "fn alpha() {}");
+            sink(
+                &k,
+                &alpha,
+                &[
+                    ("decision", "decline"),
+                    ("reason", "misread"),
+                    ("made", "single"),
+                ],
+            )
+            .unwrap();
+            revise(&k, &alpha);
+            let (_, pass, on_alpha) = repeat(&root, &store);
+            assert_eq!(pass["suppressed_items"], 0, "{case}: {pass}");
+            let again: Vec<&serde_json::Value> = on_alpha
+                .iter()
+                .filter(|r| r["iri"] != alpha.as_str())
+                .collect();
+            assert_eq!(again.len(), 1, "{case}: {on_alpha:?}");
+            assert_eq!(again[0]["state"], "pending", "{case}");
+            assert_eq!(
+                again[0]["prior_decision"],
+                serde_json::Value::Null,
+                "{case}: {}",
+                again[0]
+            );
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
 }
