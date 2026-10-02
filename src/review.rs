@@ -209,7 +209,14 @@
 //!
 //! A finding whose quote does not anchor (the model misquoted) mints nothing
 //! and is COUNTED (`orphaned_items` in the entry and the json face) — one bad
-//! item must not kill the pass. But a pass in which NOTHING parses or NOTHING
+//! item must not kill the pass. So is a finding CUT OFF by the output budget
+//! (ledger #695): the pass asks for ikigai-llm's envelope face, and when the
+//! answer did not stop on its own (`finish_reason` other than `stop`, or a
+//! backend that does not say) an answer's last item whose note does not end
+//! a sentence is refused and counted; a region whose answer hit the budget is
+//! not memoized. And a quote that occurs more than once in the file anchors
+//! in the REGION its call was shown, then near the code its note names
+//! (`annotate::find_anchor_within`), never simply on the file's first copy. But a pass in which NOTHING parses or NOTHING
 //! anchors is an error and is not archived: silently serving an empty review
 //! under a key that will never re-derive would poison the archive.
 //!
@@ -1348,6 +1355,38 @@ pub(crate) fn answer_excerpt(answer: &str) -> String {
     format!("{}…", &flat[..end])
 }
 
+/// A model answer's text and, when the backend reported it, why generation
+/// stopped (`stop`, `length`, …). Reads ikigai-llm's `as=application/json`
+/// envelope (`{text, model, finish_reason, usage}`); any other answer — a
+/// backend without that face, a plain-text stub — is its own text with no
+/// reason, which [`body_ends`] then stands in for.
+pub(crate) fn answer_text(repr: &Representation) -> (String, Option<String>) {
+    if repr.repr_type.media_type == "application/json" {
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&repr.bytes) {
+            if let Some(text) = v["text"].as_str() {
+                return (
+                    text.to_string(),
+                    v["finish_reason"].as_str().map(str::to_string),
+                );
+            }
+        }
+    }
+    (String::from_utf8_lossy(&repr.bytes).to_string(), None)
+}
+
+/// Whether a finding's note ENDS — closes on sentence punctuation, a closing
+/// bracket or quote, or a code span — rather than stopping mid-sentence. The
+/// heuristic half of truncation detection, used only where the backend did
+/// not say it stopped on its own.
+pub(crate) fn body_ends(note: &str) -> bool {
+    note.trim_end().chars().next_back().is_some_and(|c| {
+        matches!(
+            c,
+            '.' | '!' | '?' | ')' | ']' | '"' | '\'' | '`' | '*' | '”' | '’'
+        )
+    })
+}
+
 /// Every review pass IRI begins here — `{PASS_PREFIX}{repo}:{hash}:{tag}:{path}`.
 /// ⚠ The colon is load-bearing: [`REGION_PREFIX`] shares the stem up to
 /// `review`, and only the `:` tells a pass from a region memo.
@@ -1934,6 +1973,8 @@ impl Endpoint for ReviewEndpoint {
         let mut reviewed = 0usize;
         let mut collapsed: Vec<String> = Vec::new();
         let mut first_error: Option<Error> = None;
+        // Regions whose answer stopped at the output budget — never memoized.
+        let mut cut_regions: std::collections::BTreeSet<usize> = Default::default();
         for (index, tile) in tiles.iter().enumerate() {
             let region = &tile.region;
             if let Some(memo) = tile.memo {
@@ -1966,7 +2007,13 @@ impl Endpoint for ReviewEndpoint {
                 .with_arg(
                     "max_tokens",
                     ArgRef::Inline(config.review_max_tokens.to_string().into_bytes()),
-                );
+                )
+                // The envelope face, so the answer says WHY it stopped: a
+                // `finish_reason` of `length` is an answer cut at max_tokens,
+                // whose last finding may be cut mid-sentence (ledger #695). A
+                // backend without the face answers text, and `answer_text`
+                // takes either.
+                .with_arg("as", ArgRef::Inline(b"application/json".to_vec()));
             // ★ PARTIAL FAILURE IS RECORDED, NOT DISCARDED. Region 4 of 7 failing
             // must not throw away six regions of real work: the pass keeps what
             // it has and declares its coverage, which is exactly the invariant
@@ -1977,8 +2024,8 @@ impl Endpoint for ReviewEndpoint {
             // of the caller's capability, identical for every region, so
             // grinding through sixteen of them would turn one refusal into
             // sixteen and bury the reason.
-            let answer = match inv.issue(request).await {
-                Ok(answer) => String::from_utf8_lossy(&answer.bytes).to_string(),
+            let (answer, finish) = match inv.issue(request).await {
+                Ok(answer) => answer_text(&answer),
                 Err(e @ Error::Denied(_)) => return Err(e),
                 Err(e) => {
                     collapsed.push(format!("region {}: {e}", index + 1));
@@ -1998,7 +2045,25 @@ impl Endpoint for ReviewEndpoint {
                 });
                 continue;
             }
-            let (region_findings, region_malformed) = parse_findings(&answer);
+            let (mut region_findings, mut region_malformed) = parse_findings(&answer);
+            // ★ A finding cut off mid-sentence is REFUSED, not minted (ledger
+            // #695: `0975bd92` was stored ending "it's likely to result in").
+            // Only the LAST item of an answer can be cut by the output budget,
+            // and only when the answer did not stop on its own: refused, it is
+            // counted with the malformed items. And a region whose answer hit
+            // the budget gets NO memo: the model stopped before it finished,
+            // so the next pass must ask again rather than carry a partial
+            // answer forward as the whole of what these bytes deserve.
+            let budget_hit = finish.as_deref() == Some("length");
+            if finish.as_deref() != Some("stop")
+                && region_findings.last().is_some_and(|f| !body_ends(&f.note))
+            {
+                region_findings.pop();
+                region_malformed += 1;
+            }
+            if budget_hit {
+                cut_regions.insert(index);
+            }
             match region_findings.is_empty() {
                 // ★ A REGION IS CLEAN ONLY ON ITS OWN SAY-SO, and the pass is
                 // clean only if every region was. The naive union — "no findings
@@ -2075,11 +2140,13 @@ impl Endpoint for ReviewEndpoint {
         );
 
         // Mint, region by region, so each memo records exactly what its call
-        // produced — attribution is by the CALL that quoted, not by where the
-        // quote anchored: a region-7 quote that also occurs in region 1 anchors
-        // in region 1 (first occurrence), but it is region 7's memo, so a later
-        // change to region 7 re-derives it rather than carrying it beside a
-        // fresh duplicate.
+        // produced — attribution is by the CALL that quoted. And since ledger
+        // #695 the ANCHOR follows the call too: a region-7 quote that also
+        // occurs in region 1 anchors in region 7, the only place that call can
+        // have copied it from (`annotate::find_anchor_within`) — before, it
+        // took the first occurrence in the file and a finding's body described
+        // code its anchor did not point at. A quote that occurs once anchors
+        // exactly as it always did, so its finding id is unchanged.
         let mut minted = Vec::new();
         let mut orphaned_items = malformed;
         let mut suppressed_items = 0u64;
@@ -2096,7 +2163,8 @@ impl Endpoint for ReviewEndpoint {
             // moved, which is the cost the memo exists to remove.
             let mut region_members = Vec::new();
             for finding in findings {
-                match annotate::mint_pending_finding(
+                let shown = &tiles[*index].region;
+                match annotate::mint_pending_finding_within(
                     &config.archive,
                     &file_iri(repo, &rel),
                     repo,
@@ -2110,6 +2178,7 @@ impl Endpoint for ReviewEndpoint {
                     &iri,
                     created.clone(),
                     annotate::Surface::File,
+                    Some((shown.start, shown.end)),
                 )? {
                     annotate::Mint::Minted(finding_iri) => {
                         region_members.push(finding_iri.clone());
@@ -2137,7 +2206,7 @@ impl Endpoint for ReviewEndpoint {
             // pass asks about them again. A region whose items were all
             // withheld is NOT that case: its members are the declines that
             // answered them.
-            if findings.is_empty() || !region_members.is_empty() {
+            if (findings.is_empty() || !region_members.is_empty()) && !cut_regions.contains(index) {
                 let region = &tiles[*index].region;
                 let region_hash =
                     annotate::content_hash(&text.as_bytes()[region.start..region.end]);
@@ -2961,7 +3030,11 @@ mod tests {
                 match reply.as_str() {
                     "ERROR" => Err(Error::Endpoint("the backend dropped the call".to_string())),
                     "DENIED" => Err(Error::Denied("no net grant".to_string())),
-                    _ => Ok(repr_utf8("text/plain", reply)),
+                    // `JSON:` + a body answers in ikigai-llm's envelope face.
+                    _ => match reply.strip_prefix("JSON:") {
+                        Some(body) => Ok(repr_utf8("application/json", body.to_string())),
+                        None => Ok(repr_utf8("text/plain", reply)),
+                    },
                 }
             })
             .with_description(
@@ -3063,6 +3136,97 @@ mod tests {
     }
 
     const CLEAN: &str = NOTHING_ABOVE_THRESHOLD;
+
+    /// ★ A REPEATED quote anchors in the region the model was SHOWN (ledger
+    /// #695). Line 1 and line 5 are byte-identical; region 3 (lines 5–6)
+    /// quotes it. Before, the first occurrence in the file won and the finding
+    /// sat on line 1, a region whose call never saw it.
+    #[test]
+    fn a_repeated_quote_anchors_in_the_region_that_quoted_it() {
+        let root = temp_dir();
+        let repeated = SIX_LINES.replace("fn five_() {}", "fn one__() {}");
+        std::fs::write(root.join("a.rs"), &repeated).unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &[CLEAN, CLEAN, &finding_on("fn one__() {}")],
+        );
+        json(&k, "urn:repo:demo:review:a.rs", &[]);
+        let rows = json(&k, "urn:repo:demo:findings:a.rs", &[]);
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["line"], 5, "anchored in region 3, not on line 1");
+    }
+
+    /// ★ A finding CUT OFF by the output budget is refused, not minted (ledger
+    /// #695: one was stored ending mid-sentence). The backend's envelope says
+    /// `finish_reason: length`; the last item's note does not end; it is
+    /// counted as malformed, the complete item before it is kept, and the
+    /// region gets no memo — the next pass asks again.
+    #[test]
+    fn a_finding_cut_off_by_the_budget_is_refused_and_its_region_not_memoized() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let cut = serde_json::json!({
+            "text": "QUOTE: fn one__() {}\nSEVERITY: minor\nNOTE: A whole note.\n\
+                     QUOTE: fn two__() {}\nSEVERITY: critical\nNOTE: Even if it compiles, it is likely to result in",
+            "finish_reason": "length",
+        });
+        let cut = format!("JSON:{cut}");
+        let k = scripted_kernel(&root, &store, &log, REGION_BYTES, 16, &[&cut, CLEAN, CLEAN]);
+        let pass = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(pass["minted"].as_array().unwrap().len(), 1, "{pass}");
+        assert_eq!(pass["orphaned_items"], 1, "{pass}");
+        let rows = json(&k, "urn:repo:demo:findings:a.rs", &[]);
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert_eq!(rows[0]["body"], "A whole note.");
+        // Two clean regions are memoized; the cut one is not.
+        assert_eq!(pass["derived_regions"], 2, "{pass}");
+    }
+
+    /// The other two halves of the rule: a note that does not end, from a
+    /// backend that does not say why it stopped, is refused too — and one the
+    /// backend says STOPPED on its own is kept, ending or not.
+    #[test]
+    fn an_unended_note_is_refused_unless_the_backend_says_it_stopped() {
+        let unended = "QUOTE: fn one__() {}\nSEVERITY: major\nNOTE: This one is cut in";
+        let stopped = format!(
+            "JSON:{}",
+            serde_json::json!({"text": unended, "finish_reason": "stop"})
+        );
+        for (reply, kept) in [(unended.to_string(), 0), (stopped, 1)] {
+            let root = six_line_root();
+            let store = Arc::new(Store::new().unwrap());
+            let log = Arc::new(Log::default());
+            let k = scripted_kernel(
+                &root,
+                &store,
+                &log,
+                REGION_BYTES,
+                16,
+                &[&reply, CLEAN, CLEAN],
+            );
+            let result = issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:review:a.rs",
+                &[("as", "application/json")],
+                &cap(),
+            );
+            let rows = json(&k, "urn:repo:demo:findings:a.rs", &[]);
+            assert_eq!(rows.as_array().unwrap().len(), kept, "{reply}: {result:?}");
+        }
+        assert!(body_ends("It ends."));
+        assert!(body_ends("It ends in `code`"));
+        assert!(!body_ends("it is likely to result in"));
+        assert!(!body_ends("and then:"));
+    }
 
     /// A fake model that answers a REVIEW prompt with `review` and a JUDGE
     /// prompt (told apart by its system prompt) with `judge`, logging both.
