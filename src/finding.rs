@@ -1326,6 +1326,22 @@ impl Endpoint for FindingsEndpoint {
             }
             Err(_) => None,
         };
+        // `verdict=` (ledger #702) narrows the rows to those whose LATEST
+        // verdict (the row's `judge`) is that word — the closed set a
+        // consumer reads from this input's `one_of`, never from prose.
+        let verdict = match inv.inline_str("verdict") {
+            Ok(word) if crate::judge::VERDICTS.contains(&word) => Some(word.to_string()),
+            Ok(other) => {
+                return Err(Error::InvalidArgument {
+                    name: "verdict".to_string(),
+                    detail: format!(
+                        "`{other}` is not a verdict — one of: {}",
+                        crate::judge::VERDICTS.join(", ")
+                    ),
+                })
+            }
+            Err(_) => None,
+        };
         // `group=` (ledger #506) is a different read of the SAME pending set:
         // it narrows nothing new and decides nothing, so it rides this face
         // (one binding, one capability, one supersession pass) rather than a
@@ -1436,6 +1452,11 @@ impl Endpoint for FindingsEndpoint {
         let findings: Vec<Annotation> = all
             .into_iter()
             .filter(|f| state == "all" || f.state() == Some(state.as_str()))
+            .filter(|f| {
+                verdict
+                    .as_deref()
+                    .is_none_or(|word| f.judges.last().map(|v| v.verdict.as_str()) == Some(word))
+            })
             .collect();
         let mut rows =
             annotate::reconcile_findings(inv, &self.archive, &self.roots, repo, findings, contents)
@@ -2236,6 +2257,19 @@ pub(crate) fn findings_description() -> Description {
                 .one_of(crate::group::GROUP_KINDS),
         )
         .input(
+            ArgSpec::new("verdict")
+                .optional()
+                .class(XSD_STRING)
+                .summary(
+                    "narrow the rows to the findings whose LATEST judge verdict (the row's \
+                     judge.verdict) is this word; a finding no judge has looked at matches \
+                     none. The one_of is the closed set of verdict words. It narrows what \
+                     state= shows and what group= proposes over, and changes no count a \
+                     summary= reports. Omitted = every row, judged or not.",
+                )
+                .one_of(crate::judge::VERDICTS),
+        )
+        .input(
             ArgSpec::new("as")
                 .optional()
                 .class(XSD_STRING)
@@ -2540,6 +2574,62 @@ mod tests {
         );
         assert_eq!(join_words(&SEVERITIES[PRAISE_SEVERITY..], "or"), "praise");
         assert_eq!(join_words(&[], "or"), "");
+    }
+
+    /// ⚠ **Which decision word only REVISES is stated in prose, and this pins
+    /// the prose** (ledger #682, item 3). `ikigai-gonk` hides a revision-only
+    /// word from a pending finding's form by reading the `decision` summary
+    /// as `word: meaning` and finding `revises=` in the meaning — so a
+    /// rewording here would bring a button back that the Sink refuses. It
+    /// cannot be a contract fact yet: core's `ArgSpec` carries no per-value
+    /// metadata, and a second `one_of` would need a real argument whose
+    /// values are exactly these words (an alias of `decision`, which cannot
+    /// stand alone while `decision` is required). Until core grows one, this
+    /// test is what keeps the convention true: every word is defined as
+    /// `word: …`, and exactly [`RETRACT`] names `revises=` in its meaning —
+    /// parsed the way gonk parses it (a meaning runs to the next marker).
+    #[test]
+    fn exactly_the_revision_only_decision_word_names_revises_in_its_meaning() {
+        let description = finding_description();
+        let sink = description
+            .action_specs()
+            .into_iter()
+            .find(|s| s.verb == Verb::Sink)
+            .expect("the Sink action");
+        let decision = sink
+            .inputs
+            .iter()
+            .find(|i| i.name == "decision")
+            .expect("decision is declared");
+        let summary = decision.summary.as_str();
+        let markers: Vec<(usize, usize)> = decision
+            .one_of
+            .iter()
+            .map(|word| {
+                let marker = format!("{word}: ");
+                summary
+                    .match_indices(&marker)
+                    .find(|(at, _)| *at == 0 || summary[..*at].ends_with(' '))
+                    .map(|(at, _)| (at, at + marker.len()))
+                    .unwrap_or_else(|| panic!("`{word}` is not defined as `{word}: …`"))
+            })
+            .collect();
+        let revision_only: Vec<&str> = decision
+            .one_of
+            .iter()
+            .zip(&markers)
+            .filter(|(_, (_, body))| {
+                let end = markers
+                    .iter()
+                    .map(|(start, _)| *start)
+                    .filter(|start| start >= body)
+                    .min()
+                    .unwrap_or(summary.len());
+                summary[*body..end].contains("revises=")
+            })
+            .map(|(word, _)| word.as_str())
+            .collect();
+        assert_eq!(revision_only, [RETRACT], "{summary}");
     }
 
     /// The severity set is CLOSED, it is in the CONTRACT, and the menu is
