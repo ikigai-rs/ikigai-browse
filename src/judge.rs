@@ -60,6 +60,17 @@
 //! back with the finding, so a re-read never repays and a second judge (a
 //! larger tier, tried as a measured choice) adds its own verdict beside the
 //! first instead of replacing it.
+//!
+//! ## Judging a queued finding on demand (ledger #696)
+//!
+//! A pass judges only what it MINTS, so the queue that predates the judge has
+//! no verdicts. `urn:repo:{repo}:judge-finding:{id}` judges one queued finding
+//! by id and archives the verdict under the same key, so a host can backfill:
+//! a re-read under the same tag is an archive hit with no call, and Exists
+//! asks whether there is one without judging. It reads the version the
+//! finding's pass reviewed (recovered from git history when the file has
+//! moved), so a backfilled verdict means what a pass-minted one means — see
+//! [`JudgeFindingEndpoint`].
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -1613,7 +1624,12 @@ pub(crate) fn bind(
         roots: Arc::clone(roots),
         config: Arc::clone(config),
     });
-    crate::bind_family(space, roots, judge, None, Some("judge:{path}"))
+    let space = crate::bind_family(space, roots, judge, None, Some("judge:{path}"));
+    let one: Arc<dyn Endpoint> = Arc::new(JudgeFindingEndpoint {
+        roots: Arc::clone(roots),
+        config: Arc::clone(config),
+    });
+    crate::bind_family(space, roots, one, None, Some("judge-finding:{id}"))
 }
 
 /// `urn:repo:{repo}:judge:{path}` — the judge, asked about ANY claim against
@@ -1824,6 +1840,486 @@ fn judge_description(config: &ExplainConfig) -> Description {
                 .summary(
                     "the LLM provider IRI to judge with instead of the configured judge \
                      provider; one_of is what this host allows",
+                )
+                .one_of(config.selectable()),
+        )
+        .input(
+            ArgSpec::new("as")
+                .optional()
+                .class(crate::XSD_STRING)
+                .summary("the face to render")
+                .one_of(["application/json", "text/plain"])
+                .default_value("application/json"),
+        )
+        .output("application/json")
+        .output("text/plain;charset=utf-8")
+}
+
+// --- the resource: judge ONE finding by id, archived (ledger #696) -------------
+
+/// `urn:repo:{repo}:judge-finding:{id}` — the judge, asked about one FINDING
+/// already in the queue, its verdict archived on the finding exactly as the
+/// review pass archives the verdicts it makes. It exists so a host can
+/// BACKFILL: only freshly minted serious findings are judged, so the queue
+/// that predates the judge has no verdicts at all.
+///
+/// ★ **Idempotent by the archive, keyed by (finding, judge tag).** A finding
+/// that already carries a verdict under this judge's tag answers it with no
+/// call (`status: "archived"`, `calls: 0`), so a backfill over the whole
+/// queue repays nothing it already paid for; Exists asks the same question
+/// without judging. A different judge (`provider=`, or a prompt-version bump)
+/// is a different tag and judges beside, never over.
+///
+/// ★ **Judged against the bytes the REVIEWER saw.** The verdict must mean what
+/// a pass-minted verdict means, or the archive holds two kinds of verdict
+/// under one key: so the site is the version the finding's pass reviewed (the
+/// `sha256` its pass IRI names), at the offset it was minted at — the current
+/// file when it still has those bytes, else that version recovered from the
+/// repository's git history by the hash of its bytes (the way
+/// `tests/corpus/judge/export.py` recovers it). A finding whose version cannot
+/// be recovered (bytes never committed, history rewritten, a pull-request
+/// diff) is ANSWERED that way — `status: "cannot"` with the reason, as a
+/// value, never as an error, and nothing archived, so a later read tries
+/// again. ⚠ The test index is the repository AS IT STANDS, not as it was at
+/// the recovered commit: a test written since the review counts as context.
+///
+/// Why its own name and not `finding=` on [`JudgeEndpoint`]: that resource
+/// judges a claim passed BY ARGUMENT against a path and archives nothing, and
+/// its `quote` and `claim` are required. A `finding=` there would make both
+/// optional (which removes the resource from every pipeline: a Source with no
+/// required by-value input cannot be piped into) and make the path a second,
+/// contradictable copy of what the finding already names. And not
+/// `judge:finding:{id}`: that is a path under `judge:{path}`, so the two rows
+/// would both match a file named `finding:…` and resolution order would
+/// decide — the same reason `explain-versions:{path}` is not
+/// `explain:versions:{path}`.
+struct JudgeFindingEndpoint {
+    roots: Roots,
+    config: Arc<ExplainConfig>,
+}
+
+/// The version of a finding's file the judge reads, and where it came from.
+struct Reviewed {
+    text: String,
+    char_start: u64,
+    /// `current` or `recovered`.
+    content: &'static str,
+    /// `recorded` (the finding's own offset), or `minted` (recovered from the
+    /// finding id: the one occurrence that reproduces it).
+    anchor: &'static str,
+    /// The commit the recovered version was read from.
+    commit: Option<String>,
+    hash: String,
+}
+
+/// The reviewed content hash a pass IRI carries: `sha256:{64 hex}` after
+/// `{PASS_PREFIX}{repo}:`.
+fn pass_hash(pass: &str, repo: &str) -> Option<String> {
+    let rest = pass
+        .strip_prefix(crate::review::PASS_PREFIX)?
+        .strip_prefix(repo)?
+        .strip_prefix(':')?;
+    let hash = rest.get(..71)?;
+    (hash.starts_with("sha256:") && hash[7..].bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| hash.to_string())
+}
+
+/// The character offset of the occurrence of `exact` in `text` whose
+/// position reproduces the finding id — `sha256(pass ‖ char_start ‖ exact)`
+/// names exactly one.
+fn minted_offset(text: &str, pass: &str, exact: &str, id: &str) -> Option<u64> {
+    if exact.is_empty() {
+        return None;
+    }
+    let mut chars = 0u64;
+    let mut last = 0usize;
+    for (byte, _) in text.match_indices(exact) {
+        chars += text[last..byte].chars().count() as u64;
+        last = byte;
+        if annotate::finding_id(pass, chars, exact) == id {
+            return Some(chars);
+        }
+    }
+    None
+}
+
+/// One version of `rel` from the repository's git history, found by the
+/// sha256 of its bytes, with a commit that carries it — `Ok(None)` when no
+/// commit does, `Err(why)` when the history cannot be read at all. Two `git`
+/// processes stream the work (one `cat-file --batch-check` over every commit
+/// that touched the path, one `cat-file --batch` over the distinct blobs),
+/// never one per version.
+fn recover_version(
+    root: &Path,
+    rel: &str,
+    hash: &str,
+) -> std::result::Result<Option<(String, String)>, String> {
+    use std::io::{BufRead, Read, Write};
+    use std::process::{Command, Stdio};
+
+    let commits = crate::git(root, &["rev-list", "--all", "--", rel])
+        .map_err(|e| format!("could not run git: {e}"))?;
+    if !commits.status.success() {
+        return Err(format!(
+            "git history is unreadable here: {}",
+            String::from_utf8_lossy(&commits.stderr).trim()
+        ));
+    }
+    let commits: Vec<String> = String::from_utf8_lossy(&commits.stdout)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    if commits.is_empty() {
+        return Ok(None);
+    }
+    let batch = |args: &[&str], input: String| -> std::result::Result<Vec<u8>, String> {
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("could not run git: {e}"))?;
+        let mut stdin = child.stdin.take().expect("stdin is piped");
+        // Written from its own thread: git answers as it reads, and a full
+        // stdout pipe would otherwise stall both sides.
+        let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+        let mut out = Vec::new();
+        child
+            .stdout
+            .take()
+            .expect("stdout is piped")
+            .read_to_end(&mut out)
+            .map_err(|e| format!("git output: {e}"))?;
+        let _ = writer.join();
+        child.wait().map_err(|e| format!("git: {e}"))?;
+        Ok(out)
+    };
+    // `rev:./path` is relative to the root, which may sit below the work
+    // tree's top; a plain `rev:path` would be read from the top.
+    let specs: String = commits.iter().map(|c| format!("{c}:./{rel}\n")).collect();
+    let checks = batch(&["cat-file", "--batch-check"], specs)?;
+    let mut blobs: Vec<(String, String)> = Vec::new();
+    for (commit, line) in commits.iter().zip(String::from_utf8_lossy(&checks).lines()) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() == 3 && parts[1] == "blob" && blobs.iter().all(|(b, _)| b != parts[0]) {
+            blobs.push((parts[0].to_string(), commit.clone()));
+        }
+    }
+    if blobs.is_empty() {
+        return Ok(None);
+    }
+    let input: String = blobs.iter().map(|(b, _)| format!("{b}\n")).collect();
+    let out = batch(&["cat-file", "--batch"], input)?;
+    let mut reader = std::io::Cursor::new(out);
+    for (_, commit) in &blobs {
+        let mut header = String::new();
+        if reader.read_line(&mut header).map_err(|e| e.to_string())? == 0 {
+            break;
+        }
+        let size: usize = header
+            .split_whitespace()
+            .nth(2)
+            .and_then(|n| n.parse().ok())
+            .ok_or_else(|| format!("git cat-file: unexpected header `{}`", header.trim()))?;
+        // The blob's bytes and the newline git ends each one with.
+        let mut bytes = vec![0; size + 1];
+        reader
+            .read_exact(&mut bytes)
+            .map_err(|e| format!("git cat-file: {e}"))?;
+        bytes.pop();
+        if annotate::content_hash(&bytes) == hash {
+            return match String::from_utf8(bytes) {
+                Ok(text) => Ok(Some((text, commit.clone()))),
+                Err(_) => Err("the reviewed version is not UTF-8".to_string()),
+            };
+        }
+    }
+    Ok(None)
+}
+
+impl JudgeFindingEndpoint {
+    /// The finding, checked: it exists, it is this repo's, the caller may
+    /// read it.
+    fn finding<'a>(&'a self, inv: &'a Invocation<'_>) -> Result<(annotate::Annotation, &'a Path)> {
+        let (repo, root) = repo_root(inv, &self.roots)?;
+        granted(inv, repo)?;
+        let id = inv
+            .bindings
+            .get("id")
+            .ok_or_else(|| Error::MissingArgument("id".to_string()))?;
+        let finding = annotate::load_record(&self.config.archive, annotate::Family::Finding, id)?
+            .ok_or_else(|| {
+            Error::NotFound(format!(
+                "browse: no finding `{}`",
+                crate::finding::finding_iri(id)
+            ))
+        })?;
+        if finding.repo != repo {
+            return Err(Error::NotFound(format!(
+                "browse: `{}` is a finding on `{}`, not `{repo}` — judge it as \
+                 urn:repo:{}:judge-finding:{id}",
+                finding.iri(),
+                finding.repo,
+                finding.repo
+            )));
+        }
+        Ok((finding, root))
+    }
+
+    /// The judge to ask and its identity — `provider=` (one this host
+    /// offers), else the configured judge, else the review tier.
+    async fn judge(&self, inv: &Invocation<'_>) -> Result<(String, String, String)> {
+        let provider = match inv.inline_str("provider") {
+            Ok(requested) => {
+                let selectable = self.config.selectable();
+                if !selectable.contains(requested) {
+                    return Err(Error::Denied(format!(
+                        "browse: `{requested}` is not a provider this host offers to judge \
+                         with; selectable here: {}",
+                        selectable.into_iter().collect::<Vec<_>>().join(", ")
+                    )));
+                }
+                requested.to_string()
+            }
+            Err(_) => self
+                .config
+                .judge_provider
+                .clone()
+                .unwrap_or_else(|| self.config.review_provider.clone()),
+        };
+        let (tag, model) = identity(inv, &self.config, &provider).await;
+        Ok((provider, tag, model))
+    }
+
+    /// The version the finding's pass reviewed — `Err(why)` when it cannot be
+    /// had, which the caller ANSWERS rather than raises.
+    async fn reviewed(
+        &self,
+        inv: &Invocation<'_>,
+        finding: &annotate::Annotation,
+        root: &Path,
+    ) -> Result<std::result::Result<Reviewed, String>> {
+        if matches!(finding.target_ref(), annotate::TargetRef::Pr(_)) {
+            return Ok(Err(
+                "a pull-request finding: its text is a diff, not a file version the judge \
+                 can read around"
+                    .to_string(),
+            ));
+        }
+        let pass = finding.generated_by.clone().unwrap_or_default();
+        // The reviewed bytes and where the quote was minted in them. Without a
+        // pass IRI (a record no pass minted), the stored selector pair is the
+        // only version on file.
+        let (hash, recorded) = match pass_hash(&pass, &finding.repo) {
+            Some(hash) => {
+                let recorded = (finding.hash == hash).then_some(finding.start);
+                (hash, recorded)
+            }
+            None => (finding.hash.clone(), Some(finding.start)),
+        };
+        let current =
+            annotate::current_content_for(inv, &self.roots, &finding.repo, &finding.target_ref())
+                .await?;
+        let (text, content, commit) = match current {
+            annotate::CurrentContent::Text(text, now) if now == hash => (text, "current", None),
+            _ => match recover_version(root, &finding.rel, &hash) {
+                Ok(Some((text, commit))) => (text, "recovered", Some(commit)),
+                Ok(None) => {
+                    return Ok(Err(format!(
+                        "the version it was reviewed against ({hash}) is neither the current \
+                         file nor any committed version of `{}`",
+                        finding.rel
+                    )))
+                }
+                Err(why) => return Ok(Err(why)),
+            },
+        };
+        let (char_start, anchor) =
+            match recorded {
+                Some(start) => (start, "recorded"),
+                None => match minted_offset(&text, &pass, &finding.exact, &finding.id) {
+                    Some(start) => (start, "minted"),
+                    None => return Ok(Err(
+                        "no occurrence of its quote in the reviewed version reproduces its id, \
+                         so where it was anchored is unknown"
+                            .to_string(),
+                    )),
+                },
+            };
+        Ok(Ok(Reviewed {
+            text,
+            char_start,
+            content,
+            anchor,
+            commit,
+            hash,
+        }))
+    }
+}
+
+#[async_trait]
+impl Endpoint for JudgeFindingEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let verb = inv.request.verb;
+        if verb != Verb::Source && verb != Verb::Exists {
+            return Err(Error::Endpoint(format!(
+                "browse-judge-finding does not support the {verb:?} verb"
+            )));
+        }
+        let (finding, root) = self.finding(inv)?;
+        let (provider, tag, model) = self.judge(inv).await?;
+        let iri = verdict_iri(&finding.iri(), &tag);
+        let archived = finding.judges.iter().find(|v| v.iri == iri).cloned();
+        // Exists: is there a verdict by THIS judge — the backfill's check,
+        // which never asks the model.
+        if verb == Verb::Exists {
+            return Ok(repr_utf8(
+                "text/plain",
+                if archived.is_some() { "true" } else { "false" }.to_string(),
+            ));
+        }
+        let mut answer = serde_json::json!({
+            "finding": finding.iri(),
+            "repo": finding.repo,
+            "path": finding.rel,
+            "tag": tag,
+            "status": "archived",
+            "calls": 0,
+            "reason": null,
+            "content": null,
+            "anchor": null,
+            "commit": null,
+            "content_hash": null,
+            "judge": null,
+        });
+        let (status, reason, calls) = match archived {
+            Some(verdict) => {
+                answer["judge"] = verdict_json(&verdict);
+                ("archived", None, 0)
+            }
+            None => match self.reviewed(inv, &finding, root).await? {
+                Err(why) => ("cannot", Some(why), 0),
+                Ok(reviewed) => {
+                    answer["content"] = reviewed.content.into();
+                    answer["anchor"] = reviewed.anchor.into();
+                    answer["commit"] = reviewed.commit.clone().into();
+                    answer["content_hash"] = reviewed.hash.clone().into();
+                    let claim = Claim {
+                        severity: finding.severity.as_deref(),
+                        quote: &finding.exact,
+                        body: &finding.body,
+                    };
+                    let files = test_files(root, &self.config.ignore);
+                    match prepare(
+                        &finding.rel,
+                        &reviewed.text,
+                        reviewed.char_start,
+                        &claim,
+                        &files,
+                    ) {
+                        None => (
+                            "cannot",
+                            Some(format!(
+                                "its quote is not at character {} of the reviewed version",
+                                reviewed.char_start
+                            )),
+                            0,
+                        ),
+                        Some(prepared) => {
+                            let (raw, parsed) =
+                                ask(inv, &self.config, &provider, &prepared).await?;
+                            let verdict = Verdict {
+                                iri,
+                                verdict: verdict_of(&parsed.answers).to_string(),
+                                stated: parsed.stated,
+                                tag: tag.clone(),
+                                model,
+                                judged_at: inv.now().map(|t| iso8601(t.as_millis())),
+                                test_code: prepared.test_code,
+                                answers: parsed.answers,
+                                raw,
+                            };
+                            store_verdict(&self.config.archive, &finding.iri(), &verdict)?;
+                            answer["judge"] = verdict_json(&verdict);
+                            ("judged", None, 1)
+                        }
+                    }
+                }
+            },
+        };
+        answer["status"] = status.into();
+        answer["reason"] = reason.clone().into();
+        answer["calls"] = calls.into();
+        if inv
+            .inline_str("as")
+            .is_ok_and(|a| a.starts_with("text/plain"))
+        {
+            let line = match (status, &reason) {
+                ("cannot", Some(why)) => format!("cannot judge {}: {why}\n", finding.iri()),
+                _ => format!(
+                    "{status} {} ({tag}) {}\n",
+                    answer["judge"]["verdict"].as_str().unwrap_or(""),
+                    finding.iri()
+                ),
+            };
+            return Ok(repr_utf8("text/plain", line));
+        }
+        Ok(crate::repr(
+            "application/json",
+            serde_json::to_string(&answer).unwrap_or_default(),
+        ))
+    }
+
+    fn name(&self) -> &str {
+        "browse-judge-finding"
+    }
+
+    fn describe(&self) -> Description {
+        judge_finding_description(&self.config)
+    }
+}
+
+fn judge_finding_description(config: &ExplainConfig) -> Description {
+    Description::new("browse-judge-finding")
+        .title("Judge one queued finding, archived")
+        .summary(
+            "Run the judge on ONE finding already in the review queue (urn:iki:finding:{id}) and \
+             ARCHIVE the verdict on it, exactly as a review pass archives the verdicts it makes \
+             (judge / judges on the finding's json row) — so a host can backfill verdicts on \
+             findings minted before the judge existed. Idempotent: a finding that already \
+             carries a verdict under this judge's tag answers it with no model call \
+             (status archived, calls 0); Exists answers whether it does, without judging. \
+             Judged against the version the finding's pass REVIEWED: the current file when it \
+             still has those bytes, else that version recovered from the repository's git \
+             history by its sha256 — and when it cannot be recovered (never committed, a \
+             pull-request diff), the answer says so (status cannot, with the reason) and \
+             nothing is archived. Nothing is dropped, withheld or re-rated by a verdict. \
+             application/json (default): {finding, repo, path, tag, status \
+             (judged|archived|cannot), calls, reason, content (current|recovered), anchor, \
+             commit, content_hash, judge (the verdict object, or null)}; text/plain: one line.",
+        )
+        .verb(Verb::Source)
+        .verb(Verb::Exists)
+        .verb(Verb::Meta)
+        .requires(CAP_WILDCARD)
+        .requires(CAP_NET)
+        .input(
+            ArgSpec::new("id")
+                .binding()
+                .class(crate::XSD_STRING)
+                .summary("the finding id (urn:iki:finding:{id}), a finding on this repo"),
+        )
+        .input(
+            ArgSpec::new("provider")
+                .optional()
+                .class("http://www.w3.org/2001/XMLSchema#anyURI")
+                .summary(
+                    "the LLM provider IRI to judge with instead of the configured judge \
+                     provider (its own tag, so its verdict sits beside the default's); one_of \
+                     is what this host allows",
                 )
                 .one_of(config.selectable()),
         )
@@ -2100,5 +2596,290 @@ mod tests {
         for triple in parser.for_slice(doc.as_bytes()) {
             triple.expect("valid turtle");
         }
+    }
+}
+
+/// The judge-one-finding resource end to end (ledger #696): a real git
+/// repository, a review pass with the judge OFF (a queue that predates it),
+/// then the judge asked about one queued finding.
+#[cfg(test)]
+mod finding_tests {
+    use super::*;
+    use futures::executor::block_on;
+    use ikigai_core::{Capability, Exact, Fallback, FnEndpoint, Iri, Kernel};
+    use oxigraph::store::Store;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Mutex;
+
+    const PROVIDER: &str = "urn:llm:coder:ask";
+    /// The first version: the claim's quote, inside an item whose comment
+    /// names the version, so a prompt says which version it was built from.
+    const V1: &str = "/// Adds.\npub fn alpha() {\n    // version one\n    let x = 1;\n}\n";
+    /// The second: lines inserted ABOVE, so every offset moves, and the
+    /// comment changed, so a prompt built from it is told apart.
+    const V2: &str =
+        "// a header\n// another\n/// Adds.\npub fn alpha() {\n    // version two\n    \
+                      let x = 1;\n}\n";
+    const REVIEW: &str = "QUOTE: let x = 1;\nSEVERITY: critical\nNOTE: This overflows.\n";
+    const JUDGE: &str = "CODE: no - it assigns a constant.\nDISCLOSED: no - nothing says so.\n\
+                         OCCURS: no - a constant cannot overflow.\nTEST: no - library code.\n\
+                         VERDICT: refuted\n";
+
+    fn temp_dir() -> PathBuf {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "ikigai-browse-judge-finding-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// `git -C dir` with a throwaway identity, asserting success.
+    fn git(dir: &Path, args: &[&str]) {
+        let mut all = vec![
+            "-C",
+            dir.to_str().unwrap(),
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
+        ];
+        all.extend(args);
+        let out = std::process::Command::new("git")
+            .args(&all)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn commit(dir: &Path, text: &str, message: &str) {
+        std::fs::write(dir.join("a.rs"), text).unwrap();
+        git(dir, &["add", "a.rs"]);
+        git(dir, &["commit", "-m", message]);
+    }
+
+    /// Every prompt the fake model was asked, with its system prompt.
+    #[derive(Default)]
+    struct Log(Mutex<Vec<(String, String)>>);
+
+    impl Log {
+        fn judge_calls(&self) -> Vec<String> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, system)| system.starts_with("You check one claim"))
+                .map(|(prompt, _)| prompt.clone())
+                .collect()
+        }
+    }
+
+    /// A kernel over `root` whose model answers a review prompt with
+    /// [`REVIEW`] and a judge prompt with [`JUDGE`]; `judge` says whether the
+    /// review pass judges what it mints (off = a queue from before the judge).
+    fn kernel(root: &Path, store: &Arc<Store>, log: &Arc<Log>, judge: bool) -> Kernel {
+        let log = Arc::clone(log);
+        let llm = EndpointSpace::new().bind(
+            Exact::new(PROVIDER),
+            FnEndpoint::new("fake-llm", move |inv: &Invocation<'_>| {
+                let system = inv.inline_str("system").unwrap_or("").to_string();
+                let prompt = inv.inline_str("prompt").unwrap_or("").to_string();
+                log.0.lock().unwrap().push((prompt, system.clone()));
+                let reply = match system.starts_with("You check one claim") {
+                    true => JUDGE,
+                    false => REVIEW,
+                };
+                Ok(repr_utf8("text/plain", reply.to_string()))
+            })
+            .with_description(
+                Description::new("fake-llm")
+                    .verb(Verb::Source)
+                    .requires(CAP_NET),
+            ),
+        );
+        let mut cfg = ExplainConfig::new(Arc::clone(store)).review_model_label("r1");
+        if !judge {
+            cfg = cfg.no_judge();
+        }
+        let browse = crate::space_with_explain(vec![("demo".to_string(), root.to_path_buf())], cfg);
+        Kernel::new(Arc::new(Fallback::new(vec![
+            Arc::new(browse),
+            Arc::new(llm),
+        ])))
+    }
+
+    fn cap() -> Capability {
+        Capability::scoped(["urn:cap:browse:read:demo", "urn:cap:net:localhost"])
+    }
+
+    fn issue(k: &Kernel, verb: Verb, iri: &str, args: &[(&str, &str)]) -> Result<String> {
+        let mut request = Request::new(verb, Iri::parse(iri.to_string()).unwrap());
+        for (name, value) in args {
+            request = request.with_arg(*name, ArgRef::Inline(value.as_bytes().to_vec()));
+        }
+        block_on(k.issue(request, &cap())).map(|r| String::from_utf8_lossy(&r.bytes).to_string())
+    }
+
+    fn json(k: &Kernel, iri: &str) -> serde_json::Value {
+        serde_json::from_str(&issue(k, Verb::Source, iri, &[("as", "application/json")]).unwrap())
+            .unwrap()
+    }
+
+    /// The review pass over `a.rs` with the judge OFF, and its one finding's id.
+    fn queued(root: &Path, store: &Arc<Store>, log: &Arc<Log>) -> String {
+        let k = kernel(root, store, log, false);
+        let pass = json(&k, "urn:repo:demo:review:a.rs");
+        let minted = pass["minted"].as_array().unwrap();
+        assert_eq!(minted.len(), 1, "{pass}");
+        let iri = minted[0].as_str().unwrap();
+        assert!(json(&k, iri)["judge"].is_null(), "the pass judged nothing");
+        assert!(log.judge_calls().is_empty());
+        iri.strip_prefix("urn:iki:finding:").unwrap().to_string()
+    }
+
+    /// ★★ A queued finding is judged ONCE: the first read asks the model and
+    /// archives the verdict on the finding (its row's `judge`), the second is
+    /// an archive hit with no call, and Exists says which without judging.
+    #[test]
+    fn a_queued_finding_is_judged_once_and_a_reread_costs_no_call() {
+        let root = temp_dir();
+        git(&root, &["init", "-q"]);
+        commit(&root, V1, "one");
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let id = queued(&root, &store, &log);
+        let k = kernel(&root, &store, &log, true);
+        let resource = format!("urn:repo:demo:judge-finding:{id}");
+
+        assert_eq!(issue(&k, Verb::Exists, &resource, &[]).unwrap(), "false");
+        assert!(log.judge_calls().is_empty(), "Exists never asks the model");
+
+        let first = json(&k, &resource);
+        assert_eq!(first["status"], "judged", "{first}");
+        assert_eq!(first["calls"], 1);
+        assert_eq!(first["content"], "current");
+        assert_eq!(first["anchor"], "recorded");
+        assert_eq!(first["judge"]["verdict"], "refuted");
+        assert_eq!(first["judge"]["tag"], "judge-v1@r1");
+        assert_eq!(first["tag"], "judge-v1@r1");
+        assert_eq!(log.judge_calls().len(), 1);
+        assert!(log.judge_calls()[0].contains("QUOTE: let x = 1;"));
+
+        // Attached to the finding exactly as a pass-minted verdict is.
+        let row = json(&k, &format!("urn:iki:finding:{id}"));
+        assert_eq!(row["judge"]["verdict"], "refuted", "{row}");
+        assert_eq!(row["judges"].as_array().unwrap().len(), 1);
+        assert_eq!(row["state"], "pending", "nothing is decided by a verdict");
+
+        let again = json(&k, &resource);
+        assert_eq!(again["status"], "archived", "{again}");
+        assert_eq!(again["calls"], 0);
+        assert_eq!(again["judge"], first["judge"]);
+        assert_eq!(log.judge_calls().len(), 1, "the re-read cost no call");
+        assert_eq!(issue(&k, Verb::Exists, &resource, &[]).unwrap(), "true");
+
+        let plain = issue(&k, Verb::Source, &resource, &[("as", "text/plain")]).unwrap();
+        assert!(
+            plain.starts_with("archived refuted (judge-v1@r1)"),
+            "{plain}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★ When the file has MOVED, the judge reads the version the reviewer
+    /// saw, recovered from git history by its hash, at the offset the id was
+    /// minted at — after a read has re-anchored the stored selector onto the
+    /// new version, so the id is the only record of the old offset.
+    #[test]
+    fn a_moved_file_is_judged_against_its_recovered_version() {
+        let root = temp_dir();
+        git(&root, &["init", "-q"]);
+        commit(&root, V1, "one");
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let id = queued(&root, &store, &log);
+        commit(&root, V2, "two");
+        let k = kernel(&root, &store, &log, true);
+        // A read re-anchors it onto V2 (the drift pass every read runs).
+        let row = json(&k, &format!("urn:iki:finding:{id}"));
+        assert_eq!(row["reanchored"], true, "{row}");
+
+        let answer = json(&k, &format!("urn:repo:demo:judge-finding:{id}"));
+        assert_eq!(answer["status"], "judged", "{answer}");
+        assert_eq!(answer["content"], "recovered");
+        assert_eq!(answer["anchor"], "minted");
+        assert_eq!(
+            answer["content_hash"],
+            annotate::content_hash(V1.as_bytes())
+        );
+        assert_eq!(answer["commit"].as_str().unwrap().len(), 40);
+        let prompts = log.judge_calls();
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].contains("version one"), "{}", prompts[0]);
+        assert!(!prompts[0].contains("version two"), "{}", prompts[0]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A finding whose reviewed bytes were never committed, once the file has
+    /// moved on, cannot be judged — and the answer SAYS so, as a value: no
+    /// call, nothing archived, so a later read tries again. An unknown id and
+    /// a finding on another repo are not found.
+    #[test]
+    fn a_finding_whose_version_cannot_be_recovered_says_so() {
+        let root = temp_dir();
+        git(&root, &["init", "-q"]);
+        commit(&root, "// something else\n", "zero");
+        std::fs::write(root.join("a.rs"), V1).unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let id = queued(&root, &store, &log);
+        commit(&root, V2, "two");
+        let k = kernel(&root, &store, &log, true);
+        let resource = format!("urn:repo:demo:judge-finding:{id}");
+
+        let answer = json(&k, &resource);
+        assert_eq!(answer["status"], "cannot", "{answer}");
+        assert_eq!(answer["calls"], 0);
+        assert!(answer["judge"].is_null());
+        let reason = answer["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("neither the current file nor any committed version"),
+            "{reason}"
+        );
+        assert!(log.judge_calls().is_empty(), "no call");
+        assert_eq!(issue(&k, Verb::Exists, &resource, &[]).unwrap(), "false");
+        let plain = issue(&k, Verb::Source, &resource, &[("as", "text/plain")]).unwrap();
+        assert!(
+            plain.starts_with("cannot judge urn:iki:finding:"),
+            "{plain}"
+        );
+
+        let err = issue(&k, Verb::Source, "urn:repo:demo:judge-finding:nope", &[]).unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_pass_hash_and_the_minted_offset_are_read_exactly() {
+        let hash = format!("sha256:{}", "a".repeat(64));
+        let pass = crate::review::pass_iri("demo", "src/a.rs", &hash, "review-v5@m:30b");
+        assert_eq!(pass_hash(&pass, "demo"), Some(hash.clone()));
+        assert_eq!(pass_hash(&pass, "other"), None);
+        assert_eq!(pass_hash("urn:x", "demo"), None);
+        // Two occurrences: only the one whose offset reproduces the id.
+        let text = "é x\nx\n";
+        let second = 4; // characters, not bytes: `é` is two bytes
+        let id = annotate::finding_id(&pass, second, "x");
+        assert_eq!(minted_offset(text, &pass, "x", &id), Some(second));
+        assert_eq!(minted_offset(text, &pass, "x", "nope"), None);
     }
 }

@@ -129,10 +129,10 @@ const RAW_FACE_IS_A_PASS_THROUGH: &str =
      `the_raw_file_face_serves_the_extension_mapped_type`; remove this waiver when \
      `Description` grows a pass-through output marker (core PENDING §20)";
 
-/// Every description id this crate binds. A twenty-first endpoint bound without a
-/// line here is held to a weaker standard than the twenty; a listed id that binds
-/// nothing is a stale list.
-const ENDPOINTS: [&str; 20] = [
+/// Every description id this crate binds. A twenty-second endpoint bound without a
+/// line here is held to a weaker standard than the twenty-one; a listed id that
+/// binds nothing is a stale list.
+const ENDPOINTS: [&str; 21] = [
     "annotation",
     "browse-annotations",
     "browse-explain",
@@ -141,6 +141,7 @@ const ENDPOINTS: [&str; 20] = [
     "browse-findings",
     "browse-hash",
     "browse-judge",
+    "browse-judge-finding",
     "browse-layout",
     "browse-pr",
     "browse-pr-explain",
@@ -370,6 +371,11 @@ fn suite(findings: &[String]) -> Suite {
                 .arg("quote", "pub fn demo() {}")
                 .arg("claim", "the fixture's claim"),
         )
+        // Judging ONE queued finding: the pass above minted it, the stub's
+        // answer carries no judge lines (an `unsure` verdict, archived on the
+        // finding), and the Exists probe then answers from that archive. The
+        // binding is per entry, so both verbs name the same finding.
+        .fixture(Fixture::new("browse-judge-finding", Verb::Source).binding("id", &findings[0]))
         // The annotation entry: the Source probe reads `walk`, and the pipeline
         // probe rewrites it (`content` is the body's piped form). `target` and
         // `exact` are per (id, verb), so the Sink gets a call that anchors —
@@ -517,6 +523,8 @@ fn conforms() {
             "browse-findings source text/turtle",
             "browse-hash source text/plain",
             "browse-judge source application/json",
+            "browse-judge-finding exists text/plain",
+            "browse-judge-finding source application/json",
             "browse-layout source text/css",
             "browse-review source text/plain",
             "browse-review source text/turtle",

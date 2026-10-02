@@ -2062,7 +2062,7 @@ struct GitState {
 }
 
 /// Run `git -C <root> <args…>` — an argument vector, never a shell string.
-fn git(root: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
+pub(crate) fn git(root: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
     Command::new("git").arg("-C").arg(root).args(args).output()
 }
 
