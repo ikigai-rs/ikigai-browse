@@ -150,8 +150,8 @@ fn main() {
     // A REASONING model (gpt-oss) spends its budget thinking before it answers; at the
     // pass's 400 tokens it returned an empty answer on every call (2026-10-02). The flag lets a
     // measurement give it room; the pass's own budget is ExplainConfig::judge_max_tokens.
-    let max_tokens: Option<u32> = take_flag(&mut args, "--max-tokens")
-        .map(|n| n.parse().expect("--max-tokens is a count"));
+    let max_tokens: Option<u32> =
+        take_flag(&mut args, "--max-tokens").map(|n| n.parse().expect("--max-tokens is a count"));
     let split = take_flag(&mut args, "--split").unwrap_or_else(|| "all".to_string());
     let scope = take_flag(&mut args, "--scope").unwrap_or_else(|| "serious".to_string());
     let limit: usize = take_flag(&mut args, "--limit")
