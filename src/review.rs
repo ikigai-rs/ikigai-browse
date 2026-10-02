@@ -2211,6 +2211,17 @@ impl Endpoint for ReviewEndpoint {
         for memo in &memos {
             store_region(&config.archive, memo, repo, &rel, &entry.model)?;
         }
+        // ★ The judge (ledger #483): one more call per SERIOUS finding this
+        // pass MINTED, with the context the reviewer's region did not have
+        // (the enclosing item, the comments at the site, whether it is test
+        // code, the repo's tests that mention it). Its verdict is ATTACHED to
+        // the finding and changes nothing else — no finding is dropped,
+        // withheld or re-rated by it (ledger #475's rule). After the pass is
+        // archived, so a judge that fails costs the pass nothing; carried
+        // findings were judged by the pass that minted them, and a re-read is
+        // an archive hit that judges nothing. The review prompt never learns
+        // any of this (ledger #449).
+        crate::judge::judge_findings(inv, config, root, &rel, &text, &entry.minted).await?;
         // Carried findings re-anchor here, on read, by the one drift path —
         // their offsets move with the insertion above them, their ids do not.
         let included = annotate::included_for_ids(&config.archive, &entry.findings(), &text)?;
@@ -2971,10 +2982,13 @@ mod tests {
         chunks: usize,
         replies: &[&str],
     ) -> Kernel {
+        // The judge is off: the replies are scripted one per call, in order,
+        // and a judge call would consume one.
         let cfg = ExplainConfig::new(Arc::clone(store))
             .review_model_label("r1")
             .max_prompt_bytes(bytes)
-            .review_max_chunks(chunks);
+            .review_max_chunks(chunks)
+            .no_judge();
         let browse = crate::space_with_explain(vec![("demo".to_string(), root.to_path_buf())], cfg);
         Kernel::new(Arc::new(Fallback::new(vec![
             Arc::new(browse),
@@ -3049,6 +3063,115 @@ mod tests {
     }
 
     const CLEAN: &str = NOTHING_ABOVE_THRESHOLD;
+
+    /// A fake model that answers a REVIEW prompt with `review` and a JUDGE
+    /// prompt (told apart by its system prompt) with `judge`, logging both.
+    fn review_and_judge_space(log: &Arc<Log>, review: &str, judge: &str) -> EndpointSpace {
+        let log = Arc::clone(log);
+        let (review, judge) = (review.to_string(), judge.to_string());
+        EndpointSpace::new().bind(
+            Exact::new(PROVIDER),
+            FnEndpoint::new("fake-review-and-judge-llm", move |inv: &Invocation<'_>| {
+                let system = inv.inline_str("system").unwrap_or("").to_string();
+                log.asks.lock().unwrap().push((
+                    inv.inline_str("prompt").unwrap_or("").to_string(),
+                    system.clone(),
+                    inv.inline_str("temperature").unwrap_or("").to_string(),
+                ));
+                let reply = match system.starts_with("You check one claim") {
+                    true => judge.clone(),
+                    false => review.clone(),
+                };
+                Ok(repr_utf8("text/plain", reply))
+            })
+            .with_description(
+                Description::new("fake-review-and-judge-llm")
+                    .verb(Verb::Source)
+                    .requires(CAP_NET),
+            ),
+        )
+    }
+
+    /// ★ The judge rides on the pass (ledger #483): one call per SERIOUS
+    /// finding the pass mints, at temperature 0, its verdict ATTACHED to the
+    /// finding row — and nothing else changes: the refuted finding is still
+    /// pending, still in the queue, still rated what the model proposed. A
+    /// re-read is an archive hit and judges nothing; a minor finding is never
+    /// judged; and the review prompt never mentions the judge.
+    #[test]
+    fn a_pass_judges_its_serious_findings_and_attaches_the_verdict() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let review = "QUOTE: fn alpha() {}\nSEVERITY: critical\nNOTE: This panics on every call.\n\
+                      QUOTE: fn beta() {}\nSEVERITY: minor\nNOTE: Consider a doc comment.\n";
+        let judge = "CODE: no - the function is empty and cannot panic.\nDISCLOSED: no - nothing \
+                     says so.\nOCCURS: no - an empty body does nothing.\nTEST: no - library \
+                     code.\nVERDICT: refuted\n";
+        let cfg = ExplainConfig::new(Arc::clone(&store)).review_model_label("r1");
+        let browse = crate::space_with_explain(vec![("demo".to_string(), root.clone())], cfg);
+        let k = Kernel::new(Arc::new(Fallback::new(vec![
+            Arc::new(browse),
+            Arc::new(review_and_judge_space(&log, review, judge)),
+        ])));
+
+        let pass = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(pass["minted"].as_array().unwrap().len(), 2, "{pass}");
+        // One review call, one judge call (the critical one only).
+        let asks = log.asks.lock().unwrap().clone();
+        assert_eq!(asks.len(), 2, "{asks:?}");
+        assert!(!asks[0].0.contains("judge") && !asks[0].1.contains("judge"));
+        assert!(asks[1].1.starts_with("You check one claim"));
+        assert_eq!(asks[1].2, "0", "the judge asks at temperature 0");
+        assert!(asks[1].0.contains("QUOTE: fn alpha() {}"));
+        assert!(asks[1].0.contains("CLAIM: This panics on every call."));
+
+        let rows = json(&k, "urn:repo:demo:findings:a.rs", &[]);
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 2, "nothing is dropped by a verdict");
+        let critical = rows.iter().find(|r| r["severity"] == "critical").unwrap();
+        assert_eq!(
+            critical["state"], "pending",
+            "nothing is withheld by a verdict"
+        );
+        assert_eq!(critical["effective_severity"], "critical", "nor re-rated");
+        let verdict = &critical["judge"];
+        assert_eq!(verdict["verdict"], "refuted", "{critical}");
+        assert_eq!(verdict["stated"], "refuted");
+        assert_eq!(verdict["tag"], "judge-v1@r1");
+        assert_eq!(verdict["model"], "r1");
+        assert_eq!(verdict["test_code"], false);
+        assert_eq!(verdict["answers"]["occurs"]["answer"], "no");
+        assert_eq!(
+            verdict["answers"]["code"]["reason"],
+            "the function is empty and cannot panic."
+        );
+        assert_eq!(critical["judges"].as_array().unwrap().len(), 1);
+        let minor = rows.iter().find(|r| r["severity"] == "minor").unwrap();
+        assert!(minor["judge"].is_null(), "a minor finding is not judged");
+
+        // The finding's graph face carries the verdict node.
+        let id = critical["id"].as_str().unwrap();
+        let ttl = body(
+            &issue(
+                &k,
+                Verb::Source,
+                &format!("urn:iki:finding:{id}"),
+                &[("as", "text/turtle")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert!(
+            ttl.contains(&format!("<urn:iki:finding:{id}:judge:judge-v1@r1>")),
+            "{ttl}"
+        );
+        assert!(ttl.contains("<urn:iki:judge:verdict:refuted>"), "{ttl}");
+
+        // A re-read is an archive hit: no review call, no judge call.
+        json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 2);
+    }
 
     #[test]
     fn a_review_derives_once_and_mints_once() {

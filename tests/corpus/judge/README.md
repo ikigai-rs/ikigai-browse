@@ -118,6 +118,56 @@ Every false finding through, every real one kept, zero calls. A judge earns its 
 refuting known-false findings while keeping known-real ones, by more than its own run-to-run
 disagreement.
 
+## The first measurement: `judge-v1` (2026-10-01)
+
+`examples/judge-probe.rs` over the serious entries (104), through `urn:repo:probe:judge:{path}` —
+the resource the review pass's own judgment runs on — with each repo extracted at the entry's
+`commit`, so the test index sees the repository as it was. Temperature 0.
+
+**How the prompt and the rule were chosen, said first.** The four questions are the brief's,
+and the brief wrote them from critical sweep 1's patterns — so the known-false set is NOT
+independent of the question design, holdout or not. Within that, I iterated only on the dev
+split (70 entries; 144 calls across three dev runs): the first wording refuted 18/21 known-false
+but lost 4/6 verified-real, mostly by answering `disclosed: yes` for a comment that DESCRIBES the
+behavior a real claim criticizes, and `code: no`/`occurs: no` when the counter-evidence lay
+outside the item shown. The second wording narrowed `disclosed` to a comment that WARNS about the
+same problem and asked for `unclear` where the answer depends on code not shown; and the rule
+dropped `code: no` as a refuter (it lost real cross-region defects and caught nothing the other
+three answers did not). Both choices were fixed before the held-out split was scored.
+
+| judge | split | known-false refuted | let through | unsure | verified-real kept / lost / unsure | published kept / lost / unsure | calls | s/call |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `qwen3-coder:30b-a3b-q8_0` (the live `coder`), rule | dev | 18/21 | 3 | 0 | 3 / 1 / 2 | 8 / 25 / 10 | 70 | 3.6 |
+| same | **holdout** | **10/11** | 1 | 0 | 0 / **1** / 0 | 2 / 19 / 1 | 34 | |
+| same | all | 28/32 | 4 | 0 | 3 / 2 / 2 | 10 / 44 / 11 | 104 | |
+| same, the model's own `VERDICT` | all | 17/32 | 15 | 0 | 5 / 2 / 0 | 41 / 20 / 4 | (same calls) | |
+| `qwen3-coder-next` (79.7B, Q4_K_M), rule | dev | 13/21 | 4 | 4 | 4 / 0 / 2 | 11 / 19 / 13 | 70 | 5.0 |
+| same | **holdout** | **6/11** | 1 | 4 | 0 / 0 / 1 | 3 / 11 / 8 | 34 | |
+| same | all | 19/32 | 5 | 8 | 4 / **0** / 3 | 14 / 30 / 21 | 104 | |
+
+**Repeatability: 104/104 identical verdicts** between two `coder` runs (208 calls, 6.3 and 7.1
+minutes wall clock on a backend shared with live review passes). At temperature 0 the local
+backend is deterministic, as ledger #449 measured for the review; the run-to-run spread that
+makes a single review pass a coin flip (ledger #492) is not present in the judge.
+
+What it says, plainly:
+
+- **The live tier refutes almost every serious finding** — 28 of 32 known-false, but also 44 of
+  65 published and 2 of 7 verified-real (`intent:ledger` and `intent:time`, both authority
+  defects whose evidence is a declaration the item does not contradict on its face). It
+  discriminates between known-false and published only weakly (88% against 68% refuted).
+- **The larger tier is more careful**: it refutes fewer known-false (19/32) but loses NO verified
+  real finding (4 kept, 3 unsure) and says `unsure` far more often. At 1.4x the time per call.
+- **The model's own VERDICT line is worse than the rule** on this set: it lets 15 of 32
+  known-false through.
+- **The published row is mostly not real defects.** Reading the 22 held-out published claims,
+  at most about three assert a concrete, checkable defect; the rest are speculation ("could",
+  "may need validation"), documentation suggestions, or commentary rated `major`. So "lost"
+  there overstates the damage, by how much nobody has measured. The set needs a real verified
+  half — findings a reproduction confirmed — before a judge's recall can be read off it.
+- **The verified-real set is 7**, six of them human-written claims. Every number in that
+  column is a handful of cases.
+
 ## Re-exporting
 
 ```sh

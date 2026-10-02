@@ -215,6 +215,10 @@ pub struct ExplainConfig {
     /// Extra guidance the REVIEW pass shows the model between its instruction
     /// and the file — [`ExplainConfig::review_guidance`], the probe seam.
     pub(crate) review_guidance: Option<String>,
+    /// The provider the JUDGE asks about each serious finding a review pass
+    /// mints — [`ExplainConfig::judge_provider`]; `None` turns the judge off.
+    pub(crate) judge_provider: Option<String>,
+    pub(crate) judge_max_tokens: u32,
 }
 
 impl ExplainConfig {
@@ -249,7 +253,36 @@ impl ExplainConfig {
             max_prompt_bytes: 16 * 1024,
             review_max_chunks: 16,
             review_guidance: None,
+            judge_provider: Some("urn:llm:coder:ask".to_string()),
+            judge_max_tokens: 400,
         }
+    }
+
+    /// The provider the JUDGE asks (default `urn:llm:coder:ask`, the review
+    /// tier's own default): one call per SERIOUS finding a review pass mints,
+    /// at temperature 0, that confirms or refutes the claim with the context
+    /// the reviewer did not have, and attaches the verdict to the finding (see
+    /// the `judge` module). ★ Configurable so a STRONGER model can be tried on
+    /// the judge alone — a measured choice, `tests/corpus/judge/` the set it is
+    /// measured on — while the review keeps its tier. A verdict is keyed by
+    /// (finding, judge tag), so a second judge's verdict sits beside the first.
+    pub fn judge_provider(mut self, iri: impl Into<String>) -> Self {
+        self.judge_provider = Some(iri.into());
+        self
+    }
+
+    /// Turn the judge off: review passes mint their findings with no verdict
+    /// attached, as every pass before the judge existed did.
+    pub fn no_judge(mut self) -> Self {
+        self.judge_provider = None;
+        self
+    }
+
+    /// The judge's `max_tokens` ceiling (default 400 — four one-sentence
+    /// answers and a verdict line).
+    pub fn judge_max_tokens(mut self, tokens: u32) -> Self {
+        self.judge_max_tokens = tokens;
+        self
     }
 
     /// Extra guidance for the REVIEW pass, inserted between the per-file

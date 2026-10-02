@@ -1,0 +1,2104 @@
+//! The **judge**: a second, separate call per SERIOUS review finding that
+//! confirms or refutes the claim with the context the reviewer did not have
+//! (ledger #483, the plan Brian approved 2026-10-01).
+//!
+//! ## Why a second call, and why this input
+//!
+//! Critical sweep 1 (ledger #655) verified all 24 critical pending findings by
+//! reproduction: 1 partly real, 23 not defects. The misses share a cause. The
+//! reviewer judges a region of at most `max_prompt_bytes` it cannot see around,
+//! so it flags a default without its data source, a "panic" a test disproves,
+//! a `?` without the caller, "won't compile" on green code, an `.expect` inside
+//! a test. Two prompt lines aimed at the class were measured and both failed
+//! (the table on `REVIEW_PROMPT_VERSION`): what the reviewer lacks is not an
+//! instruction but CONTEXT, and context is something code can hand it.
+//!
+//! So the judge sees, for one claim:
+//!
+//! * the WHOLE enclosing item (function, impl, struct, `def`), not the tile,
+//!   numbered, with the quoted line marked — and its leading doc comment and
+//!   attributes;
+//! * the comments at the site, pulled out on their own: the block immediately
+//!   above the quoted line, a trailing comment on it, the item's doc;
+//! * whether the site is TEST code, and why (a `tests/` path, a `#[cfg(test)]`
+//!   module, a `#[test]` function);
+//! * the tests in the repository that MENTION the claim's symbols — each test's
+//!   name and its asserting lines;
+//! * the claim itself: its severity, its quote and its body.
+//!
+//! And it answers four narrow questions, each with a short reason, instead of
+//! being asked to review again: does the cited code do what the claim says;
+//! is the hazard already disclosed at the site; would the claimed failure
+//! actually occur; is this test code where failing loudly is the intent.
+//!
+//! ## The verdict is a RULE over the answers, and the model's own word rides beside it
+//!
+//! [`verdict_of`] maps the four answers to `confirmed` / `refuted` / `unsure`
+//! deterministically, so a refutation names the answer that refuted it and a
+//! router can key on the answers rather than on a word. The model's own
+//! `VERDICT:` line is kept as `stated` — measured beside the rule on the eval
+//! set (`tests/corpus/judge/`), never used to override it.
+//!
+//! ## What a verdict does: NOTHING, by itself
+//!
+//! ★ **No finding is dropped, withheld or re-rated because of a verdict.** The
+//! rule ledger #475 rejected — a review that silently withholds a finding is
+//! worse than one that repeats a false one — stands. The verdict is ATTACHED to
+//! the finding (`judge` on the json row, the verdict node on the Turtle face)
+//! and routing on it is the host's (gonk's) decision, made in the open.
+//!
+//! ## Separation from the review prompt (ledger #449)
+//!
+//! The REVIEW prompt never learns the judge exists, the decline words, or any
+//! decision: telling a model how its output is filtered is the measured way to
+//! make it write past the filter. The judge is its own call, with its own system
+//! prompt, its own version tag ([`JUDGE_PROMPT_VERSION`]), at temperature 0.
+//!
+//! ## Archived, keyed by (finding, judge tag)
+//!
+//! A verdict is stored once under `urn:iki:finding:{id}:judge:{tag}` and read
+//! back with the finding, so a re-read never repays and a second judge (a
+//! larger tier, tried as a measured choice) adds its own verdict beside the
+//! first instead of replacing it.
+
+use std::collections::BTreeSet;
+use std::path::Path;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use ikigai_core::{
+    ArgRef, ArgSpec, Description, Endpoint, EndpointSpace, Error, Invocation, Representation,
+    Request, Result, Verb,
+};
+use oxigraph::model::{Literal, NamedNode, Quad, Term};
+
+use crate::annotate::{self, PROV};
+use crate::archive::Archive;
+use crate::explain::{ik, iso8601, parse_iri, provider_label, resolve_model, CAP_NET};
+use crate::finding::SEVERITIES;
+use crate::{
+    file_iri, granted, iri_encode, path_binding, repo_root, repr_utf8, resolve, ExplainConfig,
+    Roots, CAP_WILDCARD,
+};
+
+/// Version of the judge prompt pair, folded into the verdict key. A prompt
+/// edit bumps this; verdicts under an older tag stay on file beside the new.
+pub(crate) const JUDGE_PROMPT_VERSION: &str = "judge-v1";
+
+/// The three verdicts, in the order a reader triages them.
+pub(crate) const VERDICTS: [&str; 3] = ["confirmed", "refuted", "unsure"];
+
+/// The four questions, by the key each answer is stored and served under.
+pub(crate) const QUESTIONS: [&str; 4] = ["code", "disclosed", "occurs", "test"];
+
+/// How many lines of an enclosing item the judge is shown before it is cut to
+/// a window around the quote. Large enough for nearly every function; an item
+/// longer than this is a module-sized `impl` whose middle is not the context.
+const MAX_ITEM_LINES: usize = 240;
+/// Lines either side of the quote when there is no item to show (prose, a
+/// manifest) or the item is longer than [`MAX_ITEM_LINES`].
+const WINDOW_LINES: usize = 40;
+/// Tests listed, and asserting lines quoted per test.
+const MAX_TESTS: usize = 8;
+const MAX_ASSERTS: usize = 3;
+/// What the repository walk reads at most — the test index is context, not a
+/// crawl, and a pathological tree must not make a pass unbounded.
+const MAX_INDEX_FILES: usize = 4000;
+const MAX_INDEX_FILE_BYTES: u64 = 512 * 1024;
+
+const JUDGE_SYSTEM_PROMPT: &str =
+    "You check one claim a code reviewer made about a file. The reviewer was shown only a \
+     slice of the file and could not see around it. You are shown the whole enclosing item, \
+     the comments at the quoted site, whether the site is test code, and the tests in the \
+     repository that mention it. Check the claim against that code: do not review the code \
+     again, do not raise new problems, and do not agree with a claim because it sounds \
+     plausible. Reason from what the code shown actually does. Answer every question, each on \
+     its own line, in exactly the format asked for.";
+
+// --- the site: what the judge is shown ----------------------------------------
+
+/// The judge's view of one quoted site in one file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Site {
+    /// 1-based lines shown, inclusive — the enclosing item with its doc and
+    /// attributes, or a window around the quote.
+    pub(crate) first_line: usize,
+    pub(crate) last_line: usize,
+    /// The quote's own lines (1-based, inclusive).
+    pub(crate) quote_first: usize,
+    pub(crate) quote_last: usize,
+    /// The enclosing item's name, when one was found.
+    pub(crate) item: Option<String>,
+    /// Lines elided from the middle of a long item: `(from, to)` inclusive.
+    pub(crate) elided: Option<(usize, usize)>,
+    /// Why the site is test code, or `None` when it is not.
+    pub(crate) test_code: Option<&'static str>,
+    /// The comments at the site: the block right above the quote, a trailing
+    /// comment on it, the item's doc — in file order, deduplicated.
+    pub(crate) comments: Vec<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lang {
+    /// `//` and `/* */` comments, braces delimit items (Rust, C, JS, Go…).
+    Brace,
+    /// `#` comments, braces delimit shell functions; Python indents.
+    Hash,
+    /// Prose and data: no items, a window is the context.
+    Plain,
+}
+
+fn lang_of(rel: &str) -> Lang {
+    let ext = rel.rsplit('.').next().unwrap_or("");
+    match ext {
+        "rs" | "c" | "h" | "cc" | "cpp" | "hpp" | "js" | "mjs" | "ts" | "tsx" | "jsx" | "go"
+        | "java" | "kt" | "swift" | "scala" | "cs" | "el" => Lang::Brace,
+        "py" | "sh" | "bash" | "zsh" | "fish" | "rb" | "pl" => Lang::Hash,
+        _ => Lang::Plain,
+    }
+}
+
+fn indent(line: &str) -> usize {
+    line.chars()
+        .take_while(|c| c.is_whitespace())
+        .map(|c| if c == '\t' { 4 } else { 1 })
+        .sum()
+}
+
+/// The name of the item a line OPENS, if it opens one — a Rust/C-like/Python
+/// declaration at the start of the (trimmed) line. Deliberately syntactic and
+/// language-agnostic in the way the region tiling is: a parser per language is
+/// not what this needs, and a miss falls back to a window, never to nothing.
+pub(crate) fn item_name(line: &str) -> Option<String> {
+    let mut rest = line.trim_start();
+    if let Some(after) = rest.strip_prefix("pub(") {
+        rest = after.split_once(')').map(|(_, r)| r.trim_start())?;
+    }
+    for prefix in [
+        "pub ", "async ", "unsafe ", "const ", "default ", "export ", "static ",
+    ] {
+        while let Some(r) = rest.strip_prefix(prefix) {
+            rest = r.trim_start();
+        }
+    }
+    if let Some(r) = rest.strip_prefix("extern \"C\" ") {
+        rest = r.trim_start();
+    }
+    let ident = |s: &str| -> Option<String> {
+        let name: String = s
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '!')
+            .collect();
+        (!name.is_empty()).then_some(name)
+    };
+    for keyword in [
+        "fn ",
+        "struct ",
+        "enum ",
+        "trait ",
+        "mod ",
+        "union ",
+        "type ",
+        "macro_rules! ",
+        "def ",
+        "class ",
+        "function ",
+    ] {
+        if let Some(r) = rest.strip_prefix(keyword) {
+            return ident(r);
+        }
+    }
+    if rest.starts_with("impl") && matches!(rest.as_bytes().get(4), Some(b' ' | b'<')) {
+        let head = rest.split('{').next().unwrap_or(rest).trim();
+        return Some(head.to_string());
+    }
+    // A constant or static item at column zero (`const NAME: T = …;`) — the
+    // prefixes above consumed `const`/`static`, so what is left is `NAME:`.
+    if line.starts_with("const ")
+        || line.starts_with("pub const ")
+        || line.starts_with("static ")
+        || line.starts_with("pub static ")
+        || line.starts_with("pub(crate) const ")
+        || line.starts_with("pub(crate) static ")
+    {
+        let name = ident(rest)?;
+        return rest[name.len()..]
+            .trim_start()
+            .starts_with(':')
+            .then_some(name);
+    }
+    // A shell function: `name() {`.
+    let trimmed = rest.trim_end();
+    if let Some(head) = trimmed
+        .strip_suffix("() {")
+        .or_else(|| trimmed.strip_suffix("(){"))
+    {
+        if !head.is_empty()
+            && head
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+        {
+            return Some(head.to_string());
+        }
+    }
+    None
+}
+
+/// Where the brace block opened on line `start` closes (0-based line index),
+/// skipping braces inside strings (multi-line and raw strings included),
+/// character literals and comments. `None` when it never closes; when the item
+/// ends at a `;` before any `{` (a declaration with no body), that line.
+fn brace_end(lines: &[&str], start: usize, lang: Lang) -> Option<usize> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum In {
+        Code,
+        /// A string; `Some(n)` is a Rust raw string closed by `"` and n `#`.
+        Str(Option<usize>),
+        Block(u32),
+    }
+    let mut state = In::Code;
+    let mut depth = 0i64;
+    let mut opened = false;
+    for (index, line) in lines.iter().enumerate().skip(start) {
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            let next = chars.get(i + 1).copied();
+            match state {
+                In::Block(n) => {
+                    if c == '*' && next == Some('/') {
+                        state = if n <= 1 { In::Code } else { In::Block(n - 1) };
+                        i += 2;
+                        continue;
+                    }
+                    if c == '/' && next == Some('*') {
+                        state = In::Block(n + 1);
+                        i += 2;
+                        continue;
+                    }
+                }
+                In::Str(None) => {
+                    if c == '\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if c == '"' {
+                        state = In::Code;
+                    }
+                }
+                In::Str(Some(hashes)) => {
+                    if c == '"' && (1..=hashes).all(|k| chars.get(i + k) == Some(&'#')) {
+                        state = In::Code;
+                        i += 1 + hashes;
+                        continue;
+                    }
+                }
+                In::Code => match (lang, c) {
+                    (Lang::Brace, '/') if next == Some('/') => break,
+                    (Lang::Brace, '/') if next == Some('*') => {
+                        state = In::Block(1);
+                        i += 2;
+                        continue;
+                    }
+                    (Lang::Hash, '#') => break,
+                    (_, '"') => {
+                        // A Rust raw string: `r"`, `r#"`, `br##"` …
+                        let mut k = i;
+                        let mut hashes = 0;
+                        while k > 0 && chars[k - 1] == '#' {
+                            hashes += 1;
+                            k -= 1;
+                        }
+                        let raw = lang == Lang::Brace && k > 0 && chars[k - 1] == 'r';
+                        state = In::Str(raw.then_some(hashes));
+                    }
+                    (Lang::Brace, '\'') => {
+                        // A char literal (`'{'`, `'\n'`) — not a lifetime (`'a`).
+                        if next == Some('\\') {
+                            i += 2;
+                            while i < chars.len() && chars[i] != '\'' {
+                                i += 1;
+                            }
+                            i += 1;
+                            continue;
+                        }
+                        if chars.get(i + 2) == Some(&'\'') {
+                            i += 3;
+                            continue;
+                        }
+                    }
+                    (_, '{') => {
+                        depth += 1;
+                        opened = true;
+                    }
+                    (_, '}') => {
+                        depth -= 1;
+                        if opened && depth <= 0 {
+                            return Some(index);
+                        }
+                    }
+                    (_, ';') if !opened && depth == 0 => return Some(index),
+                    _ => {}
+                },
+            }
+            i += 1;
+        }
+        // A `#`-comment language's string does not span lines in practice
+        // (Python's triple quotes aside); a Rust string does, and is carried.
+        if lang != Lang::Brace && matches!(state, In::Str(_)) {
+            state = In::Code;
+        }
+    }
+    None
+}
+
+/// Where a Python block opened on line `start` ends: the last line before the
+/// next non-blank line indented no deeper than the opener.
+fn indent_end(lines: &[&str], start: usize) -> usize {
+    let base = indent(lines[start]);
+    let mut end = start;
+    for (index, line) in lines.iter().enumerate().skip(start + 1) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if indent(line) <= base {
+            break;
+        }
+        end = index;
+    }
+    end
+}
+
+fn is_comment(line: &str, lang: Lang) -> bool {
+    let t = line.trim_start();
+    match lang {
+        Lang::Brace => {
+            t.starts_with("//") || t.starts_with("/*") || t.starts_with('*') || t.starts_with("*/")
+        }
+        Lang::Hash => t.starts_with('#'),
+        Lang::Plain => false,
+    }
+}
+
+/// A line that belongs ABOVE an item: its doc comment, an attribute, a
+/// decorator.
+fn is_leading(line: &str, lang: Lang) -> bool {
+    let t = line.trim_start();
+    is_comment(line, lang) || t.starts_with("#[") || t.starts_with("#![") || t.starts_with('@')
+}
+
+/// The trailing comment on a line, if any (`code // why`).
+fn trailing_comment(line: &str, lang: Lang) -> Option<String> {
+    let marker = match lang {
+        Lang::Brace => "//",
+        Lang::Hash => " #",
+        Lang::Plain => return None,
+    };
+    let (code, comment) = line.split_once(marker)?;
+    (!code.trim().is_empty() && !code.contains('"')).then(|| comment.trim().to_string())
+}
+
+/// The judge's view of the quote at `[byte_start, byte_end)` in `text`.
+pub(crate) fn site(rel: &str, text: &str, byte_start: usize, byte_end: usize) -> Site {
+    let lang = lang_of(rel);
+    let lines: Vec<&str> = text.split('\n').collect();
+    let quote_first = text[..byte_start].matches('\n').count();
+    let quote_last = text[..byte_end.max(byte_start)].matches('\n').count();
+    let anchor_indent = indent(lines[quote_first]);
+
+    // The innermost item that encloses the quote: walk up from the quoted line
+    // to the first opener at or outside the quote's indentation whose block
+    // reaches it.
+    let mut item: Option<(usize, usize, String)> = None;
+    if lang != Lang::Plain {
+        for start in (0..=quote_first).rev() {
+            let line = lines[start];
+            if start != quote_first && indent(line) > anchor_indent {
+                continue;
+            }
+            let Some(name) = item_name(line) else {
+                continue;
+            };
+            let end = match (lang, line.trim_end().ends_with(':')) {
+                (Lang::Hash, true) => Some(indent_end(&lines, start)),
+                _ => brace_end(&lines, start, lang),
+            };
+            if let Some(end) = end {
+                if end >= quote_last {
+                    item = Some((start, end, name));
+                    break;
+                }
+            }
+        }
+    }
+
+    let (mut first, mut last, name) = match item {
+        Some((start, end, name)) => (start, end, Some(name)),
+        None => (
+            quote_first.saturating_sub(WINDOW_LINES),
+            (quote_last + WINDOW_LINES).min(lines.len().saturating_sub(1)),
+            None,
+        ),
+    };
+    let item_start = first;
+    if name.is_some() {
+        // Its doc comment and attributes, which are part of what it says.
+        while first > 0 && is_leading(lines[first - 1], lang) && item_start - first < 60 {
+            first -= 1;
+        }
+    }
+    // A long item is shown as its head and a window around the quote.
+    let mut elided = None;
+    if last - first + 1 > MAX_ITEM_LINES {
+        let from = (item_start + 2).max(quote_first.saturating_sub(WINDOW_LINES * 2));
+        if from > item_start + 2 {
+            elided = Some((item_start + 3, from));
+        }
+        last = last.min(quote_last + WINDOW_LINES * 2);
+    }
+
+    // The comments at the site.
+    let mut comments = Vec::new();
+    let mut above = Vec::new();
+    let mut index = quote_first;
+    while index > 0 && is_comment(lines[index - 1], lang) && above.len() < 30 {
+        index -= 1;
+        above.push(lines[index].trim().to_string());
+    }
+    above.reverse();
+    if name.is_some() {
+        for line in &lines[first..item_start] {
+            if is_comment(line, lang) {
+                comments.push(line.trim().to_string());
+            }
+        }
+    }
+    for line in above {
+        if !comments.contains(&line) {
+            comments.push(line);
+        }
+    }
+    for line in &lines[quote_first..=quote_last.min(lines.len() - 1)] {
+        if let Some(c) = trailing_comment(line, lang) {
+            comments.push(c);
+        }
+    }
+
+    let test_code = test_reason(
+        rel,
+        &lines,
+        lang,
+        first,
+        item_start,
+        quote_first,
+        name.as_deref(),
+    );
+
+    Site {
+        first_line: first + 1,
+        last_line: last + 1,
+        quote_first: quote_first + 1,
+        quote_last: quote_last + 1,
+        item: name,
+        elided: elided.map(|(a, b)| (a + 1, b)),
+        test_code,
+        comments,
+    }
+}
+
+/// Whether a path names a test file — a `tests/` directory, a `*_test.*` or
+/// `test_*.py` file, a `.test.`/`.spec.` script, a `tests.rs` module.
+pub(crate) fn is_test_path(rel: &str) -> bool {
+    let parts: Vec<&str> = rel.split('/').collect();
+    let file = parts.last().copied().unwrap_or("");
+    parts[..parts.len().saturating_sub(1)]
+        .iter()
+        .any(|p| *p == "tests" || *p == "test" || *p == "testdata")
+        || file == "tests.rs"
+        || file.ends_with("_tests.rs")
+        || file.ends_with("_test.rs")
+        || file.ends_with("_test.go")
+        || file.ends_with("_test.py")
+        || (file.starts_with("test_") && file.ends_with(".py"))
+        || file.contains(".test.")
+        || file.contains(".spec.")
+}
+
+fn test_reason(
+    rel: &str,
+    lines: &[&str],
+    lang: Lang,
+    lead: usize,
+    item_start: usize,
+    quote: usize,
+    item: Option<&str>,
+) -> Option<&'static str> {
+    if is_test_path(rel) {
+        return Some("the file is a test file (its path)");
+    }
+    if item.is_some()
+        && lines[lead..item_start]
+            .iter()
+            .any(|l| l.trim_start().starts_with("#[test]") || l.contains("::test]"))
+    {
+        return Some("the enclosing function is a #[test]");
+    }
+    if item.is_some_and(|n| n.starts_with("test_")) && lang == Lang::Hash {
+        return Some("the enclosing function is a test_ function");
+    }
+    // Inside a `#[cfg(test)]` module: the attribute, then the `mod` it gates,
+    // whose block reaches the quote.
+    for (index, line) in lines.iter().enumerate().take(quote) {
+        if !line.trim_start().starts_with("#[cfg(test)]") {
+            continue;
+        }
+        let Some(module) = (index + 1..(index + 4).min(lines.len()))
+            .find(|&i| item_name(lines[i]).is_some_and(|_| lines[i].contains("mod ")))
+        else {
+            continue;
+        };
+        if brace_end(lines, module, lang).is_some_and(|end| end >= quote) {
+            return Some("the site is inside a #[cfg(test)] module");
+        }
+    }
+    None
+}
+
+// --- the tests that mention the claim's symbols --------------------------------
+
+/// The words a claim is ABOUT, for finding the tests that exercise it: the
+/// enclosing item's name and the most specific identifiers in the quote.
+/// Keywords, std vocabulary and short words would match every test.
+pub(crate) fn symbols(quote: &str, item: Option<&str>) -> Vec<String> {
+    const COMMON: &[&str] = &[
+        "let",
+        "mut",
+        "pub",
+        "crate",
+        "self",
+        "Self",
+        "super",
+        "use",
+        "mod",
+        "impl",
+        "struct",
+        "enum",
+        "trait",
+        "type",
+        "const",
+        "static",
+        "async",
+        "await",
+        "move",
+        "ref",
+        "return",
+        "match",
+        "else",
+        "for",
+        "while",
+        "loop",
+        "break",
+        "continue",
+        "where",
+        "true",
+        "false",
+        "Some",
+        "None",
+        "Ok",
+        "Err",
+        "Option",
+        "Result",
+        "String",
+        "Vec",
+        "Box",
+        "Arc",
+        "Rc",
+        "new",
+        "std",
+        "str",
+        "bool",
+        "usize",
+        "u64",
+        "u32",
+        "i64",
+        "clone",
+        "into",
+        "from",
+        "unwrap",
+        "expect",
+        "iter",
+        "map",
+        "collect",
+        "len",
+        "push",
+        "get",
+        "and",
+        "the",
+        "def",
+        "class",
+        "import",
+        "return",
+        "None",
+        "this",
+        "function",
+        "echo",
+        "then",
+        "local",
+        "format",
+        "assert",
+        "assert_eq",
+        "to_string",
+        "as_str",
+        "as_ref",
+        "default",
+        "main",
+        "test",
+        "tests",
+        "fmt",
+        "with",
+        "not",
+        "Error",
+    ];
+    let mut found: Vec<(i64, usize, String)> = Vec::new();
+    let mut word = String::new();
+    // Only CODE-SHAPED words: an identifier with an underscore, a camelCase
+    // or PascalCase one, or a call (`name(`) long enough to be specific. A
+    // plain English word in a quoted comment (`store`, `version`, `ONLY`)
+    // would match half the tests in a repository and say nothing.
+    let mut flush = |word: &mut String, at: usize| {
+        let w = std::mem::take(word);
+        let call = quote[at..].starts_with('(') && w.len() >= 6;
+        let mixed =
+            w.chars().any(|c| c.is_lowercase()) && w.chars().skip(1).any(|c| c.is_uppercase());
+        let specific = w.contains('_') || mixed;
+        if w.len() >= 4
+            && !w.chars().next().is_some_and(|c| c.is_ascii_digit())
+            && !COMMON.contains(&w.as_str())
+            && (specific || call)
+        {
+            let score = w.len() as i64 + if specific { 10 } else { 0 };
+            found.push((-score, at, w));
+        }
+    };
+    for (at, c) in quote.char_indices() {
+        if c.is_alphanumeric() || c == '_' {
+            word.push(c);
+        } else {
+            flush(&mut word, at);
+        }
+    }
+    flush(&mut word, quote.len());
+    found.sort();
+    let mut out: Vec<String> = Vec::new();
+    // The enclosing item's name is the strongest symbol there is: the tests
+    // that call the function are the ones that say what it does.
+    if let Some(name) = item {
+        let bare: String = name
+            .trim_start_matches("impl")
+            .trim()
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if bare.len() >= 4 && !COMMON.contains(&bare.as_str()) {
+            out.push(bare);
+        }
+    }
+    for (_, _, w) in found {
+        if out.len() >= 3 {
+            break;
+        }
+        if !out.contains(&w) {
+            out.push(w);
+        }
+    }
+    out
+}
+
+/// One text file of the repository, for the test index.
+pub(crate) struct RepoFile {
+    pub(crate) rel: String,
+    pub(crate) text: String,
+}
+
+/// Every text file under `root` that holds tests — a test path, or a file with
+/// a `#[cfg(test)]`/`#[test]` in it — skipping the host's ignore set, dot
+/// directories, links and anything larger than [`MAX_INDEX_FILE_BYTES`].
+pub(crate) fn test_files(root: &Path, ignore: &BTreeSet<String>) -> Vec<RepoFile> {
+    let mut out = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), String::new())];
+    let mut seen = 0usize;
+    while let Some((dir, prefix)) = stack.pop() {
+        let Ok(entries) = crate::list_entries(&dir) else {
+            continue;
+        };
+        for entry in entries.into_iter().rev() {
+            let name = entry.name.clone();
+            if ignore.contains(&name) || name.starts_with('.') {
+                continue;
+            }
+            let rel = match prefix.is_empty() {
+                true => name.clone(),
+                false => format!("{prefix}/{name}"),
+            };
+            match entry.kind {
+                crate::Kind::Dir => stack.push((dir.join(&name), rel)),
+                crate::Kind::File => {
+                    seen += 1;
+                    if seen > MAX_INDEX_FILES {
+                        return out;
+                    }
+                    if entry.size.unwrap_or(0) > MAX_INDEX_FILE_BYTES {
+                        continue;
+                    }
+                    let Ok(text) = std::fs::read_to_string(dir.join(&name)) else {
+                        continue;
+                    };
+                    if is_test_path(&rel)
+                        || text.contains("#[cfg(test)]")
+                        || text.contains("#[test]")
+                        || text.contains("def test_")
+                    {
+                        out.push(RepoFile { rel, text });
+                    }
+                }
+                crate::Kind::Link => {}
+            }
+        }
+    }
+    out.sort_by(|a, b| a.rel.cmp(&b.rel));
+    out
+}
+
+/// One test that mentions a symbol: where, its name, and its asserting lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Mention {
+    pub(crate) rel: String,
+    pub(crate) line: usize,
+    pub(crate) test: String,
+    pub(crate) asserts: Vec<String>,
+}
+
+fn has_word(line: &str, word: &str) -> bool {
+    line.match_indices(word).any(|(at, _)| {
+        let before = line[..at].chars().next_back();
+        let after = line[at + word.len()..].chars().next();
+        let boundary = |c: Option<char>| !c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+        boundary(before) && boundary(after)
+    })
+}
+
+/// The tests that mention any of `symbols`, at most [`MAX_TESTS`]: the file
+/// under review first, then the rest by path.
+pub(crate) fn mentions(files: &[RepoFile], symbols: &[String], under_review: &str) -> Vec<Mention> {
+    if symbols.is_empty() {
+        return Vec::new();
+    }
+    let mut ordered: Vec<&RepoFile> = files.iter().filter(|f| f.rel == under_review).collect();
+    ordered.extend(files.iter().filter(|f| f.rel != under_review));
+    let mut out: Vec<Mention> = Vec::new();
+    for file in ordered {
+        let lang = lang_of(&file.rel);
+        let lines: Vec<&str> = file.text.split('\n').collect();
+        // The test REGION: the whole of a test file, else from the first
+        // `#[cfg(test)]` on.
+        let region_start = match is_test_path(&file.rel) {
+            true => 0,
+            false => match lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("#[cfg(test)]"))
+            {
+                Some(at) => at,
+                None => continue,
+            },
+        };
+        let mut index = region_start;
+        while index < lines.len() {
+            let line = lines[index];
+            let Some(name) = item_name(line).filter(|_| {
+                let t = line.trim_start();
+                t.contains("fn ") || t.starts_with("def ")
+            }) else {
+                index += 1;
+                continue;
+            };
+            let end = match (lang, line.trim_end().ends_with(':')) {
+                (Lang::Hash, true) => indent_end(&lines, index),
+                _ => brace_end(&lines, index, lang).unwrap_or(index),
+            };
+            let body = &lines[index..=end.min(lines.len() - 1)];
+            if body.iter().any(|l| symbols.iter().any(|s| has_word(l, s))) {
+                let clip = |l: &str| -> String {
+                    let t = l.trim();
+                    match t.char_indices().nth(160) {
+                        Some((at, _)) => format!("{}…", &t[..at]),
+                        None => t.to_string(),
+                    }
+                };
+                let asserting: Vec<&str> = body
+                    .iter()
+                    .copied()
+                    .filter(|l| l.contains("assert") || l.contains("should_panic"))
+                    .collect();
+                let mut asserts: Vec<String> = asserting
+                    .iter()
+                    .filter(|l| symbols.iter().any(|s| has_word(l, s)))
+                    .map(|l| clip(l))
+                    .collect();
+                for l in &asserting {
+                    if asserts.len() >= MAX_ASSERTS {
+                        break;
+                    }
+                    let c = clip(l);
+                    if !asserts.contains(&c) {
+                        asserts.push(c);
+                    }
+                }
+                asserts.truncate(MAX_ASSERTS);
+                out.push(Mention {
+                    rel: file.rel.clone(),
+                    line: index + 1,
+                    test: name,
+                    asserts,
+                });
+                if out.len() >= MAX_TESTS {
+                    return out;
+                }
+            }
+            index = end.max(index) + 1;
+        }
+    }
+    out
+}
+
+// --- the prompt and its answer -----------------------------------------------
+
+/// The claim under judgment.
+pub(crate) struct Claim<'a> {
+    pub(crate) severity: Option<&'a str>,
+    pub(crate) quote: &'a str,
+    pub(crate) body: &'a str,
+}
+
+/// The per-claim prompt: the site, the tests, the claim, the four questions.
+pub(crate) fn prompt(
+    rel: &str,
+    text: &str,
+    site: &Site,
+    tests: &[Mention],
+    symbols: &[String],
+    claim: &Claim<'_>,
+) -> String {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut code = String::new();
+    for n in site.first_line..=site.last_line.min(lines.len()) {
+        if let Some((from, to)) = site.elided {
+            if n == from {
+                code.push_str(&format!("      | … lines {from} to {to} not shown …\n"));
+            }
+            if (from..=to).contains(&n) {
+                continue;
+            }
+        }
+        let mark = match (site.quote_first..=site.quote_last).contains(&n) {
+            true => '>',
+            false => ' ',
+        };
+        code.push_str(&format!(
+            "{mark}{n:>5} | {}\n",
+            lines[n - 1].trim_end_matches('\r')
+        ));
+    }
+    let what = match &site.item {
+        Some(name) => format!("The enclosing item `{name}`"),
+        None => "The lines around the quote".to_string(),
+    };
+    let test_code = match site.test_code {
+        Some(why) => format!("yes — {why}"),
+        None => "no".to_string(),
+    };
+    let comments = match site.comments.is_empty() {
+        true => "(none)".to_string(),
+        false => site.comments.join("\n"),
+    };
+    let tests_text = match (tests.is_empty(), symbols.is_empty()) {
+        (_, true) => "(no symbol to search for)".to_string(),
+        (true, false) => "(none found)".to_string(),
+        (false, false) => tests
+            .iter()
+            .map(|m| {
+                let mut s = format!("- {} line {}: {}", m.rel, m.line, m.test);
+                for a in &m.asserts {
+                    s.push_str(&format!("\n    {a}"));
+                }
+                s
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    format!(
+        "Path: {rel}\n\
+         Test code: {test_code}\n\n\
+         THE CLAIM (rated {severity} by the reviewer)\n\
+         QUOTE: {quote}\n\
+         CLAIM: {body}\n\n\
+         {what}, lines {first} to {last} (the quoted line is marked >):\n\
+         ```\n{code}```\n\n\
+         Comments at the quoted site:\n{comments}\n\n\
+         Tests in the repository that mention {symbols}:\n{tests_text}\n\n\
+         Answer these four questions about the claim, each on one line, in exactly this form: \
+         the question's label, a colon, one answer word, a dash, and one short sentence of \
+         reason. Answer from the code shown: where the answer depends on code that is not \
+         shown, say unclear rather than guess either way.\n\
+         CODE: yes|no|unclear - Does the quoted code actually do what the claim says it does? \
+         no only if the code shown contradicts the claim.\n\
+         DISCLOSED: yes|no - Does a comment or doc at this site already WARN about this same \
+         problem, so that the claim only repeats the author's own warning? A comment that \
+         describes or justifies the behavior the claim criticizes is not a warning about the \
+         problem: answer no for it.\n\
+         OCCURS: yes|no|unclear|n/a - Would the consequence the claim predicts (a panic, a \
+         failure, a wrong result, a compile error, a hole) actually follow, for the inputs this \
+         code can really receive? no if the code shown prevents it; n/a if the claim predicts \
+         no consequence.\n\
+         TEST: yes|no - Is the quoted code test code whose only problem, per the claim, is \
+         that it fails loudly (a panic, an expect, an assert), which is how a test reports a \
+         failure?\n\
+         Then one final line:\n\
+         VERDICT: confirmed|refuted|unsure",
+        severity = claim.severity.unwrap_or("unrated"),
+        quote = claim.quote,
+        body = claim.body,
+        first = site.first_line,
+        last = site.last_line,
+        symbols = match symbols.is_empty() {
+            true => "the claim".to_string(),
+            false => symbols
+                .iter()
+                .map(|s| format!("`{s}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        },
+    )
+}
+
+/// One answer: the word (`yes`, `no`, `unclear`, `n/a`) and its reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Answer {
+    pub(crate) question: String,
+    pub(crate) answer: String,
+    pub(crate) reason: String,
+}
+
+/// What a judge answer parses to: one [`Answer`] per question it gave (in
+/// [`QUESTIONS`] order) and the model's own `VERDICT:` word.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Parsed {
+    pub(crate) answers: Vec<Answer>,
+    pub(crate) stated: Option<String>,
+}
+
+/// Parse the judge's answer. Tolerant of the decoration models add (bold, a
+/// bullet, a trailing period), strict about the words: anything but the
+/// allowed words reads as `unclear`, never as a guess at what was meant.
+pub(crate) fn parse(answer: &str) -> Parsed {
+    let mut answers: Vec<Answer> = Vec::new();
+    let mut stated = None;
+    for line in answer.lines() {
+        let line = line
+            .trim()
+            .trim_start_matches(['-', '*', '#', ' '])
+            .replace("**", "");
+        let Some((label, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let label = label.trim().to_ascii_lowercase();
+        let rest = rest.trim();
+        let word_end = rest
+            .find(|c: char| c.is_whitespace() || c == ',' || c == ';' || c == '-' || c == '—')
+            .unwrap_or(rest.len());
+        // `n/a` contains a `/` and no separator; `-` ends a word, so `n/a -`
+        // and `yes - why` both split at the dash.
+        let word = rest[..word_end]
+            .trim_end_matches(['.', ':'])
+            .to_ascii_lowercase();
+        let reason = rest[word_end..]
+            .trim_start_matches(|c: char| c.is_whitespace() || c == '-' || c == '—' || c == ',')
+            .trim()
+            .to_string();
+        if label == "verdict" {
+            if VERDICTS.contains(&word.as_str()) {
+                stated = Some(word);
+            }
+            continue;
+        }
+        if !QUESTIONS.contains(&label.as_str()) || answers.iter().any(|a| a.question == label) {
+            continue;
+        }
+        let word = match word.as_str() {
+            "yes" | "no" | "unclear" => word,
+            "n/a" | "na" | "none" if label == "occurs" => "n/a".to_string(),
+            _ => "unclear".to_string(),
+        };
+        answers.push(Answer {
+            question: label,
+            answer: word,
+            reason,
+        });
+    }
+    answers.sort_by_key(|a| QUESTIONS.iter().position(|q| *q == a.question));
+    Parsed { answers, stated }
+}
+
+/// The verdict the four answers amount to.
+///
+/// * **refuted** when an answer refutes the claim on the code's own terms: the
+///   predicted consequence would NOT follow (`occurs: no`), the site already
+///   WARNS about the same problem (`disclosed: yes`), or it is TEST code whose
+///   only fault is failing loudly (`test: yes`);
+/// * **confirmed** when every answer supports it: the code does it, the
+///   consequence would follow (or none was predicted), nothing at the site
+///   already warns about it, and it is not a test failing as tests do;
+/// * **unsure** otherwise — an `unclear`, a question left unanswered, or
+///   `code: no` on its own.
+///
+/// ⚠ `code: no` does NOT refute, and that is a measured choice, not an
+/// oversight. On the eval set's dev split (`tests/corpus/judge/`, 70 entries,
+/// `judge-v1@qwen3-coder:30b-a3b-q8_0`) the judge answered `code: no` on real
+/// defects whose evidence lies outside the item it was shown — a constant
+/// declared at the top of a file and enforced 1400 lines below it — while the
+/// known-false findings it caught were caught by the other three answers
+/// anyway: with `code` as a refuter the rule lost 3 of 6 verified-real findings
+/// and caught 18 of 21 known-false; without it, 1 of 6 and the same 18. The
+/// rule was chosen on the dev split only; the held-out split is the result.
+pub(crate) fn verdict_of(answers: &[Answer]) -> &'static str {
+    let said = |q: &str| {
+        answers
+            .iter()
+            .find(|a| a.question == q)
+            .map(|a| a.answer.as_str())
+    };
+    if said("occurs") == Some("no")
+        || said("disclosed") == Some("yes")
+        || said("test") == Some("yes")
+    {
+        return "refuted";
+    }
+    if said("code") == Some("yes")
+        && matches!(said("occurs"), Some("yes" | "n/a"))
+        && said("disclosed") == Some("no")
+        && said("test") == Some("no")
+    {
+        return "confirmed";
+    }
+    "unsure"
+}
+
+// --- the record ----------------------------------------------------------------
+
+/// One archived verdict on one finding, by one judge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Verdict {
+    pub(crate) iri: String,
+    pub(crate) verdict: String,
+    pub(crate) stated: Option<String>,
+    pub(crate) tag: String,
+    pub(crate) model: String,
+    pub(crate) judged_at: Option<String>,
+    /// Whether the judge was told the site is test code.
+    pub(crate) test_code: bool,
+    pub(crate) answers: Vec<Answer>,
+    /// The judge's raw answer, for audit.
+    pub(crate) raw: String,
+}
+
+/// `urn:iki:finding:{id}:judge:{tag}` — keyed by (finding, judge tag).
+pub(crate) fn verdict_iri(finding_iri: &str, tag: &str) -> String {
+    format!("{finding_iri}:judge:{}", iri_encode(tag))
+}
+
+const VERDICT_PREFIX: &str = "urn:iki:judge:verdict:";
+const ANSWER_PREFIX: &str = "urn:iki:judge:answer:";
+const SITE_TEST: &str = "urn:iki:judge:site:test";
+const SITE_CODE: &str = "urn:iki:judge:site:code";
+const DCTERMS: &str = "http://purl.org/dc/terms/";
+
+fn dcterms(term: &str) -> NamedNode {
+    NamedNode::new(format!("{DCTERMS}{term}")).expect("dcterms terms are valid IRIs")
+}
+
+fn store_err(e: impl std::fmt::Display) -> Error {
+    Error::Endpoint(format!("browse: judge store: {e}"))
+}
+
+fn answer_iri(verdict: &str, question: &str) -> String {
+    format!("{verdict}:answer:{question}")
+}
+
+/// Store one verdict on `finding_iri`. Written once: a second store of the same
+/// (finding, tag) is refused by the caller's lookup, never overwritten here.
+pub(crate) fn store_verdict(archive: &Archive, finding_iri: &str, v: &Verdict) -> Result<()> {
+    use oxigraph::model::vocab::{rdf, xsd};
+    let g = archive.graph().clone();
+    let subject = NamedNode::new(&v.iri).map_err(store_err)?;
+    let node = |iri: &str| NamedNode::new(iri).map_err(store_err);
+    let mut quads = vec![
+        Quad::new(
+            subject.clone(),
+            rdf::TYPE,
+            node(&format!("{PROV}Activity"))?,
+            g.clone(),
+        ),
+        Quad::new(
+            subject.clone(),
+            node(&format!("{PROV}used"))?,
+            node(finding_iri)?,
+            g.clone(),
+        ),
+        Quad::new(
+            subject.clone(),
+            dcterms("type"),
+            node(&format!("{VERDICT_PREFIX}{}", v.verdict))?,
+            g.clone(),
+        ),
+        Quad::new(
+            subject.clone(),
+            ik("versionTag"),
+            Literal::new_simple_literal(&v.tag),
+            g.clone(),
+        ),
+        Quad::new(
+            subject.clone(),
+            dcterms("creator"),
+            Literal::new_simple_literal(&v.model),
+            g.clone(),
+        ),
+        Quad::new(
+            subject.clone(),
+            dcterms("subject"),
+            node(if v.test_code { SITE_TEST } else { SITE_CODE })?,
+            g.clone(),
+        ),
+        Quad::new(
+            subject.clone(),
+            dcterms("description"),
+            Literal::new_simple_literal(&v.raw),
+            g.clone(),
+        ),
+    ];
+    if let Some(at) = &v.judged_at {
+        quads.push(Quad::new(
+            subject.clone(),
+            dcterms("created"),
+            Literal::new_typed_literal(at, xsd::DATE_TIME),
+            g.clone(),
+        ));
+    }
+    let mut parts: Vec<(String, &str, &str)> = v
+        .answers
+        .iter()
+        .map(|a| (a.question.clone(), a.answer.as_str(), a.reason.as_str()))
+        .collect();
+    if let Some(stated) = &v.stated {
+        parts.push(("stated".to_string(), stated.as_str(), ""));
+    }
+    for (question, word, reason) in parts {
+        let part = node(&answer_iri(&v.iri, &question))?;
+        let word = word.replace('/', "-");
+        quads.push(Quad::new(
+            subject.clone(),
+            dcterms("hasPart"),
+            part.clone(),
+            g.clone(),
+        ));
+        quads.push(Quad::new(
+            part.clone(),
+            dcterms("identifier"),
+            Literal::new_simple_literal(&question),
+            g.clone(),
+        ));
+        quads.push(Quad::new(
+            part.clone(),
+            dcterms("type"),
+            node(&format!("{ANSWER_PREFIX}{word}"))?,
+            g.clone(),
+        ));
+        if !reason.is_empty() {
+            quads.push(Quad::new(
+                part,
+                dcterms("description"),
+                Literal::new_simple_literal(reason),
+                g.clone(),
+            ));
+        }
+    }
+    for quad in &quads {
+        archive.insert(quad).map_err(store_err)?;
+    }
+    Ok(())
+}
+
+/// Every verdict on a finding, oldest first (then by tag) — found from the
+/// finding inward along `prov:used`, the way its decisions are.
+pub(crate) fn load_verdicts(archive: &Archive, finding_iri: &str) -> Result<Vec<Verdict>> {
+    let Ok(finding) = NamedNode::new(finding_iri) else {
+        return Ok(Vec::new());
+    };
+    let used = NamedNode::new(format!("{PROV}used")).map_err(store_err)?;
+    let prefix = format!("{finding_iri}:judge:");
+    let mut iris = BTreeSet::new();
+    for quad in archive.quads_for_pattern(None, Some(used.as_ref()), Some(finding.as_ref().into()))
+    {
+        let quad = quad.map_err(store_err)?;
+        let subject = quad.subject.to_string();
+        let iri = subject.trim_start_matches('<').trim_end_matches('>');
+        if iri.starts_with(&prefix) && !iri.contains(":answer:") {
+            iris.insert(iri.to_string());
+        }
+    }
+    let mut out = Vec::new();
+    for iri in iris {
+        if let Some(v) = load_verdict(archive, &iri)? {
+            out.push(v);
+        }
+    }
+    out.sort_by(|a, b| (&a.judged_at, &a.tag).cmp(&(&b.judged_at, &b.tag)));
+    Ok(out)
+}
+
+fn literal(term: &Term) -> String {
+    match term {
+        Term::Literal(l) => l.value().to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn load_verdict(archive: &Archive, iri: &str) -> Result<Option<Verdict>> {
+    let subject = NamedNode::new(iri).map_err(store_err)?;
+    let mut v = Verdict {
+        iri: iri.to_string(),
+        verdict: String::new(),
+        stated: None,
+        tag: String::new(),
+        model: String::new(),
+        judged_at: None,
+        test_code: false,
+        answers: Vec::new(),
+        raw: String::new(),
+    };
+    let mut parts = Vec::new();
+    for quad in archive.quads_for_pattern(Some(subject.as_ref().into()), None, None) {
+        let quad = quad.map_err(store_err)?;
+        let named = match &quad.object {
+            Term::NamedNode(n) => Some(n.as_str().to_string()),
+            _ => None,
+        };
+        match quad.predicate.as_str().strip_prefix(DCTERMS) {
+            Some("type") => {
+                if let Some(word) = named
+                    .as_deref()
+                    .and_then(|n| n.strip_prefix(VERDICT_PREFIX))
+                {
+                    v.verdict = word.to_string();
+                }
+            }
+            Some("creator") => v.model = literal(&quad.object),
+            Some("created") => v.judged_at = Some(literal(&quad.object)),
+            Some("description") => v.raw = literal(&quad.object),
+            Some("subject") => v.test_code = named.as_deref() == Some(SITE_TEST),
+            Some("hasPart") => parts.extend(named),
+            _ if quad.predicate.as_str().ends_with("#versionTag") => v.tag = literal(&quad.object),
+            _ => {}
+        }
+    }
+    if !VERDICTS.contains(&v.verdict.as_str()) {
+        return Ok(None);
+    }
+    for part in parts {
+        let node = NamedNode::new(&part).map_err(store_err)?;
+        let (mut question, mut word, mut reason) = (String::new(), String::new(), String::new());
+        for quad in archive.quads_for_pattern(Some(node.as_ref().into()), None, None) {
+            let quad = quad.map_err(store_err)?;
+            match quad.predicate.as_str().strip_prefix(DCTERMS) {
+                Some("identifier") => question = literal(&quad.object),
+                Some("type") => {
+                    if let Term::NamedNode(n) = &quad.object {
+                        if let Some(w) = n.as_str().strip_prefix(ANSWER_PREFIX) {
+                            word = match w {
+                                "n-a" => "n/a".to_string(),
+                                other => other.to_string(),
+                            };
+                        }
+                    }
+                }
+                Some("description") => reason = literal(&quad.object),
+                _ => {}
+            }
+        }
+        match question.as_str() {
+            "stated" => v.stated = Some(word),
+            q if QUESTIONS.contains(&q) => v.answers.push(Answer {
+                question,
+                answer: word,
+                reason,
+            }),
+            _ => {}
+        }
+    }
+    v.answers
+        .sort_by_key(|a| QUESTIONS.iter().position(|q| *q == a.question));
+    Ok(Some(v))
+}
+
+/// A verdict as JSON — the shape of `judge` (and each entry of `judges`) on a
+/// finding row, and of the judge resource's answer.
+///
+/// ```json
+/// {"iri": "urn:iki:finding:{id}:judge:judge-v1@qwen3-coder:30b",
+///  "verdict": "refuted", "stated": "refuted",
+///  "tag": "judge-v1@qwen3-coder:30b", "model": "qwen3-coder:30b",
+///  "judged_at": "2026-10-01T23:00:00.000Z", "test_code": false,
+///  "answers": {"code": {"answer": "no", "reason": "…"},
+///              "disclosed": {"answer": "no", "reason": "…"},
+///              "occurs": {"answer": "no", "reason": "…"},
+///              "test": {"answer": "no", "reason": "…"}}}
+/// ```
+pub(crate) fn verdict_json(v: &Verdict) -> serde_json::Value {
+    let mut answers = serde_json::Map::new();
+    for a in &v.answers {
+        answers.insert(
+            a.question.clone(),
+            serde_json::json!({"answer": a.answer, "reason": a.reason}),
+        );
+    }
+    serde_json::json!({
+        "iri": v.iri,
+        "verdict": v.verdict,
+        "stated": v.stated,
+        "tag": v.tag,
+        "model": v.model,
+        "judged_at": v.judged_at,
+        "test_code": v.test_code,
+        "answers": answers,
+    })
+}
+
+/// The verdict nodes as Turtle, for the finding's graph face.
+pub(crate) fn verdict_turtle(finding_iri: &str, v: &Verdict) -> String {
+    let mut props = vec![
+        "a prov:Activity".to_string(),
+        format!("prov:used <{finding_iri}>"),
+        format!("dcterms:type <{VERDICT_PREFIX}{}>", v.verdict),
+        format!("ik:versionTag {}", crate::ttl_str(&v.tag)),
+        format!("dcterms:creator {}", crate::ttl_str(&v.model)),
+        format!(
+            "dcterms:subject <{}>",
+            if v.test_code { SITE_TEST } else { SITE_CODE }
+        ),
+        format!("dcterms:description {}", crate::ttl_str(&v.raw)),
+    ];
+    if let Some(at) = &v.judged_at {
+        props.push(format!("dcterms:created \"{at}\"^^xsd:dateTime"));
+    }
+    let mut parts: Vec<(String, String, String)> = v
+        .answers
+        .iter()
+        .map(|a| (a.question.clone(), a.answer.clone(), a.reason.clone()))
+        .collect();
+    if let Some(stated) = &v.stated {
+        parts.push(("stated".to_string(), stated.clone(), String::new()));
+    }
+    if !parts.is_empty() {
+        props.push(format!(
+            "dcterms:hasPart {}",
+            parts
+                .iter()
+                .map(|(q, _, _)| format!("<{}>", answer_iri(&v.iri, q)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let mut out = format!("\n<{}> {} .\n", v.iri, props.join(" ;\n    "));
+    for (question, word, reason) in parts {
+        let mut p = vec![
+            format!("dcterms:identifier {}", crate::ttl_str(&question)),
+            format!("dcterms:type <{ANSWER_PREFIX}{}>", word.replace('/', "-")),
+        ];
+        if !reason.is_empty() {
+            p.push(format!("dcterms:description {}", crate::ttl_str(&reason)));
+        }
+        out.push_str(&format!(
+            "\n<{}> {} .\n",
+            answer_iri(&v.iri, &question),
+            p.join(" ;\n    ")
+        ));
+    }
+    out
+}
+
+// --- asking --------------------------------------------------------------------
+
+/// Everything one judgment needs, assembled — the prompt and what it was built
+/// from (the site flag is recorded with the verdict).
+pub(crate) struct Prepared {
+    pub(crate) prompt: String,
+    pub(crate) test_code: bool,
+}
+
+/// Build the judge's prompt for the quote at character offset `char_start`.
+pub(crate) fn prepare(
+    rel: &str,
+    text: &str,
+    char_start: u64,
+    claim: &Claim<'_>,
+    files: &[RepoFile],
+) -> Option<Prepared> {
+    let byte_start = text
+        .char_indices()
+        .nth(char_start as usize)
+        .map(|(b, _)| b)
+        .or_else(|| (char_start as usize == text.chars().count()).then_some(text.len()))?;
+    if !text[byte_start..].starts_with(claim.quote) {
+        return None;
+    }
+    let site = site(rel, text, byte_start, byte_start + claim.quote.len());
+    let symbols = symbols(claim.quote, site.item.as_deref());
+    let tests = mentions(files, &symbols, rel);
+    Some(Prepared {
+        prompt: prompt(rel, text, &site, &tests, &symbols, claim),
+        test_code: site.test_code.is_some(),
+    })
+}
+
+/// The judge's identity: its tag and model, resolved the way the review pass
+/// resolves its own — the operator's label only while the judge asks the
+/// configured review backend, else the backend's own `:model`.
+pub(crate) async fn identity(
+    inv: &Invocation<'_>,
+    config: &ExplainConfig,
+    provider: &str,
+) -> (String, String) {
+    let explicit = match provider == config.review_provider {
+        true => config.review_model_label.clone(),
+        false => None,
+    };
+    let model = match explicit {
+        Some(label) => label,
+        None => resolve_model(inv, provider)
+            .await
+            .unwrap_or_else(|| provider_label(provider)),
+    };
+    (format!("{JUDGE_PROMPT_VERSION}@{model}"), model)
+}
+
+/// Ask the judge once and parse what it said.
+pub(crate) async fn ask(
+    inv: &Invocation<'_>,
+    config: &ExplainConfig,
+    provider: &str,
+    prepared: &Prepared,
+) -> Result<(String, Parsed)> {
+    let request = Request::new(Verb::Source, parse_iri(provider)?)
+        .with_arg(
+            "prompt",
+            ArgRef::Inline(prepared.prompt.clone().into_bytes()),
+        )
+        .with_arg(
+            "system",
+            ArgRef::Inline(JUDGE_SYSTEM_PROMPT.as_bytes().to_vec()),
+        )
+        // Temperature 0: a verdict must be reproducible, and the local backend
+        // is deterministic there (measured, ledger #449's noise-floor comment).
+        .with_arg("temperature", ArgRef::Inline(b"0".to_vec()))
+        .with_arg(
+            "max_tokens",
+            ArgRef::Inline(config.judge_max_tokens.to_string().into_bytes()),
+        );
+    let answer = inv.issue(request).await?;
+    let raw = String::from_utf8_lossy(&answer.bytes).trim().to_string();
+    let parsed = parse(&raw);
+    Ok((raw, parsed))
+}
+
+/// Judge every SERIOUS finding in `finding_iris` that has no verdict under this
+/// judge's tag yet — the review pass's last step. Never fails the pass: a
+/// judgment that cannot be made (a transport error, an anchor that no longer
+/// matches) records nothing and is counted, so the next pass can try again.
+///
+/// Returns `(judged, failed)`.
+pub(crate) async fn judge_findings(
+    inv: &Invocation<'_>,
+    config: &ExplainConfig,
+    root: &Path,
+    rel: &str,
+    text: &str,
+    finding_iris: &[String],
+) -> Result<(usize, usize)> {
+    let Some(provider) = config.judge_provider.clone() else {
+        return Ok((0, 0));
+    };
+    let mut todo = Vec::new();
+    for iri in finding_iris {
+        let Some(id) = iri.strip_prefix(annotate::Family::Finding.prefix()) else {
+            continue;
+        };
+        let Some(finding) = annotate::load_record(&config.archive, annotate::Family::Finding, id)?
+        else {
+            continue;
+        };
+        if !finding
+            .severity
+            .as_deref()
+            .is_some_and(|s| SEVERITIES[..crate::finding::SERIOUS_SEVERITIES].contains(&s))
+        {
+            continue;
+        }
+        todo.push(finding);
+    }
+    if todo.is_empty() {
+        return Ok((0, 0));
+    }
+    let (tag, model) = identity(inv, config, &provider).await;
+    let files = test_files(root, &config.ignore);
+    let (mut judged, mut failed) = (0, 0);
+    for finding in todo {
+        let iri = verdict_iri(&finding.iri(), &tag);
+        if finding.judges.iter().any(|v| v.iri == iri) {
+            continue;
+        }
+        let claim = Claim {
+            severity: finding.severity.as_deref(),
+            quote: &finding.exact,
+            body: &finding.body,
+        };
+        let Some(prepared) = prepare(rel, text, finding.start, &claim, &files) else {
+            failed += 1;
+            continue;
+        };
+        let (raw, parsed) = match ask(inv, config, &provider, &prepared).await {
+            Ok(answer) => answer,
+            // A denial is the caller's authority, identical for every finding:
+            // stop asking, but the pass it rides on stands.
+            Err(Error::Denied(_)) => return Ok((judged, failed + 1)),
+            Err(_) => {
+                failed += 1;
+                continue;
+            }
+        };
+        let verdict = Verdict {
+            iri,
+            verdict: verdict_of(&parsed.answers).to_string(),
+            stated: parsed.stated,
+            tag: tag.clone(),
+            model: model.clone(),
+            judged_at: inv.now().map(|t| iso8601(t.as_millis())),
+            test_code: prepared.test_code,
+            answers: parsed.answers,
+            raw,
+        };
+        store_verdict(&config.archive, &finding.iri(), &verdict)?;
+        judged += 1;
+    }
+    Ok((judged, failed))
+}
+
+// --- the resource: judge any claim against a file ---------------------------------
+
+pub(crate) fn bind(
+    space: EndpointSpace,
+    roots: &Roots,
+    config: &Arc<ExplainConfig>,
+) -> EndpointSpace {
+    let judge: Arc<dyn Endpoint> = Arc::new(JudgeEndpoint {
+        roots: Arc::clone(roots),
+        config: Arc::clone(config),
+    });
+    crate::bind_family(space, roots, judge, None, Some("judge:{path}"))
+}
+
+/// `urn:repo:{repo}:judge:{path}` — the judge, asked about ANY claim against
+/// the file's current content: the same site, the same test index, the same
+/// prompt and the same rule the review pass runs on its serious findings, with
+/// nothing archived (a claim passed by argument has no finding to attach to).
+///
+/// ★ It is the measurement seam as much as a tool: `examples/judge-probe.rs`
+/// runs the eval set through it, so what is measured is what ships.
+struct JudgeEndpoint {
+    roots: Roots,
+    config: Arc<ExplainConfig>,
+}
+
+#[async_trait]
+impl Endpoint for JudgeEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        if inv.request.verb != Verb::Source {
+            return Err(Error::Endpoint(format!(
+                "browse-judge does not support the {:?} verb",
+                inv.request.verb
+            )));
+        }
+        let (repo, root) = repo_root(inv, &self.roots)?;
+        granted(inv, repo)?;
+        let rel = path_binding(inv)?;
+        if rel.is_empty() {
+            return Err(Error::MissingArgument("path".to_string()));
+        }
+        let target = resolve(root, &rel)?;
+        if target.is_dir() {
+            return Err(Error::NotFound(format!(
+                "browse: `{rel}` is a directory — a claim is judged against one file"
+            )));
+        }
+        let quote = inv
+            .inline_str("quote")
+            .map_err(|_| Error::MissingArgument("quote".to_string()))?
+            .to_string();
+        let body = inv
+            .inline_str("claim")
+            .map_err(|_| Error::MissingArgument("claim".to_string()))?
+            .to_string();
+        let severity = match inv.inline_str("severity") {
+            Ok(s) if crate::finding::is_severity(s) => Some(s.to_string()),
+            Ok(other) => {
+                return Err(Error::InvalidArgument {
+                    name: "severity".to_string(),
+                    detail: format!("`{other}` is not one of {}", SEVERITIES.join(", ")),
+                })
+            }
+            Err(_) => None,
+        };
+        let provider = match inv.inline_str("provider") {
+            Ok(requested) => {
+                let selectable = self.config.selectable();
+                if !selectable.contains(requested) {
+                    return Err(Error::Denied(format!(
+                        "browse: `{requested}` is not a provider this host offers to judge \
+                         with; selectable here: {}",
+                        selectable.into_iter().collect::<Vec<_>>().join(", ")
+                    )));
+                }
+                requested.to_string()
+            }
+            Err(_) => self
+                .config
+                .judge_provider
+                .clone()
+                .unwrap_or_else(|| self.config.review_provider.clone()),
+        };
+        let content = inv.source(&parse_iri(&file_iri(repo, &rel))?).await?;
+        let Ok(text) = String::from_utf8(content.bytes.clone()) else {
+            return Err(Error::InvalidArgument {
+                name: "path".to_string(),
+                detail: format!("`{rel}` is binary — there is nothing to judge"),
+            });
+        };
+        // Which occurrence: `start` (a character offset, as a finding row
+        // carries it), else the first.
+        let char_start = match inv.inline_str("start") {
+            Ok(s) => s.parse::<u64>().map_err(|_| Error::InvalidArgument {
+                name: "start".to_string(),
+                detail: format!("`{s}` is not a character offset"),
+            })?,
+            Err(_) => match text.find(&quote) {
+                Some(at) => text[..at].chars().count() as u64,
+                None => {
+                    return Err(Error::InvalidArgument {
+                        name: "quote".to_string(),
+                        detail: format!("the quote does not occur in `{rel}`"),
+                    })
+                }
+            },
+        };
+        let claim = Claim {
+            severity: severity.as_deref(),
+            quote: &quote,
+            body: &body,
+        };
+        let files = test_files(root, &self.config.ignore);
+        let Some(prepared) = prepare(&rel, &text, char_start, &claim, &files) else {
+            return Err(Error::InvalidArgument {
+                name: "start".to_string(),
+                detail: format!("the quote is not at character {char_start} of `{rel}`"),
+            });
+        };
+        let (tag, model) = identity(inv, &self.config, &provider).await;
+        let (raw, parsed) = ask(inv, &self.config, &provider, &prepared).await?;
+        let verdict = Verdict {
+            iri: String::new(),
+            verdict: verdict_of(&parsed.answers).to_string(),
+            stated: parsed.stated,
+            tag,
+            model,
+            judged_at: inv.now().map(|t| iso8601(t.as_millis())),
+            test_code: prepared.test_code,
+            answers: parsed.answers,
+            raw,
+        };
+        let as_text = inv
+            .inline_str("as")
+            .is_ok_and(|a| a.starts_with("text/plain"));
+        if as_text {
+            let mut out = format!("{} ({})\n", verdict.verdict, verdict.tag);
+            for a in &verdict.answers {
+                out.push_str(&format!("{}: {} - {}\n", a.question, a.answer, a.reason));
+            }
+            return Ok(repr_utf8("text/plain", out));
+        }
+        let mut json = verdict_json(&verdict);
+        json["iri"] = serde_json::Value::Null;
+        json["raw"] = serde_json::Value::String(verdict.raw.clone());
+        json["prompt_bytes"] = serde_json::Value::from(prepared.prompt.len());
+        Ok(crate::repr(
+            "application/json",
+            serde_json::to_string(&json).unwrap_or_default(),
+        ))
+    }
+
+    fn name(&self) -> &str {
+        "browse-judge"
+    }
+
+    fn describe(&self) -> Description {
+        judge_description(&self.config)
+    }
+}
+
+fn judge_description(config: &ExplainConfig) -> Description {
+    Description::new("browse-judge")
+        .title("Judge a review claim against a file")
+        .summary(
+            "Confirm or refute ONE review claim (a quote and a claim body) against a file's \
+             current content, with the context the reviewer lacked: the whole enclosing item, \
+             the comments at the site, whether it is test code, and the repository's tests that \
+             mention the claim's symbols. Four answers, each with a reason (code: does the cited \
+             code do what the claim says; disclosed: is the hazard already stated at the site; \
+             occurs: would the predicted failure happen; test: is this test code where failing \
+             loudly is the intent) and a verdict BY RULE: refuted when any answer refutes, \
+             confirmed when all support, else unsure. The model's own VERDICT line rides along \
+             as `stated`. Temperature 0. Nothing is archived: the review pass runs the same \
+             judgment on each serious finding it mints and attaches the verdict to the finding \
+             (`judge` on its json row), and nothing is dropped or withheld because of one. \
+             application/json (default) is the verdict object plus `raw` (the answer) and \
+             `prompt_bytes`; text/plain is a digest.",
+        )
+        .verb(Verb::Source)
+        .verb(Verb::Meta)
+        .requires(CAP_WILDCARD)
+        .requires(CAP_NET)
+        .input(
+            ArgSpec::new("path")
+                .binding()
+                .class(crate::XSD_STRING)
+                .summary("file path within the root, percent-encoded"),
+        )
+        .input(
+            ArgSpec::new("quote").class(crate::XSD_STRING).summary(
+                "the claim's quote: text that occurs in the file, character for character",
+            ),
+        )
+        .input(
+            ArgSpec::new("claim")
+                .class(crate::XSD_STRING)
+                .summary("the claim's body: what the reviewer says is wrong at the quote"),
+        )
+        .input(
+            ArgSpec::new("severity")
+                .optional()
+                .class(crate::XSD_STRING)
+                .summary("the severity the reviewer proposed")
+                .one_of(SEVERITIES),
+        )
+        .input(
+            ArgSpec::new("start")
+                .optional()
+                .class("http://www.w3.org/2001/XMLSchema#nonNegativeInteger")
+                .summary(
+                    "which occurrence: the quote's character offset in the file (a finding \
+                     row's `start`); default the first occurrence",
+                ),
+        )
+        .input(
+            ArgSpec::new("provider")
+                .optional()
+                .class("http://www.w3.org/2001/XMLSchema#anyURI")
+                .summary(
+                    "the LLM provider IRI to judge with instead of the configured judge \
+                     provider; one_of is what this host allows",
+                )
+                .one_of(config.selectable()),
+        )
+        .input(
+            ArgSpec::new("as")
+                .optional()
+                .class(crate::XSD_STRING)
+                .summary("the face to render")
+                .one_of(["application/json", "text/plain"])
+                .default_value("application/json"),
+        )
+        .output("application/json")
+        .output("text/plain;charset=utf-8")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RUST: &str = "\
+//! A module.
+
+/// Adds one.
+///
+/// ⚠ Panics on overflow, by design.
+pub fn add_one(x: u8) -> u8 {
+    // The caller checked.
+    x + 1 // overflow is the caller's
+}
+
+impl Thing {
+    fn other(&self) {
+        let s = \"{ not a brace\";
+        let c = '{';
+        call(s, c);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adds() {
+        let v = add_one(1);
+        assert_eq!(v, 2);
+        add_one(255).expect(\"boom\");
+    }
+}
+";
+
+    fn at(text: &str, quote: &str) -> (usize, usize) {
+        let s = text.find(quote).unwrap();
+        (s, s + quote.len())
+    }
+
+    #[test]
+    fn item_names_are_read_from_declarations_only() {
+        assert_eq!(
+            item_name("pub fn add_one(x: u8) -> u8 {").as_deref(),
+            Some("add_one")
+        );
+        assert_eq!(
+            item_name("    pub(crate) async fn go() {").as_deref(),
+            Some("go")
+        );
+        assert_eq!(item_name("impl Thing {").as_deref(), Some("impl Thing"));
+        assert_eq!(
+            item_name("impl<T> Foo for Bar<T> {").as_deref(),
+            Some("impl<T> Foo for Bar<T>")
+        );
+        assert_eq!(item_name("def test_x(self):").as_deref(), Some("test_x"));
+        assert_eq!(item_name("my-func() {").as_deref(), Some("my-func"));
+        assert_eq!(
+            item_name("const LIMIT: usize = 4;").as_deref(),
+            Some("LIMIT")
+        );
+        assert_eq!(item_name("    let f = fn_like();"), None);
+        assert_eq!(item_name("    implement();"), None);
+        assert_eq!(item_name("// fn commented() {}"), None);
+    }
+
+    #[test]
+    fn the_site_is_the_whole_enclosing_function_with_its_doc_and_comments() {
+        let (s, e) = at(RUST, "x + 1");
+        let st = site("src/lib.rs", RUST, s, e);
+        assert_eq!(st.item.as_deref(), Some("add_one"));
+        // The doc block starts at line 3, the closing brace is line 9.
+        assert_eq!((st.first_line, st.last_line), (3, 9));
+        assert_eq!((st.quote_first, st.quote_last), (8, 8));
+        assert!(st.comments.iter().any(|c| c.contains("Panics on overflow")));
+        assert!(st.comments.iter().any(|c| c == "// The caller checked."));
+        assert!(st.comments.iter().any(|c| c == "overflow is the caller's"));
+        assert_eq!(st.test_code, None);
+    }
+
+    #[test]
+    fn braces_in_strings_and_char_literals_do_not_end_an_item() {
+        let (s, e) = at(RUST, "call(s, c);");
+        let st = site("src/lib.rs", RUST, s, e);
+        assert_eq!(st.item.as_deref(), Some("other"));
+        assert_eq!((st.first_line, st.last_line), (12, 16));
+    }
+
+    #[test]
+    fn multi_line_and_raw_strings_hide_their_braces() {
+        let text = "fn a() {\n    let s = \"one {\n two\";\n    let r = r#\"}\"# ;\n    call();\n}\nfn b() {}\n";
+        let lines: Vec<&str> = text.split('\n').collect();
+        assert_eq!(brace_end(&lines, 0, Lang::Brace), Some(5));
+        let (s, e) = at(text, "call();");
+        assert_eq!(site("src/a.rs", text, s, e).item.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn a_cfg_test_module_and_a_test_path_are_test_code() {
+        let (s, e) = at(RUST, "add_one(255)");
+        let st = site("src/lib.rs", RUST, s, e);
+        assert_eq!(st.item.as_deref(), Some("adds"));
+        assert!(st.test_code.is_some());
+        let (s, e) = at(RUST, "x + 1");
+        assert!(site("tests/it.rs", RUST, s, e).test_code.is_some());
+        assert!(is_test_path("crates/a/tests/x.rs"));
+        assert!(is_test_path("src/thing_test.go"));
+        assert!(!is_test_path("src/testing.rs"));
+    }
+
+    #[test]
+    fn prose_gets_a_window_not_an_item() {
+        let text: String = (1..=200).map(|n| format!("line {n}\n")).collect();
+        let (s, e) = at(&text, "line 100\n");
+        let st = site("README.md", &text, s, e - 1);
+        assert_eq!(st.item, None);
+        assert_eq!((st.first_line, st.last_line), (60, 140));
+    }
+
+    #[test]
+    fn symbols_prefer_the_item_and_specific_identifiers() {
+        let s = symbols(
+            "bursts.apply(std::slice::from_mut(ann));",
+            Some("included_for_ids"),
+        );
+        assert_eq!(s[0], "included_for_ids");
+        assert!(s.contains(&"from_mut".to_string()));
+        assert!(!s.contains(&"std".to_string()));
+        assert!(symbols("let x = 1;", None).is_empty());
+        // Prose in a quoted comment names nothing a test would.
+        assert!(symbols("the store is ONLY read once", None).is_empty());
+        assert!(
+            symbols("parse(kernel, stream);", None).is_empty(),
+            "a short call is too common"
+        );
+        assert_eq!(
+            symbols("dispatch(kernel);", None),
+            vec!["dispatch".to_string()]
+        );
+    }
+
+    #[test]
+    fn mentions_name_the_test_and_its_asserting_lines() {
+        let files = vec![RepoFile {
+            rel: "src/lib.rs".to_string(),
+            text: RUST.to_string(),
+        }];
+        let found = mentions(&files, &["add_one".to_string()], "src/lib.rs");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].test, "adds");
+        assert_eq!(found[0].asserts, vec!["assert_eq!(v, 2);".to_string()]);
+        // A function outside the test region that mentions it is not a test.
+        assert!(mentions(&files, &["call".to_string()], "src/lib.rs").is_empty());
+    }
+
+    #[test]
+    fn answers_parse_tolerantly_and_the_rule_decides() {
+        let p = parse(
+            "**CODE:** no - the operator does not panic.\n\
+             DISCLOSED: no — nothing says so\n\
+             - OCCURS: n/a - no failure predicted\n\
+             TEST: maybe - who knows\n\
+             VERDICT: refuted\n",
+        );
+        assert_eq!(p.stated.as_deref(), Some("refuted"));
+        let words: Vec<(&str, &str)> = p
+            .answers
+            .iter()
+            .map(|a| (a.question.as_str(), a.answer.as_str()))
+            .collect();
+        assert_eq!(
+            words,
+            vec![
+                ("code", "no"),
+                ("disclosed", "no"),
+                ("occurs", "n/a"),
+                ("test", "unclear")
+            ]
+        );
+        assert_eq!(p.answers[0].reason, "the operator does not panic.");
+        // `code: no` alone is not a refutation (see `verdict_of`).
+        assert_eq!(verdict_of(&p.answers), "unsure");
+        assert_eq!(
+            verdict_of(&parse("CODE: yes - x\nOCCURS: no - y").answers),
+            "refuted"
+        );
+        let ok = parse("CODE: yes - x\nDISCLOSED: no - x\nOCCURS: yes - x\nTEST: no - x\n");
+        assert_eq!(verdict_of(&ok.answers), "confirmed");
+        let half = parse("CODE: yes - x\nOCCURS: unclear - x\n");
+        assert_eq!(verdict_of(&half.answers), "unsure");
+        assert_eq!(
+            verdict_of(&parse("DISCLOSED: yes - it says so").answers),
+            "refuted"
+        );
+    }
+
+    #[test]
+    fn the_prompt_marks_the_quote_and_never_mentions_decisions() {
+        let (s, e) = at(RUST, "x + 1");
+        let st = site("src/lib.rs", RUST, s, e);
+        let claim = Claim {
+            severity: Some("critical"),
+            quote: "x + 1",
+            body: "This overflows.",
+        };
+        let p = prompt(
+            "src/lib.rs",
+            RUST,
+            &st,
+            &[],
+            &["add_one".to_string()],
+            &claim,
+        );
+        assert!(p.contains(">    8 |     x + 1 // overflow is the caller's"));
+        assert!(p.contains("CLAIM: This overflows."));
+        assert!(p.contains("Test code: no"));
+        for word in crate::finding::DECLINE_REASONS {
+            assert!(
+                !p.contains(word),
+                "the judge prompt names the decline word `{word}`"
+            );
+        }
+    }
+
+    #[test]
+    fn a_verdict_round_trips_through_the_store() {
+        let store = Arc::new(oxigraph::store::Store::new().unwrap());
+        let archive = Archive::new(store, oxigraph::model::GraphName::DefaultGraph);
+        let finding = "urn:iki:finding:abc";
+        let parsed = parse(
+            "CODE: no - x\nDISCLOSED: no - y\nOCCURS: n/a - z\nTEST: yes - w\nVERDICT: refuted",
+        );
+        let v = Verdict {
+            iri: verdict_iri(finding, "judge-v1@m:1"),
+            verdict: verdict_of(&parsed.answers).to_string(),
+            stated: parsed.stated.clone(),
+            tag: "judge-v1@m:1".to_string(),
+            model: "m:1".to_string(),
+            judged_at: Some("2026-10-01T00:00:00Z".to_string()),
+            test_code: true,
+            answers: parsed.answers,
+            raw: "the raw answer".to_string(),
+        };
+        store_verdict(&archive, finding, &v).unwrap();
+        assert_eq!(load_verdicts(&archive, finding).unwrap(), vec![v.clone()]);
+        let json = verdict_json(&v);
+        assert_eq!(json["verdict"], "refuted");
+        assert_eq!(json["answers"]["occurs"]["answer"], "n/a");
+        assert_eq!(json["test_code"], true);
+        // The Turtle face parses.
+        let doc = format!(
+            "@prefix prov: <{PROV}> .\n@prefix dcterms: <{DCTERMS}> .\n@prefix ik: <{}> .\n\
+             @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n{}",
+            crate::explain::IK,
+            verdict_turtle(finding, &v)
+        );
+        let parser = oxttl::TurtleParser::new();
+        for triple in parser.for_slice(doc.as_bytes()) {
+            triple.expect("valid turtle");
+        }
+    }
+}
