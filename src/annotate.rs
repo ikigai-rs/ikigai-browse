@@ -207,6 +207,24 @@ pub(crate) const DCTERMS_REPLACES: &str = "http://purl.org/dc/terms/replaces";
 /// types only the term, which is a statement about provenance). A dedicated
 /// `ik:` term is the right end state and is REPORTED.
 pub(crate) const DCTERMS_PROVENANCE: &str = "http://purl.org/dc/terms/provenance";
+/// `prov:wasInformedBy` — a PUBLISH decision to the REPRODUCTION that backs it
+/// (ledger #696): a human showed the defect happen, and the decision's note
+/// says how. The object is the finding's own sub-IRI,
+/// [`reproduction_iri`], so the mark is one triple and a SPARQL count of
+/// reproduced findings is one pattern.
+///
+/// ★ Chosen because its entailment is TRUE rather than merely harmless:
+/// PROV-O gives it `rdfs:domain prov:Activity` and `rdfs:range prov:Activity`,
+/// and the decision node is already typed `prov:Activity` (so nothing new is
+/// entailed about it), while the reproduction IS an activity: someone ran
+/// something and watched it fail. ⚠ Not a sixth decline word on
+/// [`DCTERMS_SUBJECT`]: a decline reason says "not a defect", and this says "a
+/// defect, proven" — the two must never be counted in one column. Not a second
+/// [`DCTERMS_PROVENANCE`] value either: that predicate says how the decision
+/// was MADE (singly or in a batch) and is read as single-valued. A dedicated
+/// `ik:reproduced` is the right end state and is REPORTED, not invented here
+/// (the vocabulary lives in core).
+pub(crate) const PROV_WAS_INFORMED_BY: &str = "http://www.w3.org/ns/prov#wasInformedBy";
 
 /// `sh:resultSeverity` — the severity of an assessment result.
 ///
@@ -325,6 +343,15 @@ pub(crate) fn revision_iri(id: &str, n: u32) -> String {
         0 | 1 => decision_iri(id),
         n => format!("{}:{n}", decision_iri(id)),
     }
+}
+
+/// `urn:iki:finding:{id}:reproduction` — the reproduction a publish decision
+/// was informed by ([`PROV_WAS_INFORMED_BY`]): DATA, like the decision node,
+/// never a resource (the finding grammar refuses an id with a `:`). One per
+/// finding: the mark says "this claim was shown to happen", and every node
+/// that carries it names the same act.
+pub(crate) fn reproduction_iri(id: &str) -> String {
+    format!("{}:reproduction", record_iri(Family::Finding, id))
 }
 
 /// Where a decision node sits in its finding's chain — the inverse of
@@ -474,6 +501,11 @@ pub(crate) struct Decision {
     /// The annotation minted on publish — `None` for a decline, which is
     /// exactly what makes a decline a RECORD rather than a deletion.
     pub(crate) minted: Option<String>,
+    /// Whether a human recorded that the finding was REPRODUCED — a real
+    /// defect, shown to happen (ledger #696). Only ever on a publish; the note
+    /// says how. Stored as [`PROV_WAS_INFORMED_BY`] [`reproduction_iri`], and
+    /// read back only when the object is exactly that IRI.
+    pub(crate) reproduced: bool,
 }
 
 /// How a decision was made — recorded when the caller says (gonk stamps it at
@@ -1083,6 +1115,19 @@ pub(crate) fn append_decision(
             g.clone(),
         ));
     }
+    if decision.reproduced {
+        let Some((Family::Finding, id)) = Family::split(finding_iri) else {
+            return Err(Error::Endpoint(format!(
+                "browse: `{finding_iri}` is not a finding, so it has no reproduction to record"
+            )));
+        };
+        quads.push(Quad::new(
+            node.clone(),
+            named(PROV_WAS_INFORMED_BY)?,
+            named(&reproduction_iri(id))?,
+            g.clone(),
+        ));
+    }
     if let Some(minted) = &decision.minted {
         quads.push(Quad::new(node, named(PROV_GENERATED)?, named(minted)?, g));
     }
@@ -1357,6 +1402,13 @@ fn load_decision(archive: &Archive, iri: &str) -> Result<Option<Decision>> {
     let mut minted = None;
     let mut revises = None;
     let mut made = None;
+    let mut reproduced = false;
+    // The one reproduction this node may name: its own finding's.
+    let reproduction = iri
+        .split_once(":decision")
+        .and_then(|(finding, _)| Family::split(finding))
+        .filter(|(family, _)| *family == Family::Finding)
+        .map(|(_, id)| reproduction_iri(id));
     for quad in archive.quads_for_pattern(Some(subject.as_ref().into()), None, None) {
         let quad = quad.map_err(store_err)?;
         let value = match &quad.object {
@@ -1394,6 +1446,12 @@ fn load_decision(archive: &Archive, iri: &str) -> Result<Option<Decision>> {
             // "not said", which is what lets the burst rule look at it.
             DCTERMS_PROVENANCE => made = node.and_then(Made::from_iri),
             PROV_GENERATED => minted = node.map(str::to_string),
+            // Exact: only THIS finding's reproduction is the mark. Anything
+            // else a later release might hang here (a judge verdict that
+            // informed the decision) reads as no mark, never as one.
+            PROV_WAS_INFORMED_BY => {
+                reproduced |= node.is_some() && node.map(str::to_string) == reproduction;
+            }
             _ => {}
         }
     }
@@ -1419,6 +1477,9 @@ fn load_decision(archive: &Archive, iri: &str) -> Result<Option<Decision>> {
         note,
         reason,
         minted,
+        // Only a publish can say "a defect, proven": a hand-written mark on a
+        // decline or a retraction reads back as no mark.
+        reproduced: reproduced && outcome == Outcome::Published,
     };
     // Pessimistic until the burst pass has run — see `Decision::confirmed`.
     decision.confirmed = crate::revision::confirmed(&decision, true);
@@ -2905,7 +2966,9 @@ pub(crate) fn annotation_json(ann: &Annotation, line: Option<u64>) -> serde_json
 ///
 /// `confirmed` and `burst` are computed on read ([`crate::revision`]);
 /// `made` is `"single"`, `"batch"` or null (not recorded), with `batch` the
-/// batch's group key; `revises` is the node this one revises, or null.
+/// batch's group key; `revises` is the node this one revises, or null;
+/// `reproduced` is true when a human recorded the defect as REPRODUCED (a
+/// publish only, ledger #696), false otherwise — never null.
 pub(crate) fn decision_json(d: &Decision) -> serde_json::Value {
     serde_json::json!({
         "iri": d.iri,
@@ -2920,6 +2983,7 @@ pub(crate) fn decision_json(d: &Decision) -> serde_json::Value {
         "batch": d.made.as_ref().and_then(Made::batch),
         "confirmed": d.confirmed,
         "burst": d.burst,
+        "reproduced": d.reproduced,
     })
 }
 
@@ -3001,6 +3065,12 @@ fn annotation_turtle(ann: &Annotation) -> String {
         }
         if let Some(made) = &decision.made {
             act.push(format!("dcterms:provenance <{}>", made.iri()));
+        }
+        if decision.reproduced {
+            act.push(format!(
+                "prov:wasInformedBy <{}>",
+                reproduction_iri(&ann.id)
+            ));
         }
         if let Some(minted) = &decision.minted {
             act.push(format!("prov:generated <{minted}>"));

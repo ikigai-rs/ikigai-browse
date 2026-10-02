@@ -4,6 +4,7 @@ file version the reviewer saw.
 
     python3 tests/corpus/judge/export.py [--socket ~/.ikigai/gonk.sock] \
         [--config ~/.config/ikigai/config.toml] [--repo NAME ...] [--include-private]
+    python3 tests/corpus/judge/export.py --self-test
 
 READS ONLY. Every finding comes out of gonk through its socket (`ikigai --mount
 "urn:gk:=<socket>" -c 'source urn:gk:repo:<repo>:findings state=<s>'`), and every file
@@ -23,9 +24,14 @@ Labels (see README.md for the reasons):
 
   known-false   a decline that carries a reason word saying the claim is not a defect:
                 misread, restates, no-issue. The decision's note is kept: it is WHY.
-  known-real    a finding a human PUBLISHED (it became an annotation); the one sweep-1
-                finding that was partly real; and the intent corpus's pre-fix defects,
-                whose claims are human-written (marked `claim_by: human`).
+  known-real    basis `verified-real`: a finding a human PUBLISHED and marked REPRODUCED
+                (`decision.reproduced`, ledger #696) — a defect shown to happen, the
+                decision's note saying how. The real half's strong evidence, and the one
+                that grows from ordinary reviewing.
+                basis `published`: a finding a human published WITHOUT the mark (it became
+                an annotation; a human kept the note, nothing more is known).
+                And the one sweep-1 finding that was partly real, and the intent corpus's
+                pre-fix defects, whose claims are human-written (marked `claim_by: human`).
 
 Declines with any other word (duplicate, wont-fix) and declines with no word are not
 labeled: a duplicate may be true, a wont-fix is true by definition, and a wordless decline
@@ -193,8 +199,16 @@ def split_of(entry_id):
 
 
 def label_of(row):
+    """(label, basis) for one gonk finding row, or (None, why it is not labeled).
+
+    A reproduced publish is `verified-real`; a plain one stays `published`. The mark is
+    read from the CURRENT decision only, and only as JSON `true`: a row from a browse
+    that predates the mark has no `reproduced` key and reads as a plain publish.
+    """
     d = row.get("decision") or {}
     if row.get("state") == "published":
+        if d.get("reproduced") is True:
+            return "known-real", "verified-real"
         return "known-real", "published"
     if row.get("state") == "declined":
         word = d.get("reason")
@@ -206,7 +220,56 @@ def label_of(row):
     return None, f"state {row.get('state')}"
 
 
+def self_test():
+    """The labels, pinned: run by `tests/corpus.rs`, so a change to what a decision row
+    means for the eval set fails a cargo test rather than a re-export nobody reads."""
+    def row(state, **decision):
+        return {"id": "f00", "state": state, "decision": decision or None}
+
+    cases = [
+        (row("published", outcome="published", reproduced=True), ("known-real", "verified-real")),
+        (row("published", outcome="published", reproduced=False), ("known-real", "published")),
+        # A browse that predates the mark: no key at all reads as a plain publish.
+        (row("published", outcome="published"), ("known-real", "published")),
+        # Only a JSON true is the mark: a string is not.
+        (row("published", outcome="published", reproduced="yes"), ("known-real", "published")),
+        (row("declined", outcome="declined", reason="misread"), ("known-false", "misread")),
+        (row("declined", outcome="declined", reason="restates"), ("known-false", "restates")),
+        (row("declined", outcome="declined", reason="no-issue"), ("known-false", "no-issue")),
+        (row("declined", outcome="declined", reason="wont-fix"),
+         (None, "declined with reason `wont-fix`")),
+        (row("declined", outcome="declined"), (None, "declined with no reason word")),
+        (row("pending"), (None, "state pending")),
+    ]
+    failed = 0
+    for given, want in cases:
+        got = label_of(given)
+        if got != want:
+            failed += 1
+            print(f"label_of({given}) = {got}, want {want}", file=sys.stderr)
+    # The scorer files a verified-real entry under the verified group, never published.
+    # No __pycache__ beside the corpus: the check must leave the tree as it found it.
+    sys.dont_write_bytecode = True
+    sys.path.insert(0, HERE)
+    import score  # noqa: E402  (beside this file; imported only for the check)
+
+    for basis, group in [("verified-real", "known-real/verified"),
+                         ("published", "known-real/published"),
+                         ("sweep-partly-real", "known-real/verified"),
+                         ("intent-corpus", "known-real/verified")]:
+        got = score.basis_group({"label": "known-real", "basis": basis})
+        if got != group:
+            failed += 1
+            print(f"basis_group({basis}) = {got}, want {group}", file=sys.stderr)
+    if failed:
+        sys.exit(f"{failed} label case(s) wrong")
+    print(f"ok: {len(cases) + 4} label cases")
+
+
 def main():
+    if sys.argv[1:] == ["--self-test"]:
+        self_test()
+        return
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--socket", default=os.path.expanduser("~/.ikigai/gonk.sock"))
     ap.add_argument("--config", default=os.path.expanduser("~/.config/ikigai/config.toml"))

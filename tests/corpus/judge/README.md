@@ -77,6 +77,17 @@ manifest), two of them the wrong-copy anchors the sweep reported (`00b8a9ce…`,
 finding id is `sha256(pass ‖ char_start ‖ exact)`, so the one occurrence that reproduces the id
 is the minted one. Every model entry reproduces its id (`anchor: "minted"`).
 
+## Growing the real half: the reproduced mark
+
+Since ledger [#696](http://localhost:1060/l/default/item/696), a human can record that a
+finding was REPRODUCED: `decision=publish reproduced=yes` on the finding Sink, with the note
+saying how, or added to a standing publication as a revision (`revises=<its decision>`). The
+exporter labels such a publish **`known-real` / `verified-real`**, and a publish without the
+mark stays `known-real` / `published`. The scorer files `verified-real` with the verified half.
+So the strong half of this set grows from ordinary reviewing, one reproduced finding at a time,
+instead of staying at seven. `python3 export.py --self-test` pins the labels, and
+`tests/corpus.rs` runs it.
+
 ## The manifest
 
 `corpus.json` → `entries[]`, one per finding:
@@ -84,7 +95,7 @@ is the minted one. Every model entry reproduces its id (`anchor: "minted"`).
 | field | meaning |
 | --- | --- |
 | `entry` | `<repo>:<finding id>` — the name a run's verdicts use. Never named after the defect: a path that said the answer would leak it (the intent corpus's rule) |
-| `label`, `basis` | `known-false` with `basis` = the decline word, or `known-real` with `basis` = `published` / `sweep-partly-real` / `intent-corpus` |
+| `label`, `basis` | `known-false` with `basis` = the decline word, or `known-real` with `basis` = `verified-real` / `published` / `sweep-partly-real` / `intent-corpus` |
 | `reason`, `decision_note`, `batch` | the decision's word, its free-text note (for the sweep declines, the reproduction evidence — WHY the claim is false), and its batch (`critical-sweep-1`) |
 | `severity`, `decided_severity` | the model's proposal and the human's final rating |
 | `quote`, `claim`, `model`, `pass`, `tag` | what the reviewer said, about which text, with which model, in which pass |

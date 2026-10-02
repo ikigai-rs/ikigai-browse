@@ -140,6 +140,30 @@
 //!   gone, the revision is an ordinary one, and the publish stays in the chain.
 //! * Capability: exactly what the first decision needs, `urn:cap:annotate`.
 //!
+//! ## "Real, reproduced" — the mark on a publish (ledger #696)
+//!
+//! `reproduced=yes` beside `decision=publish` records that a human SHOWED the
+//! defect happen, with the piped note saying how. It lives on the decision
+//! node (`prov:wasInformedBy <urn:iki:finding:{id}:reproduction>` — see
+//! [`crate::annotate::PROV_WAS_INFORMED_BY`] for why that term), never on the
+//! annotation, and it is the publish counterpart of nothing: a decline word
+//! says "not a defect", this says "a defect, proven". It is refused beside a
+//! decline or a retraction.
+//!
+//! * **Adding it to a standing publication is a revision** — `decision=publish
+//!   reproduced=yes revises=<its decision>` — and the ONE revision of a
+//!   publication allowed while its annotation exists: the outcome and the
+//!   rating stay (an omitted `severity` keeps the publication's, a different
+//!   one is refused), the new node names the same annotation as `minted`, and
+//!   nothing is re-promoted. Without `revises=` it is refused, naming the
+//!   way, like any change to a recorded answer.
+//! * A repeat that omits the mark does not contradict one on file; its second
+//!   submit is a no-op like every other double click.
+//!
+//! The judge eval set reads it: a reproduced publish is labeled
+//! `verified-real`, a plain one stays `published`
+//! (`tests/corpus/judge/export.py`).
+//!
 //! ## How a decision was made, and whether it was meant
 //!
 //! `made=single`, or `made=batch batch=<group key>` (a `group=` proposal's
@@ -161,8 +185,9 @@
 //! in one shape — `iri`, `outcome` (`published` | `declined` | `retracted`),
 //! `severity`, `decided_at`, `note`, `reason`, `minted`, `revises` (the node it
 //! revises, or null), `made` (`single` | `batch` | null), `batch` (the group
-//! key, or null), `confirmed` (bool) and `burst` (the burst's first timestamp,
-//! or null); `prior_decision` adds `finding`, the declined twin.
+//! key, or null), `confirmed` (bool), `burst` (the burst's first timestamp,
+//! or null) and `reproduced` (bool: the mark, true only on a publish);
+//! `prior_decision` adds `finding`, the declined twin.
 //! ## Staleness borrows the annotation layer's answer; it does not invent one
 //!
 //! A pending finding whose file has since changed is stale by construction.
@@ -310,6 +335,20 @@ pub(crate) fn is_decline_reason(word: &str) -> bool {
     DECLINE_REASONS.contains(&word)
 }
 
+/// **The reproduced mark** (ledger #696) — the words `reproduced=` accepts,
+/// the `one_of` a host renders its control from. One word: the mark is
+/// recorded or it is not, and "not" is saying nothing (an omitted or empty
+/// value), never a second word that would have to mean something.
+///
+/// ★ It says "a real defect, SHOWN to happen" — a publish whose claim a human
+/// reproduced, with the decision's note saying how. Publishing alone means a
+/// human kept the note, which measured as far weaker evidence (two published
+/// findings quote a line a sweep refuted by reproduction): the judge eval set
+/// labels a reproduced publish `verified-real` and a plain one `published`.
+/// ⚠ It is not a decline word and is refused beside a decline or a
+/// retraction: those say the claim is not a defect, or withdraw an answer.
+pub(crate) const REPRODUCED_WORDS: [&str; 1] = ["yes"];
+
 /// The Sink's `reason` summary: when it applies, then every word with its
 /// meaning, in contract order.
 fn decline_reason_summary() -> String {
@@ -424,6 +463,12 @@ pub(crate) fn decision_html(
                 esc(reason)
             ));
         }
+        if decision.reproduced {
+            out.push_str(
+                " <span class=\"browse-finding-reproduced\" title=\"a human showed the defect \
+                 happen; the note says how\">reproduced</span>",
+            );
+        }
         if !decision.confirmed {
             out.push_str(&format!(
                 " <span class=\"browse-finding-unconfirmed\">unconfirmed — no word, made in {}\
@@ -458,6 +503,9 @@ pub(crate) fn decision_html(
         if decision.outcome == Outcome::Declined {
             out.push_str(&revise_html(id, decision));
         }
+        if decision.outcome == Outcome::Published && !decision.reproduced {
+            out.push_str(&reproduce_html(id, decision));
+        }
         return out;
     }
     let mut out = String::new();
@@ -490,14 +538,38 @@ pub(crate) fn decision_html(
          <select name=\"severity\">{options}</select></label>\
          <label class=\"browse-finding-label\">reason (decline only) \
          <select name=\"reason\">{reasons}</select></label>\
+         <label class=\"browse-finding-label\"><input type=\"checkbox\" name=\"reproduced\" \
+         value=\"{yes}\"> reproduced (publish only — say how below)</label>\
          <textarea name=\"content\" placeholder=\"why (optional; kept either way)\"></textarea>\
          <button type=\"submit\" name=\"decision\" value=\"{PUBLISH}\">publish</button>\
          <button type=\"submit\" name=\"decision\" value=\"{DECLINE}\">decline</button>\
          </form>",
         iri = esc(&finding_iri(id)),
         reasons = reason_options(None),
+        yes = REPRODUCED_WORDS[0],
     ));
     out
+}
+
+/// The MARK affordance under a published finding's record (ledger #696):
+/// record that the defect was reproduced, saying how. A revision that names
+/// the publication and keeps its rating, so the Sink adds the mark without
+/// touching the annotation. Markup only, and it stamps no `made=`, like
+/// [`revise_html`].
+fn reproduce_html(id: &str, decision: &Decision) -> String {
+    format!(
+        "<details class=\"browse-finding-reproduce\"><summary>record a reproduction</summary>\
+         <form class=\"browse-finding-decide\" hx-post=\"/k/sink {iri}\" hx-target=\"#browse\" \
+         hx-swap=\"innerHTML\">\
+         <input type=\"hidden\" name=\"revises\" value=\"{revises}\">\
+         <input type=\"hidden\" name=\"reproduced\" value=\"{yes}\">\
+         <textarea name=\"content\" placeholder=\"how it was reproduced\"></textarea>\
+         <button type=\"submit\" name=\"decision\" value=\"{PUBLISH}\">reproduced</button>\
+         </form></details>",
+        iri = esc(&finding_iri(id)),
+        revises = esc(&decision.iri),
+        yes = REPRODUCED_WORDS[0],
+    )
 }
 
 /// The reason picker: every word of [`DECLINE_REASONS`], its meaning as the
@@ -736,10 +808,50 @@ impl FindingEndpoint {
                 .filter(|v| !v.is_empty())
                 .map(str::to_string)
         };
+        // "A defect, proven" (ledger #696): only beside a publish, refused by
+        // name anywhere else — a decline says the claim is NOT a defect, and
+        // an accepted-then-ignored argument is invisible from the caller's
+        // side. An EMPTY value is omitted, as for `reason`.
+        let reproduced = match stated("reproduced") {
+            Some(word) => {
+                if outcome != Outcome::Published {
+                    return Err(Error::InvalidArgument {
+                        name: "reproduced".to_string(),
+                        detail: format!(
+                            "`reproduced={word}` records that a PUBLISHED finding's defect was \
+                             shown to happen, and this decision is {} — drop `reproduced`, or \
+                             use decision={PUBLISH}",
+                            word_of(outcome)
+                        ),
+                    });
+                }
+                if !REPRODUCED_WORDS.contains(&word.as_str()) {
+                    return Err(Error::InvalidArgument {
+                        name: "reproduced".to_string(),
+                        detail: format!(
+                            "`{word}` is not a reproduced mark — one of: {} (omit it to record \
+                             none)",
+                            REPRODUCED_WORDS.join(", ")
+                        ),
+                    });
+                }
+                true
+            }
+            None => false,
+        };
+        // The publication the mark may be added to: the CURRENT decision,
+        // when it is a publish. Its rating is what an omitted severity keeps,
+        // because adding the mark revises a publication without re-rating it.
+        let marking = finding
+            .decision
+            .clone()
+            .filter(|d| reproduced && d.outcome == Outcome::Published);
         // The final rating: the human's choice, or the model's proposal
-        // accepted unchanged. ⚠ The proposal on the finding is never touched
-        // by either path. A retraction states none, and is refused one by
-        // name rather than accepting a rating it would not record.
+        // accepted unchanged (or, when the mark is being added to a
+        // publication, that publication's rating). ⚠ The proposal on the
+        // finding is never touched by any path. A retraction states none, and
+        // is refused one by name rather than accepting a rating it would not
+        // record.
         let severity = match (outcome, stated("severity")) {
             (Outcome::Retracted, Some(chosen)) => {
                 return Err(Error::InvalidArgument {
@@ -762,6 +874,7 @@ impl FindingEndpoint {
                 }
                 Some(chosen)
             }
+            (_, None) if marking.is_some() => marking.as_ref().and_then(|d| d.severity.clone()),
             (_, None) => Some(finding.severity.clone().ok_or_else(|| {
                 Error::InvalidArgument {
                     name: "severity".to_string(),
@@ -808,15 +921,21 @@ impl FindingEndpoint {
         let made = made_arg(inv)?;
         let revises_arg = stated("revises");
         let head = finding.history.last().cloned();
+        // A repeat that states no reason (or no mark) does not contradict one
+        // on file; one that states a different reason, or the mark where none
+        // was recorded, does.
         let same_answer = |d: &Decision| {
             d.outcome == outcome
                 && d.severity == severity
                 && (reason.is_none() || reason == d.reason)
+                && (!reproduced || d.reproduced)
         };
 
         // ★ A decision is the RECORD, and a record is not overwritten. What
         // may follow one is a REVISION — a new node that names the one it
         // revises — and nothing else; see the module doc for every case.
+        // The annotation a mark-only revision keeps (see `revisable`).
+        let mut keeps: Option<String> = None;
         let revises = match (&revises_arg, &head) {
             (Some(named), None) => {
                 return Err(Error::InvalidArgument {
@@ -850,7 +969,7 @@ impl FindingEndpoint {
                 });
             }
             (Some(_), Some(head)) => {
-                self.revisable(&id, head, outcome)?;
+                keeps = self.revisable(&id, head, outcome, severity.as_deref(), reproduced)?;
                 Some(head.iri.clone())
             }
             (None, Some(head)) if head.outcome != Outcome::Retracted => {
@@ -864,9 +983,15 @@ impl FindingEndpoint {
                 if same_answer(head) {
                     return self.answer(inv, finding);
                 }
-                let name = match head.outcome == outcome && head.severity == severity {
-                    true => "reason",
-                    false => "decision",
+                let same_rating = head.outcome == outcome && head.severity == severity;
+                // Only the mark differs: say how to add it, and that the
+                // annotation stays.
+                let only_the_mark =
+                    same_rating && (reason.is_none() || reason == head.reason) && reproduced;
+                let name = match (only_the_mark, same_rating) {
+                    (true, _) => "reproduced",
+                    (false, true) => "reason",
+                    (false, false) => "decision",
                 };
                 return Err(Error::InvalidArgument {
                     name: name.to_string(),
@@ -877,12 +1002,16 @@ impl FindingEndpoint {
                         finding_iri(&id),
                         on_file(head),
                         head.iri,
-                        match &head.minted {
-                            Some(iri) => format!(
+                        match (&head.minted, only_the_mark) {
+                            (Some(iri), true) => format!(
+                                " Adding the reproduced mark is a revision that keeps the \
+                                 annotation it minted (`{iri}`)."
+                            ),
+                            (Some(iri), false) => format!(
                                 " A publication is revised only once the annotation it minted \
                                  (`{iri}`) is deleted."
                             ),
-                            None => String::new(),
+                            (None, _) => String::new(),
                         },
                     ),
                 });
@@ -914,8 +1043,10 @@ impl FindingEndpoint {
         // Pipeline citizenship: a piped value is the human's reason.
         let note = stated("content");
         let at = inv.now().map(|t| iso8601(t.as_millis()));
-        let minted = match (outcome, &severity) {
-            (Outcome::Published, Some(severity)) => {
+        let minted = match (outcome, &severity, keeps) {
+            // A mark-only revision: the publication stands, unchanged.
+            (_, _, Some(kept)) => Some(kept),
+            (Outcome::Published, Some(severity), None) => {
                 Some(promote(&self.archive, &finding, severity)?)
             }
             _ => None,
@@ -933,6 +1064,7 @@ impl FindingEndpoint {
             note,
             reason,
             minted,
+            reproduced,
         };
         annotate::append_decision(&self.archive, &finding.iri(), &decision)?;
         finding.history.push(decision);
@@ -941,7 +1073,15 @@ impl FindingEndpoint {
     }
 
     /// Whether the CURRENT decision may be revised to `outcome` — refused,
-    /// naming the way, when not.
+    /// naming the way, when not. `Some(annotation)` when the revision only
+    /// ADDS the reproduced mark to a standing publication (ledger #696): the
+    /// annotation is kept as it is, and the new node names it as `minted`.
+    ///
+    /// ★ That one revision of a standing publication is allowed because it
+    /// changes nothing the annotation carries: same outcome, same rating, and
+    /// the mark lives on the decision node, never on the annotation. A
+    /// re-rating beside it is refused by name — the published annotation
+    /// carries the rating, so re-rating is the delete-then-revise path.
     ///
     /// ★ A PUBLICATION stands while the annotation it minted does. Revising
     /// it is "delete the annotation (`Delete urn:iki:annotation:{id}`, the
@@ -949,7 +1089,14 @@ impl FindingEndpoint {
     /// Sink that reaches into the annotation family and removes a published
     /// note as a side effect. Once the annotation is gone, a publish may be
     /// revised to anything, including a fresh publish that re-mints it.
-    fn revisable(&self, id: &str, head: &Decision, outcome: Outcome) -> Result<()> {
+    fn revisable(
+        &self,
+        id: &str,
+        head: &Decision,
+        outcome: Outcome,
+        severity: Option<&str>,
+        reproduced: bool,
+    ) -> Result<Option<String>> {
         if head.outcome == Outcome::Retracted && outcome == Outcome::Retracted {
             return Err(Error::InvalidArgument {
                 name: "decision".to_string(),
@@ -964,6 +1111,25 @@ impl FindingEndpoint {
                 Some((Family::Annotation, aid)) => annotate::load_annotation(&self.archive, aid)?,
                 _ => None,
             };
+            let adds_the_mark = outcome == Outcome::Published
+                && head.outcome == Outcome::Published
+                && reproduced
+                && !head.reproduced;
+            if still.is_some() && adds_the_mark {
+                if severity != head.severity.as_deref() {
+                    return Err(Error::InvalidArgument {
+                        name: "severity".to_string(),
+                        detail: format!(
+                            "reproduced=yes adds the mark to the publication `{minted}` without \
+                             changing it, and `severity={}` would re-rate it (it is published \
+                             as `{}`) — drop `severity`, or Delete `{minted}` first and revise",
+                            severity.unwrap_or("none"),
+                            head.severity.as_deref().unwrap_or("unrated"),
+                        ),
+                    });
+                }
+                return Ok(Some(minted.clone()));
+            }
             if still.is_some() {
                 return Err(Error::InvalidArgument {
                     name: "revises".to_string(),
@@ -976,7 +1142,7 @@ impl FindingEndpoint {
                 });
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     /// The finding, settled for the faces (confirmation), as an ack.
@@ -999,6 +1165,9 @@ fn word_of(outcome: Outcome) -> &'static str {
 /// reason stated) by a human at …` and its kin.
 fn on_file(d: &Decision) -> String {
     let mut out = d.outcome.label().to_string();
+    if d.reproduced {
+        out.push_str(" (reproduced)");
+    }
     if let Some(severity) = &d.severity {
         out.push_str(&format!(" as `{severity}`"));
     }
@@ -1429,6 +1598,9 @@ pub(crate) fn plain_row(finding: &Annotation, line: Option<u64>) -> String {
         if let Some(reason) = &decision.reason {
             out.push_str(&format!(" ({reason})"));
         }
+        if decision.reproduced {
+            out.push_str(" [reproduced]");
+        }
         if !decision.confirmed {
             out.push_str(" [unconfirmed]");
         }
@@ -1806,7 +1978,9 @@ fn finding_description() -> Description {
              kept. decision=retract (only as a revision) withdraws the current answer, so \
              the finding is undecided again; a publication is revised only after the \
              annotation it minted is deleted. made=single|batch (with batch=<group key>) \
-             records how a decision was made. The \
+             records how a decision was made. reproduced=yes (publish only) records that \
+             the defect was shown to happen; added to a standing publication it is a \
+             revision that keeps the annotation. The \
              finding carries the MODEL'S proposed sh:resultSeverity; the decision node \
              carries the human's final one, so both survive and calibration stays a query. \
              Reads run the annotation layer's drift pass (ik:reanchored / ik:orphaned). \
@@ -1921,6 +2095,22 @@ fn finding_description() -> Description {
                     "the batch's group key (a group= proposal's key) — required with \
                              made=batch, refused otherwise",
                 ))
+                .input(
+                    ArgSpec::new("reproduced")
+                        .class(XSD_STRING)
+                        .optional()
+                        .summary(
+                            "yes: the defect was REPRODUCED — a real defect, shown to happen, \
+                             with the piped note saying how. Only with decision=publish \
+                             (refused beside a decline or a retraction). Recorded on the \
+                             decision node (prov:wasInformedBy \
+                             urn:iki:finding:{id}:reproduction) and read back as \
+                             decision.reproduced. To add it to a standing publication, revise \
+                             it: decision=publish reproduced=yes revises=<its decision> — the \
+                             annotation and its rating are kept. Omitted = not recorded.",
+                        )
+                        .one_of(REPRODUCED_WORDS),
+                )
                 .input(
                     ArgSpec::new("content")
                         .class(XSD_STRING)
@@ -3839,6 +4029,7 @@ mod tests {
             "note",
             "outcome",
             "reason",
+            "reproduced",
             "revises",
             "severity",
         ];
@@ -3850,6 +4041,314 @@ mod tests {
         with_finding.push("finding");
         with_finding.sort();
         assert_eq!(keys(&of(&k, &again)["prior_decision"]), with_finding);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // --- "real, reproduced" (ledger #696) ---------------------------------
+
+    /// The objects of `prov:wasInformedBy` on one decision node, from the STORE.
+    fn informed_by(store: &Store, node: &str) -> Vec<String> {
+        let subject = oxigraph::model::NamedNode::new(node).unwrap();
+        let predicate =
+            oxigraph::model::NamedNode::new(crate::annotate::PROV_WAS_INFORMED_BY).unwrap();
+        store
+            .quads_for_pattern(
+                Some(subject.as_ref().into()),
+                Some(predicate.as_ref()),
+                None,
+                None,
+            )
+            .map(|q| q.unwrap().object.to_string())
+            .collect()
+    }
+
+    /// ★ The mark is the CONTRACT's, read the way gonk reads its menus: the
+    /// Sink's `reproduced` input, optional, `one_of` exactly `yes` — and the
+    /// Source takes none (it is an answer, not a filter).
+    #[test]
+    fn the_reproduced_mark_is_declared() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        let description = k
+            .describe(&Iri::parse("urn:iki:finding:x".to_string()).unwrap())
+            .expect("a finding describes itself");
+        let specs = description.action_specs();
+        let sink = specs.iter().find(|s| s.verb == Verb::Sink).unwrap();
+        let mark = sink
+            .inputs
+            .iter()
+            .find(|i| i.name == "reproduced")
+            .expect("reproduced is declared");
+        assert_eq!(mark.one_of, ["yes"]);
+        assert!(!mark.required, "omitted stays valid");
+        let source = specs.iter().find(|s| s.verb == Verb::Source).unwrap();
+        assert!(source.inputs.iter().all(|i| i.name != "reproduced"));
+        let form = decision_html("x", Some("major"), None, None);
+        assert!(
+            form.contains("<input type=\"checkbox\" name=\"reproduced\" value=\"yes\">"),
+            "{form}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★★ Recorded on a first publish, read back on every face: the json
+    /// `decision.reproduced` and `decisions[].reproduced`, one
+    /// `prov:wasInformedBy <…:reproduction>` triple in the store and on the
+    /// turtle face, the plain row and the html card in words — and the note
+    /// saying how, kept as the decision's note. A plain publish says false
+    /// and writes no triple.
+    #[test]
+    fn a_reproduced_publish_reads_back_on_every_face() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        let findings = pass(&k);
+        let alpha = finding_on(&k, &findings, "fn alpha() {}");
+        let beta = finding_on(&k, &findings, "fn beta() {}");
+        sink(
+            &k,
+            &alpha,
+            &[
+                ("decision", "publish"),
+                ("reproduced", "yes"),
+                ("content", "called alpha() from a test; it panicked"),
+            ],
+        )
+        .unwrap();
+        sink(&k, &beta, &[("decision", "publish"), ("severity", "minor")]).unwrap();
+
+        let row = of(&k, &alpha);
+        assert_eq!(row["state"], "published");
+        assert_eq!(row["decision"]["reproduced"], true, "{row}");
+        assert_eq!(row["decisions"][0]["reproduced"], true);
+        assert_eq!(
+            row["decision"]["note"],
+            "called alpha() from a test; it panicked"
+        );
+        let plain_publish = of(&k, &beta);
+        assert_eq!(plain_publish["decision"]["reproduced"], false);
+        assert_eq!(plain_publish["decisions"][0]["reproduced"], false);
+
+        assert_eq!(
+            informed_by(&store, &format!("{alpha}:decision")),
+            [format!("<{alpha}:reproduction>")]
+        );
+        assert!(informed_by(&store, &format!("{beta}:decision")).is_empty());
+
+        let ttl = body(&issue(&k, Verb::Source, &alpha, &[("as", "text/turtle")]).unwrap());
+        assert!(
+            ttl.contains(&format!("prov:wasInformedBy <{alpha}:reproduction>")),
+            "{ttl}"
+        );
+        let ttl = body(&issue(&k, Verb::Source, &beta, &[("as", "text/turtle")]).unwrap());
+        assert!(!ttl.contains("wasInformedBy"), "{ttl}");
+
+        let plain = body(&issue(&k, Verb::Source, &alpha, &[("as", "text/plain")]).unwrap());
+        assert!(plain.contains("-> major [reproduced]"), "{plain}");
+        let html = body(&issue(&k, Verb::Source, &alpha, &[("as", "text/html")]).unwrap());
+        assert!(html.contains("browse-finding-reproduced"), "{html}");
+        assert!(
+            !html.contains("record a reproduction"),
+            "a reproduced publish offers no second mark: {html}"
+        );
+        let html = body(&issue(&k, Verb::Source, &beta, &[("as", "text/html")]).unwrap());
+        assert!(html.contains("record a reproduction"), "{html}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★★ The mark is ADDED to a standing publication by a revision that
+    /// changes nothing else: refused without `revises=` (naming it, and
+    /// saying the annotation stays), accepted with it — the annotation kept
+    /// and not re-minted, the publication's rating kept (not the model's
+    /// proposal), both nodes in the chain. A re-rating beside it is refused,
+    /// and the second submit is a no-op.
+    #[test]
+    fn the_mark_is_added_to_a_standing_publication_by_a_revision() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        let findings = pass(&k);
+        let alpha = finding_on(&k, &findings, "fn alpha() {}");
+        let minted = sink(
+            &k,
+            &alpha,
+            &[("decision", "publish"), ("severity", "minor")],
+        )
+        .unwrap();
+        let first = format!("{alpha}:decision");
+        let annotations = |k: &Kernel| {
+            json(k, "urn:repo:demo:annotations:a.rs", &[])
+                .as_array()
+                .unwrap()
+                .len()
+        };
+
+        refused(
+            sink(
+                &k,
+                &alpha,
+                &[("decision", "publish"), ("reproduced", "yes")],
+            ),
+            "reproduced",
+            &format!("revises={first}"),
+        );
+        refused(
+            sink(
+                &k,
+                &alpha,
+                &[
+                    ("decision", "publish"),
+                    ("reproduced", "yes"),
+                    ("severity", "critical"),
+                    ("revises", &first),
+                ],
+            ),
+            "severity",
+            "would re-rate it",
+        );
+        assert_eq!(nodes(&store, &alpha).len(), 1, "a refusal writes nothing");
+
+        let args = [
+            ("decision", "publish"),
+            ("reproduced", "yes"),
+            ("revises", first.as_str()),
+            ("content", "reproduced with a failing test"),
+        ];
+        let answer = sink(&k, &alpha, &args).unwrap();
+        assert_eq!(answer, minted, "the same annotation answers");
+        let row = of(&k, &alpha);
+        assert_eq!(row["state"], "published");
+        assert_eq!(row["decisions"].as_array().unwrap().len(), 2, "{row}");
+        assert_eq!(row["decisions"][0]["reproduced"], false);
+        assert_eq!(row["decision"]["reproduced"], true);
+        assert_eq!(row["decision"]["revises"], first.as_str());
+        assert_eq!(row["decision"]["outcome"], "published");
+        assert_eq!(
+            row["decision"]["severity"], "minor",
+            "the publication's rating, not the model's major"
+        );
+        assert_eq!(row["decision"]["minted"], minted.as_str());
+        assert_eq!(row["decision"]["note"], "reproduced with a failing test");
+        assert_eq!(annotations(&k), 1, "kept, not re-minted beside itself");
+        assert_eq!(json(&k, &minted, &[])["severity"], "minor");
+        assert_eq!(
+            informed_by(&store, &format!("{alpha}:decision:2")),
+            [format!("<{alpha}:reproduction>")]
+        );
+        assert!(
+            informed_by(&store, &first).is_empty(),
+            "the old node is untouched"
+        );
+
+        // The double click: the same submit again is a no-op.
+        assert_eq!(sink(&k, &alpha, &args).unwrap(), minted);
+        // So is a plain publish repeat, which does not contradict the mark.
+        assert_eq!(
+            sink(
+                &k,
+                &alpha,
+                &[("decision", "publish"), ("severity", "minor")]
+            )
+            .unwrap(),
+            minted
+        );
+        assert_eq!(nodes(&store, &alpha).len(), 2);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Fail loud: the mark beside a decline or a retraction is refused by
+    /// NAME (a decline says "not a defect"; the mark says "a defect, proven"),
+    /// a word outside its set is refused naming the set, and an EMPTY value is
+    /// omitted (a form's unticked box) — none of the refusals writes anything.
+    #[test]
+    fn the_mark_is_refused_beside_a_decline_or_a_retraction() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        let findings = pass(&k);
+        let alpha = finding_on(&k, &findings, "fn alpha() {}");
+        refused(
+            sink(
+                &k,
+                &alpha,
+                &[("decision", "decline"), ("reproduced", "yes")],
+            ),
+            "reproduced",
+            "this decision is decline",
+        );
+        refused(
+            sink(&k, &alpha, &[("decision", "publish"), ("reproduced", "no")]),
+            "reproduced",
+            "one of: yes",
+        );
+        assert!(nodes(&store, &alpha).is_empty(), "a refusal writes nothing");
+
+        sink(&k, &alpha, &[("decision", "decline"), ("reproduced", "")]).unwrap();
+        let first = format!("{alpha}:decision");
+        assert_eq!(of(&k, &alpha)["decision"]["reproduced"], false);
+        refused(
+            sink(
+                &k,
+                &alpha,
+                &[
+                    ("decision", "retract"),
+                    ("reproduced", "yes"),
+                    ("revises", &first),
+                ],
+            ),
+            "reproduced",
+            "this decision is retract",
+        );
+        // A decline reversed to a REPRODUCED publish is an ordinary reversal
+        // that carries the mark.
+        sink(
+            &k,
+            &alpha,
+            &[
+                ("decision", "publish"),
+                ("reproduced", "yes"),
+                ("revises", &first),
+            ],
+        )
+        .unwrap();
+        let row = of(&k, &alpha);
+        assert_eq!(row["state"], "published");
+        assert_eq!(row["decision"]["reproduced"], true);
+        assert_eq!(row["decisions"][0]["reproduced"], false);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A hand-written mark the Sink would refuse — on a DECLINE node, or one
+    /// naming another finding's reproduction — reads back as no mark: the
+    /// loader is exact, like the reason word.
+    #[test]
+    fn a_mark_the_sink_would_refuse_reads_back_as_none() {
+        use oxigraph::model::{NamedNode, Quad};
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        let findings = pass(&k);
+        let alpha = finding_on(&k, &findings, "fn alpha() {}");
+        let beta = finding_on(&k, &findings, "fn beta() {}");
+        sink(&k, &alpha, &[("decision", "decline")]).unwrap();
+        sink(&k, &beta, &[("decision", "publish"), ("severity", "minor")]).unwrap();
+        let informed = NamedNode::new(crate::annotate::PROV_WAS_INFORMED_BY).unwrap();
+        for (node, object) in [
+            (format!("{alpha}:decision"), format!("{alpha}:reproduction")),
+            (format!("{beta}:decision"), format!("{alpha}:reproduction")),
+        ] {
+            store
+                .insert(&Quad::new(
+                    NamedNode::new(node).unwrap(),
+                    informed.clone(),
+                    NamedNode::new(object).unwrap(),
+                    oxigraph::model::GraphName::DefaultGraph,
+                ))
+                .unwrap();
+        }
+        assert_eq!(of(&k, &alpha)["decision"]["reproduced"], false);
+        assert_eq!(of(&k, &beta)["decision"]["reproduced"], false);
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -3865,6 +4364,7 @@ mod tests {
         for sub in [
             "urn:iki:finding:abc:decision",
             "urn:iki:finding:abc:selector:quote",
+            "urn:iki:finding:abc:reproduction",
         ] {
             assert!(
                 grammar

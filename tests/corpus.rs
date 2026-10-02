@@ -136,6 +136,18 @@ fn every_judge_corpus_entry_is_the_reviewed_bytes_with_its_quote_at_its_anchor()
                 ["misread", "restates", "no-issue"].contains(&reason),
                 "{name}: a known-false entry must carry the decline word that says why, got `{reason}`"
             );
+        } else {
+            let basis = entry["basis"].as_str().unwrap_or_default();
+            assert!(
+                [
+                    "verified-real",
+                    "published",
+                    "sweep-partly-real",
+                    "intent-corpus"
+                ]
+                .contains(&basis),
+                "{name}: known-real basis `{basis}` is not one the scorer groups"
+            );
         }
         for key in ["repo", "path", "quote", "claim", "split", "basis"] {
             assert!(
@@ -197,4 +209,35 @@ fn every_judge_corpus_entry_is_the_reviewed_bytes_with_its_quote_at_its_anchor()
             }
         }
     }
+}
+
+/// The exporter's LABELS, pinned (ledger #696): a publish marked reproduced is
+/// `verified-real`, a plain publish stays `published`, a decline is
+/// known-false only with a word that says the claim does not hold — and the
+/// scorer files `verified-real` with the verified half. `export.py
+/// --self-test` holds the cases; this runs it, so a change to what a decision
+/// row means for the eval set fails here rather than in a re-export nobody
+/// reads. ⚠ It needs `python3`, and FAILS without it rather than skipping: a
+/// check that silently does not run is the gate this exists to be.
+#[test]
+fn the_judge_exporter_labels_a_reproduced_publish_verified_real() {
+    let dir = corpus_dir("judge");
+    let in_checkout = Path::new(env!("CARGO_MANIFEST_DIR")).join(".git").exists();
+    if !dir.join("export.py").exists() {
+        assert!(!in_checkout, "tests/corpus/judge/export.py is missing");
+        return;
+    }
+    let out = std::process::Command::new("python3")
+        .arg(dir.join("export.py"))
+        .arg("--self-test")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("python3 runs (the exporter's label check needs it)");
+    assert!(
+        out.status.success(),
+        "export.py --self-test failed:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("ok:"));
 }
