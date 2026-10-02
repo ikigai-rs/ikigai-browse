@@ -1724,6 +1724,149 @@ fn find_anchor_on_file(
     })
 }
 
+/// Anchoring a quote the model copied from ONE REGION of the file
+/// (`region`, a byte range of `content`) — the review pass's case.
+///
+/// ★ A quote that occurs ONCE anchors exactly as [`find_anchor_on_file`]
+/// anchors it: nothing changes for it, and the finding id it mints is the id
+/// it always minted. Only a REPEATED quote is decided differently, and it used
+/// to be decided wrongly: the first occurrence in the whole file won, so a
+/// region-7 finding about `let ann = Annotation {` was pinned to the copy in
+/// region 5, and its body described code the anchor did not point at
+/// (critical sweep 1, ledger #695: `annotate.rs` ×2, ikigai-cli's
+/// `handle_connection(&kernel, stream);` ×3). Now:
+///
+/// 1. the occurrences INSIDE the region the model was shown win — it can only
+///    have copied the quote from there;
+/// 2. among several there, the one whose surrounding lines (± [`NOTE_WINDOW`])
+///    carry the most of the note's code — its backticked spans and its
+///    `snake_case`/`camelCase` identifiers — wins, so a note about the
+///    `motivation:` field lands on the copy beside it;
+/// 3. a tie, or a note naming nothing, takes the first of them — the old rule,
+///    applied to the right range.
+///
+/// Outside-region occurrences are used only when the region has none (a quote
+/// that straddles the region's edge). The leading-decoration retry is the same
+/// one [`find_anchor_on_file`] makes, and the stored exact is again read back
+/// out of `content`.
+pub(crate) fn find_anchor_within(
+    content: &str,
+    exact: &str,
+    region: (usize, usize),
+    note: &str,
+) -> Option<DiffAnchor> {
+    let occurrences = |needle: &str| -> Vec<usize> {
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        content.match_indices(needle).map(|(at, _)| at).collect()
+    };
+    let (needle, mut found, stripped) = match occurrences(exact) {
+        hits if !hits.is_empty() => (exact, hits, false),
+        _ => {
+            let bare = strip_leading_decoration(exact)?;
+            (bare, occurrences(bare), true)
+        }
+    };
+    if found.is_empty() {
+        return None;
+    }
+    let inside: Vec<usize> = found
+        .iter()
+        .copied()
+        .filter(|&at| at >= region.0 && at + needle.len() <= region.1)
+        .collect();
+    if !inside.is_empty() {
+        found = inside;
+    }
+    let byte_start = match found.len() {
+        1 => found[0],
+        _ => {
+            let clues = note_clues(note);
+            let mut best = (0usize, found[0]);
+            for &at in &found {
+                let window = line_window(content, at, NOTE_WINDOW);
+                let score = clues.iter().filter(|c| window.contains(c.as_str())).count();
+                if score > best.0 {
+                    best = (score, at);
+                }
+            }
+            best.1
+        }
+    };
+    let byte_end = byte_start + needle.len();
+    let char_start = content[..byte_start].chars().count() as u64;
+    let anchor = Anchor {
+        byte_start,
+        byte_end,
+        char_start,
+        char_end: char_start + needle.chars().count() as u64,
+        line: 1 + content[..byte_start].matches('\n').count() as u64,
+    };
+    Some(DiffAnchor {
+        stored_exact: stripped.then(|| content[byte_start..byte_end].to_string()),
+        anchor,
+    })
+}
+
+/// Lines either side of a candidate occurrence that a note's clues are looked
+/// for in — about one short function's worth.
+const NOTE_WINDOW: usize = 12;
+
+/// What a review note names that could tell two copies of a line apart: its
+/// backticked spans and its code-shaped identifiers (an underscore, or a
+/// lower-then-upper camel hump). Plain words would match everywhere.
+fn note_clues(note: &str) -> Vec<String> {
+    let mut clues: Vec<String> = Vec::new();
+    let mut push = |c: &str| {
+        let c = c.trim();
+        if c.len() >= 3 && !clues.iter().any(|x| x == c) {
+            clues.push(c.to_string());
+        }
+    };
+    for (i, span) in note.split('`').enumerate() {
+        if i % 2 == 1 {
+            push(span);
+        }
+    }
+    for word in note.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+        let camel = word
+            .as_bytes()
+            .windows(2)
+            .any(|w| w[0].is_ascii_lowercase() && w[1].is_ascii_uppercase());
+        if word.contains('_') || camel {
+            push(word);
+        }
+    }
+    clues
+}
+
+/// The text of the lines from `lines` above the line holding byte `at` to
+/// `lines` below it.
+fn line_window(content: &str, at: usize, lines: usize) -> &str {
+    let mut start = at;
+    for _ in 0..=lines {
+        match content[..start].rfind('\n') {
+            Some(nl) => start = nl,
+            None => {
+                start = 0;
+                break;
+            }
+        }
+    }
+    let mut end = at;
+    for _ in 0..=lines {
+        match content[end..].find('\n') {
+            Some(nl) => end += nl + 1,
+            None => {
+                end = content.len();
+                break;
+            }
+        }
+    }
+    &content[start..end.min(content.len())]
+}
+
 /// Which anchoring discipline a target's text demands: [`find_anchor_on_file`]
 /// for file content, the marker-tolerant [`find_anchor_in_diff`] for a pull
 /// request's unified diff.
@@ -3479,10 +3622,40 @@ pub(crate) fn mint_pending_finding(
     created: Option<String>,
     surface: Surface,
 ) -> Result<Mint> {
+    mint_pending_finding_within(
+        archive, target_iri, repo, rel, text, hash, exact, note, severity, model, pass_iri,
+        created, surface, None,
+    )
+}
+
+/// [`mint_pending_finding`], told WHERE the model was looking: the byte range
+/// of the region its call was shown. See [`find_anchor_within`] for what that
+/// changes, and for the one thing it does not (a quote that occurs once).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mint_pending_finding_within(
+    archive: &Archive,
+    target_iri: &str,
+    repo: &str,
+    rel: &str,
+    text: &str,
+    hash: &str,
+    exact: &str,
+    note: &str,
+    severity: Option<&str>,
+    model: &str,
+    pass_iri: &str,
+    created: Option<String>,
+    surface: Surface,
+    within: Option<(usize, usize)>,
+) -> Result<Mint> {
+    let found = match (surface, within) {
+        (Surface::File, Some(region)) => find_anchor_within(text, exact, region, note),
+        _ => find_anchor_on(surface, text, exact, "", ""),
+    };
     let Some(DiffAnchor {
         anchor,
         stored_exact,
-    }) = find_anchor_on(surface, text, exact, "", "")
+    }) = found
     else {
         return Ok(Mint::Orphaned);
     };
@@ -5480,5 +5653,39 @@ mod tests {
                 .is_empty()
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_repeated_quote_prefers_the_region_and_then_the_note() {
+        let filler = "// filler\n".repeat(30);
+        let text = format!(
+            "let ann = A {{\n    x: 1,\n}};\nfn mid() {{}}\n{filler}let ann = A {{\n    motivation: m,\n}};\n"
+        );
+        let text = text.as_str();
+        let second = text.rfind("let ann = A {").unwrap();
+        // Shown only the second half: the second copy.
+        let hit = find_anchor_within(text, "let ann = A {", (second - 1, text.len()), "").unwrap();
+        assert_eq!(hit.anchor.line, 35);
+        assert!(hit.stored_exact.is_none());
+        // Shown the whole file: the note's `motivation` names the second copy.
+        let hit = find_anchor_within(
+            text,
+            "let ann = A {",
+            (0, text.len()),
+            "sets `motivation` here",
+        )
+        .unwrap();
+        assert_eq!(hit.anchor.line, 35);
+        // A note that names nothing: the first copy in range, the old rule.
+        let hit =
+            find_anchor_within(text, "let ann = A {", (0, text.len()), "a struct literal").unwrap();
+        assert_eq!(hit.anchor.line, 1);
+        // A quote that occurs once anchors where it is, whatever region.
+        let hit = find_anchor_within(text, "fn mid() {}", (second, text.len()), "").unwrap();
+        assert_eq!(hit.anchor.line, 4);
+        // The decoration retry still applies, storing the file's characters.
+        let hit = find_anchor_within(text, "⚠ fn mid() {}", (0, text.len()), "").unwrap();
+        assert_eq!(hit.stored_exact.as_deref(), Some("fn mid() {}"));
+        assert!(find_anchor_within(text, "absent", (0, text.len()), "").is_none());
     }
 }
