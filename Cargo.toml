@@ -358,7 +358,7 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # additive; every call a 0.12.0 caller makes is byte-identical. gonk pins
 # `"0.12.0"` and `^0.12.0` is `<0.13.0`, so the hub moves its pin before a
 # queue row can carry a lens.
-version = "0.15.0"
+version = "0.16.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
