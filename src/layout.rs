@@ -312,6 +312,10 @@ padding:.3rem}\n\
 .browse-finding-retract{display:grid;gap:.4rem;max-width:32rem;margin:.5rem 0}\n\
 .browse-finding-retract textarea{font:inherit;padding:.3rem}\n\
 .browse-finding-retract button{justify-self:start}\n\
+/* The reproduced mark (ledger #696): a word in the record line, weighted like a
+   decline reason, and its affordance folded under a publication's record. */\n\
+.browse-finding-reproduced{font-weight:600}\n\
+.browse-finding-reproduce{font-size:.85em;margin:.25rem 0}\n\
 .browse-findings-unconfirmed{margin:.5rem 0}\n\
 .browse-findings-unconfirmed-group{font-size:.95em;margin:.75rem 0 .25rem}\n\
 .browse-finding-label{font-size:.85em;opacity:.8}\n\
