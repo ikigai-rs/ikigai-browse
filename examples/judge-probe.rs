@@ -4,6 +4,7 @@
 //!
 //!   cargo run --example judge-probe -- [--model <ollama tag>] [--base-url <url>] \
 //!       [--split dev|holdout|all] [--scope serious|all] [--limit <n>] [--entry <name>]... \
+//!       [--max-tokens <n>] \
 //!       [--repos ~/git-personal] [--trees <dir>] <out.jsonl>
 //!
 //! Writes `<out.jsonl>` (the RULE's verdict, which is what ships) and
@@ -146,6 +147,11 @@ fn main() {
     let model =
         take_flag(&mut args, "--model").unwrap_or_else(|| "qwen3-coder:30b-a3b-q8_0".to_string());
     let base_url = take_flag(&mut args, "--base-url");
+    // A REASONING model (gpt-oss) spends its budget thinking before it answers; at the
+    // pass's 400 tokens it returned an empty answer on every call (2026-10-02). The flag lets a
+    // measurement give it room; the pass's own budget is ExplainConfig::judge_max_tokens.
+    let max_tokens: Option<u32> = take_flag(&mut args, "--max-tokens")
+        .map(|n| n.parse().expect("--max-tokens is a count"));
     let split = take_flag(&mut args, "--split").unwrap_or_else(|| "all".to_string());
     let scope = take_flag(&mut args, "--scope").unwrap_or_else(|| "serious".to_string());
     let limit: usize = take_flag(&mut args, "--limit")
@@ -219,7 +225,10 @@ fn main() {
         let store = Arc::new(Store::new().expect("store"));
         let browse = ikigai_browse::space_with_explain(
             [("probe".to_string(), root.clone())],
-            ikigai_browse::ExplainConfig::new(store),
+            match max_tokens {
+                Some(n) => ikigai_browse::ExplainConfig::new(store).judge_max_tokens(n),
+                None => ikigai_browse::ExplainConfig::new(store),
+            },
         );
         let llm = ikigai_llm::space(Arc::new(UreqTransport), registry.clone());
         let kernel = Kernel::new(Arc::new(Fallback::new(vec![
