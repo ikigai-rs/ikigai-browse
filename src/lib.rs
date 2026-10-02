@@ -156,6 +156,9 @@ mod finding;
 /// of pending findings, a human decides it once. Proposals only; no Sink.
 mod group;
 mod hash;
+/// The JUDGE — a second call per serious review finding that confirms or
+/// refutes it with the context the reviewer lacked, attached to the finding.
+mod judge;
 /// The layout stylesheet for the `browse-*` classes the HTML faces emit —
 /// `urn:repo:style:layout`, the sibling of `urn:repo:style`. See the module
 /// docs for why it is a sibling and not an extension.
@@ -510,6 +513,9 @@ impl Mount {
         // The S4 review pass (machine-minted annotations) rides with the
         // explanation family: it needs the same LLM seam and the same store.
         let space = review::bind(space, &roots, &shared);
+        // The judge rides with the review pass it serves: the same LLM seam,
+        // the same archive (its verdicts hang off the findings).
+        let space = judge::bind(space, &roots, &shared);
         // So do the pull-request derived layers (pr:{n}:explain / pr:{n}:review).
         let space = pr::bind_explain(space, &roots, &shared);
         // The pending-finding family rides with the annotation family: one

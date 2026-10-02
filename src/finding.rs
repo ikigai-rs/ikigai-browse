@@ -2114,7 +2114,11 @@ mod tests {
                     .requires(CAP_NET),
             ),
         );
-        let cfg = ExplainConfig::new(Arc::clone(store)).review_model_label("r1");
+        // The judge is off: these tests count decision nodes and model calls,
+        // and a verdict is neither (its own tests are in `review` and `judge`).
+        let cfg = ExplainConfig::new(Arc::clone(store))
+            .review_model_label("r1")
+            .no_judge();
         let browse = crate::space_with_explain(vec![("demo".to_string(), root.to_path_buf())], cfg);
         Kernel::new(Arc::new(Fallback::new(vec![
             Arc::new(browse),

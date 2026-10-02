@@ -719,6 +719,12 @@ pub(crate) struct Annotation {
     /// an undecided FILE finding — a decision is a record and never changes
     /// state, and a PR-family finding is keyed to a PR page, not a pass.
     pub(crate) superseded_by: Option<String>,
+    /// Every JUDGE verdict on this finding, oldest first — one per judge tag
+    /// (`urn:iki:finding:{id}:judge:{tag}`, [`crate::judge`]). Finding family
+    /// only; empty until a judge has looked. ★ ATTACHED, never acted on: no
+    /// state, rating or queue membership here depends on it — routing on a
+    /// verdict is the host's decision.
+    pub(crate) judges: Vec<crate::judge::Verdict>,
 }
 
 /// What an annotation's recorded target IS — derived from the stored
@@ -1171,6 +1177,7 @@ pub(crate) fn load_record(
         history: Vec::new(),
         prior: None,
         superseded_by: None,
+        judges: Vec::new(),
     };
     let mut prior_id: Option<String> = None;
     let literal = |term: &Term| match term {
@@ -1266,6 +1273,7 @@ pub(crate) fn load_record(
     if family == Family::Finding {
         ann.history = load_decisions(archive, id)?;
         ann.settle();
+        ann.judges = crate::judge::load_verdicts(archive, &record_iri(family, id))?;
         if let Some(twin) = prior_id {
             ann.prior = Some(Prior {
                 finding: record_iri(Family::Finding, &twin),
@@ -2426,6 +2434,7 @@ impl AnnotationEndpoint {
             history: Vec::new(),
             prior: None,
             superseded_by: None,
+            judges: Vec::new(),
         };
         rewrite_annotation(&self.archive, &ann)?;
         match inv.inline_str("as").unwrap_or("text/plain") {
@@ -2734,6 +2743,17 @@ pub(crate) fn annotation_json(ann: &Annotation, line: Option<u64>) -> serde_json
             json["finding"] = serde_json::Value::String(p.finding.clone());
             Some(json)
         }),
+        // ★ The JUDGE's verdict (ledger #483): the most recent one, null until
+        // a judge has looked — the field a host routes on. `verdict` is
+        // confirmed / refuted / unsure BY RULE over the four `answers`
+        // (code, disclosed, occurs, test — each {answer, reason}); `stated` is
+        // the model's own word beside it; `tag`/`model`/`judged_at` say which
+        // judge and when; `test_code` what it was told about the site. See
+        // `crate::judge::verdict_json`. ATTACHED, never acted on here: no
+        // finding is dropped, withheld or re-rated because of it.
+        "judge": ann.judges.last().map(crate::judge::verdict_json),
+        // Every verdict, oldest first — one per judge tag.
+        "judges": ann.judges.iter().map(crate::judge::verdict_json).collect::<Vec<_>>(),
     })
 }
 
@@ -2810,6 +2830,10 @@ fn annotation_turtle(ann: &Annotation) -> String {
         props.push(format!("prov:wasInfluencedBy <{}>", prior.decision_iri()));
     }
     let mut out = format!("<{}> {} .\n", ann.iri(), props.join(" ;\n    "));
+    // Every judge verdict, oldest first.
+    for verdict in &ann.judges {
+        out.push_str(&crate::judge::verdict_turtle(&ann.iri(), verdict));
+    }
     // Every decision node, oldest first — the record is the chain.
     for decision in &ann.history {
         let mut act = vec![
@@ -3523,6 +3547,7 @@ pub(crate) fn mint_pending_finding(
         history: Vec::new(),
         prior,
         superseded_by: None,
+        judges: Vec::new(),
     };
     store_annotation(archive, &ann)?;
     Ok(Mint::Minted(ann.iri()))

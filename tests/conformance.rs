@@ -129,10 +129,10 @@ const RAW_FACE_IS_A_PASS_THROUGH: &str =
      `the_raw_file_face_serves_the_extension_mapped_type`; remove this waiver when \
      `Description` grows a pass-through output marker (core PENDING §20)";
 
-/// Every description id this crate binds. A twentieth endpoint bound without a
-/// line here is held to a weaker standard than the nineteen; a listed id that binds
+/// Every description id this crate binds. A twenty-first endpoint bound without a
+/// line here is held to a weaker standard than the twenty; a listed id that binds
 /// nothing is a stale list.
-const ENDPOINTS: [&str; 19] = [
+const ENDPOINTS: [&str; 20] = [
     "annotation",
     "browse-annotations",
     "browse-explain",
@@ -140,6 +140,7 @@ const ENDPOINTS: [&str; 19] = [
     "browse-file",
     "browse-findings",
     "browse-hash",
+    "browse-judge",
     "browse-layout",
     "browse-pr",
     "browse-pr-explain",
@@ -361,6 +362,14 @@ fn suite(findings: &[String]) -> Suite {
         // path answers — named anyway, so the walk fires the face this crate
         // means rather than whatever sample the suite would invent.
         .fixture(Fixture::new("browse-review-options", Verb::Source).binding("path", "src/lib.rs"))
+        // The judge's quote is in `src/lib.rs`; the stub's answer carries no
+        // judge lines, so the verdict is `unsure` — the face is what is probed.
+        .fixture(
+            Fixture::new("browse-judge", Verb::Source)
+                .binding("path", "src/lib.rs")
+                .arg("quote", "pub fn demo() {}")
+                .arg("claim", "the fixture's claim"),
+        )
         // The annotation entry: the Source probe reads `walk`, and the pipeline
         // probe rewrites it (`content` is the body's piped form). `target` and
         // `exact` are per (id, verb), so the Sink gets a call that anchors —
@@ -507,6 +516,7 @@ fn conforms() {
             "browse-findings source application/json",
             "browse-findings source text/turtle",
             "browse-hash source text/plain",
+            "browse-judge source application/json",
             "browse-layout source text/css",
             "browse-review source text/plain",
             "browse-review source text/turtle",
