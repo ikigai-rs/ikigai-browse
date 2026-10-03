@@ -638,7 +638,11 @@ line).
 `urn:cap:browse:read:*` (checked against the annotation's root, like every
 browse read); Sink and Delete require `urn:cap:annotate`; Sink also declares
 the browse wildcard because anchoring sources the target through the kernel —
-a capability that cannot read a file cannot annotate it.
+a capability that cannot read a file cannot annotate it. Delete and an
+UPDATING Sink are also checked against the EXISTING annotation's root (so
+Delete declares the browse wildcard too, since ledger #736): the annotate key
+is not a grant on every root, and a tenant cannot delete or overwrite a note
+it cannot read.
 
 ## The machine review pass (S4)
 
