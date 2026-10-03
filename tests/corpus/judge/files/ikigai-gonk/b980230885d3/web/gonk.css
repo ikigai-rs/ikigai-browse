@@ -1,0 +1,314 @@
+/* gonk — the ledger's HTML face.
+ *
+ * ★ The palette is the contract `tests/web.rs::the_palette_clears_the_contrast_floor` holds to
+ * ikigai-a11y's WCAG AA floor (4.5:1 for text), in BOTH schemes. The test reads the two
+ * marked blocks below; keep every color token inside them and on its own line.
+ */
+
+:root {
+  color-scheme: light dark;
+  /* palette: light */
+  --bg: #ffffff;
+  --surface: #f4f6f8;
+  --fg: #1b1f24;
+  --muted: #545d68;
+  --accent: #0b5cad;
+  --accent-fg: #ffffff;
+  --danger: #a8200d;
+  --danger-fg: #ffffff;
+  --ok: #19703a;
+  --line: #c9d1d9;
+  /* end palette */
+  --radius: 0.5rem;
+  --gap: 0.75rem;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  line-height: 1.5;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    /* palette: dark */
+    --bg: #0d1117;
+    --surface: #161b22;
+    --fg: #e6edf3;
+    --muted: #9ea8b3;
+    --accent: #6cb6ff;
+    --accent-fg: #0d1117;
+    --danger: #ff9b8f;
+    --danger-fg: #0d1117;
+    --ok: #5bd07a;
+    --line: #30363d;
+    /* end palette */
+  }
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; background: var(--bg); color: var(--fg); }
+a { color: var(--accent); text-underline-offset: 0.15em; }
+code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.9em; }
+h1 { font-size: 1.5rem; line-height: 1.25; margin: 0 0 var(--gap); overflow-wrap: anywhere; }
+h2 { font-size: 1.1rem; margin: 0 0 var(--gap); }
+[hidden] { display: none !important; }
+:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+
+.skip { position: absolute; left: -999px; top: 0; }
+.skip:focus { left: 0.5rem; top: 0.5rem; background: var(--bg); padding: 0.5rem; z-index: 10; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+.top {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 1rem;
+  padding: 0.6rem 1rem; border-bottom: 1px solid var(--line); background: var(--surface);
+}
+.brand { font-weight: 700; color: var(--fg); text-decoration: none; font-size: 1.1rem; }
+.ledgers { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+.ledger-link[aria-current] { font-weight: 700; color: var(--fg); }
+.auth { margin-left: auto; display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+.who, .note { color: var(--muted); font-size: 0.9rem; }
+
+main { max-width: 60rem; margin: 0 auto; padding: 1rem; }
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 1rem; margin: 0 0 1rem; }
+.enrol { max-width: 60rem; margin: 1rem auto; }
+
+form { margin: 0; }
+label { font-size: 0.9rem; color: var(--muted); }
+input[type="text"], input[type="search"], select, textarea {
+  font: inherit; color: var(--fg); background: var(--bg);
+  border: 1px solid var(--line); border-radius: 0.375rem; padding: 0.45rem 0.55rem;
+  min-width: 0; max-width: 100%;
+}
+textarea { width: 100%; resize: vertical; }
+button {
+  font: inherit; cursor: pointer; border-radius: 0.375rem; padding: 0.45rem 0.9rem;
+  border: 1px solid var(--accent); background: var(--accent); color: var(--accent-fg);
+  min-height: 2.5rem;
+}
+button.quiet { background: transparent; color: var(--accent); }
+button.small { min-height: 2rem; padding: 0.2rem 0.6rem; font-size: 0.85rem; }
+button.danger { background: var(--danger); border-color: var(--danger); color: var(--danger-fg); }
+
+.row { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
+.row.wrap { gap: 0.75rem 1.25rem; margin: var(--gap) 0; }
+.stack { display: grid; gap: 0.5rem; margin: 0 0 var(--gap); }
+.stack button { justify-self: start; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr)); gap: 0.5rem; margin: 0.5rem 0; }
+.grid label { display: grid; gap: 0.25rem; }
+details { margin: 0.5rem 0; }
+summary { cursor: pointer; color: var(--accent); }
+.file { display: grid; gap: 0.5rem; }
+.file button { justify-self: start; }
+
+.ledger-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.5rem 1rem; margin-bottom: var(--gap); }
+.ledger-head h1 { margin: 0; }
+.filters { display: flex; gap: 0.75rem; }
+.filters a[aria-current] { font-weight: 700; color: var(--fg); text-decoration: none; }
+.search { display: flex; gap: 0.5rem; margin-left: auto; flex-wrap: wrap; }
+
+/* How many rows this page rendered, and out of how many — above the list, not under it,
+ * because it is the answer to "is this everything?" and that question is asked first. */
+.count { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: baseline; margin: 0 0 0.4rem; }
+.count .how-many { color: var(--muted); }
+.items { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--line); }
+.row.open, .row.closed {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.25rem 0.75rem;
+  padding: 0.6rem 0.25rem; border-bottom: 1px solid var(--line);
+}
+.num { color: var(--muted); font-variant-numeric: tabular-nums; min-width: 3ch; }
+.title { font-weight: 600; overflow-wrap: anywhere; flex: 1 1 14rem; }
+.closed .title { color: var(--muted); }
+.badges { display: inline-flex; flex-wrap: wrap; gap: 0.35rem; }
+.badge { font-size: 0.8rem; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 0 0.5rem; }
+.badge.open { color: var(--ok); border-color: var(--ok); }
+.inline { display: inline; }
+
+.item-head { margin-bottom: var(--gap); }
+.crumbs { margin: 0 0 0.25rem; display: flex; gap: 0.5rem; }
+.body { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0 0 var(--gap); }
+.meta { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 1rem; margin: 0 0 1rem; }
+.meta dt { color: var(--muted); }
+.meta dd { margin: 0; overflow-wrap: anywhere; }
+.iri { overflow-wrap: anywhere; }
+.plain { list-style: none; margin: 0; padding: 0; }
+.plain > li { padding: 0.4rem 0; border-bottom: 1px solid var(--line); display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: baseline; }
+.rel { color: var(--muted); min-width: 5rem; }
+.comment { display: block !important; }
+.comment-meta { margin: 0; color: var(--muted); font-size: 0.85rem; }
+.danger h2 { color: var(--danger); }
+
+.flash-area:empty { display: none; }
+.flash-area { max-width: 60rem; margin: 0.75rem auto 0; padding: 0 1rem; }
+.flash { border-left: 4px solid var(--ok); background: var(--surface); padding: 0.5rem 0.75rem; margin: 0 0 var(--gap); white-space: pre-wrap; overflow-wrap: anywhere; }
+.flash.error { border-left-color: var(--danger); }
+.empty, .hint, .result-meta { color: var(--muted); }
+
+/* A refusal that belongs to ONE affordance, shown where that affordance is (web/gonk.js;
+ * ledger #442). Deliberately quieter than .flash: the page around it is fine, and a band
+ * that shouts would re-create the failure it replaces. ⚠ These are gonk's own chrome
+ * classes, not browse's — no `browse-*` rule is defined here (that is #441's whole point,
+ * and the layout sheet the page links owns those). */
+.affordance-error { color: var(--danger); font-size: 0.9rem; margin: 0.25rem 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+[data-denied="true"] { opacity: 0.6; }
+
+/* The browse landing page: the roots this grant may read. */
+.root-list { list-style: none; margin: 0; padding: 0; }
+.root-list > li { padding: 0.4rem 0; border-bottom: 1px solid var(--line); display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: baseline; }
+.root-link { font-weight: 600; }
+
+/* The sample-query buttons. `quiet small` reuses the palette the contrast test already
+ * holds to the floor; the focus ring is the global :focus-visible outline, so they are
+ * reachable and visible from the keyboard. They wrap at phone width rather than scroll. */
+.samples { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0 0 0.5rem; }
+.samples button { white-space: normal; text-align: left; }
+.sample-text { display: none; }
+/* The cross-graph example. Deliberately NOT a sample: it is a collapsed `details` below the
+ * buttons, with a dashed edge rather than the buttons' filled one, so nothing about it invites
+ * a click that would load it into the editor (the page sends one graph; see web::CROSS_GRAPH).
+ * No colour is invented — --surface, --line and --muted are the ones the contrast test already
+ * holds to ikigai-a11y's floor. It scrolls sideways at phone width rather than wrapping a
+ * query mid-token; the page body never scrolls, the block does. */
+.cross-graph-text { white-space: pre; overflow-x: auto; background: var(--surface); border: 1px dashed var(--line); padding: 0.75rem; border-radius: var(--radius); margin: 0; }
+/* ★ The ACTIVE sample (#370). The STATE is `aria-pressed` on the button — web/gonk.js sets it
+ * on click and clears it the moment the editor is typed in — so a screen reader hears which
+ * sample the editor holds; this rule is only how that looks. Two signals, because the render
+ * arc set the bar that a control is never signalled by colour alone (WCAG 1.4.1): the button
+ * fills, AND its label goes bold, the same weight change `[aria-current]` already uses for the
+ * current ledger and the current filter. --accent on --accent-fg is the pairing
+ * `the_palette_clears_the_contrast_floor` already holds to ikigai-a11y's floor in both
+ * schemes — no colour is invented here. */
+.samples button[aria-pressed="true"] { background: var(--accent); color: var(--accent-fg); font-weight: 700; }
+
+/* ★ A result cell sets NO `overflow-wrap`, and that is the whole of #368's fix.
+ *
+ * This rule used to carry `overflow-wrap: anywhere`, which differs from `break-word` in that
+ * it ALSO lowers a box's MIN-CONTENT size: every character boundary becomes a soft wrap
+ * opportunity while the browser computes a column's minimum. With `width: 100%` and auto
+ * table layout the long `title` column then took the space it was allowed to take, and the
+ * short ones collapsed below one word — `number` rendered as nu/mb/er and every status broke
+ * as `ledger:` / `open`. Nothing overflowed; the table did exactly what it was told.
+ *
+ * The long-IRI case that rule was defending is already covered by `.table-wrap`. Measured in
+ * Chrome against the live page, `SELECT ?item ?number ?priority ?status ?title`: with the rule
+ * gone the table's min-content is 835px inside a 637px wrapper, the wrapper scrolls, and
+ * `document.documentElement.scrollWidth` stays at the viewport — the page body never scrolls
+ * sideways. A data table that scrolls is what the wrapper exists for, and WCAG 1.4.10 exempts
+ * it. `break-word` is not the middle ground it looks like: nothing caps this table's width,
+ * so a cell is never squeezed below its longest word and the property would never fire.
+ *
+ * ⚠ Scoping `anywhere` to `td.uri` — the obvious repair — does NOT work: a shortened status
+ * CURIE carries that same class, so it would go on breaking at its colon. */
+.table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius); }
+table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
+th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+/* A column header is a short label; it never wraps, mid-word or otherwise. */
+th { background: var(--surface); white-space: nowrap; }
+td.uri { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.85em; }
+td.unbound { color: var(--muted); }
+
+/* A cell the render rules turned into a control (see src/rules.rs). It is a real anchor:
+ * keyboard-reachable in reading order, activated by Enter, and wearing the global
+ * :focus-visible ring. The color is --accent, the one the contrast test already holds to
+ * ikigai-a11y's floor in BOTH schemes — a link colour invented here would not be checked.
+ * Underlined always, so the control is not signalled by colour alone (WCAG 1.4.1); a
+ * `query` link is dotted because it does something rather than going somewhere. */
+a.cell-link { color: var(--accent); text-decoration: underline; text-underline-offset: 0.15em; }
+a.cell-link[data-action="query"] { text-decoration-style: dotted; }
+a.cell-link:hover { text-decoration-thickness: 2px; }
+.graph { white-space: pre-wrap; overflow-x: auto; background: var(--surface); padding: 0.75rem; border-radius: var(--radius); }
+
+@media (max-width: 40rem) {
+  .search { margin-left: 0; width: 100%; }
+  .search input { flex: 1 1 auto; }
+  .meta { grid-template-columns: 1fr; }
+  .meta dd { margin-bottom: 0.4rem; }
+  .auth { margin-left: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}
+
+/* ---------------------------------------------------------- the review queue
+ *
+ * Ledger #444. No new color token: every rule here reuses one the contrast test above
+ * already holds to ikigai-a11y's 4.5:1 floor in BOTH schemes (see
+ * `tests/web.rs::the_palette_clears_the_contrast_floor`). A severity is never signalled by
+ * colour alone — the badge carries its word — so the palette here is emphasis, not meaning
+ * (WCAG 1.4.1). */
+.queue-head { margin: 0 0 var(--gap); }
+.intray { border-left: 4px solid var(--line); background: var(--surface); padding: 0.5rem 0.75rem; margin: 0 0 var(--gap); }
+/* Waiting work is the one state worth an accent: it is the number a person came to see. */
+.intray.count, .intray.working { border-left-color: var(--accent); }
+.intray.error, .intray.stuck { border-left-color: var(--danger); }
+
+/* The header's live depth badge (ledger #466). ⚠ Colour is emphasis and never the message:
+ * the number is the number, and the whole sentence — including "NONE IN FLIGHT", which is
+ * what tells a stuck reviewer from a slow one — is the `title`, so nothing here is carried
+ * by hue alone (WCAG 1.4.1). It is `:empty`-collapsed so the header does not jump between
+ * the first paint and the first poll. */
+.queue-badge:empty { display: none; }
+/* The badge sits INSIDE the Queue link. As an inline-block with its own line-height it grew the
+ * link's line box to the pill's height, the header's align-items:center centred that taller box,
+ * and the word "Queue" rode above its neighbours while the pill hung below (Brian, 2026-09-22:
+ * "this UI layout is janky"). The link is a flex row, so the word and the pill centre on each
+ * other and the link's box is the same height as Browse's and SPARQL's. The gap replaces the
+ * pill's own margin; the tighter line-height keeps the pill from re-growing the row. */
+.navlink { display: inline-flex; align-items: center; gap: 0.35rem; }
+.badge-depth { display: inline-block; padding: 0 0.35rem; border: 1px solid var(--line); border-radius: 999px; font-size: 0.8em; line-height: 1.3; }
+.badge-depth.empty { opacity: 0.55; }
+.badge-depth.count, .badge-depth.working, .badge-depth.recent { color: var(--accent); border-color: var(--accent); }
+.badge-depth.stuck, .badge-depth.error { color: var(--danger); border-color: var(--danger); font-weight: 600; }
+/* The second number (ledger #496): findings minted and counted, not queued. Quieter than the
+   first, which is what is waiting for a person. */
+.badge-depth .other { margin-left: 0.2em; opacity: 0.6; font-size: 0.85em; }
+.filters.scope { margin-top: 0.35rem; font-size: 0.9em; }
+.hidden-rows { opacity: 0.85; }
+.hidden-rows a { margin-left: 0.4em; }
+
+/* The activity spark (ledger #469): a pass running now, or one that ended within the window
+ * the server measures against its own poll interval. ⚠ It is a DOT FIRST and an animation
+ * second — the reduced-motion rule above kills every animation on this page, so a spark that
+ * was only a pulse would say nothing at all to a reader who asked for less motion. And as
+ * everywhere else here, the hue is emphasis: the sentence ("A pass has been running for 3s",
+ * "the last ended 4s ago") is the badge's `title`. */
+.spark { display: inline-block; width: 0.5em; height: 0.5em; margin-right: 0.3em; border-radius: 50%; background: currentColor; }
+.spark.running { animation: spark-pulse 1.2s ease-in-out infinite; }
+.spark.recent { opacity: 0.55; }
+@keyframes spark-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.2; } }
+
+/* A refresh that was held back because a decision was open. Unhidden by web/gonk.js. */
+.stale { border-left: 4px solid var(--accent); background: var(--surface); padding: 0.5rem 0.75rem; margin: 0 0 var(--gap); }
+.stale[hidden] { display: none; }
+.posture { margin: 0 0 var(--gap); }
+.findings { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--line); }
+.findings:empty { border-top: 0; }
+.finding { padding: 0.75rem 0.25rem; border-bottom: 1px solid var(--line); }
+.finding-head { display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: baseline; }
+.finding-where { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.85em; overflow-wrap: anywhere; }
+.badge.sev.critical, .badge.sev.major { color: var(--danger); border-color: var(--danger); }
+.badge.sev.praise { color: var(--ok); border-color: var(--ok); }
+.badge.final { color: var(--accent); border-color: var(--accent); }
+.finding-body { margin: 0.4rem 0; overflow-wrap: anywhere; }
+.finding-quote { white-space: pre-wrap; overflow-x: auto; background: var(--surface); border-radius: var(--radius); padding: 0.5rem 0.75rem; margin: 0.4rem 0; font-size: 0.9em; }
+.finding-prov { margin: 0.25rem 0; overflow-wrap: anywhere; }
+.decision { border-left: 4px solid var(--line); padding: 0.4rem 0.75rem; margin: 0.5rem 0 0; }
+.decision.published { border-left-color: var(--ok); }
+.decision-line { margin: 0; font-weight: 600; }
+.decision-note { margin: 0.25rem 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+/* The prior-decision mark (ledger #475): quiet, but not a note — it changes what the form
+ * beside it means, so it keeps the text colour and a left rule rather than the muted tone. */
+.prior-decision { margin: 0.4rem 0 0; padding: 0.2rem 0.75rem; border-left: 4px solid var(--accent); font-size: 0.95em; }
+.prior-note { white-space: pre-wrap; overflow-wrap: anywhere; }
+.prior-twin { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85em; opacity: 0.7; }
+.minted { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.8em; overflow-wrap: anywhere; }
+.decide { display: flex; flex-wrap: wrap; gap: var(--gap); align-items: flex-end; margin: 0.5rem 0 0; }
+.decide label { display: flex; flex-direction: column; gap: 0.2rem; }
+.decide-reason { flex: 1 1 18rem; }
+.decide-buttons { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+/* ★ Declining is not destructive and must not wear the danger colour: it is a RECORD that a
+ * human looked and said no, and the finding is kept. Publishing is the consequential act. */
+.decide-button.decline { background: transparent; color: var(--accent); }
+
+@media (max-width: 40rem) {
+  .decide { flex-direction: column; align-items: stretch; }
+  .decide-reason { flex: 1 1 auto; }
+}

@@ -1,0 +1,520 @@
+# ikigai-cli
+
+The `ikigai` command — a REPL client for resource-resolution kernels. It attaches to
+a kernel instance over a pluggable transport and lets you issue requests, inspect
+self-descriptions, and observe the cache.
+
+**New here? Start with [The ikigai Book](https://ikigai-rs.github.io/ikigai-tutorial/)** —
+the tutorial walks from resolution to a kernel behind a socket, and its Part III is this
+crate's transports, identity and mounts seen from the outside.
+
+This repository carries the transport dependencies, keeping
+[`ikigai-core`](https://github.com/ikigai-rs/ikigai-core) lean and WebAssembly-friendly.
+
+## Run it
+
+```bash
+cargo run --bin ikigai          # full-screen TUI on a terminal
+cargo run --bin ikigai -- --plain   # line REPL (also used automatically when piped)
+cargo run --bin ikigai -- -c 'source urn:iki:fn:toUpper hello'   # run and exit (one-shot)
+cargo run --bin ikigai -- --daemon  # headless kernel: timers + watchers, no REPL
+```
+
+`-c '<command>'` runs a command non-interactively and exits — repeat it to run
+several in order (`-c '…' -c '…'`). Output goes to stdout, errors to stderr, and
+the exit code is non-zero if any command failed, so it composes in a shell.
+
+By default you attach to an **in-process** kernel. You can also attach to a kernel
+running in **another process** over IPC — same REPL, same commands:
+
+```bash
+ikigai serve                    # run a kernel server on the default per-user socket
+ikigai --connect                # attach the REPL to it
+ikigai serve /tmp/k.sock        # …or an explicit socket path, on both sides
+ikigai --connect /tmp/k.sock -c 'source urn:iki:fn:toUpper hi'
+```
+
+The cache indicator then reflects the *server's* cache, so two clients sharing a
+server see each other's `cached` results. The socket lives in a `0700` per-user
+directory and is `0600`; the server checks each peer's kernel-verified UID and
+refuses other users — no certificates, because the OS already authenticates a
+local peer.
+
+Across a **network**, the same `serve` / `--connect` work over QUIC (built with
+`--features quic`), authenticated by **mutually-pinned TLS certificates**:
+
+```bash
+ikigai cert generate                       # writes server/client certs to your config dir
+ikigai serve quic://0.0.0.0:4433           # run a QUIC kernel server
+ikigai --connect quic://host:4433          # attach the REPL over QUIC
+```
+
+A `quic://host:port` target selects QUIC; a plain path stays a Unix socket. Each
+side presents its own self-signed cert and pins the exact peer cert — no CA. On
+the same machine both default to the generated certs; to attach from another
+machine, copy `client.crt`, `client.key`, and `server.crt` there (or point the
+`--server-cert` / `--client-cert` / `--server-key` / `--client-key` flags at
+them). The response is the resolved representation's bytes. On an interactive terminal
+this is a full-screen [`ratatui`](https://ratatui.rs) REPL — a scrollback
+transcript above an input line; when output is piped or `--plain` is passed it
+falls back to a line-oriented REPL (handy for scripting). All drive the same
+engine, whether the kernel is in-process or across a socket.
+
+```
+ikigai> source urn:iki:fn:toUpper resource-oriented computing
+RESOURCE-ORIENTED COMPUTING
+ikigai> source urn:demo:echo/hello          # {message} captured during resolution
+hello
+ikigai> describe urn:iki:fn:toUpper         # META → text/turtle self-description
+@prefix ik: <https://ikigai-rs.dev/ns#> .
+<urn:ikigai:endpoint:toUpper> a ik:Endpoint ;
+    ik:id "toUpper" .
+```
+
+Commands: `source <iri> [input]` (SOURCE; `input` is routed to the endpoint's
+**declared argument**, discovered from its self-description rather than assumed),
+`describe <iri> [type]` (META; `type` defaults to `text/turtle`),
+`list` (show the resources bound in the current space, pattern → endpoint),
+`config [key=value]` (show settings or save one — see below), `help`, `quit`.
+The demo space exercises every input style: `toUpper` / `reverseList` read the
+`in` argument; `wrap` reads a differently-named `text` argument; `echo` reads a
+`{message}` binding captured from the IRI; `split` turns a comma-list into a
+newline list (a list producer for `..` map); `greet` takes two arguments. The
+routing follows each endpoint's self-description, so `source urn:demo:wrap hello`
+→ `[hello]` lands the input in `text` (not `in`) — and passing a value to `echo`
+(`source urn:demo:echo/hi x`) reports that its parameter belongs in the
+identifier instead.
+
+**Named arguments.** An endpoint can declare more than one argument. Name one
+with `key=value`, where `key` is a declared argument of the target; any other
+word is positional and fills the single argument left unnamed (so the one-argument
+case above is just the degenerate form). A piped value fills that unnamed argument
+too, and `..` can pin some arguments while mapping items into the rest:
+
+```
+ikigai> source urn:demo:greet greeting=Hello name=World
+Hello, World
+ikigai> source urn:demo:greet Hello name=World        # positional fills `greeting`
+Hello, World
+ikigai> source urn:demo:split "a,b,c" .. urn:demo:greet greeting=Hi   # items fill `name`
+Hi, a
+Hi, b
+Hi, c
+```
+
+Because the split is contract-driven, an `=` in ordinary input is harmless when
+the key isn't a declared argument (`source urn:iki:fn:toUpper a=b` → `A=B`). If a
+positional value is left over with no unnamed argument to take it — or two
+arguments are unnamed and only one value is given — `source` says so. A named
+value can be quoted to carry whitespace — `title="Dinner with the Hendersons"`
+stays one argument (`\"` and `\\` escape inside the quotes); an undeclared key
+or an unterminated quote falls back to ordinary positional input.
+
+**Pipelines.** `source a [input] | b | c` feeds each stage's output into the next
+as its input (the first stage may take a literal input; later stages get the pipe):
+
+```
+ikigai> source urn:iki:fn:toUpper hi | urn:demo:wrap
+[HI]
+```
+
+Each stage is just a `source`, so input is routed to each endpoint's declared
+argument — and piping into a binding-only endpoint reports the same helpful error.
+
+**Map.** Where `|` pipes a stage's whole output into the next, `..` maps the next
+stage over the output's **newline-separated items**, running it once per item and
+rejoining with newlines. That newline-list is the convention `reverseList` and
+`split` already speak, so `..` threads a list endpoint through a per-item transform:
+
+```
+ikigai> source urn:demo:split "a,b,c" .. urn:iki:fn:toUpper
+A
+B
+C
+```
+
+`|` and `..` compose freely — `split "c,b,a" | urn:iki:fn:reverseList .. urn:demo:wrap`
+reverses the list as one value, then wraps each item: `[a]` / `[b]` / `[c]`.
+
+**Fork/join.** A stage can be a `( a | b ; c )` fork: each `;`-separated branch is
+itself a pipeline, the same input is fanned to all of them, and their outputs are
+joined (newline-concatenated, the same list convention):
+
+```
+ikigai> source urn:demo:split "a,b,c" | ( urn:iki:fn:toUpper ; urn:iki:fn:reverseList )
+A
+B
+C
+c
+b
+a
+```
+
+Forks nest and compose with the connectors: a branch can be multi-stage
+(`( urn:iki:fn:reverseList | urn:demo:wrap ; … )`), and `..` can map a whole fork over
+each item. At the top level a fork has no incoming value, so each branch takes its
+own literal input (`source ( urn:iki:fn:toUpper hi ; urn:demo:wrap there )`).
+
+**Quoting.** Wrap a word in `"…"` to keep an operator — `|`, `..`, `(`, `)`, `;` —
+or whitespace literal inside an IRI or input, so it's data rather than structure:
+
+```
+ikigai> source urn:iki:fn:toUpper "a | (b ; c)"
+A | (B ; C)
+```
+
+Inside a quoted span, `\"` is a literal quote and `\\` a literal backslash. (`..`
+is an operator only as a whole, unquoted word, so a dotted IRI like `urn:x/../y`
+needs no quoting; `|`, `(`, `)`, and `;` split even mid-word, so quote them to use
+them literally.) These three operators are parsed by one recursive-descent parser.
+
+**Cache visibility.** Every resolution reports how the kernel's representation
+cache served it: `computed` the first time (and cached for next time), `cached`
+when it came straight from the cache, or `uncacheable` for a result that opts out
+of caching and recomputes each time. A pipeline summarises its stages, so you can
+see partial reuse:
+
+```
+ikigai> source urn:iki:fn:toUpper hi        (computed)
+HI
+ikigai> source urn:iki:fn:toUpper hi        (cached)
+HI
+ikigai> source urn:iki:fn:toUpper hi | urn:demo:wrap   (1 cached · 1 computed)
+[HI]
+```
+
+In the full-screen TUI the tag is dimmed after the prompt; in the line REPL it
+goes to stderr (prefixed `[…]`) so piped stdout stays clean.
+
+To ask *without* resolving, `cache <iri> [args]` reports whether the request is
+already in the cache — a read-only probe (it takes the same `<iri> [key=value …]
+[input]` as one `source` stage, but no pipelines):
+
+```
+ikigai> cache urn:iki:fn:toUpper hi
+not cached
+ikigai> source urn:iki:fn:toUpper hi
+HI
+ikigai> cache urn:iki:fn:toUpper hi
+cached
+```
+
+In the TUI the input line is a real editor with **Emacs / readline keybindings**:
+
+| keys | action |
+|------|--------|
+| `Ctrl-A` / `Ctrl-E` | start / end of line |
+| `Ctrl-F` / `Ctrl-B` (or `←`/`→`) | char forward / back |
+| `Alt-F` / `Alt-B` | word forward / back |
+| `Ctrl-P` / `Ctrl-N` (or `↑`/`↓`) | history previous / next |
+| `Ctrl-K` / `Ctrl-U` | kill to end / start of line |
+| `Ctrl-Space`, move, `Alt-W` / `Ctrl-W` | set mark, then **copy** / **cut** the region |
+| `Ctrl-W` (no mark) | cut the previous word |
+| `Ctrl-Y` | **yank** (paste) the last cut/copied text |
+| `Ctrl-D` | delete forward, or exit on an empty line |
+| `PgUp` / `PgDn` · `Esc` · `Ctrl-C` | scroll · clear line · exit |
+
+Kill/copy/cut feed a kill buffer that **Ctrl-Y** yanks back; it also flows
+through the **system clipboard**, so you can cut in the REPL and paste in another
+app (and vice versa). Clipboard access is best-effort via the platform tools
+(`pbcopy`/`pbpaste`, `wl-copy`/`xclip`, `clip`/PowerShell); with none present it
+falls back to an in-process buffer. Over SSH (or with no tool installed) copies
+also go out as an **OSC-52** escape sequence, which sets your *local* terminal's
+clipboard rather than the unreachable remote one. The active scheme is shown in
+the title.
+
+**`vi` keybindings** are also available — modal editing with an Insert mode (type
+text; `Esc` → Normal) and a Normal mode: `h`/`l` (or `←`/`→`), `w`/`b`/`e`, and
+`0`/`$` to move; `i`/`a`/`A`/`I` to enter Insert; `x`/`X`/`D`/`C` to delete;
+`p`/`P` to paste; `j`/`k` for history. **Operators** compose with motions —
+`dw`/`db`/`d$`/`dd` delete, `cw`/`cc` change (then Insert; `cw` stops at the word
+end like `ce`), `yw`/`yy` yank — and the title shows the pending operator. A fresh
+line starts in Insert (like `set -o vi`). (Counts like `3w` aren't in yet.)
+
+The scheme is configurable — set `keybindings` from inside the REPL with
+`config keybindings=vi`, or edit `$XDG_CONFIG_HOME/ikigai/config.toml`
+(falling back to `~/.config/ikigai/config.toml` — the one shared config home, the
+same file the host reads `mail.*`, `mount` and `scheduler` from):
+
+```toml
+keybindings = "emacs"   # "emacs" (default) · "vi" · "native"
+```
+
+`config` with no argument shows the file path and current settings; `config
+key=value` validates and saves a property. `native` resolves to the platform's
+terminal default, which is Emacs on every supported OS — a terminal can't capture
+OS GUI shortcuts (⌘C etc.), so terminal-native editing *is* readline/Emacs. The
+demo space is composed in `ikigai-embedded`; a real host binds its own
+endpoints there.
+
+## The HTTP door
+
+`ikigai serve --http <port> --routes <file> --routes-only --cap <scope>…` serves the
+kernel over plain HTTP behind a reverse proxy (`crates/ikigai-web`): a route maps a
+path to a resource, `Accept` becomes the `as=` face, query parameters become named
+arguments, and every request resolves under the `--cap` ceiling. Besides the public
+intakes (`urn:contact:submit`, `urn:booking:submit` — validated forms that drop a
+tuple into a space), the emailed decision links and the passkey ceremony, it carries
+**`urn:iki:foaf`**: one FOAF document (`src=`), every face by negotiation — the RDF/XML as
+fetched by default, `text/html` through a workspace stylesheet (`urn:file:foaf.xsl`;
+`fragment=1` for just `<main>`), `application/ld+json` compacted against a workspace
+context, and Turtle / N-Triples / N-Quads / TriG re-serialized (`format=turtle` for a
+plain link, since a link has no `Accept`). The source must sit
+under a `urn:cap:net:<host>` grant on the unit, so the allowlist is the capability,
+not code in the endpoint.
+
+> **Renamed in 0.1.20.** This shipped as a bare `urn:foaf` in 0.1.19 — an invented
+> top-level namespace rather than one we own. The old name still resolves, through an
+> `exact` rule in the host's alias table (`urn:kernel:aliases` lists it), so an existing
+> route or link keeps working; because that is a rewrite and not a second binding, both
+> spellings share one cache entry and one golden thread. New callers should write
+> `urn:iki:foaf`; the catalog advertises only that.
+
+## Lisp, s-expressions, and signing
+
+The embedded host mounts a family of modules that make **code, queries, and graphs
+one substrate** — all addressable as `urn:*` resources, composable with `|`.
+
+**Lisp** ([`ikigai-lisp`](https://github.com/ikigai-rs/ikigai-lisp)) — `urn:lisp:eval`
+runs an s-expression whose builtins *are* the kernel verbs. In the REPL a line
+starting with `(` evaluates as Lisp; from the command line `-e` evaluates an
+expression and `--load <uri>` runs a script:
+
+```bash
+ikigai -e '(source "urn:iki:fn:toUpper" "hi")'      # -> HI
+ikigai -e '(cacheable (+ 1 2))'                 # opt-in cacheable eval
+```
+
+`:lisp` opens a multi-line mode; the TUI has a **Scratch (Lisp) tab** where `F5`
+evaluates the buffer.
+
+**S-expressions as an RDF surface** ([`ikigai-sexpr`](https://github.com/ikigai-rs/ikigai-sexpr))
+— write queries and graphs *as data*, transrepted on the fly:
+
+```bash
+source urn:file:q.sexpr | urn:sparql:from-sexpr | urn:sparql:select  # query -> SPARQL -> run
+source urn:file:g.sexpr | urn:rdf:from-sexpr                         # graph -> Turtle
+source urn:file:prog.sexpr | urn:sexpr:to-rdf | urn:sexpr:from-rdf   # code <-> graph, losslessly
+```
+
+**Signing** ([`ikigai-sign`](https://github.com/ikigai-rs/ikigai-sign)) — sign any
+representation, verify it later; the signature is an RDF graph and keys are
+resources:
+
+```bash
+source urn:file:msg | urn:sign:sign key=urn:file:key.pem   # -> a signature graph
+```
+
+Together these are the beginnings of **portable, verifiable code**: encode a
+program as a content-addressed graph, sign that graph, and it can be shipped and
+checked on the far side.
+
+## Instance names and the daemon
+
+Every process has an **instance name** — `repl`, `serve`, or `daemon` by mode,
+or `--name <x>` to override — and configuration can be **scoped to a name**:
+a `<name>.key` property applies only to the instance so named. Scoped-only is
+deliberate (explicit beats ambient): a kernel server you spin up for something
+else never starts a background job just because a config file exists.
+
+`ikigai --daemon` runs the embedded kernel headless — persistent timers and
+filesystem watchers stay live, nothing is printed but their output — which is
+the shape a LaunchAgent/systemd unit wants.
+
+## The scheduler (how wide the fan-out actually is)
+
+Every host in this workspace — REPL, `serve`, `mcp`, `--daemon` — drives one process
+**scheduler**, and it is what makes `( a ; b )` forks and `..` maps run *concurrently*.
+The default is `single`, which does not spawn: tasks are polled cooperatively on one
+thread, and the native HTTP transport blocks that thread for the length of a call. So at
+the default **a ten-branch fan-out is ten sequential calls**, and from outside the process
+that is indistinguishable from a slow server (ten concurrent 27B LLM calls measured 17.9s
+against one local backend and 49.3s against another).
+
+Set it on the command line, in the config home, or — deprecated — in the environment:
+
+```bash
+ikigai --scheduler pool:8            # any mode: repl, serve, mcp, --daemon
+ikigai serve --scheduler pool        # `pool` = one worker per available core
+```
+
+```toml
+# ~/.config/ikigai/config.toml  ($XDG_CONFIG_HOME/ikigai/config.toml when set)
+scheduler = "pool:8"
+serve.scheduler = "pool:16"   # instance-scoped: this applies to `serve` alone
+```
+
+**Precedence: flag > config > env > `single`.** `IKIGAI_SCHEDULER` still works so
+already-running services keep their width, but it warns when it is the channel that
+decided the value. An invalid *flag* is a hard error — a typo'd `--scheduler pool:xyz`
+must not quietly become one-wide — while an invalid config or environment value warns and
+falls through to the next channel, so a bad line cannot brick a supervised daemon.
+
+Read it back from the running host, which is the point: `urn:kernel:scheduler` reports the
+backend, the worker count, live task counters, **and the channel that set it**.
+
+```
+source urn:kernel:scheduler
+scheduler
+  backend    pool:8
+  threads    8
+  active     0
+  spawned    31
+  completed  31
+  source     config
+```
+
+The TUI's Control tab composes the same rows. `config` inside the REPL shows the
+*configured* value (`config scheduler=pool:8` persists it to the same file).
+
+### Routing a fan-out by the width it actually reaches (opt-in)
+
+Backend choice follows load shape. On one machine, against one model, a *single* request
+ran ~1.8× better on the serializing backend (53.0 vs 28.9 tok/s) while *ten concurrent*
+ones finished in 17.9s against the batching backend and 49.3s against the other. A caller
+can declare that with [`ikigai-llm`](https://github.com/ikigai-rs/ikigai-llm)'s
+`needs=batchAt<=10` — but the runtime already knows the number: a `..` map or a `( a ; b )`
+fork builds its whole request vector before dispatching any of it.
+
+With `--width-routing on` (or `width-routing = "on"` in the config home, instance-scoped as
+`<name>.width-routing`), a fan-out appends `needs=batchAt<=W` to its requests, where **W is
+the width the run will actually reach** — the request count bounded by the scheduler's
+worker count. On the default `single` scheduler that is **1** however many branches there
+are, and a width of 1 appends nothing: routing a serialized run to a batching backend is
+the ~1.8×-slower direction, so the hint is never emitted on a guess.
+
+It is off by default and it stays out of everyone else's way:
+
+- **Only targets that declare an optional `needs` argument ever see it.** Every other
+  request is byte-identical, so its cache key — request id ⊕ capability fingerprint — does
+  not move with the width of the construct it happened to be resolved inside. The same
+  resource resolved inside a 3-wide map and a 10-wide map is *one* cache entry.
+- **Explicit routing wins.** `provider=` first, then `needs=`, then the automatic width
+  hint, then the endpoint's configured default. (`ikigai-browse` keys its durable
+  explanation archive on model identity; an automatic override of a caller's own choice
+  would write width-dependent nondeterminism into a store.)
+- **A no-match falls back rather than failing.** `needs=` is a hard filter and a no-match
+  is a loud error, so when nothing declares a crossover at or below W the request is
+  re-issued without the term. An unrelated failure is *not* retried.
+
+Every fan-out reports itself on stderr, routed or not — the unrouted number is the useful
+one, since a ten-branch fork that ran one-wide is invisible from outside the process:
+
+```
+$ ikigai -c 'source urn:test:items .. urn:llm:ask'
+[10 uncacheable]
+[fan-out 10 → 8 wide · needs=batchAt<=8]
+```
+
+and `urn:kernel:scheduler` carries `routing` (`by-width`/`off`) and `routing.by`
+(`flag`/`config`/`default`) beside the width itself.
+
+## The local root as a declared arrangement
+
+The local kernel's root — which spaces are consulted, in what order, with which doors bound to
+which endpoints — is an **arrangement**, and the host can run one from a file instead of the
+built-in one. The file is a **declaration**: the same `ik:` graph `urn:kernel:topology` writes,
+read back in. It arranges the endpoints the host already has, by name, and never creates one.
+
+```bash
+ikigai -c 'source urn:iki:host:arrangement' > root.ttl   # what the host runs today, as a declaration
+ikigai --arrangement root.ttl                           # edit it, then start from it
+```
+
+```toml
+# ~/.config/ikigai/config.toml
+arrangement = "root.ttl"                  # relative to the config home
+daemon.arrangement = "daemon-root.ttl"    # instance-scoped
+```
+
+**Precedence: flag > `<instance>.arrangement` > `arrangement` > the built-in arrangement.** It
+applies to the REPL, `-c`, `--daemon`, `mcp` and `serve <socket>`; the served doors (`serve
+quic://…`, `serve --http`) never read it, and refuse the flag. The alias table, config-home mounts
+and the demo runbook stay layered around the declared root. A declaration that is missing,
+malformed or does not build **stops the start** with the reason, naming the node — never a quiet
+fall back to the default.
+
+The declaration can also be an **`.arrangement` file**, the same arrangement as an s-expression,
+converted to Turtle on the way in losslessly (`ikigai-fs` types the file, `ikigai-sexpr` transrepts
+it):
+
+```lisp
+;; game.arrangement
+(fallback :id "urn:game:root"
+  (endpoints (door "urn:host:demo" host-demo))
+  (endpoints (door "urn:host:info" host-info)))
+```
+
+```bash
+ikigai --arrangement game.arrangement
+ikigai -c 'source urn:iki:host:arrangement as=text/x-ikigai-arrangement'   # the running root, as one
+```
+
+And the arrangement can be **seen**: `urn:diagram:kernel` draws the one you are in as an accessible
+SVG (it needs `urn:cap:kernel:inspect`, like `urn:kernel:topology`), and `urn:diagram:arrangement
+of=<iri>` draws any declaration by name. Both are bound in the local root only.
+
+⚠ The built-in root's own dump does not start as it stands: `file`, `meeting` and `org-agenda` (and
+the `llm-*` backends, with two or more providers) each name two different endpoints, so a door
+naming one cannot say which, and the host refuses it. The dump marks them in its header. Every
+declaration, in any surface, is bounded — 48 spaces deep, 65,536 nodes and 16 MiB of text once every
+reference is expanded — and one past a bound stops the start with exit 2 and a message naming the bound,
+never an abort (core 0.1.84, ledger [#643](http://localhost:1060/l/default/item/643)). See
+[`docs/declared-arrangement.md`](docs/declared-arrangement.md).
+
+## The consolidated calendar (the embedded host's standing job)
+
+The embedded host wires the [`ikigai-personal`](https://github.com/ikigai-rs/ikigai-personal)
+calendar, the [`ikigai-org`](https://github.com/ikigai-rs/ikigai-org) agenda,
+and `urn:rdf:diff` into a **derived-calendar pipeline**, configured by
+`~/.config/ikigai/calendar.json` (or `$IKIGAI_CALENDAR_CONFIG`):
+
+```json
+{ "view": "Brian-Busy", "account": "iCloud",
+  "sources": ["Brian", "Bosatsu"], "inbox": "Brian-New",
+  "org_dir": "~/Dropbox/org-mode-files", "org_files": ["calendar.org"],
+  "repl.derive_every": "300s", "daemon.derive_every": "300s" }
+```
+
+- **`urn:view:derive`** — one materialization pass: desired (the org agenda ∪
+  each source calendar, over a rolling `today−7d..today+400d` window) minus
+  current (the view calendar) via `urn:rdf:diff`; gone/changed events deleted,
+  new/changed created. Identity rides as `urn:event:{uid}`, so the pass is
+  idempotent and alarms (`:ALERT: 1h 1d` in org → `ik:alert` → `EKAlarm`)
+  survive the round-trip.
+- **`urn:view:ingest`** — drains the capture-inbox calendar into the first org
+  file (heading + `:ID:` drawer + `:ALERT:` line + round-trippable timestamp),
+  then deletes the inbox copies; derive runs it first each pass.
+- **Freshness** — `<name>.derive_every` registers a persistent timer, and two
+  watchers make it event-driven from both directions: the org directory
+  (your edits, incl. Dropbox arrivals) and the calendar store (the world's —
+  an invitation lands, the view re-derives within seconds).
+- A per-source projection (`"project": {"Bosatsu": "busy"}`) renders that
+  source as `Busy (Bosatsu)` — titles, locations, and alarms withheld.
+
+macOS note: calendar access is TCC-gated per *hosting* process — terminal
+launches prompt normally; a non-bundled binary under launchd may be silently
+denied.
+
+## Crates
+The engine drives a `Resolver` — the seam in `ikigai-resolve` (`issue` / `is_cached`
+/ `entries`) that a kernel implements, local or remote. `ikigai-engine` is the
+renderer-agnostic REPL engine over that seam; `ikigai-wire` is the postcard Call/Reply
+protocol the remote transports speak. The transports are feature-gated:
+
+| crate | feature | targets |
+|-------|---------|---------|
+| `ikigai-embedded` | `embedded` (default) | native + wasm |
+| `ikigai-ipc`      | `ipc` (default) | Unix only (Unix domain socket) |
+| `ikigai-quic`     | `quic` (opt-in) | native (QUIC + mutually-pinned TLS) |
+
+`quic` is opt-in (it pulls quinn/rustls/tokio); the default build is `embedded` +
+`ipc`. The WebAssembly build enables only `embedded`; `ipc`/`quic` are gated out
+by target.
+
+## Local development against a core checkout
+Copy `.cargo/config.toml.example` to `.cargo/config.toml` (gitignored) to redirect
+the `ikigai-core` dependency to a sibling `../ikigai-core` checkout.
+
+## License
+MIT OR Apache-2.0. See `LICENSE-MIT` / `LICENSE-APACHE`. See `ACKNOWLEDGEMENTS.md`.

@@ -102,7 +102,7 @@ fn the_disclosure_corpus_fixtures_are_present() {
 /// the pass anchored it, every label is one the scorer knows, and nothing on
 /// disk is unreferenced.
 ///
-/// ⚠ The directory is excluded from the published crate (5 MB of other repos'
+/// ⚠ The directory is excluded from the published crate (11 MB of other repos'
 /// file versions), so outside a git checkout it is absent and this returns.
 /// Inside one — `.git` beside the manifest — it must be there.
 #[test]
@@ -130,20 +130,31 @@ fn every_judge_corpus_entry_is_the_reviewed_bytes_with_its_quote_at_its_anchor()
             "{name}: label `{label}`"
         );
         *labels.entry(label.to_string()).or_default() += 1;
-        if label == "known-false" {
+        let basis = entry["basis"].as_str().unwrap_or_default();
+        if label == "known-false" && basis == "reproduced" {
+            // Findings sweep 2 (ledger #706): shown not to hold by reproduction, so
+            // the reason is the SUGGESTED word, which may be one a decline alone
+            // would not count (`duplicate` of a twin that was itself reproduced).
+            let reason = entry["reason"].as_str().unwrap_or_default();
+            assert!(
+                !reason.is_empty(),
+                "{name}: a reproduced known-false entry must carry its suggested word"
+            );
+        } else if label == "known-false" {
             let reason = entry["reason"].as_str().unwrap_or_default();
             assert!(
                 ["misread", "restates", "no-issue"].contains(&reason),
                 "{name}: a known-false entry must carry the decline word that says why, got `{reason}`"
             );
         } else {
-            let basis = entry["basis"].as_str().unwrap_or_default();
             assert!(
                 [
                     "verified-real",
                     "published",
                     "sweep-partly-real",
-                    "intent-corpus"
+                    "intent-corpus",
+                    "reproduced-real",
+                    "reproduced-partly-real"
                 ]
                 .contains(&basis),
                 "{name}: known-real basis `{basis}` is not one the scorer groups"

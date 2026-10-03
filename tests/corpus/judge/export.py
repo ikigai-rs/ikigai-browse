@@ -3,7 +3,8 @@
 file version the reviewer saw.
 
     python3 tests/corpus/judge/export.py [--socket ~/.ikigai/gonk.sock] \
-        [--config ~/.config/ikigai/config.toml] [--repo NAME ...] [--include-private]
+        [--config ~/.config/ikigai/config.toml] [--repo NAME ...] [--include-private] \
+        [--labels LABELS.tsv ...] [--out DIR]
     python3 tests/corpus/judge/export.py --self-test
 
 READS ONLY. Every finding comes out of gonk through its socket (`ikigai --mount
@@ -33,6 +34,23 @@ Labels (see README.md for the reasons):
                 And the one sweep-1 finding that was partly real, and the intent corpus's
                 pre-fix defects, whose claims are human-written (marked `claim_by: human`).
 
+REPRODUCED labels (findings sweep 2, ledger #706) come from a LABELS FILE, not from a
+decision: a satellite verified each finding by reproduction or a traced code path before
+Brian recorded anything, so the finding is still pending in gonk. One row per finding,
+tab-separated `iri  repo  outcome  word`, `#` comments:
+
+  not-a-defect  -> known-false, basis `reproduced` (`reason` = the suggested decline word)
+  partly-real   -> known-real,  basis `reproduced-partly-real` (`word` = the fixing PR)
+  real          -> known-real,  basis `reproduced-real`
+
+A reproduced label OUTRANKS a decision on the same finding: a reproduction is stronger
+evidence than a decline word. `reproduced.tsv` beside this file holds the PUBLIC rows and
+is always read; `--labels FILE` adds more (the hub's file), and when the output is this
+directory its public rows are merged into `reproduced.tsv`, so a later re-export without
+the flag rebuilds the same set. ⚠ A private repo's rows are never written there.
+⚠ SELECTION: sweep 2 verified only findings `judge-v1@qwen3-coder-next` CONFIRMED, so the
+reproduced group measures a judge's precision on what v1 let through, not a random sample.
+
 Declines with any other word (duplicate, wont-fix) and declines with no word are not
 labeled: a duplicate may be true, a wont-fix is true by definition, and a wordless decline
 says nothing about why.
@@ -40,7 +58,8 @@ says nothing about why.
 ⚠ PRIVATE REPOS ARE EXCLUDED by default. This repo is public; a finding's quote, note and
 the file it was minted against are the private repo's content. Visibility is asked of
 GitHub (`gh api repos/ikigai-rs/<repo>`); a repo whose visibility cannot be established
-is treated as private. `--include-private` exists for a local, uncommitted run.
+is treated as private. `--include-private` exists for a local, uncommitted run: give it
+`--out` outside this directory (a scratch dir), and score that run with `score.py --corpus`.
 
 Re-running it rewrites corpus.json and files/ from the live store, so the counts move as
 Brian decides more findings. The README's numbers name the run they came from.
@@ -64,6 +83,14 @@ PASS_PREFIX = "urn:ikigai:browse:review:"
 EXTRA_REAL = {
     "801ad4f26abdaea286af38ae": "critical sweep 1 (ledger #655): partly real, fixed in "
     "ikigai-cli PR #375 (76eacc5)",
+}
+# The reproduced labels this corpus was built from (public rows only), and what each
+# outcome word means for the eval set.
+REPRODUCED_TSV = os.path.join(HERE, "reproduced.tsv")
+REPRODUCED = {
+    "not-a-defect": ("known-false", "reproduced"),
+    "partly-real": ("known-real", "reproduced-partly-real"),
+    "real": ("known-real", "reproduced-real"),
 }
 # The intent corpus's repos, by the directory name its entries use.
 INTENT_DIR = os.path.join(os.path.dirname(HERE), "intent")
@@ -198,13 +225,56 @@ def split_of(entry_id):
     return "holdout" if int(hashlib.sha256(entry_id.encode()).hexdigest(), 16) % 3 == 0 else "dev"
 
 
-def label_of(row):
+def read_labels(path):
+    """finding id -> {iri, repo, outcome, word} from one labels file. A row whose
+    outcome is not one of REPRODUCED is an error, not a skip: a label the exporter
+    cannot place would silently shrink the set."""
+    out = {}
+    with open(path) as f:
+        for n, line in enumerate(f, 1):
+            line = line.rstrip("\n")
+            if not line.strip() or line.startswith("#"):
+                continue
+            cols = line.split("\t")
+            if cols[0] == "iri":
+                continue
+            if len(cols) < 3 or not cols[0].startswith("urn:iki:finding:"):
+                sys.exit(f"{path}:{n}: not `iri<TAB>repo<TAB>outcome<TAB>word`: {line!r}")
+            iri, repo, outcome = cols[0], cols[1], cols[2]
+            word = cols[3] if len(cols) > 3 else ""
+            if outcome not in REPRODUCED:
+                sys.exit(f"{path}:{n}: outcome {outcome!r} is not one of {sorted(REPRODUCED)}")
+            out[iri[len("urn:iki:finding:"):]] = {
+                "iri": iri, "repo": repo, "outcome": outcome, "word": word,
+            }
+    return out
+
+
+def write_labels(path, labels):
+    with open(path, "w") as f:
+        f.write(
+            "# Reproduced labels for the judge eval set (export.py reads this file; README.md says\n"
+            "# why). One row per finding, verified by reproduction or a traced code path before any\n"
+            "# decision was recorded. Public repos only. outcome: not-a-defect | partly-real | real.\n"
+            "# word: the suggested decline word, or the PR that fixed it.\n"
+            "iri\trepo\toutcome\tword\n"
+        )
+        for fid in sorted(labels, key=lambda k: (labels[k]["repo"], k)):
+            r = labels[fid]
+            f.write(f"{r['iri']}\t{r['repo']}\t{r['outcome']}\t{r['word']}\n")
+
+
+def label_of(row, reproduced=None):
     """(label, basis) for one gonk finding row, or (None, why it is not labeled).
 
-    A reproduced publish is `verified-real`; a plain one stays `published`. The mark is
-    read from the CURRENT decision only, and only as JSON `true`: a row from a browse
-    that predates the mark has no `reproduced` key and reads as a plain publish.
+    A REPRODUCED label (`reproduced`, the row's entry in a labels file) wins over any
+    decision. Otherwise a reproduced publish is `verified-real`; a plain one stays
+    `published`. The mark is read from the CURRENT decision only, and only as JSON
+    `true`: a row from a browse that predates the mark has no `reproduced` key and
+    reads as a plain publish.
     """
+    if reproduced is not None:
+        return REPRODUCED[reproduced["outcome"]]
     d = row.get("decision") or {}
     if row.get("state") == "published":
         if d.get("reproduced") is True:
@@ -241,7 +311,21 @@ def self_test():
         (row("declined", outcome="declined"), (None, "declined with no reason word")),
         (row("pending"), (None, "state pending")),
     ]
+    lab = lambda outcome: {"iri": "urn:iki:finding:f00", "repo": "r", "outcome": outcome, "word": ""}
+    reproduced_cases = [
+        # A reproduction outranks a decision, either way.
+        (row("pending"), lab("not-a-defect"), ("known-false", "reproduced")),
+        (row("published", outcome="published"), lab("not-a-defect"), ("known-false", "reproduced")),
+        (row("declined", outcome="declined", reason="misread"), lab("real"),
+         ("known-real", "reproduced-real")),
+        (row("pending"), lab("partly-real"), ("known-real", "reproduced-partly-real")),
+    ]
     failed = 0
+    for given, label, want in reproduced_cases:
+        got = label_of(given, label)
+        if got != want:
+            failed += 1
+            print(f"label_of({given}, {label['outcome']}) = {got}, want {want}", file=sys.stderr)
     for given, want in cases:
         got = label_of(given)
         if got != want:
@@ -253,17 +337,27 @@ def self_test():
     sys.path.insert(0, HERE)
     import score  # noqa: E402  (beside this file; imported only for the check)
 
-    for basis, group in [("verified-real", "known-real/verified"),
-                         ("published", "known-real/published"),
-                         ("sweep-partly-real", "known-real/verified"),
-                         ("intent-corpus", "known-real/verified")]:
-        got = score.basis_group({"label": "known-real", "basis": basis})
+    groups = [("known-real", "verified-real", "known-real/verified"),
+              ("known-real", "published", "known-real/published"),
+              ("known-real", "sweep-partly-real", "known-real/verified"),
+              ("known-real", "intent-corpus", "known-real/verified"),
+              ("known-real", "reproduced-real", "known-real/reproduced"),
+              ("known-real", "reproduced-partly-real", "known-real/reproduced"),
+              ("known-false", "misread", "known-false"),
+              ("known-false", "reproduced", "known-false/reproduced")]
+    for label, basis, group in groups:
+        got = score.basis_group({"label": label, "basis": basis})
         if got != group:
             failed += 1
-            print(f"basis_group({basis}) = {got}, want {group}", file=sys.stderr)
+            print(f"basis_group({label}, {basis}) = {got}, want {group}", file=sys.stderr)
+    # Every outcome a labels file may carry has a group the scorer reports.
+    for outcome, (label, basis) in REPRODUCED.items():
+        if score.basis_group({"label": label, "basis": basis}) not in score.GROUPS:
+            failed += 1
+            print(f"outcome {outcome}: no scorer group", file=sys.stderr)
     if failed:
         sys.exit(f"{failed} label case(s) wrong")
-    print(f"ok: {len(cases) + 4} label cases")
+    print(f"ok: {len(cases) + len(reproduced_cases) + len(groups) + len(REPRODUCED)} label cases")
 
 
 def main():
@@ -276,30 +370,43 @@ def main():
     ap.add_argument("--ikigai", default="ikigai")
     ap.add_argument("--repo", action="append", help="limit to these repos (default: every root)")
     ap.add_argument("--include-private", action="store_true")
+    ap.add_argument("--labels", action="append", default=[],
+                    help="a reproduced-labels TSV to add (repeatable); reproduced.tsv is always read")
     ap.add_argument("--out", default=HERE)
     args = ap.parse_args()
 
     table = roots(args.config)
     repos = args.repo or sorted(table)
+    labels = read_labels(REPRODUCED_TSV) if os.path.exists(REPRODUCED_TSV) else {}
+    committed = dict(labels)
+    for path in args.labels:
+        labels.update(read_labels(os.path.expanduser(path)))
+    vis = {}
     rows, excluded, private = [], [], {}
     for repo in repos:
-        public = args.include_private or visibility(repo) == "public"
+        vis[repo] = visibility(repo)
+        public = args.include_private or vis[repo] == "public"
         repo_rows = []
         for state in ("declined", "published"):
             repo_rows += gonk(args, f"urn:gk:repo:{repo}:findings state={state}")
-        for fid in EXTRA_REAL:
+        wanted = list(EXTRA_REAL) + [fid for fid, r in labels.items() if r["repo"] == repo]
+        for fid in wanted:
             if any(r["id"] == fid for r in repo_rows):
                 continue
             try:
                 one = gonk(args, f"urn:gk:iki:finding:{fid} as=application/json")
             except Exception:
+                if fid in labels:
+                    print(f"{repo}: labeled finding {fid} not found in gonk", file=sys.stderr)
                 continue
             if one.get("repo") == repo:
                 repo_rows.append(one)
         for row in repo_rows:
-            label, basis = label_of(row)
+            reproduced = labels.get(row["id"])
+            label, basis = label_of(row, reproduced)
             if label is None:
                 continue
+            row["_reproduced"] = reproduced
             if not public:
                 private[repo] = private.get(repo, 0) + 1
                 continue
@@ -337,6 +444,17 @@ def main():
         }
         if fid in EXTRA_REAL:
             entry["decision_note"] = EXTRA_REAL[fid]
+        rep = row.get("_reproduced")
+        if rep is not None:
+            # The suggested word is the reason a known-false entry carries; the
+            # decision fields stay what gonk holds (normally none: still pending).
+            entry["reason"] = rep["word"] if entry["label"] == "known-false" else None
+            entry["decision_note"] = (
+                f"findings sweep 2 (ledger #706): {rep['outcome']} by reproduction or a traced "
+                f"code path; {rep['word'] or 'no word'}. Evidence: the ledger #706 comments."
+            )
+            entry["batch"] = "major-sweep-2"
+            entry["selected_by"] = "judge-v1@qwen3-coder-next:latest confirmed"
         if row.get("pr") is not None:
             entry.update(file=None, unrecovered="a pull-request diff, not a file version")
             entries.append(entry)
@@ -400,7 +518,7 @@ def main():
             "severity": "critical",
             "quote": quote,
             "claim": item["finding"],
-            "file": os.path.join("..", "intent", name, item["path"]),
+            "file": os.path.relpath(os.path.join(INTENT_DIR, name, item["path"]), args.out),
             "commit": item["sha"],
             "char_start": start,
             "anchor": "first-occurrence",
@@ -432,6 +550,18 @@ def main():
     with open(os.path.join(args.out, "corpus.json"), "w") as f:
         json.dump(manifest, f, indent=1, ensure_ascii=False)
         f.write("\n")
+
+    # The public labels this export used, kept beside it so a re-export without
+    # `--labels` rebuilds the same set. Only into THIS directory, only public repos.
+    if os.path.realpath(args.out) == os.path.realpath(HERE):
+        keep = dict(committed)
+        for fid, r in labels.items():
+            if r["repo"] not in vis:
+                vis[r["repo"]] = visibility(r["repo"])
+            if vis[r["repo"]] == "public":
+                keep[fid] = r
+        if keep != committed:
+            write_labels(REPRODUCED_TSV, keep)
 
     by = {}
     for e in entries:

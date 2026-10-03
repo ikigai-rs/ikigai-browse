@@ -1,0 +1,4782 @@
+//! Renderer-agnostic REPL engine.
+//!
+//! Parses a command line, issues it against the kernel, and reports the result.
+//! It knows nothing about terminals or rendering — the plain line REPL, the
+//! `ratatui` TUI, and a future `ratzilla` browser frontend all drive this same
+//! engine and present the [`Action`] it returns however suits their medium.
+//!
+//! `source` is self-description-driven: rather than assuming an `in` argument, it
+//! asks the target endpoint for its parameter contract (a `Meta` request rendered
+//! as `application/json`) and routes by it — so an endpoint that reads a
+//! differently-named argument, several arguments, or only a grammar binding is
+//! handled correctly. A `key=value` word names a declared argument; the
+//! positional text or piped value fills the one argument left unnamed. The
+//! contract is fetched through `issue`, so this works the same against a remote
+//! kernel.
+
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+
+use futures::executor::block_on;
+use futures::future::join_all;
+use ikigai_core::{
+    ArgRef, BoxFuture, Capability, Description, Expiry, FixedClock, InputSource, Iri, Provenance,
+    Representation, Request, Scope, Space, Spawner, Thread, TraceEvent, Tracer, Verb,
+};
+use ikigai_resolve::{CacheStatus, Resolver};
+
+use crate::fanout::{self, FanOut};
+use crate::suggest;
+use std::collections::BTreeSet;
+
+/// A pipe stage's output: its raw bytes plus the cache provenance (expiry + golden
+/// threads) to hand the next stage, so cacheability flows down the pipeline. The
+/// downstream stage resolves with this as its upstream [`Provenance`], and the
+/// kernel folds it into the result — a transform is no more cacheable than its input.
+/// The bytes stay bytes: a plain `|` passes any representation (a PDF, an image)
+/// through untouched; only the inherently textual surfaces — the `..` item split
+/// and the terminal display — decode, each with an error naming what needed text.
+#[derive(Clone)]
+pub(crate) struct Staged {
+    pub(crate) bytes: Vec<u8>,
+    expiry: Expiry,
+    threads: BTreeSet<Thread>,
+}
+
+impl Staged {
+    /// The provenance this stage hands to the next.
+    pub(crate) fn provenance(&self) -> Provenance {
+        Provenance::new(self.expiry, self.threads.clone())
+    }
+
+    /// The output as owned text — the terminal display surface. A binary
+    /// representation flows *through* a pipe fine; what it can't do is be
+    /// printed, so the error points at the `sink` terminal that stores it.
+    pub(crate) fn into_text(self) -> Result<String, String> {
+        let len = self.bytes.len();
+        String::from_utf8(self.bytes).map_err(|_| {
+            format!(
+                "output is not UTF-8 text ({len} bytes) — pipe it into a `sink` to store the bytes"
+            )
+        })
+    }
+}
+
+/// The neutral upstream for the first stage of a pipeline (no pipe feeds it): a
+/// `Never`/empty provenance folds as the identity, so the first stage resolves on
+/// its own merits.
+pub(crate) fn root_provenance() -> Provenance {
+    Provenance::new(Expiry::Never, BTreeSet::new())
+}
+
+/// Join several stage outputs (fork branches or mapped items) into one, combining
+/// their provenance: the result is cacheable only if *every* part is (the most
+/// restrictive expiry wins), and depends on the union of their threads.
+pub(crate) fn combine_outputs(parts: Vec<Staged>) -> Staged {
+    let mut expiry = Expiry::Never;
+    let mut threads = BTreeSet::new();
+    let mut bytes = Vec::new();
+    for (index, part) in parts.into_iter().enumerate() {
+        expiry = expiry.most_restrictive(part.expiry);
+        threads.extend(part.threads);
+        if index > 0 {
+            bytes.push(b'\n');
+        }
+        bytes.extend_from_slice(&part.bytes);
+    }
+    Staged {
+        bytes,
+        expiry,
+        threads,
+    }
+}
+
+use crate::config;
+
+/// Help text shown by the `help` command (and the TUI's hint line links to it).
+pub const HELP: &str = "\
+commands:
+  source <iri> [input]       SOURCE a resource; `input` is routed to its declared argument
+  source <iri> key=value …   name arguments; positional/pipe fills the one left unnamed
+  source a [input] | b | c   pipeline: `|` pipes the whole output into the next stage
+  source a [input] .. b      map: run `b` per newline-item of `a`'s output, rejoin
+  source a | ( b ; c )       fork: fan the input to each branch, join their outputs
+  source … as-of=<instant>   resolve the whole line AS OF an RFC 3339 instant: a temporal
+                             corridor `urn:ctx:time:<instant>` pins every clock it reaches
+                             (also on `trace` and `cache`; in-process kernel only)
+  plan <spec>                render a pipeline as an ik:Process graph (Turtle) instead of running it
+  run <spec>                 resolve <spec> and RUN the ik:Process graph it returns
+  sink <iri> [k=v …] <content>  SINK into a resource: leading k=v name declared args, the rest is content
+  source a | sink <iri> [k=v …]  pipeline write-terminal: store the piped value as the sink's content
+  delete <iri> [k=v …]       DELETE a resource (the delete verb)
+  describe <iri> [type]      META a resource; `type` defaults to text/turtle
+  (<sexpr>)                  evaluate a Lisp form (leading `(` routes to urn:lisp:eval)
+  :lisp                      enter multi-line Lisp mode; a blank line evaluates, `:lisp` cancels
+  :load <uri> [cap=<scope>]  read a script resource and evaluate it as Lisp (cap= narrows first)
+  cache <iri> [args]         report whether resolving it would hit the cache (no resolve)
+  cap [scope…]               show the session capability, narrow it to `scope`s, or `cap reset`
+                             (`net-<host>` is shorthand for the `urn:cap:net:<host>` scope)
+  login [scope…] / logout    set the session identity to the minted `scope`s (the floor `cap
+                             reset` returns to), or drop to anonymous — auth-scheme-agnostic
+                             (also `sink urn:host:login <scope…>` / `sink urn:host:logout`)
+  trace <iri> [args]         resolve a resource and show its path: client, transport, endpoint
+  config [key=value]         show settings, or save one (e.g. config keybindings=emacs)
+  list                       list the resources bound in the current space
+  demo [on|off]              show or toggle the interactive runbook (urn:runbook:*)
+  history [on|off]           show or toggle persisting command history across runs
+  clear                      clear the visible output (history is kept)
+  help                       show this help
+  quit                       exit
+
+arguments:
+  `key=value` sets an argument by name (`key` must be a declared argument of the
+  target); any other word is positional and fills the one argument left unnamed.
+
+quoting:
+  wrap a word in \"…\" to keep `|`, `..`, `(`, `)`, `;`, or spaces literal inside an
+  IRI or input; \\\" is a literal quote and \\\\ a literal backslash.
+
+try:
+  source urn:iki:fn:toUpper resource-oriented computing
+  source urn:demo:echo/hello
+  source urn:demo:greet greeting=Hello name=World
+  source urn:demo:greet Hello name=World
+  source urn:iki:fn:toUpper hello | urn:iki:fn:toUpper
+  source urn:tz:now zone=UTC as-of=2026-09-25T18:00Z
+  source urn:iki:fn:toUpper \"a | b\"
+  source urn:demo:split \"a,b,c\" .. urn:iki:fn:toUpper
+  source urn:demo:split \"a,b,c\" | ( urn:iki:fn:toUpper ; urn:iki:fn:reverseList )
+  plan urn:iki:fn:toUpper hello | urn:iki:fn:toUpper
+  sink urn:file:plan.ttl content=\"…the Turtle `plan` printed…\"
+  run urn:file:plan.ttl
+  sink urn:file:notes.txt remember the milk
+  source urn:iki:fn:toUpper hello | sink urn:file:shout.txt
+  source urn:file:notes.txt
+  (+ 1 2)
+  (source \"urn:iki:fn:toUpper\" \"hi\")
+  cap read-only ; sink urn:file:notes.txt nope   (write now refused)
+  describe urn:iki:fn:toUpper text/turtle";
+
+/// One evaluated request: the line the user typed, what came back, and how the
+/// kernel's cache served it.
+pub struct Entry {
+    pub input: String,
+    pub result: Result<String, String>,
+    pub cache: CacheStats,
+}
+
+/// A tally of the cache outcomes across the (possibly many) requests one input
+/// line issues — a pipeline stage, a fork branch, and a mapped item each count.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct CacheStats {
+    hits: u32,
+    misses: u32,
+    uncacheable: u32,
+}
+
+impl CacheStats {
+    fn record(&mut self, status: CacheStatus) {
+        match status {
+            CacheStatus::Hit => self.hits += 1,
+            CacheStatus::Miss => self.misses += 1,
+            CacheStatus::Uncacheable => self.uncacheable += 1,
+        }
+    }
+
+    /// Fold another tally into this one — used to summarise a `-c` batch.
+    pub fn merge(&mut self, other: CacheStats) {
+        self.hits += other.hits;
+        self.misses += other.misses;
+        self.uncacheable += other.uncacheable;
+    }
+
+    /// A compact label for the outcome — `None` when nothing was issued (e.g.
+    /// `list`, `help`, or a command that errored before resolving). A single
+    /// request reads as one word; several stages summarise their mix.
+    pub fn label(&self) -> Option<String> {
+        match (self.hits, self.misses, self.uncacheable) {
+            (0, 0, 0) => None,
+            (1, 0, 0) => Some("cached".to_string()),
+            (0, 1, 0) => Some("computed".to_string()),
+            (0, 0, 1) => Some("uncacheable".to_string()),
+            _ => {
+                let mut parts = Vec::new();
+                let mut push = |n: u32, what: &str| {
+                    if n > 0 {
+                        parts.push(format!("{n} {what}"));
+                    }
+                };
+                push(self.hits, "cached");
+                push(self.misses, "computed");
+                push(self.uncacheable, "uncacheable");
+                Some(parts.join(" · "))
+            }
+        }
+    }
+}
+
+/// What the frontend should do with an evaluated line.
+pub enum Action {
+    /// Display this request/response.
+    Output(Entry),
+    /// Show [`HELP`].
+    Help,
+    /// Clear the visible output. Command history is kept.
+    Clear,
+    /// Leave the REPL.
+    Quit,
+    /// Empty line — do nothing.
+    Noop,
+}
+
+/// Holds the resolver (a local or remote kernel) and turns input lines into
+/// [`Action`]s.
+/// A one-shot piped-stdin payload: the bytes, or a way to obtain them when they are first
+/// needed. See [`Engine::set_piped_input_with`] for why the second variant exists.
+enum PipedInput {
+    Ready(Vec<u8>),
+    Deferred(Box<dyn FnOnce() -> Vec<u8>>),
+}
+
+pub struct Engine {
+    resolver: Arc<dyn Resolver>,
+    /// Cache outcomes recorded by [`run`](Self::run) during the current `eval`.
+    /// Interior-mutable so the `&self` resolution path can tally without
+    /// threading an accumulator through every stage; the REPL is single-threaded.
+    cache: Cell<CacheStats>,
+    /// The session's current authority — every request resolves under it. It
+    /// starts at `identity` and the `cap` command can only ever *narrow* it.
+    capability: RefCell<Capability>,
+    /// The authority this session was opened with (the host's identity). `cap
+    /// reset` returns here — the owner-only move; a holder of a narrowed
+    /// capability has no identity to widen back to. Interior-mutable so a host can
+    /// swap the identity at runtime via [`login`](Self::login)/[`logout`](Self::logout)
+    /// (e.g. a browser passkey establishing a per-client identity) — `cap reset` then
+    /// returns to the *logged-in* identity, not the process default.
+    identity: RefCell<Capability>,
+    /// Named capability profiles a host registers (e.g. `freebusy` → a set of
+    /// `urn:cap:` scopes), so `cap <name>` reads friendlier than a scope list.
+    profiles: RefCell<HashMap<String, Vec<String>>>,
+    /// The scheduler (as a [`Spawner`]) a host injects so `( a ; b )` forks and `..`
+    /// maps over single `source` stages resolve concurrently on it. Absent ⇒ those
+    /// run sequentially (the default; the browser frontend has no scheduler).
+    spawner: Option<Arc<dyn Spawner>>,
+    /// The `:lisp` multi-line buffer. `Some` while in Lisp mode: each subsequent
+    /// line accumulates here until a blank line (submit) or another `:lisp`
+    /// (cancel). `None` in the normal verb-grammar mode. Interior-mutable so the
+    /// `&self` eval path can toggle and accumulate; the REPL is single-threaded.
+    lisp_buffer: RefCell<Option<Vec<String>>>,
+    /// Whether an automatic fan-out width hint may be appended to the requests of a
+    /// fork/map whose target declares it reads `needs=` (see [`crate::fanout`]).
+    /// **Off unless a host turns it on**: routing by width changes *which backend*
+    /// answers, and `ikigai-browse` folds model identity into a durable archive key —
+    /// so silent width-based routing would write "which backend answered depends on how
+    /// many siblings the request happened to have" permanently into a store.
+    width_routing: bool,
+    /// The widest fan-out this line performed, for [`last_fan_out`](Self::last_fan_out).
+    /// Recorded whether or not anything was routed, and on the sequential path too: "you
+    /// asked for ten and got one" is the fact an operator most needs, and from outside
+    /// the process a serialized fan-out and a slow server look identical.
+    fan_out: RefCell<Option<FanOut>>,
+    /// A one-shot piped-stdin payload for a batch (`-c`) run. When the CLI is fed content on a
+    /// non-TTY stdin (`… | ikigai -c 'sink <iri>'`), the first content-less `sink` uses this as
+    /// its `content` — so a secret can be piped in and never touch the command line (argv/`ps`)
+    /// or the shell history. `take`n on use, so it feeds exactly one write.
+    piped_input: RefCell<Option<PipedInput>>,
+    /// The doors a temporal corridor binds when a line says `as-of=<instant>` — the HOST's to
+    /// supply ([`with_as_of_doors`](Self::with_as_of_doors)), because which time names a
+    /// corridor rebinds is a fact about the host's topology, not the grammar's. `None` ⇒
+    /// `as-of=` is refused, never ignored.
+    as_of_doors: Option<Arc<dyn Space>>,
+    /// The resolution chain the CURRENT line resolves in — every stage, fork branch, mapped
+    /// item, contract fetch and cache probe of the line reads it, so a pipeline runs inside
+    /// ONE chain (`Kernel::issue_with_incoming_in` per stage) rather than pinning its first
+    /// stage and resolving the rest live. The empty chain outside an `as-of=` line, and
+    /// restored after one, so nothing leaks into the next line: a per-request corridor needs
+    /// no session state, which is why this is not (yet) a `scope` command.
+    scope: RefCell<Scope>,
+}
+
+/// The name a temporal corridor is injected under: `urn:ctx:time:` + the instant in canonical
+/// RFC 3339 UTC (`2026-09-25T18:00:00Z`). The name IS the corridor's cache identity (core keys
+/// the chain by corridor names, never by the clock), so two spellings of one instant must name
+/// one corridor — hence the canonical form, not what the caller typed.
+pub const AS_OF_CORRIDOR_PREFIX: &str = "urn:ctx:time:";
+
+/// The reserved argument that pins a whole line to one instant. Reserved the way `as` is: it
+/// is peeled off every stage before argument routing, so it never reaches an endpoint and can
+/// never be mistaken for positional input.
+const AS_OF: &str = "as-of";
+
+/// An `as-of=` instant, parsed: its canonical spelling (the corridor's name) and the epoch
+/// milliseconds its derived clock reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AsOf {
+    canonical: String,
+    millis: u64,
+}
+
+/// Parse an `as-of=` value: RFC 3339, with the seconds optional (`2026-09-25T18:00Z` is how
+/// people write an instant, and how the design notes do). A pre-1970 instant is refused —
+/// the kernel's `Time` is unsigned milliseconds.
+fn parse_as_of(raw: &str) -> Result<AsOf, String> {
+    use chrono::{DateTime, SecondsFormat, Utc};
+    let with_seconds = |raw: &str| -> Option<String> {
+        let (date, time) = raw.split_once('T')?;
+        let offset_at_five = matches!(time.as_bytes().get(5), Some(b'Z' | b'z' | b'+' | b'-'));
+        (time.len() > 5 && offset_at_five)
+            .then(|| format!("{date}T{}:00{}", &time[..5], &time[5..]))
+    };
+    let parsed = DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .or_else(|| with_seconds(raw).and_then(|s| DateTime::parse_from_rfc3339(&s).ok()))
+        .ok_or_else(|| {
+            format!(
+                "`{AS_OF}={raw}` is not an instant — write RFC 3339 with an offset, e.g. \
+                 {AS_OF}=2026-09-25T18:00Z or {AS_OF}=2026-09-25T11:00:00-07:00"
+            )
+        })?
+        .with_timezone(&Utc);
+    let millis = u64::try_from(parsed.timestamp_millis()).map_err(|_| {
+        format!("`{AS_OF}={raw}` is before 1970; the kernel's clock cannot read it")
+    })?;
+    Ok(AsOf {
+        canonical: parsed.to_rfc3339_opts(SecondsFormat::AutoSi, true),
+        millis,
+    })
+}
+
+/// Peel every `as-of=` word out of a parsed line — from any stage, branch or sink terminal —
+/// and return the one instant they name. The line runs in ONE chain, so where the word sits
+/// does not change what it means; two words naming DIFFERENT instants are refused (two
+/// spellings of the same instant are one).
+fn take_as_of(pipeline: &mut Pipeline) -> Result<Option<AsOf>, String> {
+    fn words(words: &mut Vec<String>, found: &mut Option<AsOf>) -> Result<(), String> {
+        let mut error = None;
+        words.retain(|word| match word.split_once('=') {
+            Some((AS_OF, raw)) => {
+                match parse_as_of(raw) {
+                    Ok(as_of) => match found {
+                        Some(prior) if *prior != as_of => {
+                            error = Some(format!(
+                                "a line resolves as of ONE instant, and this one names two: \
+                                 {} and {}",
+                                prior.canonical, as_of.canonical
+                            ))
+                        }
+                        _ => *found = Some(as_of),
+                    },
+                    Err(e) => error = Some(e),
+                }
+                false
+            }
+            _ => true,
+        });
+        error.map_or(Ok(()), Err)
+    }
+    fn node(node: &mut Node, found: &mut Option<AsOf>) -> Result<(), String> {
+        match node {
+            Node::Source(w) | Node::Sink(w) => words(w, found),
+            Node::Fork(branches) => branches.iter_mut().try_for_each(|b| walk(b, found)),
+        }
+    }
+    fn walk(pipeline: &mut Pipeline, found: &mut Option<AsOf>) -> Result<(), String> {
+        node(&mut pipeline.first, found)?;
+        pipeline
+            .rest
+            .iter_mut()
+            .try_for_each(|step| node(&mut step.node, found))
+    }
+    let mut found = None;
+    walk(pipeline, &mut found)?;
+    Ok(found)
+}
+
+impl Engine {
+    /// An engine that resolves with full (root) authority — the trusted,
+    /// same-process default.
+    pub fn new(resolver: impl Resolver + 'static) -> Self {
+        Self::with_identity(resolver, Capability::root())
+    }
+
+    /// An engine whose session authority is derived from a caller's identity.
+    /// The session starts at `identity`, and `cap reset` returns to it.
+    pub fn with_identity(resolver: impl Resolver + 'static, identity: Capability) -> Self {
+        Self {
+            resolver: Arc::new(resolver),
+            cache: Cell::new(CacheStats::default()),
+            capability: RefCell::new(identity.clone()),
+            identity: RefCell::new(identity),
+            profiles: RefCell::new(HashMap::new()),
+            spawner: None,
+            width_routing: false,
+            fan_out: RefCell::new(None),
+            lisp_buffer: RefCell::new(None),
+            piped_input: RefCell::new(None),
+            as_of_doors: None,
+            scope: RefCell::new(Scope::empty()),
+        }
+    }
+
+    /// Enable `as-of=<instant>`: the doors a temporal corridor binds. A line carrying
+    /// `as-of=` then resolves in `Scope::with_named_at(urn:ctx:time:<instant>, doors, clock)` —
+    /// the corridor AND the clock derived from its instant in one call (ledger #517), so an
+    /// endpoint sees the same pinned time whether it resolves `urn:time:now` or reads
+    /// `inv.now()`.
+    ///
+    /// The doors must not name themselves (`.named(iri)`): the corridor's identity is its
+    /// instant, and core refuses a self-named space injected under another name. Such doors
+    /// make every `as-of=` line an error rather than a panic.
+    pub fn with_as_of_doors(mut self, doors: Arc<dyn Space>) -> Self {
+        self.as_of_doors = Some(doors);
+        self
+    }
+
+    /// The chain an `as-of=` line resolves in, or the empty chain for a line without one.
+    fn as_of_scope(&self, as_of: Option<&AsOf>) -> Result<Scope, String> {
+        let Some(as_of) = as_of else {
+            return Ok(Scope::empty());
+        };
+        let doors = self.as_of_doors.as_ref().ok_or_else(|| {
+            format!(
+                "`{AS_OF}=` needs a host that supplies time doors, and this one does not — a \
+                 `--connect` session resolves on the far kernel, which owns its own topology"
+            )
+        })?;
+        if let Some(own) = doors.id() {
+            return Err(format!(
+                "`{AS_OF}=` cannot inject the host's time doors: they name themselves `{}`, and \
+                 a temporal corridor is named for its instant",
+                own.as_str()
+            ));
+        }
+        let name = Iri::parse(format!("{AS_OF_CORRIDOR_PREFIX}{}", as_of.canonical))
+            .map_err(|e| e.to_string())?;
+        Ok(Scope::empty().with_named_at(
+            name,
+            Arc::clone(doors),
+            Arc::new(FixedClock::at(as_of.millis)),
+        ))
+    }
+
+    /// Run `body` with `scope` as the line's chain, restoring the previous chain after — so a
+    /// nested run (a stored plan's pipeline) cannot leak its chain into the rest of the line.
+    async fn in_scope<T>(&self, scope: Scope, body: impl Future<Output = T>) -> T {
+        let previous = self.scope.replace(scope);
+        let out = body.await;
+        *self.scope.borrow_mut() = previous;
+        out
+    }
+
+    /// The chain the current line resolves in (cheap: an `Arc` clone, or nothing).
+    fn line_scope(&self) -> Scope {
+        self.scope.borrow().clone()
+    }
+
+    /// Provide a one-shot piped-stdin payload LAZILY: `read` runs only if a content-less
+    /// `sink` actually asks for it.
+    ///
+    /// The eager version hung. Reading stdin to EOF before running the commands blocks
+    /// whenever stdin is a non-TTY that never closes — an inherited pipe from an editor, a
+    /// test harness, launchd — so `ikigai -c 'source …' > file` waited forever for input no
+    /// command wanted. `is_terminal()` does not distinguish "a pipe with data" from "a pipe
+    /// nobody will ever write to", and nothing can: the only safe moment to block on stdin
+    /// is when a command has asked for its content.
+    pub fn set_piped_input_with(&self, read: impl FnOnce() -> Vec<u8> + 'static) {
+        *self.piped_input.borrow_mut() = Some(PipedInput::Deferred(Box::new(read)));
+    }
+
+    /// Provide a one-shot piped-stdin payload for a batch run: a content-less `sink <iri>` then
+    /// reads it as `content`. The CLI sets this from a non-TTY stdin so a secret piped in
+    /// (`printf %s "$v" | ikigai -c 'sink urn:secret:<name>'`) never lands on the command line.
+    pub fn set_piped_input(&self, bytes: Vec<u8>) {
+        *self.piped_input.borrow_mut() = Some(PipedInput::Ready(bytes));
+    }
+
+    /// Inject the scheduler (as a [`Spawner`]) so `( a ; b )` forks and `..` maps
+    /// whose branches are single `source` stages resolve **concurrently** on it.
+    /// Without one — or for multi-stage branches — they run sequentially.
+    pub fn with_spawner(mut self, spawner: Arc<dyn Spawner>) -> Self {
+        self.spawner = Some(spawner);
+        self
+    }
+
+    /// Enable automatic fan-out width routing: a fork/map wide enough to matter appends
+    /// `needs=batchAt<=W` to the requests of targets that declare they read `needs=`, so
+    /// a backend can be chosen by the load shape the runtime already knows.
+    ///
+    /// **Opt-in, and deliberately so** — see the field docs on `width_routing`. The host
+    /// decides (`--width-routing on`, or `width-routing = "on"` in the config home);
+    /// with it off, the requests this engine issues are byte-identical to the ones it
+    /// issued before the feature existed.
+    pub fn with_width_routing(mut self, enabled: bool) -> Self {
+        self.width_routing = enabled;
+        self
+    }
+
+    /// The widest fan-out the last evaluated line performed — its nominal width, the
+    /// width it actually achieved, and any width hint it applied. `None` when the line
+    /// fanned out nowhere.
+    ///
+    /// This is the observable half of width routing. A routing decision nobody can see
+    /// is one nobody can debug, and the *unrouted* number is worth as much: a ten-branch
+    /// fork on the default `single` scheduler is one-wide, which is invisible from
+    /// outside the process.
+    pub fn last_fan_out(&self) -> Option<FanOut> {
+        self.fan_out.borrow().clone()
+    }
+
+    /// Start a fresh per-line tally: the cache outcomes and the fan-out note both
+    /// describe *this* line, so both are cleared together.
+    fn reset_line_stats(&self) {
+        self.cache.set(CacheStats::default());
+        *self.fan_out.borrow_mut() = None;
+    }
+
+    /// Record a fan-out, keeping the widest of the line (ties to the first). A line can
+    /// fan out more than once — a map inside a fork — and the widest is the one whose
+    /// shape explains the line's cost.
+    fn record_fan_out(&self, fan_out: FanOut) {
+        let mut slot = self.fan_out.borrow_mut();
+        if slot
+            .as_ref()
+            .is_none_or(|prev| fan_out.nominal > prev.nominal)
+        {
+            *slot = Some(fan_out);
+        }
+    }
+
+    /// A construct that fans out but resolves its parts one after another: no spawner,
+    /// or a multi-stage branch (which must run in sequence, so a spawned branch is
+    /// always a single resolve). Its achievable width is 1 **by definition** — reporting
+    /// the branch count here would name a concurrency the run never reaches.
+    pub(crate) fn record_sequential_fan_out(&self, nominal: usize) {
+        self.record_fan_out(FanOut {
+            nominal,
+            effective: 1,
+            hint: None,
+        });
+    }
+
+    /// The session's current capability.
+    pub fn capability(&self) -> Capability {
+        self.capability.borrow().clone()
+    }
+
+    /// The session's identity — the authority `cap reset` returns to.
+    pub fn identity(&self) -> Capability {
+        self.identity.borrow().clone()
+    }
+
+    /// Establish a new session identity, replacing both the identity (the `cap reset`
+    /// target) and the current capability. A signed-in session therefore resolves
+    /// under — and resets back to — its scoped identity, not the process default. The
+    /// browser passkey flow mints a per-client identity this way; the same hook serves
+    /// the future CLI browser-handoff. Attenuation (`cap`) and `logout` still apply on
+    /// top of it.
+    pub fn login(&self, identity: Capability) {
+        *self.identity.borrow_mut() = identity.clone();
+        *self.capability.borrow_mut() = identity;
+    }
+
+    /// Drop the session back to the process default (root) identity — the anonymous
+    /// state before any `login`.
+    pub fn logout(&self) {
+        self.login(Capability::root());
+    }
+
+    /// Register a named capability profile — `cap <name>` then attenuates to its
+    /// scopes (e.g. `freebusy`). A host sets these so the REPL reads friendlier
+    /// than a bare scope list.
+    pub fn define_cap_profile(
+        &self,
+        name: impl Into<String>,
+        scopes: impl IntoIterator<Item = impl Into<String>>,
+    ) {
+        self.profiles
+            .borrow_mut()
+            .insert(name.into(), scopes.into_iter().map(Into::into).collect());
+    }
+
+    /// Evaluate one input line. The synchronous entry point — a thin
+    /// `block_on` over [`eval_async`](Self::eval_async), kept byte-identical for
+    /// the native frontends. A browser frontend drives `eval_async` directly
+    /// (where `block_on` would deadlock on a JS Promise).
+    pub fn eval(&self, line: &str) -> Action {
+        block_on(self.eval_async(line))
+    }
+
+    /// Evaluate an arbitrary Lisp program as one unit — the entry point the TUI's
+    /// scratch buffer uses. Unlike [`eval`](Self::eval), which paren-sniffs a single
+    /// line, this routes the whole (possibly multi-line) `src` straight to
+    /// `urn:lisp:eval` — the SAME seam as the paren-sniff, `:lisp` mode, and `:load` —
+    /// so a buffer that opens with a comment or a blank line still evaluates as Lisp.
+    /// Returns [`Action::Output`] carrying the result, or [`Action::Noop`] for an empty
+    /// program. Synchronous `block_on` over [`eval_lisp_async`](Self::eval_lisp_async),
+    /// like `eval`.
+    pub fn eval_lisp(&self, src: &str) -> Action {
+        block_on(self.eval_lisp_async(src))
+    }
+
+    /// The async form of [`eval_lisp`](Self::eval_lisp) — a browser frontend drives
+    /// this directly (where `block_on` would deadlock on a JS Promise).
+    pub async fn eval_lisp_async(&self, src: &str) -> Action {
+        if src.trim().is_empty() {
+            return Action::Noop;
+        }
+        // Each eval starts a fresh cache tally (like `eval_async`), read back into the
+        // entry once resolved. Runs under the session capability, so a session lacking
+        // `urn:cap:lisp` is denied cleanly by the endpoint.
+        self.reset_line_stats();
+        let result = self.run_lisp(src).await;
+        Action::Output(Entry {
+            input: src.to_string(),
+            result,
+            cache: self.cache.get(),
+        })
+    }
+
+    /// The resources bound in the kernel's space, or `None` if it can't enumerate —
+    /// the same list `list` shows. A frontend uses it to discover bound resources
+    /// (e.g. the TUI enumerating `urn:runbook:*` to build its demo tabs).
+    pub fn entries(&self) -> Option<Vec<ikigai_core::SpaceEntry>> {
+        self.resolver.entries()
+    }
+
+    /// Evaluate one input line, async-first. The resolving commands `.await`
+    /// their helpers so the whole resolution path can be driven without
+    /// blocking; the non-resolving commands stay synchronous.
+    pub async fn eval_async(&self, line: &str) -> Action {
+        let line = line.trim();
+
+        // `:lisp` multi-line mode: while a buffer is open every line accumulates
+        // (a blank line submits, another `:lisp` cancels), so this is checked
+        // before the empty-line short-circuit below.
+        if self.lisp_buffer.borrow().is_some() {
+            return self.eval_lisp_mode(line).await;
+        }
+
+        if line.is_empty() {
+            return Action::Noop;
+        }
+        // Each `run` during this line accumulates into `self.cache`; reset it
+        // first, then read it back into the entry once the command has resolved.
+        self.reset_line_stats();
+        let output = |this: &Self, result| {
+            Action::Output(Entry {
+                input: line.to_string(),
+                result,
+                cache: this.cache.get(),
+            })
+        };
+
+        // Paren-sniff: a line whose first non-whitespace char is `(` is a Lisp
+        // form — route it to `urn:lisp:eval` instead of the verb grammar. Every
+        // frontend inherits this because it lives here in the engine.
+        if line.starts_with('(') {
+            return output(self, self.run_lisp(line).await);
+        }
+
+        let (cmd, rest) = split_first_word(line);
+        match cmd {
+            "quit" | "exit" => Action::Quit,
+            "help" | "?" => Action::Help,
+            "clear" | "cls" => Action::Clear,
+            "list" | "ls" => output(self, self.run_list()),
+            "config" => output(self, run_config(rest)),
+            "cache" => output(self, self.run_cache(rest).await),
+            "cap" => output(self, self.run_cap(rest)),
+            "login" => output(self, self.run_login(rest)),
+            "logout" => output(self, self.run_logout()),
+            "demo" => output(self, self.run_demo(rest).await),
+            "history" => output(self, self.run_history(rest).await),
+            "trace" => output(self, self.run_trace(rest).await),
+            ":lisp" => output(self, self.enter_lisp_mode()),
+            ":load" => output(self, self.run_load(rest).await),
+            "source" | "src" => output(self, self.run_pipeline(rest).await),
+            "plan" => output(self, self.run_plan(rest).await),
+            "run" => output(self, self.run_stored_plan(rest).await),
+            "sink" => output(self, self.run_sink(rest).await),
+            "delete" | "del" => output(self, self.run_delete(rest).await),
+            "describe" | "desc" => {
+                let (target, ty) = split_first_word(rest);
+                let ty = if ty.is_empty() { "text/turtle" } else { ty };
+                output(self, self.run_meta(target, ty).await)
+            }
+            other => output(self, Err(format!("unknown command `{other}` (try `help`)"))),
+        }
+    }
+
+    /// Parse and run a pipeline. Stages are joined by connectors — `|` passes the
+    /// whole output into the next stage, `..` maps the next stage over the
+    /// output's newline-separated items — and a stage may be a `( a | b ; c )`
+    /// fork that fans the same input to each branch and joins their outputs.
+    ///
+    /// The spec is parsed by [`parse_spec`], which honours `"…"` quoting so a
+    /// literal operator can appear inside an IRI or input. Every leaf is just a
+    /// `source`, so routing, the binding-only error, and caching all come from
+    /// [`run_source`](Self::run_source).
+    pub(crate) async fn run_pipeline(&self, spec: &str) -> Result<String, String> {
+        let mut pipeline = parse_spec(spec)?;
+        let scope = self.as_of_scope(take_as_of(&mut pipeline)?.as_ref())?;
+        self.in_scope(
+            scope,
+            self.run_pipeline_node(&pipeline, None, root_provenance()),
+        )
+        .await?
+        .into_text()
+    }
+
+    /// Evaluate an s-expression as Lisp: issue `source urn:lisp:eval` with the
+    /// source as its `in` argument. The one seam every Lisp surface routes through
+    /// — the paren-sniff, `:lisp` mode, `:load`, and the CLI's `-e`. The eval runs
+    /// under the session capability, so a `cap`/`login`-narrowed session that lacks
+    /// `urn:cap:lisp` is denied cleanly (a typed `Denied`, surfaced as an error).
+    async fn run_lisp(&self, src: &str) -> Result<String, String> {
+        let iri = parse_target("urn:lisp:eval")?;
+        let request =
+            Request::new(Verb::Source, iri).with_arg("in", ArgRef::Inline(src.as_bytes().to_vec()));
+        self.run(request).await
+    }
+
+    /// `:lisp` — open the multi-line Lisp buffer. Subsequent lines accumulate
+    /// (handled by [`eval_lisp_mode`](Self::eval_lisp_mode)) until a blank line
+    /// evaluates them as one program.
+    fn enter_lisp_mode(&self) -> Result<String, String> {
+        *self.lisp_buffer.borrow_mut() = Some(Vec::new());
+        Ok("lisp mode — enter forms; a blank line evaluates, `:lisp` cancels".to_string())
+    }
+
+    /// Handle a line while the `:lisp` buffer is open: a blank line (or `:end`)
+    /// evaluates the accumulated program; a bare `:lisp` cancels; anything else is
+    /// appended. Returns the evaluated [`Action`] on submit, else `Noop` (the line
+    /// was buffered).
+    async fn eval_lisp_mode(&self, line: &str) -> Action {
+        if line == ":lisp" {
+            *self.lisp_buffer.borrow_mut() = None;
+            self.reset_line_stats();
+            return Action::Output(Entry {
+                input: line.to_string(),
+                result: Ok("lisp mode cancelled".to_string()),
+                cache: CacheStats::default(),
+            });
+        }
+        if !line.is_empty() && line != ":end" {
+            if let Some(buffer) = self.lisp_buffer.borrow_mut().as_mut() {
+                buffer.push(line.to_string());
+            }
+            return Action::Noop;
+        }
+        // Blank line or `:end`: close the buffer and evaluate what accumulated.
+        let program = self.lisp_buffer.borrow_mut().take().unwrap_or_default();
+        if program.is_empty() {
+            return Action::Noop;
+        }
+        let src = program.join("\n");
+        self.reset_line_stats();
+        let result = self.run_lisp(&src).await;
+        Action::Output(Entry {
+            input: src,
+            result,
+            cache: self.cache.get(),
+        })
+    }
+
+    /// `:load <uri> [cap=<scope>]` — read a script *resource* through the kernel
+    /// and evaluate it as Lisp (sugar over `source <uri>` → `source urn:lisp:eval`).
+    /// `cap=<scope>` narrows the session capability for the duration of the load —
+    /// for an untrusted external script, so both the read and the eval run under the
+    /// reduced authority — then restores it, so the narrowing never leaks into later
+    /// commands. `<scope>` accepts a registered profile name or a comma-separated
+    /// scope list (with the same `net-<host>` shorthand as `cap`).
+    async fn run_load(&self, rest: &str) -> Result<String, String> {
+        let rest = rest.trim();
+        let mut uri: Option<&str> = None;
+        let mut cap: Option<&str> = None;
+        for word in rest.split_whitespace() {
+            match word.split_once('=') {
+                Some(("cap", scope)) => cap = Some(scope),
+                _ if uri.is_none() => uri = Some(word),
+                _ => {
+                    return Err(format!(
+                        "unexpected token `{word}` (usage: `:load <uri> [cap=<scope>]`)"
+                    ))
+                }
+            }
+        }
+        let uri = uri.ok_or("usage: `:load <uri> [cap=<scope>]`")?;
+        let iri = parse_target(uri)?;
+
+        // Narrow just for this load, if asked, saving the prior capability to restore.
+        let saved = cap.map(|scope| {
+            let prev = self.capability.borrow().clone();
+            let scopes: Vec<String> = match self.profiles.borrow().get(scope) {
+                Some(scopes) => scopes.clone(),
+                None => scope.split(',').map(expand_cap_shorthand).collect(),
+            };
+            let narrowed = self.capability.borrow().attenuate(scopes);
+            *self.capability.borrow_mut() = narrowed;
+            prev
+        });
+
+        // Read the script through the kernel, then evaluate it — both under the
+        // (possibly narrowed) session capability.
+        let outcome = async {
+            let script = self.run(Request::new(Verb::Source, iri)).await?;
+            self.run_lisp(&script).await
+        }
+        .await;
+
+        if let Some(prev) = saved {
+            *self.capability.borrow_mut() = prev;
+        }
+        outcome
+    }
+
+    /// Run a parsed pipeline. `incoming` is the value flowing in from an enclosing
+    /// connector or fork — `None` at the top level, where the first stage takes
+    /// its literal input from the command line instead.
+    fn run_pipeline_node<'a>(
+        &'a self,
+        pipeline: &'a Pipeline,
+        incoming: Option<&'a [u8]>,
+        prov: Provenance,
+    ) -> Pin<Box<dyn Future<Output = Result<Staged, String>> + 'a>> {
+        Box::pin(async move {
+            let mut staged = self.run_node(&pipeline.first, incoming, prov).await?;
+            for step in &pipeline.rest {
+                // Each `|` hands the prior stage's provenance down as the next stage's
+                // upstream, so cacheability flows along the pipe; `..` does the same per
+                // mapped item.
+                staged = match step.connector {
+                    Connector::Pipe => {
+                        self.run_node(&step.node, Some(&staged.bytes), staged.provenance())
+                            .await?
+                    }
+                    Connector::Map => self.run_map(&step.node, &staged).await?,
+                };
+            }
+            Ok(staged)
+        })
+    }
+
+    /// Run one stage. A `Source` is a `source` request; a `Fork` fans `incoming`
+    /// to every branch and joins their outputs with newlines (the same list
+    /// convention `..` reads).
+    fn run_node<'a>(
+        &'a self,
+        node: &'a Node,
+        incoming: Option<&'a [u8]>,
+        prov: Provenance,
+    ) -> Pin<Box<dyn Future<Output = Result<Staged, String>> + 'a>> {
+        Box::pin(async move {
+            match node {
+                Node::Source(words) => {
+                    let (target, args) = words.split_first().ok_or("expected an IRI")?;
+                    self.run_source(target, args, incoming, prov).await
+                }
+                Node::Sink(words) => {
+                    let (target, args) = words.split_first().ok_or("`sink` needs a target IRI")?;
+                    let request = self.sink_request(target, args, incoming).await?;
+                    self.run_staged(request, Some(prov)).await
+                }
+                Node::Fork(branches) => {
+                    // Concurrent path: when every branch is a lone `source` stage and a
+                    // scheduler is injected, resolve them on it in parallel.
+                    if let Some(spawner) = &self.spawner {
+                        if let Some(branch_words) = single_source_branches(branches) {
+                            let mut requests = Vec::with_capacity(branch_words.len());
+                            for words in &branch_words {
+                                let (target, args) =
+                                    words.split_first().ok_or("expected an IRI")?;
+                                requests.push(self.source_request(target, args, incoming).await?);
+                            }
+                            let outputs =
+                                self.run_parallel(spawner, requests, prov.clone()).await?;
+                            return Ok(combine_outputs(outputs));
+                        }
+                    }
+                    // No spawner, or a multi-stage branch: the branches run one after
+                    // another, so this fork is one-wide however many branches it has.
+                    self.record_sequential_fan_out(branches.len());
+                    let mut outputs = Vec::with_capacity(branches.len());
+                    for branch in branches {
+                        outputs.push(
+                            self.run_pipeline_node(branch, incoming, prov.clone())
+                                .await?,
+                        );
+                    }
+                    Ok(combine_outputs(outputs))
+                }
+            }
+        })
+    }
+
+    /// Map a stage over the newline-separated items of `value`: run the node once
+    /// per item (feeding the item in) and rejoin the outputs with newlines. This
+    /// is the list convention used across the kernel (e.g. `reverseList`), so `..`
+    /// threads a list through a per-item transform. An error on any item aborts.
+    fn run_map<'a>(
+        &'a self,
+        node: &'a Node,
+        value: &'a Staged,
+    ) -> Pin<Box<dyn Future<Output = Result<Staged, String>> + 'a>> {
+        Box::pin(async move {
+            // `..` is the one connector that must read the piped value: it splits on
+            // newlines, a textual convention. A binary upstream can't be item-mapped —
+            // say which operator demanded text (a plain `|` would have passed it through).
+            let text = std::str::from_utf8(&value.bytes).map_err(|_| {
+                "`..` maps over newline-separated text items, but the piped value is not \
+                 UTF-8 text — use a plain `|` to pass the bytes through whole"
+                    .to_string()
+            })?;
+            // Every mapped item descends from the same upstream, so each inherits its
+            // provenance; the joined result combines them (cacheable iff all are).
+            let prov = value.provenance();
+            // Concurrent path: mapping a single `source` over each item — resolve the
+            // items on the injected scheduler in parallel.
+            if let (Node::Source(words), Some(spawner)) = (node, &self.spawner) {
+                let (target, args) = words.split_first().ok_or("expected an IRI")?;
+                let mut requests = Vec::new();
+                for item in text.split('\n') {
+                    requests.push(
+                        self.source_request(target, args, Some(item.as_bytes()))
+                            .await?,
+                    );
+                }
+                let outputs = self.run_parallel(spawner, requests, prov).await?;
+                return Ok(combine_outputs(outputs));
+            }
+            // Sequential per-item mapping (no spawner, or a stage that isn't a lone
+            // `source`): one item at a time, so the achieved width is 1.
+            self.record_sequential_fan_out(text.split('\n').count());
+            let mut outputs = Vec::new();
+            for item in text.split('\n') {
+                outputs.push(
+                    self.run_node(node, Some(item.as_bytes()), prov.clone())
+                        .await?,
+                );
+            }
+            Ok(combine_outputs(outputs))
+        })
+    }
+
+    /// Resolve `requests` concurrently on `spawner` and return their text outputs in
+    /// order, recording each cache outcome (so the batch summary reflects them).
+    /// Each resolve is spawned (`issue_as_async`, which *parks* rather than blocking
+    /// a worker) and joined under a local `block_on` on this thread — which is the
+    /// REPL thread, not a pool worker, so there's no nesting and no deadlock with the
+    /// kernel's own fan-out. Only used for single-`source` branches/items, so a
+    /// spawned task never itself re-enters this `block_on`.
+    async fn run_parallel(
+        &self,
+        spawner: &Arc<dyn Spawner>,
+        requests: Vec<Request>,
+        prov: Provenance,
+    ) -> Result<Vec<Staged>, String> {
+        // The branch error stays TYPED across the join: the near-name suggestion needs the
+        // catalog, and reading it can be a blocking round-trip on a remote resolver — which
+        // must not happen on a spawned worker. Stringify on this thread, after the join.
+        type Slot = Arc<Mutex<Option<Result<(Representation, CacheStatus), ikigai_core::Error>>>>;
+        let capability = self.capability.borrow().clone();
+        // Every branch resolves in the line's chain — a fork under `as-of=` is as-of too.
+        let scope = self.line_scope();
+        // The width this fan-out will actually reach: the request count bounded by how
+        // many tasks the spawner carries at once, with an unknown width read as 1. The
+        // default `single` scheduler answers 1 however many branches there are, and that
+        // is the number worth acting on — routing a serialized run to a batching backend
+        // is measurably ~1.8x SLOWER, so widening on ignorance is the one unsafe guess.
+        let nominal = requests.len();
+        let effective = fanout::effective_width(nominal, spawner.width());
+        let hints = self.width_hints(effective, &requests).await;
+        self.record_fan_out(FanOut {
+            nominal,
+            effective,
+            // One note per fan-out: the term applied, if any request took one. A fork
+            // whose branches hit different targets can in principle have some hinted and
+            // some not; the note names the term, not the branch list.
+            hint: hints.iter().find_map(Clone::clone),
+        });
+        let slots: Vec<Slot> = requests
+            .iter()
+            .map(|_| Arc::new(Mutex::new(None)))
+            .collect();
+        let joins: Vec<BoxFuture<()>> = requests
+            .into_iter()
+            .zip(hints)
+            .zip(&slots)
+            .map(|((request, hint), slot)| {
+                let resolver = Arc::clone(&self.resolver);
+                let capability = capability.clone();
+                let prov = prov.clone();
+                let scope = scope.clone();
+                let slot = Arc::clone(slot);
+                // `needs=` is a HARD filter and a no-match is a LOUD error, so an
+                // automatic term nothing satisfies must not break a pipeline that would
+                // have worked. Keep the un-hinted request to retry with.
+                let fallback = hint.as_ref().map(|_| request.clone());
+                let request = match &hint {
+                    Some(term) => {
+                        request.with_arg("needs", ArgRef::Inline(term.as_bytes().to_vec()))
+                    }
+                    None => request,
+                };
+                spawner.spawn(Box::pin(async move {
+                    // Each fanned-out branch/item inherits the same upstream provenance.
+                    let mut result = resolver
+                        .issue_as_async_in(request, &capability, Some(prov.clone()), scope.clone())
+                        .await;
+                    if let (Err(error), Some(term), Some(fallback)) = (&result, &hint, fallback) {
+                        if fanout::is_hint_no_match(&error.to_string(), term) {
+                            // Nothing declares a crossover at or below this width. Ask
+                            // for what the caller actually asked for.
+                            result = resolver
+                                .issue_as_async_in(fallback, &capability, Some(prov), scope)
+                                .await;
+                        }
+                    }
+                    *slot.lock().expect("branch slot") = Some(result);
+                }))
+            })
+            .collect();
+        join_all(joins).await;
+
+        let mut outputs = Vec::with_capacity(slots.len());
+        let mut stats = self.cache.get();
+        for slot in slots {
+            let (representation, status) = slot
+                .lock()
+                .expect("branch slot")
+                .take()
+                .expect("spawned branch completed")
+                .map_err(|e| describe(&*self.resolver, &e))?;
+            stats.record(status);
+            let expiry = representation.expiry;
+            let threads = representation.threads().clone();
+            outputs.push(Staged {
+                bytes: representation.bytes,
+                expiry,
+                threads,
+            });
+        }
+        self.cache.set(stats);
+        Ok(outputs)
+    }
+
+    /// The width hint each request of a fan-out should carry, in request order.
+    ///
+    /// ★ **This is where the cache is protected.** A width argument added to every
+    /// fanned-out request would enter request identity — the kernel caches on request id
+    /// plus capability fingerprint — and the same resource resolved inside a 3-wide map
+    /// and a 10-wide map would become two entries: a miss manufactured out of nothing,
+    /// on every cacheable endpoint reached through `..` or a fork. So the hint is offered
+    /// only where it is *read*, which the target's own self-description says: an
+    /// **optional** `needs` argument. Everything else is left exactly as it was.
+    ///
+    /// The contract lookup is a `Meta` request, so it costs something — which is why it
+    /// happens only when the switch is on, only above width 1, only for a request that
+    /// isn't already explicitly routed, and only once per distinct target of the fan-out
+    /// (a `..` map has one target for all its items).
+    async fn width_hints(&self, effective: usize, requests: &[Request]) -> Vec<Option<String>> {
+        if !self.width_routing || effective < 2 {
+            return vec![None; requests.len()];
+        }
+        let mut contracts: HashMap<String, Option<Description>> = HashMap::new();
+        let mut hints = Vec::with_capacity(requests.len());
+        for request in requests {
+            if fanout::explicitly_routed(request) {
+                hints.push(None);
+                continue;
+            }
+            let target = request.target.as_str().to_string();
+            if !contracts.contains_key(&target) {
+                let description = self.describe_struct(&request.target).await;
+                contracts.insert(target.clone(), description);
+            }
+            hints.push(fanout::hint_for(
+                true,
+                effective,
+                request,
+                contracts[&target].as_ref(),
+            ));
+        }
+        hints
+    }
+
+    /// `SOURCE` a resource, folding the upstream pipe `prov` into its cacheability,
+    /// and return the stage's bytes + its own provenance for the next stage.
+    async fn run_source(
+        &self,
+        target: &str,
+        args: &[String],
+        incoming: Option<&[u8]>,
+        prov: Provenance,
+    ) -> Result<Staged, String> {
+        let request = self.source_request(target, args, incoming).await?;
+        self.run_staged(request, Some(prov)).await
+    }
+
+    /// `sink` command: write a representation *into* a resource — the write half
+    /// of the REPL. `sink <iri> [key=value …] <content>` issues a `Sink` under the
+    /// session capability (so a `cap`-narrowed session is refused by a gated
+    /// endpoint exactly as a read is) and shows the endpoint's reply.
+    async fn run_sink(&self, rest: &str) -> Result<String, String> {
+        // `urn:host:login` / `urn:host:logout` are session operations, not kernel
+        // resources — the engine owns the session capability, so it handles them here
+        // (like `urn:kernel:*` is handled by the kernel before its space). This makes
+        // login/logout addressable as resources: `sink urn:host:login <scope…>` over
+        // any transport whose session layer intercepts them.
+        let (target, content) = split_first_word(rest);
+        match target {
+            "urn:host:login" => return self.run_login(content),
+            "urn:host:logout" => return self.run_logout(),
+            _ => {}
+        }
+        self.run(self.write_request(Verb::Sink, rest).await?).await
+    }
+
+    /// `login [scope…]` / `sink urn:host:login <scope…>` — establish a session
+    /// **identity** from a minted capability (the `scope`s). Unlike `cap` (which only
+    /// narrows the current capability), this sets the identity floor `cap reset`
+    /// returns to. The scopes ARE the minted authority; *who* computes them is the
+    /// auth scheme (the browser's passkey flow, a QUIC server's client cert, …) — so
+    /// login is auth-scheme-agnostic. Bare `login` reports the current identity.
+    fn run_login(&self, rest: &str) -> Result<String, String> {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return Ok(self.describe_capability());
+        }
+        let scopes: Vec<String> = rest.split_whitespace().map(expand_cap_shorthand).collect();
+        self.login(Capability::root().attenuate(scopes));
+        Ok(format!("logged in — {}", self.describe_capability()))
+    }
+
+    /// `logout` / `sink urn:host:logout` — drop the session back to the anonymous
+    /// (root) identity, the state before any `login`.
+    fn run_logout(&self) -> Result<String, String> {
+        self.logout();
+        Ok(format!("logged out — {}", self.describe_capability()))
+    }
+
+    /// `delete` command: remove a resource (the `Delete` verb). Same
+    /// `delete <iri> [key=value …]` shape as `sink`, capability-gated identically.
+    async fn run_delete(&self, rest: &str) -> Result<String, String> {
+        self.run(self.write_request(Verb::Delete, rest).await?)
+            .await
+    }
+
+    /// Build a write [`Request`] (`Sink`/`Delete`) for `sink`/`delete`.
+    ///
+    /// A leading run of `key=value` words whose key is a *declared* argument of the
+    /// target is routed as named arguments; the **verbatim remainder** (untokenized,
+    /// so whitespace and quotes survive) becomes the `content` argument. This keeps
+    /// `sink urn:file:notes.txt remember   the milk` byte-exact when there are no
+    /// named args, while letting `sink urn:httpPost url=https://… the body` name the
+    /// URL and still pass an arbitrary body. The contract is only consulted when the
+    /// first word looks like `key=value`, so a plain content write needs no lookup.
+    ///
+    /// ⚠ `content` is itself a declared argument of most sinks, so `content="…"` names
+    /// the body directly — which is the way to send a *structured* body, since the
+    /// remainder is verbatim down to the quote characters. When `content=` is named the
+    /// remainder fallback is skipped entirely (it would otherwise overwrite it), and a
+    /// remainder alongside `content=` is refused rather than silently resolved.
+    async fn write_request(&self, verb: Verb, rest: &str) -> Result<Request, String> {
+        let (target, mut tail) = split_first_word(rest);
+        if target.is_empty() {
+            return Err(format!(
+                "usage: {} <iri> [key=value …] <content>",
+                if verb == Verb::Delete {
+                    "delete"
+                } else {
+                    "sink"
+                }
+            ));
+        }
+        let iri = parse_target(target)?;
+
+        // Only look up the argument contract if a leading word could be a named
+        // argument — a bare content write (the common case) skips it.
+        let declared = if split_first_word(tail).0.contains('=') {
+            declared_arguments(self.describe_struct(&iri).await.as_ref())
+        } else {
+            Vec::new()
+        };
+
+        let mut request = Request::new(verb, iri.clone());
+        let mut content_named = false;
+        while let Some((key, value, after)) = take_named_arg(tail, &declared) {
+            content_named |= key == "content";
+            request = request.with_arg(key, ArgRef::Inline(value.into_bytes()));
+            tail = after;
+        }
+        // `content=` names the body explicitly — and `with_arg` is LAST-WINS, so the
+        // remainder fallback below must not run or it overwrites the named value with the
+        // empty remainder. That was silent: most sinks accept an empty body as a legal
+        // no-op (an empty SPARQL update reports success), so the write simply did nothing
+        // while `urn:kernel:actions` went on advertising `content` as a named argument.
+        // A remainder *alongside* `content=` is two bodies with no rule for choosing
+        // between them, so refuse rather than pick one and drop the other.
+        if content_named {
+            if !tail.is_empty() {
+                return Err(format!(
+                    "`{}` was given content twice — named `content=` and the trailing \
+                     `{tail}`; use one or the other",
+                    iri.as_str()
+                ));
+            }
+            return Ok(request);
+        }
+        // The verbatim remainder is the content. When a `sink` carries none, a one-shot piped
+        // stdin payload feeds it instead — so a value (e.g. a secret) can be piped in without
+        // ever appearing on the command line. Empty otherwise (e.g. a no-body delete).
+        let content = if tail.is_empty() && verb == Verb::Sink {
+            // Take FIRST, then read: a deferred reader may block, and holding the
+            // RefCell borrow across that is a deadlock waiting to happen.
+            let piped = self.piped_input.borrow_mut().take();
+            match piped {
+                Some(PipedInput::Ready(bytes)) => bytes,
+                Some(PipedInput::Deferred(read)) => read(),
+                None => Vec::new(),
+            }
+        } else {
+            tail.as_bytes().to_vec()
+        };
+        Ok(request.with_arg("content", ArgRef::Inline(content)))
+    }
+
+    /// Build the `Source` [`Request`] for a stage without issuing it — shared by
+    /// `source` (which then runs it) and `cache` (which probes it). `args` are
+    /// the stage's words after the IRI; a word `key=value` is a named argument
+    /// when `key` is a declared argument of the target (discovered from its
+    /// self-description), otherwise it is positional text. The positional text —
+    /// or `incoming`, the value flowing in from a connector/fork — is routed to
+    /// the one declared argument left unnamed.
+    async fn source_request(
+        &self,
+        target: &str,
+        args: &[String],
+        incoming: Option<&[u8]>,
+    ) -> Result<Request, String> {
+        let iri = parse_target(target)?;
+
+        // The contract is only needed to recognise named arguments and route the
+        // value; a bare `source <iri>` (no args, no pipe) skips the lookup.
+        let description = if !args.is_empty() || incoming.is_some() {
+            self.describe_struct(&iri).await
+        } else {
+            None
+        };
+        let declared = declared_arguments(description.as_ref());
+
+        // Split args into named (`key=value` with a declared key) and positional.
+        // `as` is reserved: it's the universal content-negotiation selector (which
+        // representation face to render), carried as an arg on the request, NOT
+        // endpoint input. So it's always named — otherwise, on an endpoint that
+        // doesn't declare `as`, it falls to positional and, in a pipe, collides
+        // with the piped value (`… | ep as=text/turtle` used to error).
+        let mut named: Vec<(&str, &str)> = Vec::new();
+        let mut positional: Vec<&str> = Vec::new();
+        for arg in args {
+            match arg.split_once('=') {
+                Some(("as", value)) => named.push(("as", value)),
+                Some((key, value)) if declared.iter().any(|name| name == key) => {
+                    named.push((key, value))
+                }
+                _ => positional.push(arg),
+            }
+        }
+        let positional = positional.join(" ");
+
+        // The value to route comes from the pipe xor the positional text — never
+        // both (a piped stage's input is the pipe, so a literal has nowhere else
+        // to go).
+        let value: Option<&[u8]> = match (incoming, positional.is_empty()) {
+            (Some(_), false) => {
+                return Err(format!(
+                    "`{}` takes its input from the pipe — drop the literal input",
+                    iri.as_str()
+                ))
+            }
+            (Some(value), true) => Some(value),
+            (None, false) => Some(positional.as_bytes()),
+            (None, true) => None,
+        };
+
+        let mut request = Request::new(Verb::Source, iri.clone());
+        for (name, value) in &named {
+            request = request.with_arg(*name, ArgRef::Inline(value.as_bytes().to_vec()));
+        }
+
+        if let Some(value) = value {
+            let names: Vec<&str> = named.iter().map(|(name, _)| *name).collect();
+            let name = route_value_name(&iri, description.as_ref(), &names)?;
+            request = request.with_arg(name, ArgRef::Inline(value.to_vec()));
+        }
+        Ok(request)
+    }
+
+    /// Build the `Sink` [`Request`] for a `sink <iri> [key=value …]` pipeline
+    /// stage — the write dual of [`source_request`](Self::source_request). Leading
+    /// words shaped `key=value` whose key is a *declared* argument of the target
+    /// (or the reserved conneg selector `as`) are routed as named arguments; the
+    /// piped upstream value fills `content`. Unlike the top-level `sink` command,
+    /// whose content is the verbatim spec remainder, a pipeline sink's content is
+    /// the previous stage's output — so a stray positional word (which would have
+    /// nowhere to go) is a usage error rather than silent content. A named
+    /// `content=` wins over the pipe fallback when nothing is piped in (a fork
+    /// branch or a lone `sink` stage) and is refused as a second body when
+    /// something is.
+    async fn sink_request(
+        &self,
+        target: &str,
+        args: &[String],
+        incoming: Option<&[u8]>,
+    ) -> Result<Request, String> {
+        let iri = parse_target(target)?;
+
+        // The contract is only consulted to recognise named arguments; a bare
+        // `… | sink <iri>` (content-only, the common case) skips the lookup.
+        let declared = if args.iter().any(|arg| arg.contains('=')) {
+            declared_arguments(self.describe_struct(&iri).await.as_ref())
+        } else {
+            Vec::new()
+        };
+
+        let mut request = Request::new(Verb::Sink, iri.clone());
+        let mut content_named = false;
+        for arg in args {
+            match arg.split_once('=') {
+                // `as` is the universal conneg selector (carried as an arg, not
+                // endpoint input), so it is always a named argument.
+                Some(("as", value)) => {
+                    request = request.with_arg("as", ArgRef::Inline(value.as_bytes().to_vec()));
+                }
+                Some((key, value)) if declared.iter().any(|name| name == key) => {
+                    content_named |= key == "content";
+                    request = request.with_arg(key, ArgRef::Inline(value.as_bytes().to_vec()));
+                }
+                _ => {
+                    return Err(format!(
+                        "`sink {}` takes its content from the pipe — name arguments with \
+                         `key=value` (unexpected `{arg}`)",
+                        iri.as_str()
+                    ))
+                }
+            }
+        }
+
+        // Same last-wins hazard as the top-level `sink`: a named `content=` must survive,
+        // so the pipe fallback below cannot run unconditionally. Here the competing body is
+        // the pipe itself, and a stage fed by a pipe that also names its content has two
+        // bodies — the same ambiguity a stray positional word already refuses.
+        if content_named {
+            if incoming.is_some() {
+                return Err(format!(
+                    "`sink {}` was given content twice — named `content=` and the piped \
+                     value; drop one",
+                    iri.as_str()
+                ));
+            }
+            return Ok(request);
+        }
+
+        // The piped upstream value is the content (empty if nothing flows in).
+        let content = incoming.unwrap_or(&[]);
+        Ok(request.with_arg("content", ArgRef::Inline(content.to_vec())))
+    }
+
+    /// Report whether resolving `spec` would be served from the cache, without
+    /// resolving it. `spec` is a single `<iri> [key=value …] [input]` — the same
+    /// surface as one `source` stage, but no pipelines (there's nothing to thread
+    /// through). Read-only except that naming arguments fetches the target's
+    /// contract (a `Meta`), which is itself cacheable.
+    async fn run_cache(&self, spec: &str) -> Result<String, String> {
+        let mut pipeline = parse_spec(spec)?;
+        // `cache … as-of=<instant>` probes the corridor's partition — the question "would this
+        // as-of read be served from the cache" — never the root's.
+        let scope = self.as_of_scope(take_as_of(&mut pipeline)?.as_ref())?;
+        self.in_scope(scope, self.probe_cache(pipeline)).await
+    }
+
+    /// [`run_cache`](Self::run_cache) inside the line's chain.
+    async fn probe_cache(&self, pipeline: Pipeline) -> Result<String, String> {
+        let words = match pipeline {
+            Pipeline {
+                first: Node::Source(words),
+                rest,
+            } if rest.is_empty() => words,
+            _ => {
+                return Err("`cache` checks a single resource — no `|`, `..`, or `( )`".to_string())
+            }
+        };
+        let (target, args) = words.split_first().ok_or("expected an IRI")?;
+        let request = self.source_request(target, args, None).await?;
+        let scope = self.line_scope();
+        Ok(
+            if self
+                .resolver
+                .is_cached_in(&request, &self.capability.borrow(), &scope)
+            {
+                "cached".to_string()
+            } else {
+                "not cached".to_string()
+            },
+        )
+    }
+
+    /// `cap` command: show, narrow, or reset the session capability.
+    ///
+    /// `cap` shows the current authority; `cap <scope>…` narrows it to the given
+    /// `urn:cap:` scopes (intersected with what's already held — it can only ever
+    /// shrink); `cap reset` returns to the session's identity. This is how the
+    /// owner voluntarily gives up authority before handing work to an agent.
+    fn run_cap(&self, rest: &str) -> Result<String, String> {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return Ok(self.describe_capability());
+        }
+        if rest == "reset" {
+            *self.capability.borrow_mut() = self.identity.borrow().clone();
+            return Ok(format!(
+                "reset to identity — {}",
+                self.describe_capability()
+            ));
+        }
+        // A registered profile name expands to its scopes; otherwise each word is
+        // a scope, with a `net-<host>` shorthand for `urn:cap:net:<host>` so a
+        // session can be narrowed to one host without typing the full scope (e.g.
+        // `cap net-example.com` before handing outbound HTTP to an agent).
+        let scopes: Vec<String> = match self.profiles.borrow().get(rest) {
+            Some(scopes) => scopes.clone(),
+            None => rest.split_whitespace().map(expand_cap_shorthand).collect(),
+        };
+        let narrowed = self.capability.borrow().attenuate(scopes);
+        *self.capability.borrow_mut() = narrowed;
+        Ok(format!("narrowed — {}", self.describe_capability()))
+    }
+
+    /// A one-line summary of the session capability.
+    fn describe_capability(&self) -> String {
+        match self.capability.borrow().scopes() {
+            None => "capability: root (full authority)".to_string(),
+            Some(scopes) if scopes.is_empty() => {
+                "capability: empty (no scopes granted)".to_string()
+            }
+            Some(scopes) => format!(
+                "capability: {}",
+                scopes.iter().cloned().collect::<Vec<_>>().join(", ")
+            ),
+        }
+    }
+
+    /// `trace` command: resolve a resource **for real**, once, and show the actual
+    /// execution — the client and capability it ran under, the transport it reached
+    /// the kernel by, and the tree of resolutions the kernel recorded. Each node
+    /// reports which **worker thread** ran it, how long it took, and whether the
+    /// cache served it. Because it's the real resolution (not a structural walk), the
+    /// tree reflects what truly happened: a plain resource is a single node, while a
+    /// `compose` shows its `$a{…}` markers as the branches it fanned out — on
+    /// distinct workers under `pool:N`, the same thread under the single-threaded
+    /// default. Trace `urn:iki:fn:compose src=<shape>` to see the fan-out, not the bare
+    /// shape (sourcing the shape itself really is one resolution).
+    async fn run_trace(&self, spec: &str) -> Result<String, String> {
+        let mut pipeline = parse_spec(spec)?;
+        let scope = self.as_of_scope(take_as_of(&mut pipeline)?.as_ref())?;
+        self.in_scope(scope, self.trace_line(pipeline)).await
+    }
+
+    /// [`run_trace`](Self::run_trace) inside the line's chain.
+    async fn trace_line(&self, pipeline: Pipeline) -> Result<String, String> {
+        let words = match pipeline {
+            Pipeline {
+                first: Node::Source(words),
+                rest,
+            } if rest.is_empty() => words,
+            _ => {
+                return Err("`trace` follows a single resource — no `|`, `..`, or `( )`".to_string())
+            }
+        };
+        let (target, args) = words.split_first().ok_or("expected an IRI")?;
+        let iri = parse_target(target)?;
+        let request = self.source_request(target, args, None).await?;
+        let capability = self.capability.borrow().clone();
+        // A scoped (non-root) session annotates each node with the authority it ran
+        // under — `cap ✓` on success, `cap ✗` on a denial; a root session has nothing
+        // to attenuate, so the tree stays uncluttered (the header says it all).
+        let scoped = capability.scopes().is_some();
+        let entries = self.resolver.entries().unwrap_or_default();
+        let mut out = vec![
+            format!("trace  {iri}"),
+            format!(
+                "  client      ikigai repl  ·  {}",
+                self.describe_capability()
+            ),
+            format!("  transport   {}", self.resolver.transport()),
+        ];
+        // An as-of line says so in the header too: the chain it resolved in, and the instant
+        // its clock was pinned at. The kernel ALSO stamps both on every event (`scope=`,
+        // `scope-clock=` — `SCOPE_NOTE`, `SCOPE_CLOCK_NOTE`), which is where they show per node.
+        let scope = self.line_scope();
+        if !scope.is_empty() {
+            let pinned = scope
+                .now()
+                .map(|t| format!("  ·  clock pinned at {} ms", t.as_millis()))
+                .unwrap_or_default();
+            out.push(format!("  scope       {scope}{pinned}"));
+        }
+        out.push(String::new());
+
+        // Record one real resolution: the kernel reports a TraceEvent per invocation
+        // — the actual execution, including the branches `compose` fans out onto
+        // worker threads — which we reconstruct into a tree via each event's parent
+        // span. The resolution genuinely runs, so its cache effects are real too.
+        let collector = Arc::new(TraceCollector::default());
+        self.resolver.set_tracer(collector.clone());
+        let result = self
+            .resolver
+            .issue_as_async_in(request, &capability, None, scope)
+            .await;
+        self.resolver.clear_tracer();
+
+        match result {
+            Ok((representation, status)) => {
+                let events = collector.take();
+                if events.is_empty() {
+                    // A resolver that doesn't trace (e.g. a wire resolver): one line.
+                    let endpoint = endpoint_name(&entries, &iri);
+                    let text = String::from_utf8_lossy(&representation.bytes);
+                    let cap_note = if scoped { " · cap ✓" } else { "" };
+                    out.push(format!(
+                        "{}   {endpoint} · {} · {}b{cap_note}   → {}",
+                        short_iri(iri.as_str()),
+                        cache_word(status),
+                        representation.bytes.len(),
+                        preview_of(&text),
+                    ));
+                } else {
+                    render_trace_tree(&events, &entries, scoped, &representation, &mut out);
+                }
+            }
+            Err(error) => {
+                // The real resolution aborted — surface where. A capability denial is
+                // the authority dimension made visible (`cap ✗`). The kernel's own
+                // `require_cap` now returns a *typed* `Error::Denied`, so recognize that
+                // structurally; modules that still spell a denial as an `Endpoint` string
+                // (ikigai-fs, until it adopts the typed variant) are bridged by the
+                // "does not grant" phrase they share with the kernel's message.
+                let tag = if is_denial(&error) {
+                    "cap ✗ denied"
+                } else {
+                    "error"
+                };
+                out.push(format!("{}   {tag}: {error}", short_iri(iri.as_str())));
+                // `trace` already holds the catalog, so the near-name hint costs nothing
+                // extra here — and this is exactly where someone is hunting a name.
+                if let ikigai_core::Error::Unresolved(missed) = &error {
+                    let patterns: Vec<String> =
+                        entries.iter().map(|entry| entry.pattern.clone()).collect();
+                    if let Some(note) = suggest::note(missed.as_str(), &patterns) {
+                        out.push(format!("{SUGGESTION_INDENT}{note}"));
+                    }
+                }
+            }
+        }
+        Ok(out.join("\n"))
+    }
+
+    /// List the bindings of the kernel's root space (pattern → endpoint), or an
+    /// error if the space doesn't support enumeration.
+    fn run_list(&self) -> Result<String, String> {
+        let entries = self
+            .resolver
+            .entries()
+            .ok_or_else(|| "the current space does not support listing".to_string())?;
+        if entries.is_empty() {
+            return Ok("(no bindings)".to_string());
+        }
+        let width = entries
+            .iter()
+            .map(|entry| entry.pattern.chars().count())
+            .max()
+            .unwrap_or(0);
+        let lines: Vec<String> = entries
+            .iter()
+            .map(|entry| {
+                // A mounted binding names where it resolves; a local one stays quiet.
+                let origin = entry
+                    .origin
+                    .as_deref()
+                    .map(|o| format!("   [{o}]"))
+                    .unwrap_or_default();
+                format!("{:<width$}  → {}{origin}", entry.pattern, entry.endpoint)
+            })
+            .collect();
+        Ok(lines.join("\n"))
+    }
+
+    /// `META` a resource, rendered to `ty`.
+    async fn run_meta(&self, target: &str, ty: &str) -> Result<String, String> {
+        let iri = parse_target(target)?;
+        let request =
+            Request::new(Verb::Meta, iri).with_arg("as", ArgRef::Inline(ty.as_bytes().to_vec()));
+        self.run(request).await
+    }
+
+    /// `demo` command: sugar over the `urn:host:demo` resource. Bare `demo` reports
+    /// the state (`source`); `demo on`/`demo off` (or any value the host accepts)
+    /// flips it (`sink`). The engine stays generic — it just resolves the resource;
+    /// the host owns the flag, so on a backend that doesn't bind `urn:host:demo` this
+    /// reports a normal "unresolved" error.
+    async fn run_demo(&self, rest: &str) -> Result<String, String> {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            self.run(Request::new(Verb::Source, parse_target("urn:host:demo")?))
+                .await
+        } else {
+            self.run(
+                self.write_request(Verb::Sink, &format!("urn:host:demo {rest}"))
+                    .await?,
+            )
+            .await
+        }
+    }
+
+    /// `history` / `history on|off` — sugar over the `urn:host:history` resource: bare
+    /// reports the persistence state, an argument sinks the new state. Mirrors
+    /// [`run_demo`](Self::run_demo); the host endpoint does the persisting.
+    async fn run_history(&self, rest: &str) -> Result<String, String> {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            self.run(Request::new(
+                Verb::Source,
+                parse_target("urn:host:history")?,
+            ))
+            .await
+        } else {
+            self.run(
+                self.write_request(Verb::Sink, &format!("urn:host:history {rest}"))
+                    .await?,
+            )
+            .await
+        }
+    }
+
+    /// Fetch a target's structured self-description via a `Meta` request rendered
+    /// as `application/json`. `None` if it doesn't resolve or isn't JSON-renderable.
+    pub(crate) async fn describe_struct(&self, iri: &Iri) -> Option<Description> {
+        let request = Request::new(Verb::Meta, iri.clone())
+            .with_arg("as", ArgRef::Inline(b"application/json".to_vec()));
+        // The contract fetch is internal plumbing — its cache outcome isn't part
+        // of the user-facing tally, so the status is discarded. It resolves under
+        // the session capability, like any request. Clone the capability so no
+        // `Ref` borrow is held across the `.await`.
+        let capability = self.capability.borrow().clone();
+        // In the line's chain: a corridor may bind the target differently from the root, and
+        // the contract that routes arguments must be the one the resolution will reach.
+        let (representation, _) = self
+            .resolver
+            .issue_as_async_in(request, &capability, None, self.line_scope())
+            .await
+            .ok()?;
+        serde_json::from_slice(&representation.bytes).ok()
+    }
+
+    /// Issue a request, record how the resolver's cache served it, and decode the
+    /// representation as UTF-8 text for display. The resolver reports the
+    /// [`CacheStatus`] directly — for a remote kernel the server knows it without
+    /// a probe.
+    async fn run(&self, request: Request) -> Result<String, String> {
+        // No pipe upstream (sink / meta / a single source): resolve on its own merits.
+        self.run_staged(request, None).await?.into_text()
+    }
+
+    /// Issue a request — optionally carrying the upstream pipe `incoming` provenance,
+    /// which the kernel folds into the result's cacheability — record how the cache
+    /// served it, and return the stage's bytes plus its own provenance for the next
+    /// stage. The resolver reports the [`CacheStatus`] directly (a remote kernel knows
+    /// it without a probe).
+    pub(crate) async fn run_staged(
+        &self,
+        request: Request,
+        incoming: Option<Provenance>,
+    ) -> Result<Staged, String> {
+        let capability = self.capability.borrow().clone();
+        // The empty chain takes the unscoped path inside `issue_as_async_in` on every resolver,
+        // so a line without `as-of=` issues exactly what it issued before chains existed.
+        let (representation, status) = self
+            .resolver
+            .issue_as_async_in(request, &capability, incoming, self.line_scope())
+            .await
+            .map_err(|e| describe(&*self.resolver, &e))?;
+        let mut stats = self.cache.get();
+        stats.record(status);
+        self.cache.set(stats);
+        let expiry = representation.expiry;
+        let threads = representation.threads().clone();
+        Ok(Staged {
+            bytes: representation.bytes,
+            expiry,
+            threads,
+        })
+    }
+}
+
+/// Lines a continuation up under the `error: ` prefix that the REPL, the `-c` batch
+/// and the TUI each write in front of a message. Presentation, not protocol: the
+/// prefix is the faces', so the indent that clears it belongs beside them.
+const SUGGESTION_INDENT: &str = "       ";
+
+/// A resolution failure as a **face** should say it: the typed error's own words,
+/// plus a near-name suggestion when — and only when — the catalog actually binds one.
+///
+/// ```text
+/// error: no endpoint resolved for urn:iki:fn:toUpper
+///        did you mean `urn:fn:toUpper`? (bound here)
+/// ```
+///
+/// [`ikigai_core::Error::Unresolved`] is deliberately untouched — it carries the fact
+/// and nothing else, and its `Display` has no kernel to consult. Enrichment happens
+/// here, where the resolver (and so the catalog) is in hand. With no candidate the
+/// returned string is byte-identical to `error.to_string()`, which is the property
+/// that keeps this from making every error noisier.
+fn describe(resolver: &dyn Resolver, error: &ikigai_core::Error) -> String {
+    let text = error.to_string();
+    let ikigai_core::Error::Unresolved(iri) = error else {
+        return text;
+    };
+    // Only reached once a resolve has already failed, so the catalog read — a blocking
+    // round-trip on a remote resolver — is off every hot path.
+    let Some(entries) = resolver.entries() else {
+        return text;
+    };
+    let patterns: Vec<String> = entries.into_iter().map(|entry| entry.pattern).collect();
+    match suggest::note(iri.as_str(), &patterns) {
+        Some(note) => format!("{text}\n{SUGGESTION_INDENT}{note}"),
+        None => text,
+    }
+}
+
+/// `config` command: with no argument, show the config file and current
+/// properties; with `<key>=<value>`, validate and persist the property.
+fn run_config(rest: &str) -> Result<String, String> {
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return Ok(config_summary());
+    }
+    let (key, value) = parse_config_assignment(rest)?;
+    let path = config::set(key, &value).map_err(|e| format!("could not save config: {e}"))?;
+    let mut message = format!("{key} = {value}  (saved to {})", path.display());
+    if key == "keybindings" && !config::keybindings_supported(&value) {
+        message.push_str(&format!(
+            "\nnote: `{value}` keybindings aren't implemented yet — emacs is used until they are"
+        ));
+    }
+    Ok(message)
+}
+
+/// Show the config file path and the current value of each known property.
+///
+/// `scheduler` is listed even though the host, not the engine, acts on it: it is the
+/// setting that decides whether `( a ; b )` and `..` actually fan out, and at the default
+/// `single` they run one after another. A width nobody can see is a width nobody sets —
+/// `urn:kernel:scheduler` reports the LIVE one, this reports the CONFIGURED one.
+fn config_summary() -> String {
+    let location = config::path().map_or_else(
+        || "(no config directory — set $XDG_CONFIG_HOME or $HOME)".to_string(),
+        |path| path.display().to_string(),
+    );
+    let keybindings = config::get("keybindings").unwrap_or_else(|| "emacs (default)".to_string());
+    let scheduler = config::get("scheduler").unwrap_or_else(|| "single (default)".to_string());
+    format!("config file: {location}\nkeybindings = {keybindings}\nscheduler = {scheduler}")
+}
+
+/// Parse and validate a `config` assignment into a `(property, value)`. Pure —
+/// the write happens in [`run_config`].
+fn parse_config_assignment(rest: &str) -> Result<(&'static str, String), String> {
+    let (key, value) = rest.split_once('=').ok_or_else(|| {
+        "usage: `config <key>=<value>` (e.g. `config keybindings=emacs`), or `config` to show \
+         current settings"
+            .to_string()
+    })?;
+    let key = match key.trim() {
+        "keybindings" => "keybindings",
+        other => return Err(format!("unknown property `{other}` (known: keybindings)")),
+    };
+    let value = value.trim().trim_matches(['"', '\'']).trim();
+    if value.is_empty() {
+        return Err(format!("`{key}` needs a value, e.g. `config {key}=emacs`"));
+    }
+    Ok((key, value.to_string()))
+}
+
+/// Which declared argument a by-value input fills — a pipe, a mapped item, a fork's
+/// input, or positional text on the command line.
+///
+/// The text face's one implicit routing decision, stated in one place so the runner and
+/// the plan renderer cannot drift apart about it: `source_request` calls it to build a
+/// request, and `Engine::build_plan` calls it to write the resolved name into the graph.
+///
+/// `named` is the arguments already set by name (including the reserved `as`).
+///
+/// ⚠ The `None` arm is the one that fails OPEN: an endpoint whose contract could not be
+/// fetched routes to the conventional `in`, so on a kernel with no JSON Meta renderer
+/// every pipe appears to work and a routing defect is invisible (cli PENDING §7).
+pub(crate) fn route_value_name(
+    iri: &Iri,
+    description: Option<&Description>,
+    named: &[&str],
+) -> Result<String, String> {
+    let declared = declared_arguments(description);
+    // No contract: assume the conventional `in`, as before.
+    let Some(description) = description else {
+        return Ok("in".to_string());
+    };
+    let remaining: Vec<&str> = declared
+        .iter()
+        .map(String::as_str)
+        .filter(|name| !named.contains(name))
+        .collect();
+    match remaining.as_slice() {
+        [name] => Ok((*name).to_string()),
+        [] if description.inputs.is_empty() => Ok("in".to_string()),
+        [] if declared.is_empty() => Err(format!(
+            "`{}` takes no by-value argument — its parameter is captured from the \
+             identifier, so put the value in the IRI",
+            iri.as_str()
+        )),
+        [] => Err(format!(
+            "`{}` has no argument left for the value — every declared argument is already \
+             set by name",
+            iri.as_str()
+        )),
+        many => {
+            // Several inputs are unnamed — but optional ones default to unset, so if
+            // exactly one *required* input is unnamed, the piped/positional value fills it
+            // (e.g. `… | urn:jsonld:flatten` → `content`, leaving optional `base` unset).
+            // Only genuinely ambiguous when 2+ required inputs are still unnamed.
+            let required: Vec<&str> = many
+                .iter()
+                .copied()
+                .filter(|name| {
+                    description
+                        .inputs
+                        .iter()
+                        .any(|input| input.name == *name && input.required)
+                })
+                .collect();
+            match required.as_slice() {
+                [name] => Ok((*name).to_string()),
+                _ => Err(format!(
+                    "`{}` accepts multiple arguments ({}); name one with `key=value`",
+                    iri.as_str(),
+                    many.join(", ")
+                )),
+            }
+        }
+    }
+}
+
+/// The names of a target's declared by-value arguments, in declaration order.
+/// Binding inputs (captured from the IRI) and an absent contract yield none.
+pub(crate) fn declared_arguments(description: Option<&Description>) -> Vec<String> {
+    let Some(description) = description else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = Vec::new();
+    let mut add = |input: &ikigai_core::ArgSpec| {
+        if input.source == InputSource::Argument && !names.iter().any(|n| n == &input.name) {
+            names.push(input.name.clone());
+        }
+    };
+    // The flat inputs (the single-verb / 93% authoring form)...
+    for input in &description.inputs {
+        add(input);
+    }
+    // ...plus every per-verb ActionSpec's inputs, so an argument declared on a specific
+    // verb — a multi-verb endpoint like the tuplespace, whose `take` (Delete) takes
+    // `match=`/`tuple=` — is recognized and routed as a named argument too, not mistaken
+    // for positional content. `action_specs()` normalizes both authoring forms (a
+    // flat-only verb synthesizes a spec from `inputs`), so this de-dupes cleanly.
+    for action in description.action_specs() {
+        for input in &action.inputs {
+            add(input);
+        }
+    }
+    names
+}
+
+/// How a stage's output feeds the next stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Connector {
+    /// `|` — pass the whole output as the next stage's input.
+    Pipe,
+    /// `..` — map the next stage over the output's newline-separated items.
+    Map,
+}
+
+/// If every branch is a lone `source` stage (no `|`, `..`, or nested `( )`), return
+/// their word lists — the case a fork can resolve concurrently. `None` if any branch
+/// is multi-stage or itself a fork, in which case the fork runs sequentially (so a
+/// spawned branch is always a single resolve, never something that re-enters the
+/// parallel path).
+fn single_source_branches(branches: &[Pipeline]) -> Option<Vec<&[String]>> {
+    branches
+        .iter()
+        .map(|branch| match &branch.first {
+            Node::Source(words) if branch.rest.is_empty() => Some(words.as_slice()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// One stage of a pipeline.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Node {
+    /// A `source` leaf: the first word is the IRI, the rest the literal input.
+    Source(Vec<String>),
+    /// A `sink` leaf: a stage written `sink <iri> [key=value …]`. The first word
+    /// is the target IRI, the rest leading named arguments; the piped upstream
+    /// value fills the sink's `content`. This is the pipeline write-terminal —
+    /// `A | B | sink <iri>` stores `B`'s output — mirroring the top-level `sink`
+    /// command, whose content instead comes verbatim from the spec.
+    Sink(Vec<String>),
+    /// A `( … ; … )` fork: each branch is run on the same input, outputs joined.
+    Fork(Vec<Pipeline>),
+}
+
+/// A non-first stage and the connector that feeds it from the previous stage.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Step {
+    pub(crate) connector: Connector,
+    pub(crate) node: Node,
+}
+
+/// A pipeline: a first stage followed by connector-fed stages. A branch of a
+/// fork is itself a `Pipeline`, so forks nest.
+///
+/// ★ `pub(crate)`, deliberately not `pub`. [`plan`](crate::plan) walks this tree to build
+/// an `ik:Process` graph, which needs the fields — but the AST is an internal reading of
+/// the grammar, not an API. A *public* field is a flag day for every consumer the day a
+/// stage grows one (`Resolved.canonical` broke published `ikigai-resolve` 0.1.16 on
+/// crates.io exactly that way), and nothing outside this crate should be parsing specs.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Pipeline {
+    pub(crate) first: Node,
+    pub(crate) rest: Vec<Step>,
+}
+
+/// A lexical token. `Word` carries already-unquoted text.
+#[derive(Debug, PartialEq, Eq)]
+enum Token {
+    Word(String),
+    Pipe,  // |
+    Map,   // ..  (only as a whole, unquoted word)
+    Open,  // (
+    Close, // )
+    Semi,  // ;
+}
+
+/// Tokenise a pipeline spec.
+///
+/// `|`, `(`, `)`, and `;` are operators that split even mid-word; `..` is an
+/// operator only as a whole, unquoted word (a `..` inside a word like
+/// `urn:x/../y` stays literal), since dots are common in IRIs while the others
+/// are not. A `"…"` span keeps any of them — and whitespace — literal and is
+/// removed from the resulting word (`"a | b"` is one `Word`); inside it `\"` is
+/// a literal quote and `\\` a literal backslash, any other `\x` left as-is.
+/// Quote a word to use any operator character, or a bare `..`, as literal data.
+fn tokenize(spec: &str) -> Result<Vec<Token>, String> {
+    let mut tokens = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false; // started a word? distinguishes "" (a quoted empty) from no word
+    let mut quoted = false; // did the current word include a quoted span? (then `..` is literal)
+    let mut chars = spec.chars().peekable();
+
+    // Finish the current word: a standalone unquoted `..` is the map operator,
+    // anything else is a `Word`.
+    let flush =
+        |tokens: &mut Vec<Token>, word: &mut String, in_word: &mut bool, quoted: &mut bool| {
+            if *in_word {
+                if !*quoted && word == ".." {
+                    tokens.push(Token::Map);
+                    word.clear();
+                } else {
+                    tokens.push(Token::Word(std::mem::take(word)));
+                }
+                *in_word = false;
+                *quoted = false;
+            }
+        };
+
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                in_word = true;
+                quoted = true;
+                loop {
+                    match chars.next() {
+                        Some('\\') => match chars.next() {
+                            Some(e @ ('"' | '\\')) => word.push(e),
+                            Some(other) => {
+                                word.push('\\');
+                                word.push(other);
+                            }
+                            None => return Err("unterminated `\\` escape in quoted text".into()),
+                        },
+                        Some('"') => break,
+                        Some(ch) => word.push(ch),
+                        None => return Err("unterminated `\"` quote".into()),
+                    }
+                }
+            }
+            '|' | '(' | ')' | ';' => {
+                flush(&mut tokens, &mut word, &mut in_word, &mut quoted);
+                tokens.push(match c {
+                    '|' => Token::Pipe,
+                    '(' => Token::Open,
+                    ')' => Token::Close,
+                    _ => Token::Semi,
+                });
+            }
+            c if c.is_whitespace() => flush(&mut tokens, &mut word, &mut in_word, &mut quoted),
+            c => {
+                in_word = true;
+                word.push(c);
+            }
+        }
+    }
+    flush(&mut tokens, &mut word, &mut in_word, &mut quoted);
+    Ok(tokens)
+}
+
+/// Parse a whole spec into a [`Pipeline`], rejecting trailing `)`/`;` that no
+/// `(` opened.
+pub(crate) fn parse_spec(spec: &str) -> Result<Pipeline, String> {
+    let mut parser = Parser {
+        tokens: tokenize(spec)?,
+        pos: 0,
+    };
+    let pipeline = parser.parse_pipeline()?;
+    match parser.peek() {
+        None => Ok(pipeline),
+        Some(Token::Close) => Err("unmatched `)`".to_string()),
+        Some(Token::Semi) => Err("`;` outside a `( … )` fork".to_string()),
+        Some(_) => Err("trailing input after the pipeline".to_string()),
+    }
+}
+
+/// Recursive-descent parser over a [`tokenize`]d spec.
+///
+/// Grammar: `pipeline := stage ((`|` | `..`) stage)*`, `stage := `(` pipeline
+/// (`;` pipeline)* `)` | word+`. A fork branch is a full pipeline, so forks and
+/// connectors nest.
+struct Parser {
+    tokens: Vec<Token>,
+    pos: usize,
+}
+
+impl Parser {
+    fn peek(&self) -> Option<&Token> {
+        self.tokens.get(self.pos)
+    }
+
+    fn parse_pipeline(&mut self) -> Result<Pipeline, String> {
+        let first = self.parse_stage()?;
+        let mut rest = Vec::new();
+        while let Some(connector) = match self.peek() {
+            Some(Token::Pipe) => Some(Connector::Pipe),
+            Some(Token::Map) => Some(Connector::Map),
+            _ => None,
+        } {
+            self.pos += 1;
+            if self.at_stage_boundary() {
+                return Err("empty pipeline stage (a stray connector?)".to_string());
+            }
+            rest.push(Step {
+                connector,
+                node: self.parse_stage()?,
+            });
+        }
+        Ok(Pipeline { first, rest })
+    }
+
+    fn parse_stage(&mut self) -> Result<Node, String> {
+        match self.peek() {
+            Some(Token::Open) => {
+                self.pos += 1;
+                let mut branches = vec![self.parse_pipeline()?];
+                while matches!(self.peek(), Some(Token::Semi)) {
+                    self.pos += 1;
+                    if self.at_stage_boundary() {
+                        return Err("empty fork branch (a stray `;`?)".to_string());
+                    }
+                    branches.push(self.parse_pipeline()?);
+                }
+                match self.peek() {
+                    Some(Token::Close) => {
+                        self.pos += 1;
+                        Ok(Node::Fork(branches))
+                    }
+                    _ => Err("unclosed `(` in a fork".to_string()),
+                }
+            }
+            Some(Token::Word(_)) => {
+                let mut words = Vec::new();
+                while let Some(Token::Word(w)) = self.peek() {
+                    words.push(w.clone());
+                    self.pos += 1;
+                }
+                // A stage led by the bare keyword `sink` is a write-terminal:
+                // `… | sink <iri> [key=value …]` sinks the piped value into `<iri>`.
+                // (A source target is always a scheme'd IRI, never the bare word
+                // `sink`, so this keyword can't shadow a real resource.)
+                if words.first().map(String::as_str) == Some("sink") {
+                    Ok(Node::Sink(words.split_off(1)))
+                } else {
+                    Ok(Node::Source(words))
+                }
+            }
+            Some(Token::Close) => Err("empty fork branch or group `()`".to_string()),
+            _ => Err("expected an IRI".to_string()),
+        }
+    }
+
+    /// True when the next token can't begin a stage (end, a connector, or a fork
+    /// delimiter) — used to catch a connector or `;` with nothing after it.
+    fn at_stage_boundary(&self) -> bool {
+        matches!(
+            self.peek(),
+            None | Some(Token::Pipe | Token::Map | Token::Semi | Token::Close)
+        )
+    }
+}
+
+pub(crate) fn parse_target(target: &str) -> Result<Iri, String> {
+    if target.is_empty() {
+        return Err("expected an IRI".to_string());
+    }
+    Iri::parse(target).map_err(|e| e.to_string())
+}
+
+// --- `trace` tree helpers ---------------------------------------------------
+
+/// Collects the [`TraceEvent`]s the kernel reports during one traced resolution,
+/// installed via [`Resolver::set_tracer`](ikigai_resolve::Resolver::set_tracer).
+#[derive(Default)]
+struct TraceCollector(Mutex<Vec<TraceEvent>>);
+
+impl TraceCollector {
+    /// Drain the recorded events.
+    fn take(&self) -> Vec<TraceEvent> {
+        std::mem::take(&mut *self.0.lock().expect("trace collector"))
+    }
+}
+
+impl Tracer for TraceCollector {
+    fn record(&self, event: TraceEvent) {
+        self.0.lock().expect("trace collector").push(event);
+    }
+}
+
+/// Reconstruct the execution tree from recorded events — linked by each event's
+/// `(span, parent)` — and render it. The root is the invocation with no parent (the
+/// traced request itself); `repr` is the assembled result, shown on that root line.
+/// Render a node's authority for a trace line: `root` (full), `∅` (no scopes), or
+/// the comma-joined scope set.
+fn render_cap(cap: &Option<Vec<String>>) -> String {
+    match cap {
+        None => "root".to_string(),
+        Some(scopes) if scopes.is_empty() => "∅".to_string(),
+        Some(scopes) => scopes.join(","),
+    }
+}
+
+fn render_trace_tree(
+    events: &[TraceEvent],
+    entries: &[ikigai_core::SpaceEntry],
+    scoped: bool,
+    repr: &Representation,
+    out: &mut Vec<String>,
+) {
+    // children[parent span] → child events; roots have no parent. Ordered by span
+    // (issue order) so siblings read in the order the parent requested them.
+    let mut children: BTreeMap<u64, Vec<&TraceEvent>> = BTreeMap::new();
+    let mut roots: Vec<&TraceEvent> = Vec::new();
+    for event in events {
+        match event.parent {
+            Some(parent) => children.entry(parent).or_default().push(event),
+            None => roots.push(event),
+        }
+    }
+    for kids in children.values_mut() {
+        kids.sort_by_key(|event| event.span);
+    }
+    roots.sort_by_key(|event| event.span);
+    let count = roots.len();
+    for (idx, root) in roots.into_iter().enumerate() {
+        render_trace_event(
+            root,
+            &children,
+            entries,
+            scoped,
+            None,
+            Some(repr),
+            String::new(),
+            true,
+            idx + 1 == count,
+            out,
+        );
+    }
+}
+
+/// Render one recorded invocation and recurse into the sub-requests it issued.
+/// `prefix` carries the box-drawing for nested levels; `root_repr` annotates the
+/// root with the assembled size and a preview (children carry no bytes).
+#[allow(clippy::too_many_arguments)]
+fn render_trace_event(
+    event: &TraceEvent,
+    children: &BTreeMap<u64, Vec<&TraceEvent>>,
+    entries: &[ikigai_core::SpaceEntry],
+    scoped: bool,
+    parent_cap: Option<&Option<Vec<String>>>,
+    root_repr: Option<&Representation>,
+    prefix: String,
+    is_root: bool,
+    is_last: bool,
+    out: &mut Vec<String>,
+) {
+    let branch = if is_root {
+        ""
+    } else if is_last {
+        "└─ "
+    } else {
+        "├─ "
+    };
+    let label = short_iri(&event.target);
+    let endpoint = Iri::parse(&event.target)
+        .map(|iri| endpoint_name(entries, &iri))
+        .unwrap_or_else(|_| "?".to_string());
+    let cache = if event.cache_hit {
+        "cached"
+    } else {
+        "computed"
+    };
+    let dur = match (event.started, event.ended) {
+        (Some(start), Some(end)) => {
+            format!("{}ms", end.as_millis().saturating_sub(start.as_millis()))
+        }
+        _ => "—".to_string(),
+    };
+    // Authority: a hop that *changed* it (an attenuation, or a mount clamp against a
+    // remote principal) names the new scopes; a uniform node under a scoped session
+    // is simply marked authorized; a root session stays uncluttered.
+    let cap_note = match parent_cap {
+        Some(parent) if parent != &event.capability => {
+            format!(" · cap ↓ {}", render_cap(&event.capability))
+        }
+        _ if scoped => " · cap ✓".to_string(),
+        _ => String::new(),
+    };
+    // Facts the endpoint attached to its own span (`Invocation::trace_note`) —
+    // e.g. the LLM facade's resolved model, or the HTTP client's redirect hops.
+    let notes = if event.notes.is_empty() {
+        String::new()
+    } else {
+        let rendered: Vec<String> = event
+            .notes
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect();
+        format!(" · {}", rendered.join(" "))
+    };
+    let mut line = format!(
+        "{prefix}{branch}{label}   {endpoint} · {cache} · {} · {dur}{cap_note}{notes}",
+        event.thread,
+    );
+    if let Some(repr) = root_repr {
+        let text = String::from_utf8_lossy(&repr.bytes);
+        line.push_str(&format!(
+            "   → {}b  {}",
+            repr.bytes.len(),
+            preview_of(&text)
+        ));
+    }
+    out.push(line);
+
+    let kids = children.get(&event.span).map(Vec::as_slice).unwrap_or(&[]);
+    let ext = if is_root {
+        ""
+    } else if is_last {
+        "   "
+    } else {
+        "│  "
+    };
+    let child_prefix = format!("{prefix}{ext}");
+    let count = kids.len();
+    for (idx, kid) in kids.iter().enumerate() {
+        render_trace_event(
+            kid,
+            children,
+            entries,
+            scoped,
+            Some(&event.capability),
+            None,
+            child_prefix.clone(),
+            false,
+            idx + 1 == count,
+            out,
+        );
+    }
+}
+
+/// The endpoint name bound to `iri` in `entries` — the most specific matching
+/// pattern ([`naming_entry`](ikigai_resolve::naming_entry)), falling back to the
+/// old literal-prefix scan for patterns that don't parse as templates (display
+/// sugar like `urn:x[:{y}]`, which nothing can properly match).
+///
+/// Specificity is what makes NESTED routes come out right: `urn:repo:{repo}:pr:{n}`
+/// matches `urn:repo:x:pr:12:explain` as surely as `urn:repo:{repo}:pr:{n}:explain`
+/// does, and the prefix scan couldn't tell them apart at all (both start
+/// `urn:repo:`), so a trace through a mount named the parent route for every child.
+fn endpoint_name(entries: &[ikigai_core::SpaceEntry], iri: &Iri) -> String {
+    if let Some(entry) = ikigai_resolve::naming_entry(entries, iri) {
+        return entry.endpoint.clone();
+    }
+    let target = iri.as_str();
+    if let Some(entry) = entries.iter().find(|entry| {
+        entry.pattern.contains('{')
+            && target.starts_with(entry.pattern.split('{').next().unwrap_or(""))
+    }) {
+        return entry.endpoint.clone();
+    }
+    "?".to_string()
+}
+
+/// A short, single-line preview of a representation's text.
+fn preview_of(text: &str) -> String {
+    let first: String = text
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(40)
+        .collect();
+    if text.lines().count() > 1 || first.chars().count() == 40 {
+        format!("{first}…")
+    } else {
+        first
+    }
+}
+
+/// Truncate a long IRI for a tree label.
+fn short_iri(iri: &str) -> String {
+    if iri.chars().count() > 50 {
+        let head: String = iri.chars().take(49).collect();
+        format!("{head}…")
+    } else {
+        iri.to_string()
+    }
+}
+
+/// The one-word cache outcome.
+fn cache_word(status: CacheStatus) -> &'static str {
+    match status {
+        CacheStatus::Hit => "cached",
+        CacheStatus::Miss => "computed",
+        CacheStatus::Uncacheable => "uncacheable",
+    }
+}
+
+/// Whether an error is a capability denial, for the trace annotation. Every module
+/// that runs its own capability check now returns the kernel's typed `Error::Denied`
+/// (ikigai-fs 0.1.4, ikigai-repo 0.1.2, ikigai-http 0.1.4 all migrated), so this is
+/// a purely structural match — the old "does not grant" text bridge is gone.
+fn is_denial(error: &ikigai_core::Error) -> bool {
+    matches!(error, ikigai_core::Error::Denied(_))
+}
+
+/// Split off the first whitespace-delimited token; trim the remainder.
+/// Take one leading `key=value` argument off `tail` when `key` is declared —
+/// quote-aware: `title="two words"` consumes the quoted span (with `\"` and
+/// `\\` escapes) as ONE value, so multi-word values survive the sink/delete
+/// grammar's word scanning. Returns `(key, value, rest)`; `None` when the next
+/// word isn't a declared `key=` (the verbatim-content boundary) or a quote is
+/// unterminated (the text then rides as content, where it's at least visible).
+fn take_named_arg<'a>(tail: &'a str, declared: &[String]) -> Option<(&'a str, String, &'a str)> {
+    let (word, _) = split_first_word(tail);
+    let (key, _) = word.split_once('=')?;
+    if key.is_empty() || !declared.iter().any(|name| name == key) {
+        return None;
+    }
+    let after_eq = &tail[key.len() + 1..];
+    if let Some(quoted) = after_eq.strip_prefix('"') {
+        let mut value = String::new();
+        let mut chars = quoted.char_indices();
+        while let Some((i, c)) = chars.next() {
+            match c {
+                // The tokenizer's rule: only `\"` and `\\` escape; any other backslash
+                // is literal. A trailing backslash ends the loop: unterminated.
+                '\\' => match chars.next() {
+                    Some((_, e @ ('"' | '\\'))) => value.push(e),
+                    Some((_, other)) => {
+                        value.push('\\');
+                        value.push(other);
+                    }
+                    None => return None,
+                },
+                '"' => return Some((key, value, quoted[i + 1..].trim_start())),
+                ch => value.push(ch),
+            }
+        }
+        None // unterminated quote: not an argument — leave it for the content
+    } else {
+        let (word, rest) = split_first_word(tail);
+        Some((key, word[key.len() + 1..].to_string(), rest))
+    }
+}
+
+fn split_first_word(s: &str) -> (&str, &str) {
+    match s.split_once(char::is_whitespace) {
+        Some((head, tail)) => (head, tail.trim()),
+        None => (s, ""),
+    }
+}
+
+/// Expand a `cap` scope word: `net-<host>` is shorthand for the full
+/// `urn:cap:net:<host>` network scope; anything else is taken verbatim (so a full
+/// `urn:cap:…` scope still works). Lets `cap net-example.com` narrow a session to
+/// one host without typing the whole scope.
+fn expand_cap_shorthand(word: &str) -> String {
+    match word.strip_prefix("net-") {
+        Some(host) if !host.is_empty() => format!("urn:cap:net:{host}"),
+        _ => word.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use ikigai_core::{
+        builtins, ArgSpec, EndpointSpace, Exact, FnEndpoint, Invocation, Kernel, MetaRenderer,
+        ReprType, Representation, Rewrite, UriTemplate,
+    };
+
+    /// A minimal renderer that emits the description as JSON — what the embedded
+    /// transport's renderer does, isolated here so engine tests don't depend on it.
+    struct JsonRenderer;
+    impl MetaRenderer for JsonRenderer {
+        fn render(
+            &self,
+            description: &Description,
+            _target: &ReprType,
+        ) -> ikigai_core::Result<Representation> {
+            Ok(Representation::new(
+                ReprType::new("application/json"),
+                serde_json::to_vec(description).expect("serialize description"),
+            ))
+        }
+    }
+
+    /// ★ The fixture names here are `urn:test:*`, deliberately, and should stay that way.
+    ///
+    /// They used to be `urn:fn:toUpper` / `urn:fn:reverseList`, which was a borrowed name:
+    /// this crate has no `ikigai-fn` dependency (not even a dev-dependency) and never
+    /// resolves fn's endpoints — every one of these binds `ikigai_core::builtins` and
+    /// exists to exercise the GRAMMAR (pipes, forks, maps, quoting, cache identity), for
+    /// which any name does. Wearing another namespace's name made them look like a
+    /// contract with `ikigai-fn`, so they had to be re-read one by one when that namespace
+    /// moved to `urn:iki:fn:`. Under `urn:test:` a rename over there cannot reach them.
+    fn builtin_engine() -> Engine {
+        let echo = UriTemplate::parse("urn:demo:echo/{message}").expect("valid template");
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:test:upper"), builtins::to_upper())
+            .bind(echo, builtins::echo());
+        Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ))
+    }
+
+    /// An engine over a write endpoint that declares a `url` argument and echoes
+    /// the verb, `url`, and `content` it received — for testing sink/delete arg
+    /// routing (named leading args vs verbatim content).
+    fn write_engine() -> Engine {
+        let endpoint = FnEndpoint::new("write", |inv: &Invocation<'_>| {
+            let url = inv.inline_str("url").unwrap_or("");
+            let content = inv.inline_str("content").unwrap_or("");
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("{:?} url={url} content={content}", inv.request.verb).into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("write")
+                .verb(Verb::Sink)
+                .verb(Verb::Delete)
+                .input(ArgSpec::new("url").summary("the target URL"))
+                .input(ArgSpec::new("content").summary("the body")),
+        );
+        Engine::new(Kernel::with_meta_renderer(
+            Arc::new(EndpointSpace::new().bind(Exact::new("urn:test:write"), endpoint)),
+            Arc::new(JsonRenderer),
+        ))
+    }
+
+    /// A cooperative spawner: returns each task as its own completion future so the
+    /// join drives them on the current thread — exercises the parallel fork/map path
+    /// without real threads (the threaded version is verified live + in ikigai-scheduler).
+    ///
+    /// It answers `width() == Some(1)`, which is the honest number for this shape:
+    /// nothing interleaves when the work inside blocks. (Core's `kernel.rs` has the same
+    /// struct answering `None` — left that way deliberately, as the witness that an
+    /// existing implementor compiles untouched. This one has no reason to lie.)
+    struct InlineSpawner;
+    impl ikigai_core::Spawner for InlineSpawner {
+        fn spawn(&self, task: ikigai_core::BoxFuture<()>) -> ikigai_core::BoxFuture<()> {
+            task
+        }
+        fn width(&self) -> Option<usize> {
+            Some(1)
+        }
+    }
+
+    /// A spawner that *declares* it carries `n` tasks at once while still running them
+    /// inline, so a test can drive the width the engine reads without real threads.
+    /// `width()` is a declaration by design — the kernel never drives the scheduler — so
+    /// declaring it is exactly what a real pool does.
+    struct WideSpawner(usize);
+    impl ikigai_core::Spawner for WideSpawner {
+        fn spawn(&self, task: ikigai_core::BoxFuture<()>) -> ikigai_core::BoxFuture<()> {
+            task
+        }
+        fn width(&self) -> Option<usize> {
+            Some(self.0)
+        }
+    }
+
+    /// A spawner that cannot say how wide it is — an elastic or remote pool. Read as
+    /// width 1, never as wide.
+    struct UnknownSpawner;
+    impl ikigai_core::Spawner for UnknownSpawner {
+        fn spawn(&self, task: ikigai_core::BoxFuture<()>) -> ikigai_core::BoxFuture<()> {
+            task
+        }
+    }
+
+    /// An engine with toUpper, reverseList, a fixed `urn:test:list` (→ "a\nb"), and an
+    /// injected spawner — so forks/maps over single sources take the parallel path.
+    fn parallel_engine() -> Engine {
+        let list = FnEndpoint::new("list", |_: &Invocation<'_>| {
+            Ok(Representation::new(ReprType::new("text/plain"), b"a\nb".to_vec()).cacheable())
+        });
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:test:upper"), builtins::to_upper())
+            .bind(Exact::new("urn:test:reverse"), builtins::reverse_list())
+            .bind(Exact::new("urn:test:list"), list);
+        Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ))
+        .with_spawner(Arc::new(InlineSpawner))
+    }
+
+    #[test]
+    fn fork_over_a_spawner_resolves_each_branch() {
+        // `( toUpper ; reverseList )` fed "a\nb" → "A\nB" then "b\na", joined.
+        let out = output(
+            parallel_engine().eval("source urn:test:list | ( urn:test:upper ; urn:test:reverse )"),
+        )
+        .unwrap();
+        assert_eq!(out, "A\nB\nb\na");
+    }
+
+    #[test]
+    fn map_over_a_spawner_resolves_each_item() {
+        // `.. toUpper` over the items a, b → A, B.
+        let out = output(parallel_engine().eval("source urn:test:list .. urn:test:upper")).unwrap();
+        assert_eq!(out, "A\nB");
+    }
+
+    // --- fan-out width routing ------------------------------------------------
+    //
+    // The engine knows how wide a fork/map is *before* it dispatches any of it, and how
+    // wide the scheduler will let that run. These pin the three properties that make
+    // acting on that number a win rather than a regression: it reaches the endpoints that
+    // route on it, it stays off the cache key of the ones that don't, and it never
+    // reports a concurrency the run will not achieve.
+
+    /// A stand-in for `urn:llm:ask`: it routes on requirements, so it declares an
+    /// **optional** `needs` (and `provider`) — the declaration the engine looks for — and
+    /// echoes back whatever `needs` it was handed.
+    fn ask_endpoint() -> FnEndpoint {
+        FnEndpoint::new("ask", |inv: &Invocation<'_>| {
+            let needs = inv.inline_str("needs").unwrap_or("none");
+            let prompt = inv.inline_str("in").unwrap_or("");
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("{prompt}:{needs}").into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("ask")
+                .verb(Verb::Source)
+                .verb(Verb::Meta)
+                .input(ArgSpec::new("provider").optional())
+                .input(ArgSpec::new("needs").optional())
+                .input(ArgSpec::new("in")),
+        )
+    }
+
+    /// An ordinary cacheable endpoint — no requirements vocabulary at all, which is the
+    /// overwhelming majority of the catalog. Its request identity must not move with the
+    /// width of the construct it happens to be resolved inside.
+    fn echo_endpoint() -> FnEndpoint {
+        FnEndpoint::new("echo", |inv: &Invocation<'_>| {
+            let value = inv.inline_str("in").unwrap_or("");
+            Ok(
+                Representation::new(ReprType::new("text/plain"), value.as_bytes().to_vec())
+                    .cacheable(),
+            )
+        })
+        .with_description(
+            Description::new("echo")
+                .verb(Verb::Source)
+                .verb(Verb::Meta)
+                .input(ArgSpec::new("in")),
+        )
+    }
+
+    fn fixed_list(items: &'static str) -> FnEndpoint {
+        FnEndpoint::new("items", move |_: &Invocation<'_>| {
+            Ok(
+                Representation::new(ReprType::new("text/plain"), items.as_bytes().to_vec())
+                    .cacheable(),
+            )
+        })
+    }
+
+    /// An engine over the fan-out fixtures, on a spawner of the caller's choosing.
+    fn fanout_engine(spawner: Arc<dyn Spawner>, width_routing: bool) -> Engine {
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:test:ask"), ask_endpoint())
+            .bind(Exact::new("urn:test:echo"), echo_endpoint())
+            .bind(Exact::new("urn:test:two"), fixed_list("a\nb"))
+            .bind(Exact::new("urn:test:three"), fixed_list("a\nb\nc"))
+            .bind(
+                Exact::new("urn:test:ten"),
+                fixed_list("a\nb\nc\nd\ne\nf\ng\nh\ni\nj"),
+            );
+        Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ))
+        .with_spawner(spawner)
+        .with_width_routing(width_routing)
+    }
+
+    /// The width reaches a routing target through `..` — the map builds its whole request
+    /// vector first, so the item count is known before anything is dispatched.
+    #[test]
+    fn the_width_reaches_a_routing_target_from_a_map() {
+        let engine = fanout_engine(Arc::new(WideSpawner(8)), true);
+        let out = output(engine.eval("source urn:test:three .. urn:test:ask")).unwrap();
+        assert_eq!(out, "a:batchAt<=3\nb:batchAt<=3\nc:batchAt<=3");
+    }
+
+    /// ...and through a fork, the other construct that reaches `run_parallel`.
+    #[test]
+    fn the_width_reaches_a_routing_target_from_a_fork() {
+        let engine = fanout_engine(Arc::new(WideSpawner(8)), true);
+        let out =
+            output(engine.eval("source urn:test:two | ( urn:test:ask ; urn:test:ask )")).unwrap();
+        assert_eq!(out.matches("batchAt<=2").count(), 2, "{out}");
+    }
+
+    /// ★ The property the whole design turns on: **the width never enters request
+    /// identity for an endpoint that does not route on it.**
+    ///
+    /// The kernel caches on request id ⊕ capability fingerprint. Had the hint ridden on
+    /// every fanned-out request, the same resource resolved inside a 3-wide map and a
+    /// 10-wide map would be two cache entries — a miss manufactured out of nothing, on
+    /// every cacheable endpoint reached through `..` or a fork. So: resolve `urn:test:echo`
+    /// over three items, then over ten whose first three are the same, **with width
+    /// routing ON**, and the repeated three must come back cached.
+    #[test]
+    fn a_cacheable_resource_hits_cache_across_two_fan_out_widths() {
+        let engine = fanout_engine(Arc::new(WideSpawner(16)), true);
+
+        let first = entry(engine.eval("source urn:test:three .. urn:test:echo"));
+        assert_eq!(
+            first.cache.label().as_deref(),
+            Some("4 computed"),
+            "cold: the list plus its three items"
+        );
+        assert_eq!(engine.last_fan_out().unwrap().effective, 3);
+
+        let second = entry(engine.eval("source urn:test:ten .. urn:test:echo"));
+        assert_eq!(engine.last_fan_out().unwrap().effective, 10, "a wider run");
+        assert_eq!(
+            second.cache.label().as_deref(),
+            Some("3 cached · 8 computed"),
+            "a, b and c are the SAME requests at width 10 as at width 3"
+        );
+    }
+
+    /// The default host is `single`, which does not spawn: it hands back an inline future
+    /// polled on one thread, and the native HTTP transport blocks that thread. Ten
+    /// branches there are one wide, and saying otherwise would route a serialized run to a
+    /// batching backend — measured ~1.8x SLOWER.
+    #[test]
+    fn an_inline_scheduler_is_one_wide_however_many_branches() {
+        let engine = fanout_engine(Arc::new(InlineSpawner), true);
+        let out = output(engine.eval("source urn:test:ten .. urn:test:ask")).unwrap();
+        let fan_out = engine.last_fan_out().unwrap();
+        assert_eq!((fan_out.nominal, fan_out.effective), (10, 1));
+        assert_eq!(fan_out.hint, None, "width 1 asks for nothing");
+        assert!(out.starts_with("a:none"), "{out}");
+    }
+
+    /// An executor that cannot say how wide it is reads as ONE, never as wide. Unknown is
+    /// not a shorthand for small, but the two guesses are not symmetric: guessing wide
+    /// runs a serialized workload on the batching backend, and guessing narrow only
+    /// declines an optimization.
+    #[test]
+    fn an_unknown_scheduler_width_is_treated_as_one() {
+        let engine = fanout_engine(Arc::new(UnknownSpawner), true);
+        let out = output(engine.eval("source urn:test:ten .. urn:test:ask")).unwrap();
+        assert_eq!(engine.last_fan_out().unwrap().effective, 1);
+        assert!(out.starts_with("a:none"), "{out}");
+    }
+
+    /// A pool bounds the fan-out and the fan-out bounds the pool — the width reported is
+    /// the one the run reaches, not the one either side would allow alone.
+    #[test]
+    fn a_pool_width_and_the_branch_count_bound_each_other() {
+        let narrow = fanout_engine(Arc::new(WideSpawner(4)), true);
+        output(narrow.eval("source urn:test:ten .. urn:test:ask")).unwrap();
+        assert_eq!(narrow.last_fan_out().unwrap().effective, 4, "pool-bound");
+
+        let wide = fanout_engine(Arc::new(WideSpawner(16)), true);
+        let out = output(wide.eval("source urn:test:ten .. urn:test:ask")).unwrap();
+        assert_eq!(wide.last_fan_out().unwrap().effective, 10, "fan-out-bound");
+        assert!(out.starts_with("a:batchAt<=10"), "{out}");
+    }
+
+    /// A multi-stage branch cannot be spawned — `single_source_branches` sends the whole
+    /// fork down the sequential loop — so its width is 1 by definition, and it is reported
+    /// as 1. Naming the branch count here would promise a concurrency the run never has.
+    #[test]
+    fn a_multi_stage_branch_reports_width_one() {
+        let engine = fanout_engine(Arc::new(WideSpawner(16)), true);
+        let out = output(
+            engine.eval("source urn:test:two | ( urn:test:echo | urn:test:echo ; urn:test:ask )"),
+        )
+        .unwrap();
+        let fan_out = engine.last_fan_out().unwrap();
+        assert_eq!((fan_out.nominal, fan_out.effective), (2, 1));
+        assert_eq!(fan_out.hint, None);
+        assert!(out.ends_with("a\nb:none"), "no hint reached the ask: {out}");
+    }
+
+    /// With the switch off — the default — the requests that reach the kernel are the
+    /// requests that reached it before this existed.
+    #[test]
+    fn with_the_switch_off_nothing_is_appended() {
+        let engine = fanout_engine(Arc::new(WideSpawner(8)), false);
+        let out = output(engine.eval("source urn:test:three .. urn:test:ask")).unwrap();
+        assert_eq!(out, "a:none\nb:none\nc:none");
+        // The fan-out is still *reported* — observability is not the opt-in half.
+        let fan_out = engine.last_fan_out().unwrap();
+        assert_eq!(
+            (fan_out.nominal, fan_out.effective, fan_out.hint),
+            (3, 3, None)
+        );
+    }
+
+    /// Explicit routing outranks the automatic kind, both spellings. `ikigai-browse` keys
+    /// a durable explanation archive on model identity, so an automatic override of a
+    /// caller's own choice would write width-dependent nondeterminism into a store.
+    #[test]
+    fn an_explicit_provider_or_needs_outranks_the_automatic_hint() {
+        let engine = fanout_engine(Arc::new(WideSpawner(8)), true);
+
+        let their_needs =
+            output(engine.eval("source urn:test:three .. urn:test:ask needs=vision")).unwrap();
+        assert_eq!(their_needs, "a:vision\nb:vision\nc:vision");
+
+        let their_provider =
+            output(engine.eval("source urn:test:three .. urn:test:ask provider=ollama")).unwrap();
+        assert_eq!(their_provider, "a:none\nb:none\nc:none");
+    }
+
+    /// `needs=` is a HARD filter and a no-match is a LOUD error, so a hint nothing
+    /// satisfies must not break a pipeline that would otherwise have worked: the request
+    /// is re-issued without the term.
+    #[test]
+    fn a_no_match_on_the_automatic_hint_retries_without_it() {
+        let picky = FnEndpoint::new("picky", |inv: &Invocation<'_>| {
+            match inv.inline_str("needs") {
+                Ok(needs) => Err(ikigai_core::Error::Endpoint(format!(
+                    "urn:test:picky: no configured backend satisfies `{needs}` (providers: solo)"
+                ))),
+                Err(_) => Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    b"served".to_vec(),
+                )),
+            }
+        })
+        .with_description(
+            Description::new("picky")
+                .verb(Verb::Source)
+                .verb(Verb::Meta)
+                .input(ArgSpec::new("needs").optional())
+                .input(ArgSpec::new("in")),
+        );
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:test:picky"), picky)
+            .bind(Exact::new("urn:test:three"), fixed_list("a\nb\nc"));
+        let engine = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ))
+        .with_spawner(Arc::new(WideSpawner(8)))
+        .with_width_routing(true);
+
+        let out = output(engine.eval("source urn:test:three .. urn:test:picky")).unwrap();
+        assert_eq!(out, "served\nserved\nserved");
+    }
+
+    /// ...but a failure that is not the hint's fault is NOT retried. Re-issuing on any
+    /// error would double the cost of every genuine failure, and an LLM call is the
+    /// expensive kind.
+    #[test]
+    fn an_unrelated_failure_is_not_retried() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        CALLS.store(0, Ordering::SeqCst);
+        let broken = FnEndpoint::new("broken", |_: &Invocation<'_>| {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            Err(ikigai_core::Error::Endpoint("boom".to_string()))
+        })
+        .with_description(
+            Description::new("broken")
+                .verb(Verb::Source)
+                .verb(Verb::Meta)
+                .input(ArgSpec::new("needs").optional())
+                .input(ArgSpec::new("in")),
+        );
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:test:broken"), broken)
+            .bind(Exact::new("urn:test:three"), fixed_list("a\nb\nc"));
+        let engine = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ))
+        .with_spawner(Arc::new(WideSpawner(8)))
+        .with_width_routing(true);
+
+        let err = output(engine.eval("source urn:test:three .. urn:test:broken")).unwrap_err();
+        assert!(err.contains("boom"), "{err}");
+        assert_eq!(CALLS.load(Ordering::SeqCst), 3, "one attempt per item");
+    }
+
+    // --- unresolved-name suggestions (see `crate::suggest`) --------------------
+
+    /// The wiring, not the rule: an unresolved name whose leaf IS bound elsewhere
+    /// comes back with the suggestion hung under the message, indented to clear the
+    /// `error: ` prefix each face writes.
+    #[test]
+    fn an_unresolved_name_names_the_near_binding_that_is_bound() {
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:fn:toUpper"), echo_endpoint())
+            .bind(Exact::new("urn:test:three"), fixed_list("a\nb\nc"));
+        let engine = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ));
+        let err = output(engine.eval("source urn:iki:fn:toUpper hi")).unwrap_err();
+        assert_eq!(
+            err,
+            "no endpoint resolved for urn:iki:fn:toUpper\n       \
+             did you mean `urn:fn:toUpper`? (bound here)"
+        );
+    }
+
+    /// The regression that matters more: with nothing near, the message must be
+    /// BYTE-IDENTICAL to the typed error's own words. A suggestion that fires on
+    /// everything is noise, and noise on an error path teaches people to stop
+    /// reading errors.
+    #[test]
+    fn an_unresolved_name_with_nothing_near_is_unchanged() {
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:fn:toUpper"), echo_endpoint())
+            .bind(Exact::new("urn:test:three"), fixed_list("a\nb\nc"));
+        let engine = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ));
+        let err = output(engine.eval("source urn:iki:fn:sideways hi")).unwrap_err();
+        let bare =
+            ikigai_core::Error::Unresolved(Iri::parse("urn:iki:fn:sideways").unwrap()).to_string();
+        assert_eq!(err, bare);
+        assert!(
+            !err.contains('\n'),
+            "the bare message stays one line: {err:?}"
+        );
+    }
+
+    /// A resolver that cannot enumerate (a remote space, a rewrite) has no catalog to
+    /// consult, and must degrade to the bare message rather than to a panic or a guess.
+    #[test]
+    fn a_space_that_cannot_enumerate_still_prints_the_bare_message() {
+        struct Opaque;
+        impl ikigai_core::Space for Opaque {
+            fn resolve(
+                &self,
+                _request: &Request,
+                _scope: &ikigai_core::Scope,
+            ) -> ikigai_core::Resolution {
+                ikigai_core::Resolution::Miss
+            }
+        }
+        let engine = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(Opaque),
+            Arc::new(JsonRenderer),
+        ));
+        let err = output(engine.eval("source urn:iki:fn:toUpper hi")).unwrap_err();
+        assert_eq!(err, "no endpoint resolved for urn:iki:fn:toUpper");
+    }
+
+    /// The fan-out path stringifies its branch errors on the REPL thread, after the
+    /// join — so a mapped stage gets the same suggestion the single-request path does.
+    #[test]
+    fn a_fanned_out_branch_gets_the_suggestion_too() {
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:fn:toUpper"), echo_endpoint())
+            .bind(Exact::new("urn:test:three"), fixed_list("a\nb\nc"));
+        let engine = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ))
+        .with_spawner(Arc::new(InlineSpawner));
+        let err = output(engine.eval("source urn:test:three .. urn:iki:fn:toUpper")).unwrap_err();
+        assert_eq!(
+            err,
+            "no endpoint resolved for urn:iki:fn:toUpper\n       \
+             did you mean `urn:fn:toUpper`? (bound here)"
+        );
+    }
+
+    /// `trace` is the other place a person hunts for a name, and it already holds the
+    /// catalog — so the hint costs it nothing.
+    #[test]
+    fn trace_hangs_the_suggestion_under_the_failing_row() {
+        let space = EndpointSpace::new().bind(Exact::new("urn:fn:toUpper"), echo_endpoint());
+        let engine = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ));
+        let out = output(engine.eval("trace urn:iki:fn:toUpper")).unwrap();
+        assert!(
+            out.contains("did you mean `urn:fn:toUpper`? (bound here)"),
+            "{out}"
+        );
+        // …and stays quiet when nothing is near.
+        let out = output(engine.eval("trace urn:iki:fn:sideways")).unwrap();
+        assert!(!out.contains("did you mean"), "{out}");
+    }
+
+    fn output(action: Action) -> Result<String, String> {
+        match action {
+            Action::Output(entry) => entry.result,
+            _ => panic!("expected Action::Output"),
+        }
+    }
+
+    fn entry(action: Action) -> Entry {
+        match action {
+            Action::Output(entry) => entry,
+            _ => panic!("expected Action::Output"),
+        }
+    }
+
+    /// An engine with a stand-in `urn:lisp:eval` that echoes its `in` argument — so a
+    /// test can prove `eval_lisp` routes the whole buffer there (as `in`) without
+    /// pulling in the real Steel interpreter.
+    fn lisp_echo_engine() -> Engine {
+        let eval = FnEndpoint::new("lisp-eval", |inv: &Invocation<'_>| {
+            let src = inv.inline_str("in")?;
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("evaluated: {src}").into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("lisp-eval")
+                .verb(Verb::Source)
+                .verb(Verb::Meta)
+                .input(ArgSpec::new("in").summary("the program"))
+                .output("text/plain"),
+        );
+        Engine::new(Kernel::with_meta_renderer(
+            Arc::new(EndpointSpace::new().bind(Exact::new("urn:lisp:eval"), eval)),
+            Arc::new(JsonRenderer),
+        ))
+    }
+
+    #[test]
+    fn eval_lisp_routes_the_whole_buffer_to_urn_lisp_eval() {
+        let engine = lisp_echo_engine();
+        // A multi-line program that does NOT begin with `(` (a leading comment). The
+        // single-line paren-sniff would miss it, but `eval_lisp` routes it straight to
+        // the Lisp endpoint with the whole buffer as the `in` argument.
+        let src = "; a scratch program\n(define x 1)\n(+ x 2)";
+        let out = match engine.eval_lisp(src) {
+            Action::Output(entry) => entry.result.unwrap(),
+            _ => panic!("expected Action::Output"),
+        };
+        assert_eq!(out, format!("evaluated: {src}"));
+    }
+
+    #[test]
+    fn eval_lisp_on_an_empty_buffer_is_a_noop() {
+        assert!(matches!(
+            lisp_echo_engine().eval_lisp("   \n  "),
+            Action::Noop
+        ));
+    }
+
+    /// The deferred reader must not run unless a content-less `sink` asks.
+    ///
+    /// The regression: the CLI read stdin to EOF BEFORE running any command, which blocks
+    /// forever when stdin is a non-TTY that never closes (an inherited pipe from an editor,
+    /// a harness, launchd). `ikigai -c 'source …' > file` hung waiting for input no command
+    /// wanted.
+    #[test]
+    fn a_deferred_piped_input_is_not_read_unless_a_sink_needs_it() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let echo = FnEndpoint::new("echo", |inv: &Invocation<'_>| {
+            let body = inv.inline_str("content").unwrap_or("");
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("stored:{body}").into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("echo")
+                .verb(Verb::Sink)
+                .input(ArgSpec::new("content").summary("the body"))
+                .output("text/plain"),
+        );
+        let engine = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(EndpointSpace::new().bind(Exact::new("urn:echo"), echo)),
+            Arc::new(JsonRenderer),
+        ));
+        let run = |e: &Engine, cmd: &str| match e.eval(cmd) {
+            Action::Output(entry) => entry.result.unwrap(),
+            _ => panic!("expected Action::Output"),
+        };
+
+        let read = Rc::new(Cell::new(false));
+        let flag = Rc::clone(&read);
+        engine.set_piped_input_with(move || {
+            flag.set(true);
+            b"deferred".to_vec()
+        });
+
+        // A `sink` WITH content never touches the pipe...
+        assert_eq!(run(&engine, "sink urn:echo typed"), "stored:typed");
+        assert!(
+            !read.get(),
+            "nothing asked for stdin yet — reading it here is the hang"
+        );
+
+        // ...and only a content-less one does.
+        assert_eq!(run(&engine, "sink urn:echo"), "stored:deferred");
+        assert!(read.get(), "the sink asked, so the read happened");
+    }
+
+    #[test]
+    fn a_content_less_sink_reads_the_one_shot_piped_input() {
+        // A sink that echoes its `content` back, so a test can see what reached it.
+        let echo = FnEndpoint::new("echo", |inv: &Invocation<'_>| {
+            let body = inv.inline_str("content").unwrap_or("");
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("stored:{body}").into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("echo")
+                .verb(Verb::Sink)
+                .input(ArgSpec::new("content").summary("the body"))
+                .output("text/plain"),
+        );
+        let engine = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(EndpointSpace::new().bind(Exact::new("urn:echo"), echo)),
+            Arc::new(JsonRenderer),
+        ));
+        let run = |e: &Engine, cmd: &str| match e.eval(cmd) {
+            Action::Output(entry) => entry.result.unwrap(),
+            _ => panic!("expected Action::Output"),
+        };
+        engine.set_piped_input(b"s3cr3t".to_vec());
+        // A content-less `sink` reads the piped payload as its content — the value never on
+        // the command line.
+        assert_eq!(run(&engine, "sink urn:echo"), "stored:s3cr3t");
+        // Consumed after one write: a second content-less sink gets nothing.
+        assert_eq!(run(&engine, "sink urn:echo"), "stored:");
+        // An explicit command-line content is used verbatim and does NOT touch the pipe.
+        engine.set_piped_input(b"piped".to_vec());
+        assert_eq!(run(&engine, "sink urn:echo typed"), "stored:typed");
+        assert_eq!(run(&engine, "sink urn:echo"), "stored:piped");
+    }
+
+    #[test]
+    fn cache_reports_computed_then_cached() {
+        let engine = builtin_engine();
+        let first = entry(engine.eval("source urn:test:upper hi"));
+        assert_eq!(first.cache.label().as_deref(), Some("computed"));
+        // Same request again: served from the cache without recomputing.
+        let second = entry(engine.eval("source urn:test:upper hi"));
+        assert_eq!(second.cache.label().as_deref(), Some("cached"));
+        // A different input is a fresh computation.
+        let other = entry(engine.eval("source urn:test:upper bye"));
+        assert_eq!(other.cache.label().as_deref(), Some("computed"));
+    }
+
+    #[test]
+    fn sink_then_source_round_trips_a_file_gated_by_capability() {
+        let root = std::env::temp_dir().join(format!("ikigai-engine-fs-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let engine = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(ikigai_fs::space(&root)),
+            Arc::new(JsonRenderer),
+        ));
+
+        // Owner (root capability): write a file, then read it back.
+        assert!(output(engine.eval("sink urn:file:notes.txt remember the milk")).is_ok());
+        assert_eq!(
+            output(engine.eval("source urn:file:notes.txt")).unwrap(),
+            "remember the milk"
+        );
+
+        // Narrow the session to read-only on the root: reads still work, but the
+        // capability-gated endpoint refuses the write — exactly like a read it
+        // doesn't authorise.
+        let read_only = format!("cap urn:cap:fs:read:{}", root.display());
+        assert!(output(engine.eval(&read_only)).is_ok());
+        assert_eq!(
+            output(engine.eval("source urn:file:notes.txt")).unwrap(),
+            "remember the milk"
+        );
+        assert!(output(engine.eval("sink urn:file:notes.txt nope")).is_err());
+        // The refused write left the file untouched.
+        assert_eq!(
+            output(engine.eval("source urn:file:notes.txt")).unwrap(),
+            "remember the milk"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn sink_routes_leading_named_args_then_verbatim_content() {
+        let engine = write_engine();
+        // `url=` is a declared arg → named; the rest is the body, byte-exact.
+        assert_eq!(
+            output(engine.eval("sink urn:test:write url=https://h/p the  body  text")).unwrap(),
+            "Sink url=https://h/p content=the  body  text"
+        );
+    }
+
+    #[test]
+    fn sink_with_no_named_args_is_all_content() {
+        let engine = write_engine();
+        // No leading `key=value` with a declared key → the whole remainder is content.
+        assert_eq!(
+            output(engine.eval("sink urn:test:write just content here")).unwrap(),
+            "Sink url= content=just content here"
+        );
+    }
+
+    #[test]
+    fn delete_command_issues_the_delete_verb_with_named_args() {
+        let engine = write_engine();
+        assert_eq!(
+            output(engine.eval("delete urn:test:write url=https://h/p")).unwrap(),
+            "Delete url=https://h/p content="
+        );
+    }
+
+    #[test]
+    fn sink_honours_a_named_content_argument() {
+        // The regression: `content` is a declared argument, so `content=` was consumed as
+        // a named arg — and then overwritten by the unconditional remainder fallback,
+        // because `with_arg` is last-wins. The body arrived EMPTY, which most sinks accept
+        // (an empty SPARQL update is a legal no-op), so the write read as a success while
+        // storing nothing.
+        let engine = write_engine();
+        assert_eq!(
+            output(
+                engine.eval(r#"sink urn:test:write content="INSERT DATA { <urn:a> <urn:b> 42 }""#)
+            )
+            .unwrap(),
+            "Sink url= content=INSERT DATA { <urn:a> <urn:b> 42 }"
+        );
+        // …and it composes with the other named arguments, in either order.
+        assert_eq!(
+            output(engine.eval(r#"sink urn:test:write url=https://h/p content="body""#)).unwrap(),
+            "Sink url=https://h/p content=body"
+        );
+        assert_eq!(
+            output(engine.eval(r#"sink urn:test:write content="body" url=https://h/p"#)).unwrap(),
+            "Sink url=https://h/p content=body"
+        );
+    }
+
+    #[test]
+    fn delete_honours_a_named_content_argument() {
+        // `delete` shares `write_request`, so it had the same defect — and the same fix.
+        let engine = write_engine();
+        assert_eq!(
+            output(engine.eval(r#"delete urn:test:write content="a body""#)).unwrap(),
+            "Delete url= content=a body"
+        );
+    }
+
+    #[test]
+    fn sink_refuses_a_body_given_both_ways() {
+        // Two bodies with no rule for choosing between them: refuse rather than pick one
+        // and drop the other, which is the failure mode this whole fix is about.
+        let engine = write_engine();
+        let err =
+            output(engine.eval(r#"sink urn:test:write content="a" and also this"#)).unwrap_err();
+        assert!(err.contains("content twice"), "{err}");
+        assert!(err.contains("and also this"), "{err}");
+    }
+
+    #[test]
+    fn a_named_content_is_not_the_whole_remainder() {
+        // Only the *named* value is the body — a following word that happens to look like
+        // an undeclared `key=value` is still a remainder, so this stays an error rather
+        // than quietly appending to the named body.
+        let engine = write_engine();
+        assert!(output(engine.eval(r#"sink urn:test:write content="a" nope=1"#)).is_err());
+    }
+
+    #[test]
+    fn a_pipeline_sink_stage_honours_named_content_when_nothing_is_piped() {
+        // A `sink` stage with no upstream (here: the only stage of a spec) has no pipe to
+        // take its body from, so `content=` is the body — the `unwrap_or(&[])` fallback
+        // used to overwrite it with the empty slice.
+        let engine = pipe_sink_engine();
+        assert_eq!(
+            output(engine.eval(r#"source sink urn:test:write content="stored""#)).unwrap(),
+            "Sink url= content=stored"
+        );
+    }
+
+    #[test]
+    fn a_piped_sink_stage_refuses_a_named_content() {
+        // The pipe IS the body of a piped sink stage, so naming one too is two bodies —
+        // the same ambiguity a stray positional word already refuses.
+        let engine = pipe_sink_engine();
+        let err = output(
+            engine.eval(r#"source urn:test:upper hi | sink urn:test:write content="other""#),
+        )
+        .unwrap_err();
+        assert!(err.contains("content twice"), "{err}");
+    }
+
+    /// An engine with both a `toUpper` source and the `urn:test:write` sink, so a
+    /// pipeline can *produce* a value and then *store* it into a sink terminal.
+    fn pipe_sink_engine() -> Engine {
+        let endpoint = FnEndpoint::new("write", |inv: &Invocation<'_>| {
+            let url = inv.inline_str("url").unwrap_or("");
+            let content = inv.inline_str("content").unwrap_or("");
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("{:?} url={url} content={content}", inv.request.verb).into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("write")
+                .verb(Verb::Sink)
+                .input(ArgSpec::new("url").summary("the target URL"))
+                .input(ArgSpec::new("content").summary("the body")),
+        );
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:test:upper"), builtins::to_upper())
+            .bind(Exact::new("urn:test:write"), endpoint);
+        Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ))
+    }
+
+    #[test]
+    fn pipeline_sink_terminal_stores_the_piped_value() {
+        // `A | sink <iri>` routes the upstream stage's output into the sink's
+        // `content` (the regression: `sink` as a non-first stage used to be read as
+        // a `source` of the bare IRI `sink` → "No scheme found").
+        let engine = pipe_sink_engine();
+        assert_eq!(
+            output(engine.eval("source urn:test:upper hello | sink urn:test:write")).unwrap(),
+            "Sink url= content=HELLO"
+        );
+    }
+
+    #[test]
+    fn pipeline_sink_terminal_takes_leading_named_args_then_the_pipe() {
+        // Leading `key=value` for a declared arg is named; the pipe still fills content.
+        let engine = pipe_sink_engine();
+        assert_eq!(
+            output(engine.eval("source urn:test:upper hi | sink urn:test:write url=https://h/p"))
+                .unwrap(),
+            "Sink url=https://h/p content=HI"
+        );
+    }
+
+    #[test]
+    fn pipeline_sink_terminal_rejects_a_stray_positional_word() {
+        // A piped sink's content is the pipe, so a bare (non-`key=value`) word has
+        // nowhere to go — that's a usage error, not silent content.
+        let engine = pipe_sink_engine();
+        let err =
+            output(engine.eval("source urn:test:upper hi | sink urn:test:write junk")).unwrap_err();
+        assert!(err.contains("takes its content from the pipe"), "{err}");
+    }
+
+    /// A representation that is not valid UTF-8 (a PDF-ish header with raw bytes).
+    const BINARY: &[u8] = b"%PDF-1.4\n\xff\xd8\x00\xfe binary body";
+
+    /// An engine for the binary-pipe regression: `urn:test:pdf` emits [`BINARY`],
+    /// `urn:test:digest` (source) and `urn:test:store` (sink) read their `content`
+    /// argument raw and report its length and whether it round-tripped byte-exact.
+    /// The regression: the engine decoded every stage's output as UTF-8, so piping
+    /// any binary representation died with "invalid utf-8 sequence". The spawner
+    /// routes single-source forks through the parallel path, covering it too.
+    fn binary_engine() -> Engine {
+        let pdf = FnEndpoint::new("pdf", |_: &Invocation<'_>| {
+            Ok(Representation::new(
+                ReprType::new("application/pdf"),
+                BINARY.to_vec(),
+            ))
+        });
+        let report = |bytes: &[u8]| format!("{} bytes, intact={}", bytes.len(), bytes == BINARY);
+        let digest = FnEndpoint::new("digest", move |inv: &Invocation<'_>| {
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                report(inv.inline_arg("content")?).into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("digest").input(ArgSpec::new("content").summary("raw bytes")),
+        );
+        let store = FnEndpoint::new("store", move |inv: &Invocation<'_>| {
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("stored {}", report(inv.inline_arg("content")?)).into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("store")
+                .verb(Verb::Sink)
+                .input(ArgSpec::new("content").summary("raw bytes")),
+        );
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:test:pdf"), pdf)
+            .bind(Exact::new("urn:test:digest"), digest)
+            .bind(Exact::new("urn:test:store"), store)
+            .bind(Exact::new("urn:test:upper"), builtins::to_upper());
+        Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ))
+        .with_spawner(Arc::new(InlineSpawner))
+    }
+
+    #[test]
+    fn pipe_passes_binary_bytes_through_untouched() {
+        // The regression: `source <binary> | <stage>` — the piped representation
+        // must reach the next stage's `content` byte-for-byte, not via a UTF-8
+        // String.
+        let out = output(binary_engine().eval("source urn:test:pdf | urn:test:digest")).unwrap();
+        assert_eq!(out, format!("{} bytes, intact=true", BINARY.len()));
+    }
+
+    #[test]
+    fn pipeline_sink_terminal_passes_binary_content() {
+        // The write dual: a sink terminal stores the piped bytes exactly.
+        let out =
+            output(binary_engine().eval("source urn:test:pdf | sink urn:test:store")).unwrap();
+        assert_eq!(out, format!("stored {} bytes, intact=true", BINARY.len()));
+    }
+
+    #[test]
+    fn fork_fans_binary_input_to_each_branch() {
+        // Single-source branches under a spawner take the parallel path — the
+        // binary input must survive the fan-out to every branch.
+        let out = output(
+            binary_engine().eval("source urn:test:pdf | ( urn:test:digest ; urn:test:digest )"),
+        )
+        .unwrap();
+        let each = format!("{} bytes, intact=true", BINARY.len());
+        assert_eq!(out, format!("{each}\n{each}"));
+    }
+
+    #[test]
+    fn fork_branches_may_emit_binary_that_pipes_onward() {
+        // Branch *outputs* are binary here: the parallel join must carry bytes too
+        // (it used to decode each branch), newline-joining them for the next stage.
+        let out =
+            output(binary_engine().eval(
+                "source urn:test:upper hi | ( urn:test:pdf ; urn:test:pdf ) | urn:test:digest",
+            ))
+            .unwrap();
+        assert_eq!(out, format!("{} bytes, intact=false", BINARY.len() * 2 + 1));
+    }
+
+    #[test]
+    fn map_rejects_a_binary_upstream_naming_the_operator() {
+        // `..` splits on newlines — inherently textual — so a binary upstream is a
+        // clear error naming the operator, not a bare utf-8 decode failure.
+        let err =
+            output(binary_engine().eval("source urn:test:pdf .. urn:test:upper")).unwrap_err();
+        assert!(err.contains("`..`"), "{err}");
+        assert!(err.contains("not UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn displaying_binary_output_points_at_a_sink_terminal() {
+        // A binary value can flow through a pipe but not onto the screen: the
+        // terminal render says so and points at `sink` as the way to keep bytes.
+        let err = output(binary_engine().eval("source urn:test:pdf")).unwrap_err();
+        assert!(err.contains("not UTF-8 text"), "{err}");
+        assert!(err.contains("sink"), "{err}");
+    }
+
+    #[test]
+    fn cap_net_shorthand_expands_to_a_net_scope() {
+        assert_eq!(
+            expand_cap_shorthand("net-example.com"),
+            "urn:cap:net:example.com"
+        );
+        // A full scope passes through unchanged; an empty host is left verbatim.
+        assert_eq!(
+            expand_cap_shorthand("urn:cap:fs:read:/x"),
+            "urn:cap:fs:read:/x"
+        );
+        assert_eq!(expand_cap_shorthand("net-"), "net-");
+    }
+
+    #[test]
+    fn cap_narrows_to_a_host_via_the_net_shorthand() {
+        let engine = builtin_engine();
+        let out = output(engine.eval("cap net-example.com")).unwrap();
+        assert!(out.contains("urn:cap:net:example.com"), "{out}");
+    }
+
+    #[test]
+    fn trace_annotates_capability_per_node() {
+        let root = std::env::temp_dir().join(format!("ikigai-engine-trace-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"hi").unwrap();
+        let mk = || {
+            Engine::new(Kernel::with_meta_renderer(
+                Arc::new(ikigai_fs::space(&root)),
+                Arc::new(JsonRenderer),
+            ))
+        };
+
+        // Root session: the tree stays uncluttered — authority is in the header.
+        let rooted = output(mk().eval("trace urn:file:a.txt")).unwrap();
+        assert!(
+            !rooted.contains("cap ✓") && !rooted.contains("cap ✗"),
+            "{rooted}"
+        );
+
+        // Narrowed to a read that covers the file: the node is marked authorized.
+        let e = mk();
+        output(e.eval(&format!("cap urn:cap:fs:read:{}", root.display()))).unwrap();
+        let ok = output(e.eval("trace urn:file:a.txt")).unwrap();
+        assert!(ok.contains("cap ✓"), "{ok}");
+
+        // Narrowed to a scope that does not cover the file: the node is denied.
+        let e = mk();
+        output(e.eval("cap urn:cap:fs:read:/nonexistent")).unwrap();
+        let denied = output(e.eval("trace urn:file:a.txt")).unwrap();
+        assert!(denied.contains("cap ✗"), "{denied}");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_hop_that_changes_authority_is_annotated() {
+        use ikigai_core::Time;
+        // A root under full authority with a child resolved under a *narrower* one —
+        // what a mount clamp against a remote principal produces.
+        let ev =
+            |target: &str, span: u64, parent: Option<u64>, cap: Option<Vec<String>>| TraceEvent {
+                target: target.to_string(),
+                thread: "w".to_string(),
+                started: Some(Time::from_millis(0)),
+                ended: Some(Time::from_millis(0)),
+                cache_hit: false,
+                span,
+                parent,
+                capability: cap,
+                notes: Vec::new(),
+            };
+        let events = vec![
+            ev("urn:local:mount", 0, None, None),
+            ev(
+                "urn:remote:leaf",
+                1,
+                Some(0),
+                Some(vec!["urn:cap:fs:read".to_string()]),
+            ),
+        ];
+        let repr = Representation::new(ReprType::new("text/plain"), b"x".to_vec());
+        let mut out = Vec::new();
+        render_trace_tree(&events, &[], false, &repr, &mut out);
+
+        // The root stays uncluttered; the child, whose authority differs, names it.
+        assert!(!out[0].contains("· cap"), "root uncluttered: {out:#?}");
+        assert!(
+            out[1].contains("· cap ↓ urn:cap:fs:read"),
+            "the attenuated hop is annotated: {out:#?}"
+        );
+    }
+
+    #[test]
+    fn trace_tree_reconstructs_the_real_execution_from_span_links() {
+        use ikigai_core::Time;
+        // Synthetic recording of a `compose` run: a root (no parent) that fanned out
+        // three markers on workers, the last of which (`about`) itself sourced a
+        // cached `toUpper` — a grandchild. The renderer must rebuild this tree purely
+        // from the (span, parent) edges, regardless of record order.
+        let ev =
+            |target: &str, thread: &str, span: u64, parent: Option<u64>, hit: bool| TraceEvent {
+                target: target.to_string(),
+                thread: thread.to_string(),
+                started: Some(Time::from_millis(0)),
+                ended: Some(Time::from_millis(2)),
+                cache_hit: hit,
+                span,
+                parent,
+                capability: None,
+                notes: Vec::new(),
+            };
+        let events = vec![
+            ev("urn:test:upper", "ikigai-sched-0", 4, Some(3), true), // grandchild, out of order
+            ev("urn:test:compose", "main", 0, None, false),
+            ev("urn:demo:wrap", "ikigai-sched-1", 1, Some(0), false),
+            ev("urn:demo:greet", "ikigai-sched-2", 2, Some(0), false),
+            ev("urn:data:about", "ikigai-sched-0", 3, Some(0), false),
+        ];
+        let repr = Representation::new(ReprType::new("text/plain"), b"assembled".to_vec());
+        let mut out = Vec::new();
+        render_trace_tree(&events, &[], false, &repr, &mut out);
+
+        // Root first, carrying the assembled result and its worker/timing.
+        assert!(out[0].contains("urn:test:compose"), "{out:#?}");
+        assert!(
+            out[0].contains("· main ·") && out[0].contains("→ 9b"),
+            "{out:#?}"
+        );
+        // The three fanned-out markers nest directly under the root, on their workers.
+        assert!(out[1].starts_with("├─ urn:demo:wrap") && out[1].contains("ikigai-sched-1"));
+        assert!(
+            out[3].starts_with("└─ urn:data:about"),
+            "last sibling: {out:#?}"
+        );
+        // The grandchild nests one level deeper under `about` and shows as a cache hit.
+        assert!(
+            out[4].starts_with("   └─ urn:test:upper") && out[4].contains("cached"),
+            "grandchild indented under about: {out:#?}"
+        );
+    }
+
+    #[test]
+    fn cap_attenuates_the_session_and_endpoints_observe_it() {
+        // An endpoint that projects on the session capability — full detail vs a
+        // minimized view, exactly like urn:personal:calendar.
+        let cal = FnEndpoint::new("cal", |inv: &Invocation<'_>| {
+            let body = if inv.capability.allows("urn:cap:demo:cal:read:detail") {
+                "DETAIL"
+            } else {
+                "freebusy"
+            };
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                body.as_bytes().to_vec(),
+            ))
+        });
+        let space = EndpointSpace::new().bind(Exact::new("urn:demo:cal"), cal);
+        let engine = Engine::with_identity(
+            Kernel::with_meta_renderer(Arc::new(space), Arc::new(JsonRenderer)),
+            Capability::root(),
+        );
+        // Identity (root) sees detail.
+        assert_eq!(
+            output(engine.eval("source urn:demo:cal")).unwrap(),
+            "DETAIL"
+        );
+        // Give it up: narrow to the free/busy scope only.
+        engine.eval("cap urn:cap:demo:cal:read:freebusy");
+        assert_eq!(
+            output(engine.eval("source urn:demo:cal")).unwrap(),
+            "freebusy"
+        );
+        // You cannot widen back by asking for detail — attenuation only narrows.
+        engine.eval("cap urn:cap:demo:cal:read:detail");
+        assert_eq!(
+            output(engine.eval("source urn:demo:cal")).unwrap(),
+            "freebusy"
+        );
+        // Reset returns to identity (root) — the owner-only move.
+        engine.eval("cap reset");
+        assert_eq!(
+            output(engine.eval("source urn:demo:cal")).unwrap(),
+            "DETAIL"
+        );
+    }
+
+    #[test]
+    fn login_sets_a_scoped_identity_that_reset_returns_to() {
+        // Same capability-projecting endpoint as above.
+        let cal = FnEndpoint::new("cal", |inv: &Invocation<'_>| {
+            let body = if inv.capability.allows("urn:cap:demo:cal:read:detail") {
+                "DETAIL"
+            } else {
+                "freebusy"
+            };
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                body.as_bytes().to_vec(),
+            ))
+        });
+        let space = EndpointSpace::new().bind(Exact::new("urn:demo:cal"), cal);
+        let engine = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ));
+
+        // Anonymous (root) identity sees detail.
+        assert_eq!(
+            output(engine.eval("source urn:demo:cal")).unwrap(),
+            "DETAIL"
+        );
+
+        // Log in as a scoped identity (the browser passkey flow mints one like this).
+        engine.login(Capability::root().attenuate(["urn:cap:demo:cal:read:freebusy".to_string()]));
+        assert_eq!(
+            output(engine.eval("source urn:demo:cal")).unwrap(),
+            "freebusy"
+        );
+
+        // `cap reset` returns to the *logged-in* identity, not root — the scope holds.
+        engine.eval("cap urn:cap:nonexistent"); // narrow further, then reset
+        engine.eval("cap reset");
+        assert_eq!(
+            output(engine.eval("source urn:demo:cal")).unwrap(),
+            "freebusy"
+        );
+
+        // Logout drops back to the anonymous (root) default.
+        engine.logout();
+        assert_eq!(
+            output(engine.eval("source urn:demo:cal")).unwrap(),
+            "DETAIL"
+        );
+    }
+
+    #[test]
+    fn login_and_logout_drive_the_session_as_resources_and_commands() {
+        let cal = FnEndpoint::new("cal", |inv: &Invocation<'_>| {
+            let body = if inv.capability.allows("urn:cap:demo:cal:read:detail") {
+                "DETAIL"
+            } else {
+                "freebusy"
+            };
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                body.as_bytes().to_vec(),
+            ))
+        });
+        let space = EndpointSpace::new().bind(Exact::new("urn:demo:cal"), cal);
+        let engine = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ));
+
+        // Anonymous (root) sees detail.
+        assert_eq!(
+            output(engine.eval("source urn:demo:cal")).unwrap(),
+            "DETAIL"
+        );
+
+        // The `login` COMMAND scopes the session to the minted scopes.
+        engine.eval("login urn:cap:demo:cal:read:freebusy");
+        assert_eq!(
+            output(engine.eval("source urn:demo:cal")).unwrap(),
+            "freebusy"
+        );
+
+        // The `logout` COMMAND returns to anonymous.
+        engine.eval("logout");
+        assert_eq!(
+            output(engine.eval("source urn:demo:cal")).unwrap(),
+            "DETAIL"
+        );
+
+        // The same via the RESOURCE form `sink urn:host:login <scope…>` — login is
+        // addressable, not just a command (the shape a remote session layer handles).
+        engine.eval("sink urn:host:login urn:cap:demo:cal:read:freebusy");
+        assert_eq!(
+            output(engine.eval("source urn:demo:cal")).unwrap(),
+            "freebusy"
+        );
+        engine.eval("sink urn:host:logout");
+        assert_eq!(
+            output(engine.eval("source urn:demo:cal")).unwrap(),
+            "DETAIL"
+        );
+    }
+
+    #[test]
+    fn config_assignment_parses_the_property() {
+        assert_eq!(
+            parse_config_assignment("keybindings=emacs").unwrap(),
+            ("keybindings", "emacs".to_string())
+        );
+        // Quotes and surrounding whitespace are trimmed.
+        assert_eq!(
+            parse_config_assignment("  keybindings = \"vi\" ").unwrap(),
+            ("keybindings", "vi".to_string())
+        );
+    }
+
+    #[test]
+    fn config_assignment_rejects_bad_input() {
+        assert!(parse_config_assignment("keybindings")
+            .unwrap_err()
+            .contains("usage"));
+        // An unknown key — including the `keybinds` misspelling — is rejected.
+        assert!(parse_config_assignment("keybinds=emacs")
+            .unwrap_err()
+            .contains("unknown property"));
+        assert!(parse_config_assignment("theme=dark")
+            .unwrap_err()
+            .contains("unknown property"));
+        assert!(parse_config_assignment("keybindings=")
+            .unwrap_err()
+            .contains("needs a value"));
+    }
+
+    #[test]
+    fn cache_command_probes_without_resolving() {
+        let engine = builtin_engine();
+        // Not cached — and probing must not resolve/cache the target itself.
+        assert_eq!(
+            output(engine.eval("cache urn:test:upper hi")).unwrap(),
+            "not cached"
+        );
+        assert_eq!(
+            output(engine.eval("cache urn:test:upper hi")).unwrap(),
+            "not cached"
+        );
+        // After resolving, the same request is a hit.
+        output(engine.eval("source urn:test:upper hi")).unwrap();
+        assert_eq!(
+            output(engine.eval("cache urn:test:upper hi")).unwrap(),
+            "cached"
+        );
+        // A different argument identity is still a miss.
+        assert_eq!(
+            output(engine.eval("cache urn:test:upper bye")).unwrap(),
+            "not cached"
+        );
+    }
+
+    #[test]
+    fn cache_command_rejects_a_pipeline() {
+        let err =
+            output(builtin_engine().eval("cache urn:test:upper hi | urn:test:upper")).unwrap_err();
+        assert!(err.contains("single resource"), "got: {err}");
+    }
+
+    #[test]
+    fn cache_command_carries_no_cache_tag() {
+        // The probe is not a resolution, so it reports no cache outcome of its own.
+        assert_eq!(
+            entry(builtin_engine().eval("cache urn:test:upper hi"))
+                .cache
+                .label(),
+            None
+        );
+    }
+
+    #[test]
+    fn cache_reports_an_uncacheable_result() {
+        // No `.cacheable()` → `Expiry::Always` → never cached, recomputes each time.
+        let now = FnEndpoint::new("now", |_inv: &Invocation<'_>| {
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                b"tick".to_vec(),
+            ))
+        });
+        let space = EndpointSpace::new().bind(Exact::new("urn:test:now"), now);
+        let engine = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ));
+        assert_eq!(
+            entry(engine.eval("source urn:test:now"))
+                .cache
+                .label()
+                .as_deref(),
+            Some("uncacheable")
+        );
+        assert_eq!(
+            entry(engine.eval("source urn:test:now"))
+                .cache
+                .label()
+                .as_deref(),
+            Some("uncacheable")
+        );
+    }
+
+    #[test]
+    fn cache_summarises_a_multi_stage_pipeline() {
+        let engine = list_engine();
+        let first = entry(engine.eval("source urn:test:upper hi | urn:test:reverse"));
+        assert_eq!(first.cache.label().as_deref(), Some("2 computed"));
+        let second = entry(engine.eval("source urn:test:upper hi | urn:test:reverse"));
+        assert_eq!(second.cache.label().as_deref(), Some("2 cached"));
+    }
+
+    #[test]
+    fn non_resolving_commands_have_no_cache_label() {
+        let engine = builtin_engine();
+        assert_eq!(entry(engine.eval("list")).cache.label(), None);
+        assert_eq!(entry(engine.eval("frobnicate")).cache.label(), None);
+    }
+
+    /// An engine with a *volatile* source (uncacheable, like a live fetch) and a
+    /// *stable* one (cacheable, like the catalog), plus the cacheable `toUpper`
+    /// transform — to prove cacheability flows down the pipe.
+    fn inheritance_engine() -> Engine {
+        let volatile = FnEndpoint::new("volatile", |_: &Invocation<'_>| {
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                b"data".to_vec(),
+            )) // no .cacheable()
+        });
+        let stable = FnEndpoint::new("stable", |_: &Invocation<'_>| {
+            Ok(Representation::new(ReprType::new("text/plain"), b"data".to_vec()).cacheable())
+        });
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:test:volatile"), volatile)
+            .bind(Exact::new("urn:test:stable"), stable)
+            .bind(Exact::new("urn:test:upper"), builtins::to_upper());
+        Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ))
+    }
+
+    #[test]
+    fn a_transform_inherits_its_pipe_sources_cacheability() {
+        let engine = inheritance_engine();
+        // Volatile upstream: the transform can't be cached either — both stages
+        // recompute every run (the live-fetch case).
+        let v1 = entry(engine.eval("source urn:test:volatile | urn:test:upper"));
+        assert_eq!(v1.cache.label().as_deref(), Some("2 uncacheable"));
+        let v2 = entry(engine.eval("source urn:test:volatile | urn:test:upper"));
+        assert_eq!(v2.cache.label().as_deref(), Some("2 uncacheable"));
+
+        // Stable upstream: the whole pipeline caches — computed once, then served
+        // (the catalog case).
+        let s1 = entry(engine.eval("source urn:test:stable | urn:test:upper"));
+        assert_eq!(s1.cache.label().as_deref(), Some("2 computed"));
+        let s2 = entry(engine.eval("source urn:test:stable | urn:test:upper"));
+        assert_eq!(s2.cache.label().as_deref(), Some("2 cached"));
+    }
+
+    #[test]
+    fn cache_label_formats_single_and_mixed_outcomes() {
+        let mut stats = CacheStats::default();
+        assert_eq!(stats.label(), None);
+        stats.record(CacheStatus::Hit);
+        assert_eq!(stats.label().as_deref(), Some("cached"));
+        stats.record(CacheStatus::Miss);
+        stats.record(CacheStatus::Uncacheable);
+        assert_eq!(
+            stats.label().as_deref(),
+            Some("1 cached · 1 computed · 1 uncacheable")
+        );
+    }
+
+    #[test]
+    fn sources_an_inline_arg() {
+        assert_eq!(
+            output(builtin_engine().eval("source urn:test:upper hi")).unwrap(),
+            "HI"
+        );
+    }
+
+    #[test]
+    fn pipeline_chains_output_into_the_next_stage() {
+        // `wrap` returns "[input]"; piping toUpper into it proves the value flows
+        // and is routed to wrap's argument.
+        let wrap = FnEndpoint::new("wrap", |inv: &Invocation<'_>| {
+            let s = inv.inline_str("in")?;
+            Ok(
+                Representation::new(ReprType::new("text/plain"), format!("[{s}]").into_bytes())
+                    .cacheable(),
+            )
+        });
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:test:upper"), builtins::to_upper())
+            .bind(Exact::new("urn:test:wrap"), wrap);
+        let engine = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ));
+        assert_eq!(
+            output(engine.eval("source urn:test:upper hi | urn:test:wrap")).unwrap(),
+            "[HI]"
+        );
+    }
+
+    #[test]
+    fn quotes_keep_a_pipe_literal_in_the_input() {
+        // Without quoting this would split into two stages; the quotes make
+        // `a | b` a single literal input to toUpper.
+        assert_eq!(
+            output(builtin_engine().eval("source urn:test:upper \"a | b\"")).unwrap(),
+            "A | B"
+        );
+    }
+
+    #[test]
+    fn quoted_input_preserves_internal_spacing() {
+        // Bare words rejoin with single spaces; a quoted word keeps its own.
+        assert_eq!(
+            output(builtin_engine().eval("source urn:test:upper \"a   b\"")).unwrap(),
+            "A   B"
+        );
+    }
+
+    #[test]
+    fn piped_stage_with_a_literal_input_is_an_error() {
+        let err = output(builtin_engine().eval("source urn:test:upper hi | urn:test:upper x"))
+            .unwrap_err();
+        assert!(err.contains("from the pipe"), "got: {err}");
+    }
+
+    #[test]
+    fn as_conneg_rides_through_a_pipe_without_colliding_with_the_input() {
+        // `as=` is the content-negotiation selector, not endpoint input — in a pipe
+        // it must ride alongside the piped value, not be mistaken for a literal that
+        // collides with it (which used to raise "takes its input from the pipe").
+        assert_eq!(
+            output(
+                builtin_engine().eval("source urn:test:upper hi | urn:test:upper as=text/plain")
+            )
+            .unwrap(),
+            "HI"
+        );
+    }
+
+    #[test]
+    fn a_stray_pipe_is_an_error() {
+        let err = output(builtin_engine().eval("source urn:test:upper hi | | urn:test:upper"))
+            .unwrap_err();
+        assert!(err.contains("empty pipeline stage"), "got: {err}");
+    }
+
+    /// Shorthand for an expected `Word` token.
+    fn w(s: &str) -> Token {
+        Token::Word(s.to_string())
+    }
+
+    #[test]
+    fn take_named_arg_handles_quotes_and_boundaries() {
+        let declared = vec!["title".to_string(), "start".to_string()];
+        // a quoted multi-word value is ONE argument, and scanning continues after it
+        let (key, value, rest) =
+            take_named_arg("title=\"two words\" start=now trailing content", &declared).unwrap();
+        assert_eq!((key, value.as_str()), ("title", "two words"));
+        let (key, value, rest) = take_named_arg(rest, &declared).unwrap();
+        assert_eq!((key, value.as_str()), ("start", "now"));
+        assert_eq!(rest, "trailing content");
+        assert!(
+            take_named_arg(rest, &declared).is_none(),
+            "content boundary"
+        );
+        // escapes inside the quoted value
+        let (_, value, _) = take_named_arg("title=\"say \\\"hi\\\"\" x", &declared).unwrap();
+        assert_eq!(value, "say \"hi\"");
+        // an undeclared key is content, not an argument
+        assert!(take_named_arg("nope=1 x", &declared).is_none());
+        // an unterminated quote falls through to content
+        assert!(take_named_arg("title=\"oops", &declared).is_none());
+    }
+
+    /// The quoting rule is ONE rule: `\"` and `\\` are the only escapes, and any other
+    /// backslash is literal. A named sink argument must read a quoted value exactly as the
+    /// tokenizer reads it for `source`, or `title="C:\dir"` is `C:\dir` on one verb and
+    /// `C:dir` on the other, and a regex like `\d+` silently loses its backslash.
+    #[test]
+    fn a_named_arg_keeps_an_unknown_escape_literal_like_the_tokenizer() {
+        let declared = vec!["title".to_string()];
+        for quoted in [r#""C:\dir""#, r#""\d+ \"x\" \\ end""#, r#""a\nb""#] {
+            let (_, value, _) = take_named_arg(&format!("title={quoted} rest"), &declared)
+                .unwrap_or_else(|| panic!("{quoted} is a terminated quote"));
+            assert_eq!(
+                vec![w(&value)],
+                tokenize(quoted).unwrap(),
+                "a sink's named arg and the tokenizer disagree on {quoted}"
+            );
+        }
+        // A backslash that escapes the closing quote, or ends the text, leaves the quote
+        // unterminated: the words fall through to content rather than become an argument.
+        assert!(take_named_arg(r#"title="abc\" rest"#, &declared).is_none());
+        assert!(take_named_arg(r#"title="abc\"#, &declared).is_none());
+    }
+
+    #[test]
+    fn tokenize_splits_and_unquotes() {
+        // The quoted span holds a literal pipe and collapses to one word.
+        assert_eq!(
+            tokenize("urn:test:upper \"a | b\" | urn:demo:wrap").unwrap(),
+            vec![
+                w("urn:test:upper"),
+                w("a | b"),
+                Token::Pipe,
+                w("urn:demo:wrap"),
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenize_processes_escapes() {
+        assert_eq!(
+            tokenize(r#"x "say \"hi\" \\ ok""#).unwrap(),
+            vec![w("x"), w(r#"say "hi" \ ok"#)]
+        );
+    }
+
+    #[test]
+    fn tokenize_rejects_an_unterminated_quote() {
+        assert!(tokenize("x \"unclosed").is_err());
+    }
+
+    #[test]
+    fn tokenize_recognises_a_standalone_map_operator() {
+        assert_eq!(
+            tokenize("urn:demo:split a | b .. urn:test:upper").unwrap(),
+            vec![
+                w("urn:demo:split"),
+                w("a"),
+                Token::Pipe,
+                w("b"),
+                Token::Map,
+                w("urn:test:upper"),
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenize_keeps_dotdot_literal_inside_a_word_or_quotes() {
+        // `..` only tokenises as Map when it's a whole, unquoted word.
+        assert_eq!(
+            tokenize(r#"urn:x/../y ".." z"#).unwrap(),
+            vec![w("urn:x/../y"), w(".."), w("z")]
+        );
+    }
+
+    #[test]
+    fn tokenize_splits_fork_punctuation_even_without_spaces() {
+        // `(`, `)`, `;` split mid-word like `|`, so spacing inside a fork is optional.
+        assert_eq!(
+            tokenize("(a|b;c)").unwrap(),
+            vec![
+                Token::Open,
+                w("a"),
+                Token::Pipe,
+                w("b"),
+                Token::Semi,
+                w("c"),
+                Token::Close,
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_spec_builds_a_nested_fork() {
+        // `a | ( b ; c .. d )` — a fork whose second branch is itself a map pipeline.
+        let pipeline = parse_spec("a | ( b ; c .. d )").unwrap();
+        assert_eq!(
+            pipeline,
+            Pipeline {
+                first: Node::Source(vec!["a".into()]),
+                rest: vec![Step {
+                    connector: Connector::Pipe,
+                    node: Node::Fork(vec![
+                        Pipeline {
+                            first: Node::Source(vec!["b".into()]),
+                            rest: vec![],
+                        },
+                        Pipeline {
+                            first: Node::Source(vec!["c".into()]),
+                            rest: vec![Step {
+                                connector: Connector::Map,
+                                node: Node::Source(vec!["d".into()]),
+                            }],
+                        },
+                    ]),
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_spec_reads_a_trailing_sink_as_a_sink_node() {
+        // `source a | sink urn:x k=v` — the `sink`-led stage parses to a Sink node
+        // carrying the target IRI and its args (the keyword is stripped), not a
+        // Source of the bare word `sink`.
+        assert_eq!(
+            parse_spec("urn:a | sink urn:x k=v").unwrap(),
+            Pipeline {
+                first: Node::Source(vec!["urn:a".into()]),
+                rest: vec![Step {
+                    connector: Connector::Pipe,
+                    node: Node::Sink(vec!["urn:x".into(), "k=v".into()]),
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_spec_rejects_malformed_forks() {
+        assert!(parse_spec("( a ; b").unwrap_err().contains("unclosed"));
+        assert!(parse_spec("a )").unwrap_err().contains("unmatched `)`"));
+        assert!(parse_spec("a ; b").unwrap_err().contains("outside"));
+        assert!(parse_spec("( )").unwrap_err().contains("empty"));
+        assert!(parse_spec("( a ; )").unwrap_err().contains("stray `;`"));
+    }
+
+    /// An engine over the list-y builtins: `reverseList` (newline list in/out)
+    /// and `toUpper`, for exercising `..` map.
+    fn list_engine() -> Engine {
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:test:reverse"), builtins::reverse_list())
+            .bind(Exact::new("urn:test:upper"), builtins::to_upper());
+        Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ))
+    }
+
+    /// An engine with a two-argument `greet` endpoint (`greeting` + `name`),
+    /// plus `toUpper`/`reverseList`, for exercising `name=value` routing.
+    fn greet_engine() -> Engine {
+        let greet = FnEndpoint::new("greet", |inv: &Invocation<'_>| {
+            let greeting = inv.inline_str("greeting")?;
+            let name = inv.inline_str("name")?;
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("{greeting}, {name}").into_bytes(),
+            )
+            .cacheable())
+        })
+        .with_description(
+            Description::new("greet")
+                .verb(Verb::Source)
+                .verb(Verb::Meta)
+                .input(ArgSpec::new("greeting"))
+                .input(ArgSpec::new("name"))
+                .output("text/plain"),
+        );
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:demo:greet"), greet)
+            .bind(Exact::new("urn:test:upper"), builtins::to_upper())
+            .bind(Exact::new("urn:test:reverse"), builtins::reverse_list());
+        Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ))
+    }
+
+    #[test]
+    fn names_both_arguments() {
+        assert_eq!(
+            output(greet_engine().eval("source urn:demo:greet greeting=Hello name=World")).unwrap(),
+            "Hello, World"
+        );
+    }
+
+    #[test]
+    fn named_arguments_are_order_independent() {
+        assert_eq!(
+            output(greet_engine().eval("source urn:demo:greet name=World greeting=Hi")).unwrap(),
+            "Hi, World"
+        );
+    }
+
+    #[test]
+    fn positional_fills_the_one_unnamed_argument() {
+        // `name` is named; the positional `Hello` lands in the remaining `greeting`.
+        assert_eq!(
+            output(greet_engine().eval("source urn:demo:greet Hello name=World")).unwrap(),
+            "Hello, World"
+        );
+    }
+
+    #[test]
+    fn a_pipe_fills_the_one_unnamed_argument() {
+        // `greeting` is named; the piped value lands in the remaining `name`.
+        assert_eq!(
+            output(greet_engine().eval("source urn:test:upper world | urn:demo:greet greeting=Hi"))
+                .unwrap(),
+            "Hi, WORLD"
+        );
+    }
+
+    #[test]
+    fn map_threads_items_through_a_fixed_named_argument() {
+        // `greeting` is pinned; `..` feeds each list item into the remaining `name`.
+        let out = output(
+            greet_engine().eval("source urn:test:reverse \"a\nb\" .. urn:demo:greet greeting=Hi"),
+        )
+        .unwrap();
+        assert_eq!(out, "Hi, b\nHi, a");
+    }
+
+    #[test]
+    fn equals_in_a_value_is_positional_when_the_key_is_not_declared() {
+        // `a` is not a declared argument of toUpper, so `a=b` is positional input.
+        assert_eq!(
+            output(greet_engine().eval("source urn:test:upper a=b")).unwrap(),
+            "A=B"
+        );
+    }
+
+    #[test]
+    fn an_undeclared_key_is_treated_as_positional_text() {
+        // `bogus` isn't declared, so `bogus=x` is positional and fills `greeting`.
+        assert_eq!(
+            output(greet_engine().eval("source urn:demo:greet bogus=x name=World")).unwrap(),
+            "bogus=x, World"
+        );
+    }
+
+    #[test]
+    fn a_positional_value_with_two_unnamed_arguments_is_ambiguous() {
+        let err = output(greet_engine().eval("source urn:demo:greet Hello")).unwrap_err();
+        assert!(err.contains("name one with `key=value`"), "got: {err}");
+    }
+
+    #[test]
+    fn a_value_fills_the_sole_required_arg_when_others_are_optional() {
+        // `content` (required) + `base` (optional): a positional/piped value fills `content`,
+        // leaving the optional `base` unset — not ambiguous (the json-ld ops rely on this).
+        let opt = FnEndpoint::new("opt", |inv: &Invocation<'_>| {
+            let content = inv.inline_str("content")?;
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                content.to_uppercase().into_bytes(),
+            )
+            .cacheable())
+        })
+        .with_description(
+            Description::new("opt")
+                .verb(Verb::Source)
+                .verb(Verb::Meta)
+                .input(ArgSpec::new("content"))
+                .input(ArgSpec::new("base").optional())
+                .output("text/plain"),
+        );
+        let engine = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(EndpointSpace::new().bind(Exact::new("urn:demo:opt"), opt)),
+            Arc::new(JsonRenderer),
+        ));
+        assert_eq!(
+            output(engine.eval("source urn:demo:opt hello")).unwrap(),
+            "HELLO"
+        );
+    }
+
+    #[test]
+    fn an_extra_value_when_all_arguments_are_named_errors() {
+        let err = output(greet_engine().eval("source urn:demo:greet greeting=Hi name=W extra"))
+            .unwrap_err();
+        assert!(err.contains("no argument left"), "got: {err}");
+    }
+
+    #[test]
+    fn map_applies_the_next_stage_per_item() {
+        // reverseList flips the three lines; `..` then uppercases each independently.
+        let out =
+            output(list_engine().eval("source urn:test:reverse \"a\nb\nc\" .. urn:test:upper"))
+                .unwrap();
+        assert_eq!(out, "C\nB\nA");
+    }
+
+    #[test]
+    fn map_and_pipe_compose() {
+        // Whole-value pipe into reverseList, then map toUpper over its items.
+        let out = output(
+            list_engine()
+                .eval("source urn:test:upper \"x\ny\" | urn:test:reverse .. urn:test:upper"),
+        )
+        .unwrap();
+        assert_eq!(out, "Y\nX");
+    }
+
+    #[test]
+    fn map_passes_blank_items_through_as_empty_input() {
+        // A blank line in the list (here the reversed middle of `a\n\nb`) must
+        // reach the stage as an empty input, not be dropped into a no-argument
+        // request that errors with "missing required argument".
+        let out = output(list_engine().eval("source urn:test:upper \"a\n\nb\" .. urn:test:upper"))
+            .unwrap();
+        assert_eq!(out, "A\n\nB");
+    }
+
+    #[test]
+    fn map_propagates_a_stage_error() {
+        let out = output(list_engine().eval("source urn:test:upper \"a\nb\" .. urn:test:nope"));
+        assert!(out.is_err());
+    }
+
+    #[test]
+    fn map_stage_with_a_literal_input_is_an_error() {
+        let err =
+            output(list_engine().eval("source urn:test:upper hi .. urn:test:upper x")).unwrap_err();
+        assert!(err.contains("from the pipe"), "got: {err}");
+    }
+
+    #[test]
+    fn fork_fans_the_input_to_each_branch_and_joins() {
+        // `X\nY` reaches both branches: reverseList flips it, toUpper passes it
+        // through; outputs join with a newline.
+        let out = output(
+            list_engine()
+                .eval("source urn:test:upper \"x\ny\" | ( urn:test:reverse ; urn:test:upper )"),
+        )
+        .unwrap();
+        assert_eq!(out, "Y\nX\nX\nY");
+    }
+
+    #[test]
+    fn fork_branches_can_be_multi_stage_pipelines() {
+        // First branch is a two-stage pipeline; second is a single stage.
+        let out = output(list_engine().eval(
+            "source urn:test:reverse \"x\ny\nz\" | ( urn:test:upper | urn:test:reverse ; urn:test:upper )",
+        ))
+        .unwrap();
+        assert_eq!(out, "X\nY\nZ\nZ\nY\nX");
+    }
+
+    #[test]
+    fn fork_at_the_top_level_runs_each_branch_with_its_own_literal() {
+        // No incoming value, so each branch's first stage takes its own literal.
+        let out =
+            output(list_engine().eval("source ( urn:test:upper a ; urn:test:upper b )")).unwrap();
+        assert_eq!(out, "A\nB");
+    }
+
+    #[test]
+    fn map_into_a_fork_fans_each_item() {
+        // reverseList → `b\na`; `..` runs the fork per item, each fanned to both.
+        let out = output(
+            list_engine()
+                .eval("source urn:test:reverse \"a\nb\" .. ( urn:test:upper ; urn:test:upper )"),
+        )
+        .unwrap();
+        assert_eq!(out, "B\nB\nA\nA");
+    }
+
+    #[test]
+    fn fork_propagates_a_branch_error() {
+        let out = list_engine()
+            .eval("source urn:test:upper \"a\nb\" | ( urn:test:upper ; urn:test:nope )");
+        assert!(output(out).is_err());
+    }
+
+    #[test]
+    fn piped_fork_branch_with_a_literal_input_is_an_error() {
+        let err = output(
+            list_engine().eval("source urn:test:upper hi | ( urn:test:upper x ; urn:test:upper )"),
+        )
+        .unwrap_err();
+        assert!(err.contains("from the pipe"), "got: {err}");
+    }
+
+    #[test]
+    fn pipeline_propagates_a_stage_error() {
+        assert!(output(builtin_engine().eval("source urn:test:upper hi | urn:test:nope")).is_err());
+    }
+
+    #[test]
+    fn pipeline_into_binding_only_endpoint_errors() {
+        let err = output(builtin_engine().eval("source urn:test:upper hi | urn:demo:echo/x"))
+            .unwrap_err();
+        assert!(err.contains("identifier"), "got: {err}");
+    }
+
+    #[test]
+    fn lists_the_bound_resources() {
+        let listing = output(builtin_engine().eval("list")).unwrap();
+        assert!(listing.contains("urn:test:upper"));
+        assert!(listing.contains("toUpper"));
+        assert!(listing.contains("urn:demo:echo/{message}"));
+        assert!(listing.contains("echo"));
+    }
+
+    #[test]
+    fn list_on_a_non_enumerable_space_errors() {
+        let inner = Arc::new(EndpointSpace::new().bind(Exact::new("urn:x"), builtins::to_upper()));
+        let engine = Engine::new(Kernel::new(Arc::new(Rewrite::new(inner, |_iri| None))));
+        assert!(output(engine.eval("list")).is_err());
+    }
+
+    #[test]
+    fn resolves_a_template_binding() {
+        assert_eq!(
+            output(builtin_engine().eval("source urn:demo:echo/hello")).unwrap(),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn passing_a_value_to_a_binding_endpoint_is_a_helpful_error() {
+        let err = output(builtin_engine().eval("source urn:demo:echo/hi extra")).unwrap_err();
+        assert!(err.contains("identifier"), "got: {err}");
+    }
+
+    #[test]
+    fn routes_input_to_the_declared_argument_name() {
+        // `shout` reads a `text` argument, not `in`. Contract-driven routing must
+        // send the input there; a hardcoded `in` would make this fail.
+        let shout = FnEndpoint::new("shout", |inv: &Invocation<'_>| {
+            let text = inv.inline_str("text")?;
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                text.to_uppercase().into_bytes(),
+            )
+            .cacheable())
+        })
+        .with_description(
+            Description::new("shout")
+                .verb(Verb::Source)
+                .verb(Verb::Meta)
+                .input(ArgSpec::new("text").summary("the text to shout"))
+                .output("text/plain"),
+        );
+        let space = EndpointSpace::new().bind(Exact::new("urn:test:shout"), shout);
+        let engine = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ));
+        assert_eq!(
+            output(engine.eval("source urn:test:shout hi")).unwrap(),
+            "HI"
+        );
+    }
+
+    #[test]
+    fn unknown_command_is_an_error() {
+        assert!(output(builtin_engine().eval("frobnicate x")).is_err());
+    }
+
+    #[test]
+    fn unresolved_iri_is_an_error() {
+        assert!(output(builtin_engine().eval("source urn:test:nope x")).is_err());
+    }
+
+    #[test]
+    fn control_words_map_to_actions() {
+        assert!(matches!(builtin_engine().eval("quit"), Action::Quit));
+        assert!(matches!(builtin_engine().eval("help"), Action::Help));
+        assert!(matches!(builtin_engine().eval("clear"), Action::Clear));
+        assert!(matches!(builtin_engine().eval("cls"), Action::Clear));
+        assert!(matches!(builtin_engine().eval("   "), Action::Noop));
+    }
+
+    #[test]
+    fn declared_arguments_lists_only_by_value_inputs() {
+        // Only `Argument`-source inputs, in declaration order — bindings excluded.
+        let description = Description::new("x")
+            .input(ArgSpec::new("greeting"))
+            .input(ArgSpec::new("who").binding())
+            .input(ArgSpec::new("name"));
+        assert_eq!(
+            declared_arguments(Some(&description)),
+            vec!["greeting", "name"]
+        );
+
+        // A binding-only contract and an absent contract both yield no arguments.
+        let binding = Description::new("echo").input(ArgSpec::new("message").binding());
+        assert!(declared_arguments(Some(&binding)).is_empty());
+        assert!(declared_arguments(None).is_empty());
+    }
+
+    #[test]
+    fn declared_arguments_includes_per_verb_action_inputs() {
+        use ikigai_core::{ActionSpec, Verb};
+        // A multi-verb endpoint that authors per-verb ActionSpecs (no flat inputs) — its
+        // arguments must still be recognized as named args, deduped across verbs.
+        let description = Description::new("space")
+            .action(
+                ActionSpec::new(Verb::Source)
+                    .input(ArgSpec::new("tuple"))
+                    .input(ArgSpec::new("match")),
+            )
+            .action(
+                ActionSpec::new(Verb::Delete)
+                    .input(ArgSpec::new("tuple"))
+                    .input(ArgSpec::new("match")),
+            );
+        assert_eq!(
+            declared_arguments(Some(&description)),
+            vec!["tuple", "match"]
+        );
+    }
+
+    /// A trace labels each span with the endpoint bound to its target, and NESTED
+    /// routes share a prefix all the way down: `urn:repo:{repo}:pr:{n}` matches
+    /// `urn:repo:acme:pr:12:explain` (its trailing `{n}` swallows `12:explain`), and
+    /// the old scan compared only the literal head before the first `{`, so both
+    /// children were labelled with the parent's endpoint. Most-specific-wins names
+    /// each route for itself.
+    #[test]
+    fn endpoint_name_labels_a_nested_route_with_its_own_endpoint() {
+        use ikigai_core::SpaceEntry;
+        let entries = vec![
+            SpaceEntry::new("urn:repo:{repo}:pr:{n}", "browse-pr"),
+            SpaceEntry::new("urn:repo:{repo}:pr:{n}:explain", "browse-explain"),
+            SpaceEntry::new("urn:status", "status"),
+        ];
+        let name = |target: &str| endpoint_name(&entries, &Iri::parse(target).unwrap());
+        assert_eq!(name("urn:repo:acme:pr:12:explain"), "browse-explain");
+        assert_eq!(name("urn:repo:acme:pr:12"), "browse-pr");
+        assert_eq!(name("urn:status"), "status");
+        assert_eq!(name("urn:nothing:here"), "?");
+    }
+
+    /// A pattern that doesn't parse as a template (here, ambiguous adjacent
+    /// variables) can't be matched properly by anyone — it still labels by its
+    /// literal head, the pre-existing scan kept as the fallback so no trace line
+    /// regresses to `?`.
+    #[test]
+    fn endpoint_name_falls_back_to_the_literal_prefix_for_unparseable_patterns() {
+        use ikigai_core::SpaceEntry;
+        let entries = vec![SpaceEntry::new("urn:org:agenda:{a}{b}", "org-agenda")];
+        assert_eq!(
+            endpoint_name(&entries, &Iri::parse("urn:org:agenda:week").unwrap()),
+            "org-agenda"
+        );
+    }
+
+    // ---- `as-of=`: one temporal corridor per line (ledger #532) --------------------------
+
+    /// 2026-09-25T18:00:00Z, the instant the tests pin.
+    const PINNED: u64 = 1_790_359_200_000;
+    /// The kernel's live clock — a different day, so a leak is visible in the digits.
+    const LIVE: u64 = 1_790_512_496_000;
+
+    /// `urn:test:clock` reads the time THROUGH THE INVOCATION, the way `urn:tz:now` does after
+    /// this arc: pinned ⇒ immutable, live ⇒ uncacheable. `urn:test:stamp` appends the time to
+    /// its piped input, so a later pipeline stage shows which clock IT saw.
+    fn clock_endpoint() -> FnEndpoint {
+        FnEndpoint::new("clock", |inv: &Invocation<'_>| {
+            let now = inv.now().map(|t| t.as_millis()).unwrap_or(0);
+            let repr =
+                Representation::new(ReprType::new("text/plain"), now.to_string().into_bytes());
+            Ok(if inv.scope().clock().is_some() {
+                repr.cacheable()
+            } else {
+                repr
+            })
+        })
+        .with_description(Description::new("clock").verb(Verb::Source))
+    }
+
+    fn as_of_engine(doors: bool) -> Engine {
+        let stamp = FnEndpoint::new("stamp", |inv: &Invocation<'_>| {
+            let input = inv.inline_str("in").unwrap_or("");
+            let now = inv.now().map(|t| t.as_millis()).unwrap_or(0);
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("{input}|{now}").into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("stamp")
+                .verb(Verb::Source)
+                .input(ArgSpec::new("in").summary("the value to stamp")),
+        );
+        let kernel = Kernel::with_meta_renderer(
+            Arc::new(
+                EndpointSpace::new()
+                    .bind(Exact::new("urn:test:clock"), clock_endpoint())
+                    .bind(Exact::new("urn:test:stamp"), stamp),
+            ),
+            Arc::new(JsonRenderer),
+        )
+        .with_clock(Arc::new(FixedClock::at(LIVE)));
+        let engine = Engine::new(kernel);
+        if doors {
+            engine.with_as_of_doors(Arc::new(
+                EndpointSpace::new().bind(Exact::new("urn:test:clock"), clock_endpoint()),
+            ))
+        } else {
+            engine
+        }
+    }
+
+    #[test]
+    fn as_of_pins_every_stage_of_the_line_and_nothing_after_it() {
+        let engine = as_of_engine(true);
+        let pinned =
+            output(engine.eval("source urn:test:clock as-of=2026-09-25T18:00Z | urn:test:stamp"));
+        assert_eq!(
+            pinned,
+            Ok(format!("{PINNED}|{PINNED}")),
+            "both stages ran in the corridor"
+        );
+        // The chain is the LINE's: the next line is live again.
+        let live = output(engine.eval("source urn:test:clock | urn:test:stamp"));
+        assert_eq!(live, Ok(format!("{LIVE}|{LIVE}")));
+    }
+
+    /// Where the word sits does not change what it means — the whole line is one chain —
+    /// and two spellings of one instant are one instant, while two instants are refused.
+    #[test]
+    fn as_of_is_one_instant_per_line_wherever_it_is_written() {
+        let engine = as_of_engine(true);
+        assert_eq!(
+            output(
+                engine.eval("source urn:test:clock | urn:test:stamp as-of=2026-09-25T18:00:00Z")
+            ),
+            Ok(format!("{PINNED}|{PINNED}"))
+        );
+        assert_eq!(
+            output(engine.eval(
+                "source urn:test:clock as-of=2026-09-25T18:00Z | urn:test:stamp \
+                 as-of=2026-09-25T11:00:00-07:00"
+            )),
+            Ok(format!("{PINNED}|{PINNED}"))
+        );
+        let two = output(engine.eval(
+            "source urn:test:clock as-of=2026-09-25T18:00Z | urn:test:stamp as-of=2026-09-25T19:00Z",
+        ))
+        .unwrap_err();
+        assert!(two.contains("names two"), "{two}");
+    }
+
+    #[test]
+    fn a_fork_under_as_of_resolves_every_branch_in_the_corridor() {
+        for engine in [
+            as_of_engine(true),
+            as_of_engine(true).with_spawner(Arc::new(InlineSpawner)),
+        ] {
+            let forked = output(engine.eval(
+                "source urn:test:clock as-of=2026-09-25T18:00Z | ( urn:test:stamp ; urn:test:stamp )",
+            ));
+            assert_eq!(forked, Ok(format!("{PINNED}|{PINNED}\n{PINNED}|{PINNED}")));
+        }
+    }
+
+    /// `cache` probes the corridor's partition: the as-of read is cached THERE (it is a pure
+    /// function of the corridor's name) and the live read is not cached anywhere.
+    #[test]
+    fn cache_probes_the_corridors_partition() {
+        let engine = as_of_engine(true);
+        assert_eq!(
+            output(engine.eval("cache urn:test:clock as-of=2026-09-25T18:00Z")),
+            Ok("not cached".to_string())
+        );
+        output(engine.eval("source urn:test:clock as-of=2026-09-25T18:00Z")).unwrap();
+        assert_eq!(
+            output(engine.eval("cache urn:test:clock as-of=2026-09-25T18:00Z")),
+            Ok("cached".to_string())
+        );
+        assert_eq!(
+            output(engine.eval("cache urn:test:clock")),
+            Ok("not cached".to_string()),
+            "the root's partition never saw the as-of read"
+        );
+    }
+
+    /// `trace` names the chain and the pinned clock in its header, and the kernel's own
+    /// `SCOPE_NOTE` / `SCOPE_CLOCK_NOTE` ride on the node.
+    #[test]
+    fn trace_shows_the_corridor_and_its_clock() {
+        let engine = as_of_engine(true);
+        let traced = output(engine.eval("trace urn:test:clock as-of=2026-09-25T18:00Z")).unwrap();
+        assert!(
+            traced.contains("scope       urn:ctx:time:2026-09-25T18:00:00Z root"),
+            "{traced}"
+        );
+        assert!(
+            traced.contains(&format!(
+                "{}=urn:ctx:time:2026-09-25T18:00:00Z root",
+                ikigai_core::SCOPE_NOTE
+            )),
+            "{traced}"
+        );
+        assert!(
+            traced.contains(&format!("{}={PINNED}", ikigai_core::SCOPE_CLOCK_NOTE)),
+            "{traced}"
+        );
+        let plain = output(engine.eval("trace urn:test:clock")).unwrap();
+        assert!(!plain.contains("scope"), "{plain}");
+    }
+
+    /// Refused, never ignored: an engine without time doors (a `--connect` session, the
+    /// browser demo) must not answer an as-of line with the live time.
+    #[test]
+    fn as_of_without_time_doors_or_with_a_bad_instant_is_refused() {
+        let bare = as_of_engine(false);
+        let refused =
+            output(bare.eval("source urn:test:clock as-of=2026-09-25T18:00Z")).unwrap_err();
+        assert!(refused.contains("time doors"), "{refused}");
+        let engine = as_of_engine(true);
+        let bad = output(engine.eval("source urn:test:clock as-of=yesterday")).unwrap_err();
+        assert!(bad.contains("is not an instant"), "{bad}");
+        let early =
+            output(engine.eval("source urn:test:clock as-of=1969-07-20T20:17Z")).unwrap_err();
+        assert!(early.contains("before 1970"), "{early}");
+    }
+
+    #[test]
+    fn the_corridor_is_named_for_the_canonical_instant() {
+        assert_eq!(
+            parse_as_of("2026-09-25T11:00-07:00").unwrap(),
+            AsOf {
+                canonical: "2026-09-25T18:00:00Z".to_string(),
+                millis: PINNED
+            }
+        );
+        assert_eq!(
+            parse_as_of("2026-09-25T18:00:00.250Z").unwrap().canonical,
+            "2026-09-25T18:00:00.250Z"
+        );
+    }
+}
