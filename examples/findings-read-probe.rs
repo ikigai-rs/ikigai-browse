@@ -44,9 +44,15 @@ use oxigraph::store::Store;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let usage = "usage: findings-read-probe <dump.nt> <reps> <name=path>…";
+    let usage = "usage: findings-read-probe <dump.nt> <reps ≥ 1> <name=path>…";
     let dump = PathBuf::from(args.next().expect(usage));
-    let reps: usize = args.next().and_then(|n| n.parse().ok()).expect(usage);
+    // At least one: every timing below reports a median of `reps` reads, and
+    // zero reads have none (ledger #736 — `reps=0` panicked indexing it).
+    let reps: usize = args
+        .next()
+        .and_then(|n| n.parse().ok())
+        .filter(|&n| n > 0)
+        .expect(usage);
     let roots: Vec<(String, PathBuf)> = args
         .map(|arg| {
             let (name, path) = arg.split_once('=').expect("a root is name=path");
