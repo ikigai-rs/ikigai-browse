@@ -1,0 +1,393 @@
+[package]
+name = "ikigai-gonk"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Brian Sletten <brian.sletten@gmail.com>"]
+repository = "https://github.com/ikigai-rs/ikigai-gonk"
+homepage = "https://github.com/ikigai-rs/ikigai-gonk"
+keywords = ["ikigai", "roc", "ledger", "rdf", "server"]
+categories = ["command-line-utilities", "development-tools"]
+description = "A standalone ikigai work-ledger server: one binary that holds the durable RDF store and serves named ledgers over loopback HTTP (port 1060), an owner-only Unix socket, and QUIC authenticated per client certificate."
+
+[[bin]]
+name = "ikigai-gonk"
+path = "src/main.rs"
+
+[dependencies]
+# ★ THE MANIFEST IS THE MODULE MANIFEST. This binary links the durable store, the work
+# ledger, the repository browse family and three transports — and nothing else: no
+# calendar, no LLM client, no inbound-network module beyond the doors themselves — and, since
+# 0.1.1, the model it explains with is MOUNTED rather than linked (`gonk.mount`, one prefix:
+# `urn:llm:`), so the outbound surface is one configured peer over ikigai's own transports
+# rather than an HTTP client any net grant could point anywhere. What is
+# not compiled in cannot be reached, whatever a capability says; what IS compiled in is
+# reachable exactly as far as a capability carries, which is why the browse and repo
+# families below are argued one door at a time in the README rather than merely listed.
+# `tests/conformance.rs::the_served_catalog_is_exactly_the_store_and_the_ledger` (no browse
+# roots) and `tests/browse.rs::the_served_catalog_is_exactly_what_this_manifest_links` (with
+# them) pin the served catalog id by id, so a dependency bump that widens it is a red test.
+#
+# Every floor is the TRUE minimum of a set that compiles together, checked by resolving
+# this manifest from scratch with every ikigai pin written `=<floor>` — a caret resolve
+# picks the newest release and says nothing about the floor it claims.
+#
+# 0.1.70: `Kernel::with_cache_policy` and the `CachePolicy` trait arrive here, and
+# `doors::NoCache` is how the socket and QUIC doors keep ONE cache (the hub's) for the
+# whole process. Nothing lower can even be typed. ⚠ `"0.1.70"` is also a ceiling
+# (`<0.2.0`); when core reaches 0.2 this line must move.
+ikigai-core = "0.1.70"
+# The Meta renderer, and in a server that is not a formatting choice: a mounting client
+# reads every contract through the JSON Meta face (0.1.47+), and without it named
+# arguments are silently dropped across the mount. 0.1.69 rather than 0.1.47 because
+# `ikigai-conformance` 0.3 requires `^0.1.69` and cargo unifies a package across normal
+# and dev dependencies — one lock serves `build` and `test`, so it is the version the
+# shipped binary links.
+ikigai-vocab = "0.1.69"
+# The durable dataset. `persistent` is the RocksDB backend, and it is the reason this
+# binary exists: gonk is the one process on a machine that holds `~/.ikigai/store`.
+# 0.2.4 is where the freshness half of this pin comes from, and it is the whole of what
+# this server says about it: `open_shared_declaring` + `SharerWrites` let gonk NAME the
+# graphs its sharer (`ikigai-browse`) may write, so the store itself declares a scoped read
+# of every other graph cacheable — which is what `src/freshness.rs` used to do from outside,
+# on four IRIs it transcribed by hand. `reserved_graphs_fingerprint` is the tripwire that
+# checks the promise, and `tests/browse.rs` takes it. (0.2.2 is yanked and does not compile
+# in any graph where a sibling enables `oxrdf/rdf-12`; 0.2.2 is also where `cap_read_graph`
+# — the narrow read door `grants.rs` computes tokens from — first exists.)
+#
+# ★ **0.2.5 is the floor because a SCOPED READ NOW TAKES A SET OF GRAPHS, and this server
+# uses it.** Through 0.2.4 `confine` set the prepared query's whole dataset specification to
+# the ONE graph the read was issued for, so the ledger↔browse join — the motivating query of
+# the graph decision, and of ledger #250 and #376 — could not be expressed through the narrow
+# door however many per-graph tokens the caller held, and came back EMPTY rather than refused.
+# In 0.2.5 `graph=` takes several IRIs separated by whitespace in ONE value (`graph="A B"`),
+# the dataset becomes `FROM`/`FROM NAMED` over the set, and a graph the caller cannot grant
+# refuses the WHOLE read with every missing `urn:cap:store:read:graph:` token named.
+# `tests/browse.rs::both_read_tokens_run_the_ledger_browse_join` is this server's use of it —
+# so `^0.2.4`, which already admitted 0.2.5, is now a floor that states the truth (rule 5).
+#
+# ⚠ Two consequences taken with it. The set is ONE argument: `graph=A graph=B` is last-wins
+# in the engine (ledger #387) and would silently narrow to `B` — the failure this pin closes,
+# re-opened one layer up. And a multi-graph read is cacheable only if EVERY member is, so the
+# join over browse's sharer-written graph is uncached by construction while the ledger's own
+# scoped read stays cached; `the_browse_graphs_scoped_reads_are_not_cached_and_the_ledgers_
+# still_are` asserts both. 0.2.5 also renames the graph-list resource to `urn:iki:store:graphs`
+# (one more id in the served catalog, pinned by `tests/conformance.rs`) and deprecates
+# `is_covered`; nothing here calls it — `read_is_covered` is a different function.
+ikigai-store = { version = "0.2.5", features = ["persistent"] }
+# Named ledgers over the store's narrow per-graph doors. 0.2.1 is the floor: through
+# 0.2.0 `item:{id}` declared the BROAD `urn:cap:store:read`, so a caller holding exactly
+# the per-ledger grant list this server hands out could list a ledger and was denied
+# reading one item out of it.
+ikigai-ledger = "0.2.1"
+# The repository browse family — `urn:repo:{root}:{tree,file,state,hash}`, `urn:repo:style`,
+# the PR pages and the W3C annotation family. 0.4.0 is the floor, and it is load-bearing
+# three times over. 0.3.0 is where the annotation family took its `urn:iki:annotation:` name,
+# which is the name this server puts on the wire (nothing here installs an alias for the
+# older spelling); `Mount::space_watched` — the `StyleWatch` that cuts `urn:repo:style`'s
+# golden threads when an `a11y.toml` layer changes — first exists in 0.3.2, and a host that
+# calls the older `Mount::space` declares those threads with nothing cutting them. What 0.4.0
+# adds is the two this server could not do without:
+#
+# 1. **Read confinement, and it is a correctness floor rather than a narrowing.** Through
+#    0.3.2 browse's annotation reads passed NO graph to `quads_for_pattern`, which means
+#    EVERY graph — and `annotate::refresh` REWRITES a drifted annotation during a Source. The
+#    combination made a READ destructive across a graph boundary: a plain Source of
+#    `urn:repo:{root}:annotations` re-anchored an annotation-shaped quad sitting in another
+#    writer's named graph and PERSISTED the move into the default graph (measured against
+#    0.3.2, ledger #265). In 0.4.0 the `Archive` holds the store privately and its
+#    `quads_for_pattern` takes no graph argument at all, so the every-graph read cannot be
+#    expressed. gonk shares ONE dataset between browse and a graph-scoped ledger, so it is
+#    exactly the host that had something to lose; `tests/browse.rs::a_browse_read_touches_no_
+#    reserved_graph` is this server's own statement of the property, over quads.
+# 2. **`Mount::graph(NamedNode)`** — a host CHOOSES the graph browse writes and reads. That is
+#    what lets `src/browse.rs::Graph` be one value feeding both the mount and the store's
+#    `SharerWrites` declaration, instead of `main` transcribing a fact about browse's
+#    internals (ledger #282). See that type; the promise is derived now, not re-typed.
+#
+# ⚠ `^0.3.2` was `>=0.3.2, <0.4.0` — a floor that was silently also a CEILING, so 0.4.0 was
+# published and unreachable while this manifest resolved clean and said nothing
+# (constitution rule 5's second half, ledger #367). Every caret pin here is a RANGE.
+#
+# ⚠ Taking 0.4.0 does NOT move gonk's data: a mount that never calls `Mount::graph` uses the
+# default graph, byte for byte as before. Giving browse its own graph is a separate decision
+# with a migration attached — see `src/browse.rs::Graph`.
+#
+# ⚠ **The last two bumps are rule 5 rather than features this binary calls, and both are
+# about what this server's door OFFERS.** A caret resolves them anyway; what the pin has to
+# state is the true minimum of the CONTRACT the door promises, and `crate::k` serves whatever
+# affordance browse emits — so browse's emitted surface is part of that contract.
+#
+# 0.4.1 is the first release where `review` takes `provider=` and `ExplainConfig::selectable()`
+# covers the review and pull-request tiers as well as the two explain ones — the first whose
+# faces emit a "Review With" affordance, and the first on which `provider=<the configured
+# review backend>` is not refused by the manifold that offers it.
+#
+# ★ 0.6.0 (ledger #449 and #450) is where the reviewer's OUTPUT changed shape twice over. The
+# 3-to-6 quota became a threshold, so a pass can now be archived with ZERO findings and a
+# statement saying so — `nothing above threshold · reviewed the whole file (4812 bytes)`. ⚠ A
+# caller reading `minted.is_empty()` as failure was correct before this and is wrong after it;
+# this server's queue must treat a clean pass as a pass that HAPPENED, not as one that failed.
+# And truncation is gone: a file is split into regions that TILE it, so `ik:reviewedBytes ==
+# ik:totalBytes` is an invariant rather than a disclosure, and `(input truncated)` became
+# `(coverage incomplete)` — a short reading now means a region that did not come back.
+# ★ Measured before shipping, and worth knowing here because this server pays it: a whole-file
+# pass over a 167 KB file is 8 regions and ~34 SECONDS, not the minutes anyone assumed. Wall
+# clock tracks OUTPUT tokens, not input size.
+#
+# ★ 0.5.0 (ledger #444) is the release where a review pass stops MINTING annotations. It produces
+# PENDING findings at `urn:iki:finding:{id}`, and promotion by a human is the only path into the
+# `urn:iki:annotation:` family — "nothing gets published to Gonk except by the human". The review
+# actions' `requires` SHRANK with it: they no longer declare `urn:cap:annotate`, because they no
+# longer write annotations, so a browse+net grant derives a pass and is Denied on the publish.
+# That is the safety interlock this door needs before the trigger (ledger #261) is ever armed, and
+# it is why this pin moves in the same wave as the publish rather than later: `^0.4.2` means
+# `<0.5.0`, so leaving it would have ceilinged this repo out of the exact change it was waiting
+# for, silently and with no diagnostic (rule 5's second half).
+#
+# ★ 0.4.2 was the first release carrying `urn:repo:style:layout` (`ikigai_browse::LAYOUT_IRI`)
+# — the layout rules for the `browse-*` classes those faces emit, as a RESOURCE. Before it the
+# only browse layout CSS in the world was a const string inside `ikigai-web`'s binary, so every
+# other host served browse's markup unstyled (ledger #441) and this door rendered a tree as a
+# cascade of gonk-chrome chips. `crate::k` links it beside `urn:repo:style`; without 0.4.2 that
+# link is a 404, which makes this the one pin here that a page would visibly miss.
+#
+# ★ 0.7.0 (ledger #496, browse PR #45) is the release whose file face takes `proposals=<severity
+# words>` and draws PENDING findings of those severities beside their lines as proposal marks —
+# labelled proposal, never annotation, nothing published. It is the other half of this server's
+# serious-only queue (PR #34): the queue asks a human about critical and major, and the rest are
+# shown where the code is. `crate::k` sends the complement of `gonk.queue.serious` against the
+# finding contract on the one command that asks for a file page as HTML, and only when the bound
+# browse declares the argument — so this pin is the floor for that whole behaviour: on 0.6.x the
+# argument is undeclared, gonk sends nothing, and the page simply has no proposals panel.
+# ⚠ `^0.6.0` is `<0.7.0`, so the pin had to move for the change to be visible at all — rule 5's
+# second half, the same as 0.5.0 -> 0.6.0 above. Minor because it is a new argument on a public
+# face; nothing stored, named or gated moved.
+#
+# ★ 0.8.0 (ledger #481, browse PR #46) is the REGION MEMO: a pass re-derives only the regions of a
+# file whose bytes moved and CARRIES the existing finding records on the rest — same ids, same
+# pending/declined state, re-anchored — so a doc-comment commit to a 180 KB file queues the findings
+# of one region, not twelve (measured on the ledger's own case: 61 -> 15). This server is where
+# that number is felt: the queue grew by 141 and then 134 from single commits on 2026-09-21. ⚠ The
+# json face's `minted` now means what THIS pass minted (`carried`, `memo_regions`,
+# `derived_regions` beside it), so a serious-share tally over `minted` counts fresh derivations
+# only — which is the number the tripwire (#449) wants. `^0.7.0` is `<0.8.0`; the pin moves for
+# the change to be visible at all. Minor: the archive gains a second key and the pass's shape grew.
+#
+# ★ 0.9.0 (ledger #475, browse PR #47) REMEMBERS DECLINES: a fresh finding whose quote matches a
+# finding a human already declined on the same file is minted carrying that prior decision
+# (json `prior_decision` {finding, iri, outcome, severity, decided_at, note}); an exact repeat is
+# withheld and counted in ik:suppressedItems. This server renders the mark on the queue row — a
+# like claim on this line was declined <date>: <reason> — so the second decision is one click and
+# visibly different when it is a different claim. Measured before it shipped: of 458 declines,
+# 98 same-line pairs share a quote and 0 share a note, so at temperature 0.2 the WITHHOLD never
+# fires and the mark carries the whole weight; 74 of the day's pending would have arrived marked.
+# `^0.8.0` is `<0.9.0`; the pin moves for the field to exist. Minor: additive fields on faces.
+#
+# ★ 0.10.0 (browse PR #48) gives a decline a REASON WORD: the finding Sink declares an optional
+# `reason` whose `one_of` is five words (and whose summary carries what each means), stored as a
+# term, read back as `decision.reason` / `prior_decision.reason`. The Queue's decide form draws
+# that menu from the contract beside the Decline button, and the adapter forwards `reason` only
+# with a decline, because browse REFUSES a word beside a publish. On 0.9.x the input is
+# undeclared, so the adapter would refuse the picker's field as undeclared — which is why this is
+# the floor and not merely the latest. `^0.9.0` is `<0.10.0`; the pin moves for the input to
+# exist at all. Minor: an additive optional input and additive read-back fields.
+# ★ 0.11.0 (ledger #504, browse PR #49) BOUNDS THE QUEUE: an undecided finding is `superseded`
+# when its file's current review neither minted nor carried it. Computed on read, stored nowhere,
+# so the ~570 findings a re-review had replaced leave `state=pending` the moment this runs, and
+# pending tracks the CODE instead of the commit history. `superseded` joins the findings face's
+# `state` one_of, which this server reads for its state tabs — no other change here. It does not
+# feed the recurrence mark (a superseded twin is not a decision). `^0.10.0` is `<0.11.0`.
+ikigai-browse = "0.11.0"
+# The dev-tooling facades browse's PR family resolves THROUGH THE KERNEL (`urn:repo:pr:list`,
+# `:view`, `:diff`) plus `urn:repo:{status,log,branch,list}` and `urn:system:exec`. browse
+# does not depend on this crate: without it the PR rows answer a typed `NotFound`, so linking
+# it is what makes those rows work. Every resource here enforces `urn:cap:exec:{tool}` —
+# `urn:system:exec` included, per tool, not under the offering wildcard — so a grant naming
+# `urn:cap:exec:git` cannot run `gh`, and `grants.rs` refuses the wildcard as a GRANT.
+ikigai-repo = "0.1.6"
+# The tuplespace behind the git-event review trigger (`crate::trigger`, ledger #261):
+# `urn:space:{name}` — `out` drops a tuple, `rd` reads without consuming, `take` claims one
+# with an atomic rename compare-and-swap. Linked for ONE property that is not a
+# convenience: a queue whose tuples are FILES survives a restart of this process, and a
+# commit that happens while nothing is draining is not lost.
+#
+# ★★ **0.1.24 IS THE FLOOR AND IT IS THE WHOLE REASON THIS ARC COULD HAPPEN.**
+# `SpaceReactor` was linked and deliberately NOT USED through 0.1.23, for the same class of
+# reason `urn:time:schedule` is not bound: it fired a handler under the scopes in a `cap`
+# file beside the space, built with `Capability::scoped` — the TRUSTED minting path, not an
+# attenuation — from a directory anything that can drop a tuple can also write. That would
+# have been a second authority file with none of the refusals `quic::check_grants` applies
+# to a certificate or a passkey, so this server used the SPACE and nothing else.
+#
+# 0.1.24 fixes that twice over (ledger #445, ikigai-cli PR #347), and this binary uses the
+# stronger half: `SpaceReactor::with_host_authority` lets the HOST supply the capability, so
+# the crate never reads a `cap` file at all and a pass runs under the grant an operator wrote
+# into `grants.json` — the same file every certificate and every passkey is checked against.
+# (The other half, `Capability::attenuate`, makes the file unable to widen even where it is
+# read.) `crate::trigger::arm` is the call; `refuse_cap_file` stays as it was and becomes
+# belt-and-braces, joined by the reactor's own `ignored_cap_files()` — under the host seam a
+# `cap` file is INERT, which is a new way to be wrong about your own configuration.
+#
+# ⚠ It is a FLOOR and a CEILING both (`^0.1.24` is `<0.2.0`), and the crate ships from the
+# cli's workspace on a shared version, so this line moves when that workspace releases.
+# Its own floors are `ikigai-core ^0.1.64` and `ikigai-resolve ^0.1.23`, both of which the
+# pins here already exceed.
+#
+# ⚠ It brings `oxigraph` with DEFAULT FEATURES, where every other oxigraph line in this
+# graph sets `default-features = false`. Cargo unions features per package, so this widens
+# the oxigraph build for the whole binary — a compile-time cost, not a served-surface one;
+# `tests/conformance.rs` still pins the catalog id by id.
+ikigai-intray = "0.1.24"
+# The mount machinery: `MountedRemote` (override mode — the IRI forwarded unchanged, the
+# peer's catalog surfaced under its own names and tagged with its origin) and the `Resolver`
+# trait `crate::mount` implements to dial lazily. Was a dev-dependency until `gonk.mount`
+# existed; it is a PRODUCTION dependency now, and the same pin serves both.
+# The resolve floor the transports below share. It has been raised three times for reasons
+# worth keeping: 0.1.18 -> 0.1.22 by `ikigai-time`, which requires `^0.1.22`; 0.1.22 ->
+# 0.1.24 because ipc and quic below needed 0.1.24; 0.1.24 -> 0.1.25 because ipc below needs
+# 0.1.25 and requires `ikigai-resolve ^0.1.25`. All three ship from one workspace on a
+# single shared version — so a lower pin here is a floor this build can never resolve. The
+# pin states the minimum that COMPILES with everything else here, and it moves when a
+# sibling moves it. (quic is still 0.1.24 on crates.io; its `^0.1.24` admits this.)
+ikigai-resolve = "0.1.25"
+# The owner-only socket door. 0.1.18 is the first release whose `ikigai-resolve`
+# requirement admits only versions that compile against the core floor above (through
+# 0.1.17 it admits `ikigai-resolve` 0.1.14–0.1.16, which build `Resolved { .. }` without
+# the `canonical` field core 0.1.60 added).
+# ⚠ Both halves of this crate are linked and both are now USED: `serve` is the door, and
+# `connect` is what a `gonk.mount` line pointed at a socket dials.
+# ★ 0.1.25 is the floor for a REASON THIS BINARY NEEDS, and it is a SECURITY-SHAPED one
+# (ledger #479, #487; ikigai-cli #353): through 0.1.24 a call that missed its read deadline
+# returned `Timeout` while KEEPING the connection, and replies are matched to calls
+# positionally with no correlation id — so the server's abandoned reply was handed to the
+# NEXT call, well-formed and wrong, permanently. A host multiplexing identities over one
+# standing resolver hands one principal's answer to another with no grant consulted. gonk
+# is exactly such a host, and its 30s describe bound is exactly the deadline that fires.
+# 0.1.25 drops the stream on a missed deadline so the next call redials.
+# `tests/ledger_479_wire_desync.rs` is the FLOOR TEST for this pin: it goes red on 0.1.24.
+# ★ 0.1.24 was the previous floor, also for a reason still needed: a mount's
+# self-description is bounded (`describe.timeout`, ikigai-cli #342, ledger #404). Before
+# it, an enumeration of a peer that accepts and never answers blocks forever, and gonk is
+# the peer that does exactly that to everyone else — it federates its LLM mount inside its
+# own `entries()`.
+ikigai-ipc = "0.1.25"
+# The authenticated remote door. 0.1.18 carries `Minter`, `PeerIdentity { fingerprint }`
+# and `fingerprint_of_pem` — per-connection authority minted from which certificate
+# authenticated, refused when it maps to none — with the same resolve floor as ipc.
+# ⚠ And the client half of this one: `connect`, `Identity` — what a `gonk.mount` line
+# pointed at `quic://` dials, presenting the client.crt in the configured directory and
+# pinning the peer's server.crt. That code was already compiled in (one crate, both roles);
+# what is new in 0.1.1 is that this binary now DIALS. See `crate::mount` for the consequence
+# that is not obvious: the client resolver owns a tokio runtime, and both wire doors dispatch
+# from inside one, so every mounted call runs on a thread of its own or panics the worker.
+# ★ 0.1.24 is what makes THIS SERVER answer an enumeration. gonk blocks in
+# `QuicResolver::entries` against its `gonk.mount` LLM peer, so a caller enumerating gonk
+# waits on a hop gonk itself never bounds — measured unanswered past 240s (ledger #404).
+# The bound is per call and shared with ipc as `describe.timeout` in the config home.
+ikigai-quic = "0.1.24"
+# The loopback HTTP door: `serve_with_listener`, the `CapFn` seam (a capability derived
+# per request), `HttpRequest::peer`, and the route table the browse face will extend.
+ikigai-web = "0.1.16"
+# Compression as RESOURCES, for the backup family (`crate::backup`). Bound into the hub,
+# so a backup reaches gzip by resolving `urn:compress:gzip` through the kernel rather than
+# by calling a gzip crate — which is the whole reason a module was built instead of a
+# helper. Three properties this server relies on and did not measure itself: the gzip
+# header fields are PINNED (so two backups of unchanged data are byte-identical), the
+# endpoints require NO capability (compression is pure computation over bytes the caller
+# already holds, so the backup path widens no authority), and decompression is BOUNDED —
+# `max-bytes` refuses rather than truncates, which is what makes restoring an archive from
+# outside this machine safe to attempt.
+# ⚠ It also registers TRANSREPTORS (`* -> application/gzip` and back). Nothing in this
+# server asks for `as=application/gzip` except `crate::backup`, so the planner gains a
+# route no page can reach; `tests/conformance.rs` pins the four ids so a version that
+# binds more is a red test.
+ikigai-compress = "0.1.0"
+# The timer that fires the backup. gonk holds the store, so gonk schedules the backup:
+# an external scheduler's failure mode is "gonk healthy, data changing, backups stopped,
+# nobody knows", and a backup job must not be able to outlive the thing it protects.
+# 0.3.0 is the floor and it is the reason this is usable at all: `JobHealth` gained
+# `last_success`, `since_last_success` and `failures_in_a_row` there, which is exactly the
+# difference between "overdue" and "failing" that a 24-hour cadence needs —
+# `urn:iki:gonk:backup:status` reports them.
+# ★ 0.4.0 is the floor now, and for a SECURITY reason (ledger #79, ikigai-cli PR #356): through
+# 0.3.0 every job fired under the REGISTRY's capability, which defaults to root — a caller who
+# could reach `urn:time:schedule` fired any request at full authority. 0.4.0 records the
+# capability that SCHEDULED each job and fires every tick under `ceiling.clamp(recorded)`, and
+# `schedule` takes that capability as a required argument. 0.3.0 is YANKED (2026-09-24), so
+# `^0.3.0` no longer resolves fresh at all; this pin had to move. gonk was never exposed — it
+# scopes the registry to `backup::JOB_SCOPES` and binds no control plane — and now names the
+# same scopes on the job itself.
+# ⚠ Only `JobRegistry` + `ThreadTimer` are used. The `urn:time:*` CONTROL PLANE is still
+# deliberately NOT bound: the backup's target set is fixed at startup by `main`, nothing here
+# needs a caller to schedule, and every bound endpoint is surface. See `crate::backup`.
+ikigai-time = "0.4.0"
+# `Endpoint::invoke` is async_trait; the hub-forwarding endpoint in `doors.rs` is one.
+async-trait = "0.1"
+# The HTTP door's accept loop. The QUIC door owns its own runtime (ikigai-quic).
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net"] }
+# `clients.json` and `grants.json` — the same two files, in the same shapes, that
+# `ikigai serve quic://…` reads.
+serde_json = "1"
+# The HTML face's renderer: `transform_xml`, xrust's XSLT called as a library function.
+# ⚠ The CRATE, not its endpoint — `urn:xslt:transform` is never bound here, so the served
+# catalog does not widen and its `http(s)://` fetch path (through `urn:httpGet`) does not
+# exist in this binary. `transform_xml` is present from 0.1.0; 0.1.3 is what is built and
+# tested, and was not re-resolved from scratch at `=0.1.0`.
+#
+# ★ **0.1.3 CACHES THE COMPILED STYLESHEET, and for this binary that is the difference
+# between paying to compile `gonk.xsl` on every HTML request and paying once per process**
+# (ledger #453). Measured here with `cargo run --release --example render-cost` over 425 real
+# ledger items, two renders in one process, which is the shape a long-lived server has:
+#
+#   0.1.2   first render 224ms · second (50 rows) 638ms
+#   0.1.3   first render 226ms · second (50 rows) 455ms
+#
+# The FIRST render is unchanged — compiling is not faster, it is amortized — and every render
+# after it in the process drops by ~183ms. That floor sits under every page this server
+# serves, the Queue page included, so it is a larger share of a small page than of a big one.
+#
+# ⚠ It is a PERFORMANCE property, not an API floor: `transform_xml`'s signature is unchanged
+# and 0.1.2 still compiles. The pin states what is built and tested, which is what this
+# manifest's pins have always meant — and stating it is what makes the property reachable for
+# anyone building without our lockfile, which `cargo install` without `--locked` is (rule 9d).
+ikigai-xslt = "0.1.3"
+# The passkey verifier: `verify`, `Policy`, `RegisteredCredential::from_spki_der`. ES256
+# only, no attestation parsing — the enrolment INVITE is the registration trust anchor, so
+# nothing here needs a CBOR decoder. Present from 0.1.14; 0.1.21 is what was built and tested.
+ikigai-passkey = "0.1.21"
+# A ledger's Turtle face re-serialized as RDF/XML for the stylesheet — `oxigraph::io`,
+# already in the graph through `ikigai-store` (with the same `default-features = false`, so
+# this line adds no feature and no compile).
+# ★ And, since the backup family, `oxigraph::sparql::results` too: a backup is
+# `urn:iki:store:select` read back through the ENGINE'S OWN results parser and written by
+# the ENGINE'S OWN N-Quads serializer, never by string surgery on either end. That is what
+# keeps a literal containing ` .`, a language tag or a datatype from becoming a corrupt
+# line in the one file nobody reads until they need it.
+oxigraph = { version = "0.5", default-features = false }
+# Passkey challenges and session tokens: 32 bytes from the OS.
+getrandom = "0.3"
+# base64url for WebAuthn's byte fields (credential ids, challenges, keys).
+base64 = "0.22"
+# An enrolment invite is stored as the SHA-256 of its code, never the code — and a backup
+# records the digest of both its N-Quads and its archive, so "is this backup the same data
+# as the last one" is a comparison rather than a belief.
+sha2 = "0.10"
+# The watch over the browse roots (`crate::watch`). gonk caches browse's filesystem reads —
+# browse declares them live and uncacheable, because a LIBRARY cannot know whether anyone is
+# watching — and a declared golden thread is a promise that something cuts it. This is that
+# something. Same major as `ikigai-browse`'s own (its `StyleWatch`) and `ikigai-cli`'s, so one
+# platform watcher implementation is in the graph.
+notify = "6.1"
+
+[dev-dependencies]
+# The module recipe as one test, walked over the kernel `main` serves. ⚠ This pin is a
+# PRODUCTION floor too: see the vocab note above.
+ikigai-conformance = "0.3"
+futures = "0.3"
+tempfile = "3"
+# A software authenticator: `tests/web.rs` signs real ES256 assertions, so the passkey path
+# is exercised end to end over HTTP — the same key type `ikigai-passkey` verifies.
+p256 = { version = "0.13", features = ["ecdsa", "pem"] }
+# The WCAG contrast floor the page's palette is held to, in both color schemes.
+ikigai-a11y = "0.2"

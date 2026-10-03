@@ -4,8 +4,12 @@
 //!
 //!   cargo run --example judge-probe -- [--model <ollama tag>] [--base-url <url>] \
 //!       [--split dev|holdout|all] [--scope serious|all] [--limit <n>] [--entry <name>]... \
-//!       [--max-tokens <n>] \
+//!       [--max-tokens <n>] [--corpus <dir>] \
 //!       [--repos ~/git-personal] [--trees <dir>] <out.jsonl>
+//!
+//! `--corpus` reads another export's `corpus.json` (default: this repo's
+//! `tests/corpus/judge/`) — a local `export.py --include-private --out <dir>` run,
+//! whose private entries must never be committed here.
 //!
 //! Writes `<out.jsonl>` (the RULE's verdict, which is what ships) and
 //! `<out>.stated.jsonl` (the model's own `VERDICT:` line), both from the same
@@ -159,15 +163,17 @@ fn main() {
         .unwrap_or(usize::MAX);
     let only = take_all(&mut args, "--entry");
     let repos = expand(&take_flag(&mut args, "--repos").unwrap_or_else(|| "~/git-personal".into()));
-    let corpus_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/judge");
+    let corpus_dir = take_flag(&mut args, "--corpus")
+        .map(|d| expand(&d))
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/judge"));
     let trees = take_flag(&mut args, "--trees")
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("ikigai-browse-judge-trees"));
     let [out] = args.as_slice() else {
         eprintln!(
             "usage: judge-probe [--model <tag>] [--base-url <url>] [--split dev|holdout|all] \
-             [--scope serious|all] [--limit <n>] [--entry <name>]... [--repos <dir>] \
-             [--trees <dir>] <out.jsonl>"
+             [--scope serious|all] [--limit <n>] [--entry <name>]... [--max-tokens <n>] \
+             [--corpus <dir>] [--repos <dir>] [--trees <dir>] <out.jsonl>"
         );
         std::process::exit(2);
     };

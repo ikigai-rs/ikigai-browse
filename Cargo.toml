@@ -367,7 +367,7 @@ readme = "README.md"
 keywords = ["ikigai", "roc", "resolution", "module", "capability"]
 categories = ["development-tools", "filesystem"]
 # The judge eval set is an instrument for this repo's measurement runs, not part
-# of the crate: about 5 MB of other repos' file versions (the bytes each review
+# of the crate: about 11 MB of other repos' file versions (the bytes each review
 # finding was minted against). Its check in `tests/corpus.rs` requires it inside
 # a git checkout and returns without it outside one.
 exclude = ["tests/corpus/judge/"]

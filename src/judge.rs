@@ -107,7 +107,23 @@ use crate::{
 
 /// Version of the judge prompt pair, folded into the verdict key. A prompt
 /// edit bumps this; verdicts under an older tag stay on file beside the new.
-pub(crate) const JUDGE_PROMPT_VERSION: &str = "judge-v1";
+///
+/// **judge-v2** (ledger #483, measured on findings sweep 2's reproduced
+/// labels, ledger #706; the table is in `tests/corpus/judge/README.md`):
+///
+/// * the RULE — `occurs: n/a` never confirms, and a stated `refuted`/`unsure`
+///   beside four supporting answers is `unsure` ([`verdict_of`]);
+/// * OCCURS asks for one concrete input the code can receive and the line where
+///   it goes wrong — "could" and "might", or a failure that depends on code not
+///   shown, are `unclear` — and counts an error the code returns or reports on
+///   purpose as the code working, not a failure.
+///
+/// Measured and DROPPED: a 30-word cap on each reason (fewer truncated
+/// answers, but more false confirmations and a reproduced real finding lost),
+/// and a DISCLOSED that counts a comment JUSTIFYING the behavior as a
+/// disclosure (it lost 2 of 6 verified-real findings on the dev split, the
+/// failure judge-v1's narrower wording was written to prevent).
+pub(crate) const JUDGE_PROMPT_VERSION: &str = "judge-v2";
 
 /// The verdict words — each spelled ONCE, here: [`verdict_of`] returns them,
 /// the archive stores them, and [`VERDICTS`] is the `one_of` a consumer reads
@@ -999,8 +1015,14 @@ pub(crate) fn prompt(
          problem: answer no for it.\n\
          OCCURS: yes|no|unclear|n/a - Would the consequence the claim predicts (a panic, a \
          failure, a wrong result, a compile error, a hole) actually follow, for the inputs this \
-         code can really receive? no if the code shown prevents it; n/a if the claim predicts \
-         no consequence.\n\
+         code can really receive? yes only if you can name one concrete input this code can \
+         receive and the line where it goes wrong; a failure that only could or might happen, \
+         or that depends on code or callers not shown, is unclear. no if the code shown, its \
+         types or a test shown prevents it. An error the code returns or reports on purpose \
+         (a `?`, an Err, a refusal, a message and a non-zero exit) is the code working, not a \
+         failure: no, unless the claim shows that error is the wrong answer. n/a if the claim \
+         predicts no concrete consequence (a matter of style, documentation or a preferred \
+         design).\n\
          TEST: yes|no - Is the quoted code test code whose only problem, per the claim, is \
          that it fails loudly (a panic, an expect, an assert), which is how a test reports a \
          failure?\n\
@@ -1097,10 +1119,21 @@ pub(crate) fn parse(answer: &str) -> Parsed {
 ///   WARNS about the same problem (`disclosed: yes`), or it is TEST code whose
 ///   only fault is failing loudly (`test: yes`);
 /// * **confirmed** when every answer supports it: the code does it, the
-///   consequence would follow (or none was predicted), nothing at the site
-///   already warns about it, and it is not a test failing as tests do;
-/// * **unsure** otherwise — an `unclear`, a question left unanswered, or
-///   `code: no` on its own.
+///   consequence WOULD follow (`occurs: yes`), nothing at the site already
+///   warns about it, it is not a test failing as tests do — and the model's
+///   own `VERDICT:` line (`stated`), when it gave one, does not say otherwise;
+/// * **unsure** otherwise — an `unclear`, a question left unanswered,
+///   `code: no` on its own, `occurs: n/a`, or a stated verdict that dissents
+///   from four supporting answers.
+///
+/// ⚠ Two judge-v1 confirmations are now `unsure`, both measured on findings
+/// sweep 2 (ledger #706, every judge-v1@qwen3-coder-next CONFIRMED major
+/// verified by reproduction): `occurs: n/a` confirmed 12 findings that were
+/// not defects and no real one — a claim the judge itself says predicts no
+/// consequence has nothing left to confirm — and a stated `refuted`/`unsure`
+/// beside four supporting answers confirmed 4 more, also none real. `stated`
+/// only ever WITHHOLDS a confirmation: it never refutes and never confirms by
+/// itself, so the verdict stays the rule's.
 ///
 /// ⚠ `code: no` does NOT refute, and that is a measured choice, not an
 /// oversight. On the eval set's dev split (`tests/corpus/judge/`, 70 entries,
@@ -1111,7 +1144,7 @@ pub(crate) fn parse(answer: &str) -> Parsed {
 /// anyway: with `code` as a refuter the rule lost 3 of 6 verified-real findings
 /// and caught 18 of 21 known-false; without it, 1 of 6 and the same 18. The
 /// rule was chosen on the dev split only; the held-out split is the result.
-pub(crate) fn verdict_of(answers: &[Answer]) -> &'static str {
+pub(crate) fn verdict_of(answers: &[Answer], stated: Option<&str>) -> &'static str {
     let said = |q: &str| {
         answers
             .iter()
@@ -1125,9 +1158,10 @@ pub(crate) fn verdict_of(answers: &[Answer]) -> &'static str {
         return REFUTED;
     }
     if said("code") == Some("yes")
-        && matches!(said("occurs"), Some("yes" | "n/a"))
+        && said("occurs") == Some("yes")
         && said("disclosed") == Some("no")
         && said("test") == Some("no")
+        && matches!(stated, None | Some(CONFIRMED))
     {
         return CONFIRMED;
     }
@@ -1402,10 +1436,10 @@ fn load_verdict(archive: &Archive, iri: &str) -> Result<Option<Verdict>> {
 /// so [`load_verdicts`] never reads one as a verdict.
 ///
 /// ```turtle
-/// <urn:iki:finding:{id}:judge:judge-v1@m> a prov:Activity ;
+/// <urn:iki:finding:{id}:judge:judge-v2@m> a prov:Activity ;
 ///     prov:used <urn:iki:finding:{id}> ;
 ///     dcterms:type <urn:iki:judge:cannot> ;
-///     ik:versionTag "judge-v1@m" ;
+///     ik:versionTag "judge-v2@m" ;
 ///     dcterms:creator "m" ;
 ///     dcterms:description "the version it was reviewed against (…) is neither …" ;
 ///     <urn:iki:judge:basis> "sha256:…" ;
@@ -1558,9 +1592,9 @@ pub(crate) fn load_cannot(archive: &Archive, iri: &str) -> Result<Option<Cannot>
 /// finding row, and of the judge resource's answer.
 ///
 /// ```json
-/// {"iri": "urn:iki:finding:{id}:judge:judge-v1@qwen3-coder:30b",
+/// {"iri": "urn:iki:finding:{id}:judge:judge-v2@qwen3-coder:30b",
 ///  "verdict": "refuted", "stated": "refuted",
-///  "tag": "judge-v1@qwen3-coder:30b", "model": "qwen3-coder:30b",
+///  "tag": "judge-v2@qwen3-coder:30b", "model": "qwen3-coder:30b",
 ///  "judged_at": "2026-10-01T23:00:00.000Z", "test_code": false,
 ///  "answers": {"code": {"answer": "no", "reason": "…"},
 ///              "disclosed": {"answer": "no", "reason": "…"},
@@ -1791,7 +1825,7 @@ pub(crate) async fn judge_findings(
         };
         let verdict = Verdict {
             iri,
-            verdict: verdict_of(&parsed.answers).to_string(),
+            verdict: verdict_of(&parsed.answers, parsed.stated.as_deref()).to_string(),
             stated: parsed.stated,
             tag: tag.clone(),
             model: model.clone(),
@@ -1934,7 +1968,7 @@ impl Endpoint for JudgeEndpoint {
         let (raw, parsed) = ask(inv, &self.config, &provider, &prepared).await?;
         let verdict = Verdict {
             iri: String::new(),
-            verdict: verdict_of(&parsed.answers).to_string(),
+            verdict: verdict_of(&parsed.answers, parsed.stated.as_deref()).to_string(),
             stated: parsed.stated,
             tag,
             model,
@@ -1983,8 +2017,9 @@ fn judge_description(config: &ExplainConfig) -> Description {
              code do what the claim says; disclosed: is the hazard already stated at the site; \
              occurs: would the predicted failure happen; test: is this test code where failing \
              loudly is the intent) and a verdict BY RULE: refuted when any answer refutes, \
-             confirmed when all support, else unsure. The model's own VERDICT line rides along \
-             as `stated`. Temperature 0. Nothing is archived: the review pass runs the same \
+             confirmed when all four support it (occurs: yes, never n/a) and the model's own \
+             VERDICT line does not dissent, else unsure. That VERDICT line rides along as \
+             `stated`. Temperature 0. Nothing is archived: the review pass runs the same \
              judgment on each serious finding it mints and attaches the verdict to the finding \
              (`judge` on its json row), and nothing is dropped or withheld because of one. \
              application/json (default) is the verdict object plus `raw` (the answer) and \
@@ -2578,7 +2613,11 @@ impl Endpoint for JudgeFindingEndpoint {
                                             ask(inv, &self.config, &provider, &prepared).await?;
                                         let verdict = Verdict {
                                             iri: iri.clone(),
-                                            verdict: verdict_of(&parsed.answers).to_string(),
+                                            verdict: verdict_of(
+                                                &parsed.answers,
+                                                parsed.stated.as_deref(),
+                                            )
+                                            .to_string(),
                                             stated: parsed.stated,
                                             tag: tag.clone(),
                                             model: model.clone(),
@@ -2880,19 +2919,59 @@ mod tests {
         );
         assert_eq!(p.answers[0].reason, "the operator does not panic.");
         // `code: no` alone is not a refutation (see `verdict_of`).
-        assert_eq!(verdict_of(&p.answers), "unsure");
-        assert_eq!(
-            verdict_of(&parse("CODE: yes - x\nOCCURS: no - y").answers),
-            "refuted"
-        );
+        assert_eq!(rule(&p), "unsure");
+        assert_eq!(rule(&parse("CODE: yes - x\nOCCURS: no - y")), "refuted");
         let ok = parse("CODE: yes - x\nDISCLOSED: no - x\nOCCURS: yes - x\nTEST: no - x\n");
-        assert_eq!(verdict_of(&ok.answers), "confirmed");
+        assert_eq!(rule(&ok), "confirmed");
         let half = parse("CODE: yes - x\nOCCURS: unclear - x\n");
-        assert_eq!(verdict_of(&half.answers), "unsure");
-        assert_eq!(
-            verdict_of(&parse("DISCLOSED: yes - it says so").answers),
-            "refuted"
+        assert_eq!(rule(&half), "unsure");
+        assert_eq!(rule(&parse("DISCLOSED: yes - it says so")), "refuted");
+    }
+
+    fn rule(p: &Parsed) -> &'static str {
+        verdict_of(&p.answers, p.stated.as_deref())
+    }
+
+    /// Claim 1 of the judge-v2 brief (ledger #483, findings sweep 2): judge-v1
+    /// CONFIRMED with `occurs: n/a` — the judge itself saying the claim predicts
+    /// no consequence — on 12 findings sweep 2 then showed were not defects, and
+    /// on no real one. A claim with no consequence to check has nothing to
+    /// confirm: it is `unsure`.
+    #[test]
+    fn occurs_n_a_never_confirms() {
+        let p = parse(
+            "CODE: yes - the text says so\nDISCLOSED: no - nothing warns\n\
+             OCCURS: n/a - a documentation inconsistency, no runtime consequence\n\
+             TEST: no - not test code\nVERDICT: confirmed",
         );
+        assert_eq!(rule(&p), "unsure");
+        // Without the VERDICT line too: the rule alone decides.
+        let bare = parse("CODE: yes - x\nDISCLOSED: no - x\nOCCURS: n/a - x\nTEST: no - x");
+        assert_eq!(rule(&bare), "unsure");
+    }
+
+    /// Claim 2 (the machine-checkable half): an answer whose own VERDICT line
+    /// says the claim does NOT hold is not a confirmation, however its four
+    /// answers read. judge-v1 confirmed four sweep-2 findings whose model said
+    /// `refuted` or `unsure` beside four supporting answers; all four were not
+    /// defects. The answers still refute on their own terms (`stated` never
+    /// overrides a refutation, and never confirms by itself).
+    #[test]
+    fn a_stated_dissent_turns_a_confirmation_into_unsure() {
+        let all_yes = "CODE: yes - x\nDISCLOSED: no - x\nOCCURS: yes - x\nTEST: no - x\n";
+        for stated in ["refuted", "unsure"] {
+            let p = parse(&format!("{all_yes}VERDICT: {stated}"));
+            assert_eq!(rule(&p), "unsure", "stated {stated}");
+        }
+        assert_eq!(
+            rule(&parse(&format!("{all_yes}VERDICT: confirmed"))),
+            "confirmed"
+        );
+        // No VERDICT line at all: the answers decide, as before.
+        assert_eq!(rule(&parse(all_yes)), "confirmed");
+        // A refutation stands whatever the model's own word says.
+        let refuting = parse("CODE: yes - x\nOCCURS: no - y\nVERDICT: confirmed");
+        assert_eq!(rule(&refuting), "refuted");
     }
 
     #[test]
@@ -2915,6 +2994,10 @@ mod tests {
         assert!(p.contains(">    8 |     x + 1 // overflow is the caller's"));
         assert!(p.contains("CLAIM: This overflows."));
         assert!(p.contains("Test code: no"));
+        // judge-v2's OCCURS: a concrete trigger, and a returned error is not a
+        // failure (measured on findings sweep 2; see JUDGE_PROMPT_VERSION).
+        assert!(p.contains("name one concrete input this code can receive"));
+        assert!(p.contains("is the code working, not a failure"));
         for word in crate::finding::DECLINE_REASONS {
             assert!(
                 !p.contains(word),
@@ -2933,7 +3016,7 @@ mod tests {
         );
         let v = Verdict {
             iri: verdict_iri(finding, "judge-v1@m:1"),
-            verdict: verdict_of(&parsed.answers).to_string(),
+            verdict: verdict_of(&parsed.answers, parsed.stated.as_deref()).to_string(),
             stated: parsed.stated.clone(),
             tag: "judge-v1@m:1".to_string(),
             model: "m:1".to_string(),
@@ -3132,8 +3215,8 @@ mod finding_tests {
         assert_eq!(first["content"], "current");
         assert_eq!(first["anchor"], "recorded");
         assert_eq!(first["judge"]["verdict"], "refuted");
-        assert_eq!(first["judge"]["tag"], "judge-v1@r1");
-        assert_eq!(first["tag"], "judge-v1@r1");
+        assert_eq!(first["judge"]["tag"], "judge-v2@r1");
+        assert_eq!(first["tag"], "judge-v2@r1");
         assert_eq!(log.judge_calls().len(), 1);
         assert!(log.judge_calls()[0].contains("QUOTE: let x = 1;"));
 
@@ -3152,7 +3235,7 @@ mod finding_tests {
 
         let plain = issue(&k, Verb::Source, &resource, &[("as", "text/plain")]).unwrap();
         assert!(
-            plain.starts_with("archived refuted (judge-v1@r1)"),
+            plain.starts_with("archived refuted (judge-v2@r1)"),
             "{plain}"
         );
         std::fs::remove_dir_all(&root).ok();
@@ -3300,7 +3383,7 @@ mod finding_tests {
         let id = queued(&root, &store, &log);
         commit(&root, V2, "two");
         let resource = format!("urn:repo:demo:judge-finding:{id}");
-        let record = verdict_iri(&format!("urn:iki:finding:{id}"), "judge-v1@r1");
+        let record = verdict_iri(&format!("urn:iki:finding:{id}"), "judge-v2@r1");
 
         let k = kernel(&root, &store, &log, true);
         let first = json(&k, &resource);

@@ -3302,7 +3302,7 @@ mod tests {
         let verdict = &critical["judge"];
         assert_eq!(verdict["verdict"], "refuted", "{critical}");
         assert_eq!(verdict["stated"], "refuted");
-        assert_eq!(verdict["tag"], "judge-v1@r1");
+        assert_eq!(verdict["tag"], "judge-v2@r1");
         assert_eq!(verdict["model"], "r1");
         assert_eq!(verdict["test_code"], false);
         assert_eq!(verdict["answers"]["occurs"]["answer"], "no");
@@ -3327,7 +3327,7 @@ mod tests {
             .unwrap(),
         );
         assert!(
-            ttl.contains(&format!("<urn:iki:finding:{id}:judge:judge-v1@r1>")),
+            ttl.contains(&format!("<urn:iki:finding:{id}:judge:judge-v2@r1>")),
             "{ttl}"
         );
         assert!(ttl.contains("<urn:iki:judge:verdict:refuted>"), "{ttl}");
