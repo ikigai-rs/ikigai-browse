@@ -866,13 +866,11 @@ fn list_versions(archive: &Archive, target_iri: &str) -> Result<Vec<ArchiveEntry
             entries.push(entry);
         }
     }
-    entries.sort_by(|a, b| {
-        (b.derived_at.as_deref().unwrap_or(""), &a.tag, &a.hash).cmp(&(
-            a.derived_at.as_deref().unwrap_or(""),
-            &b.tag,
-            &b.hash,
-        ))
-    });
+    // Newest first, by TIME, not text (ledger #736); no stamp sorts oldest.
+    fn at(e: &ArchiveEntry) -> (Option<u64>, Option<&str>) {
+        crate::revision::time_key(e.derived_at.as_deref())
+    }
+    entries.sort_by(|a, b| (at(b), &a.tag, &a.hash).cmp(&(at(a), &b.tag, &b.hash)));
     Ok(entries)
 }
 

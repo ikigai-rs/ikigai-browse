@@ -3883,10 +3883,11 @@ pub(crate) fn declined_twins(
             twins.push(finding);
         }
     }
-    twins.sort_by(|a, b| {
-        let at = |f: &Annotation| f.decision.as_ref().and_then(|d| d.at.clone());
-        at(b).cmp(&at(a)).then_with(|| a.id.cmp(&b.id))
-    });
+    // Newest decline first, by TIME, not text (ledger #736).
+    fn at(f: &Annotation) -> (Option<u64>, Option<&str>) {
+        crate::revision::time_key(f.decision.as_ref().and_then(|d| d.at.as_deref()))
+    }
+    twins.sort_by(|a, b| at(b).cmp(&at(a)).then_with(|| a.id.cmp(&b.id)));
     Ok(twins)
 }
 

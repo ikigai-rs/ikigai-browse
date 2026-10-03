@@ -305,7 +305,11 @@ fn near_duplicates<'a>(pending: &[&'a Row]) -> Vec<Group<'a>> {
         .map(|((_, line, severity), mut rows)| {
             // Oldest first: mint time, then id. A finding with no recorded
             // time sorts oldest — it predates the stamp.
-            rows.sort_by(|(a, _), (b, _)| (&a.created, &a.id).cmp(&(&b.created, &b.id)));
+            // By TIME, not text (ledger #736).
+            fn at(f: &Annotation) -> (Option<u64>, Option<&str>) {
+                crate::revision::time_key(f.created.as_deref())
+            }
+            rows.sort_by(|(a, _), (b, _)| (at(a), &a.id).cmp(&(at(b), &b.id)));
             let kept = rows.remove(0);
             let n = rows.len();
             let label = format!(

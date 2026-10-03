@@ -1339,7 +1339,11 @@ pub(crate) fn load_verdicts(archive: &Archive, finding_iri: &str) -> Result<Vec<
             out.push(v);
         }
     }
-    out.sort_by(|a, b| (&a.judged_at, &a.tag).cmp(&(&b.judged_at, &b.tag)));
+    // By TIME, not text (ledger #736): `judge` is the LATEST verdict.
+    fn at(v: &Verdict) -> (Option<u64>, Option<&str>) {
+        crate::revision::time_key(v.judged_at.as_deref())
+    }
+    out.sort_by(|a, b| (at(a), &a.tag).cmp(&(at(b), &b.tag)));
     Ok(out)
 }
 
