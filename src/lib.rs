@@ -1092,9 +1092,10 @@ pub(crate) fn crumb_trail(items: &[(String, Option<String>)]) -> String {
     for (label, target) in items {
         match target {
             Some(iri) => out.push_str(&format!(
-                "<button class=\"browse-crumb\" hx-get=\"/k/source {iri} as=text/html\" \
+                "<button class=\"browse-crumb\" hx-get=\"/k/source {} as=text/html\" \
                  hx-target=\"#browse\" hx-swap=\"innerHTML\">{}</button>\
                  <span class=\"browse-sep\">/</span>",
+                esc(iri),
                 esc(label)
             )),
             None => out.push_str(&format!(
@@ -1144,7 +1145,7 @@ fn explain_button(repo: &str, rel: &str, label: &str, title: Option<&str>) -> St
     format!(
         "<button class=\"browse-explain-link\"{title} hx-get=\"/k/source {iri} \
          as=text/html\" hx-target=\"#browse\" hx-swap=\"innerHTML\">{label}</button>",
-        iri = explain::explain_iri(repo, rel),
+        iri = esc(&explain::explain_iri(repo, rel)),
     )
 }
 
@@ -1195,7 +1196,7 @@ fn tree_html(repo: &str, rel: &str, entries: &[Entry], explain: bool) -> String 
         actions.push_str(&format!(
             "<button class=\"browse-prs-link\" hx-get=\"/k/source {} as=text/html\" \
              hx-target=\"#browse\" hx-swap=\"innerHTML\">pull requests</button>",
-            pr::prs_iri(repo),
+            esc(&pr::prs_iri(repo)),
         ));
     }
     if !actions.is_empty() {
@@ -1219,6 +1220,10 @@ fn tree_html(repo: &str, rel: &str, entries: &[Entry], explain: bool) -> String 
             Kind::Dir => (tree_iri(repo, &child), format!("{}/", esc(&e.name))),
             _ => (file_iri(repo, &child), esc(&e.name)),
         };
+        // Escaped like every attribute value: `iri_encode` keeps `&` (it is
+        // IRI-legal), and the browser entity-decodes the attribute before htmx
+        // reads it, so a raw `a&lt;b.rs` would request `a<b.rs` (ledger #736).
+        let iri = esc(&iri);
         let size = e
             .size
             .map(|s| format!(" <span class=\"browse-size\">{}</span>", human_size(s)))
@@ -1269,6 +1274,7 @@ fn tree_html(repo: &str, rel: &str, entries: &[Entry], explain: bool) -> String 
          <div hx-get=\"/k/source {iri_with_args} chrome=embed as=text/html\" \
          hx-trigger=\"load\" hx-swap=\"innerHTML\">\
          <p class=\"browse-recent-prs-loading\">loading&#8230;</p></div></section>",
+        iri_with_args = esc(&iri_with_args),
     ));
     out.push_str("</div>");
     out
@@ -2292,6 +2298,71 @@ mod tests {
         assert!(matches!(err, Error::Endpoint(_)), "{err:?}");
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&outside).ok();
+    }
+
+    /// Every `hx-get` value in `html`, entity-decoded the way a browser
+    /// decodes an attribute before htmx reads it.
+    fn hx_gets(html: &str) -> Vec<String> {
+        html.split("hx-get=\"")
+            .skip(1)
+            .map(|rest| {
+                rest[..rest.find('"').unwrap()]
+                    .replace("&lt;", "<")
+                    .replace("&gt;", ">")
+                    .replace("&quot;", "\"")
+                    .replace("&amp;", "&")
+            })
+            .collect()
+    }
+
+    /// Ledger #736: `iri_encode` keeps `&` literal (it is IRI-legal), so an
+    /// IRI interpolated into an attribute UNESCAPED is entity-decoded by the
+    /// browser into a different IRI — a file named `a&lt;b.rs` got a row
+    /// whose `hx-get` requests `a<b.rs`. Every navigation affordance that
+    /// names a path must survive the decode. The tree row case is the
+    /// review-value experiment's reproduction (ledger #723), failing on
+    /// 0b1ec3e.
+    #[test]
+    fn hx_get_attributes_name_the_resource_they_list() {
+        let (dir, file) = ("d&amp;e", "a&lt;b.rs");
+        let rel = format!("{dir}/{file}");
+        let entries = vec![
+            Entry {
+                name: file.to_string(),
+                kind: Kind::File,
+                size: None,
+            },
+            Entry {
+                name: "sub&gt;".to_string(),
+                kind: Kind::Dir,
+                size: None,
+            },
+        ];
+        let pages = [
+            ("tree", tree_html("demo", dir, &entries, true)),
+            ("crumbs", crumbs_html("demo", &format!("{rel}/x"))),
+            ("explain button", explain_button("demo", &rel, "?", None)),
+            ("explain menu", explain::menu_html("demo", &rel)),
+            ("review button", review::review_button_html("demo", &rel)),
+            ("review menu", review::menu_html("demo", &rel)),
+            ("findings link", finding::findings_link_html("demo", &rel)),
+        ];
+        for (what, html) in &pages {
+            let gets = hx_gets(html);
+            assert!(!gets.is_empty(), "{what}: no hx-get in {html}");
+            for get in &gets {
+                assert!(
+                    !get.contains("a<b") && !get.contains("d&e") && !get.contains("sub>"),
+                    "{what}: hx-get decodes to another resource: {get:?} in {html}"
+                );
+            }
+        }
+        let tree = hx_gets(&pages[0].1);
+        let wanted = format!("/k/source {} as=text/html", file_iri("demo", &rel));
+        assert!(tree.contains(&wanted), "the file row: {tree:?}");
+        let crumbs = hx_gets(&pages[1].1);
+        let wanted = format!("/k/source {} as=text/html", tree_iri("demo", dir));
+        assert!(crumbs.contains(&wanted), "the directory crumb: {crumbs:?}");
     }
 
     #[test]

@@ -616,7 +616,7 @@ fn pr_row_li(repo: &str, n: u64, title: &str, state: &str, branch: &str, updated
          hx-target=\"#browse\" hx-swap=\"innerHTML\">#{n} {title}</button>{state_span} \
          <span class=\"browse-pr-branch\">{branch}</span> \
          <span class=\"browse-pr-updated\">{updated}</span></li>",
-        iri = pr_iri(repo, n),
+        iri = esc(&pr_iri(repo, n)),
         title = esc(title),
         branch = esc(branch),
         updated = esc(updated),
@@ -1188,13 +1188,13 @@ fn pr_html(
     let mut actions = format!(
         "<button class=\"browse-view-link\" hx-get=\"/k/source {} as=text/html\" \
          hx-target=\"#browse\" hx-swap=\"innerHTML\">pull requests</button>",
-        prs_iri(repo),
+        esc(&prs_iri(repo)),
     );
     if explain {
         actions.push_str(&format!(
             "<button class=\"browse-explain-link\" hx-get=\"/k/source {} as=text/html\" \
              hx-target=\"#browse\" hx-swap=\"innerHTML\">explain</button>",
-            pr_explain_iri(repo, n),
+            esc(&pr_explain_iri(repo, n)),
         ));
     }
     out.push_str(&format!("<nav class=\"browse-actions\">{actions}</nav>"));
@@ -1328,7 +1328,7 @@ fn pr_explain_face(
                 "<nav class=\"browse-actions\"><button class=\"browse-view-link\" \
                  hx-get=\"/k/source {} as=text/html\" hx-target=\"#browse\" \
                  hx-swap=\"innerHTML\">view pull request</button></nav>",
-                entry.target_iri,
+                esc(&entry.target_iri),
             ));
             out.push_str("<div class=\"browse-explain\">");
             for paragraph in entry.text.split("\n\n").filter(|p| !p.trim().is_empty()) {
@@ -1602,7 +1602,7 @@ fn pr_review_face(
                 "<nav class=\"browse-actions\"><button class=\"browse-view-link\" \
                  hx-get=\"/k/source {} as=text/html\" hx-target=\"#browse\" \
                  hx-swap=\"innerHTML\">view pull request</button></nav>",
-                entry.target_iri,
+                esc(&entry.target_iri),
             ));
             out.push_str(&included.panel_html(None));
             let oid_short: String = entry.hash.chars().take(12).collect();

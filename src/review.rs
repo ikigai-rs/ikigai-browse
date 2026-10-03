@@ -1748,7 +1748,7 @@ pub(crate) fn review_button_html(repo: &str, rel: &str) -> String {
         "<button class=\"browse-review-link\" title=\"review this file — one model call, \
          findings minted as annotations\" hx-get=\"/k/source {iri} as=text/html\" \
          hx-target=\"#browse\" hx-swap=\"innerHTML\">review</button>",
-        iri = review_iri(repo, rel),
+        iri = esc(&review_iri(repo, rel)),
     )
 }
 
@@ -1767,7 +1767,7 @@ pub(crate) fn menu_html(repo: &str, rel: &str) -> String {
          <div class=\"browse-review-menu-body\" hx-get=\"/k/source {iri} as=text/html\" \
          hx-trigger=\"toggle once from:closest details\" hx-target=\"this\" \
          hx-swap=\"innerHTML\"><p>loading options…</p></div></details>",
-        iri = options_iri(repo, rel),
+        iri = esc(&options_iri(repo, rel)),
     )
 }
 
@@ -2400,7 +2400,7 @@ fn review_html(
         "<nav class=\"browse-actions\"><button class=\"browse-view-link\" \
          hx-get=\"/k/source {} as=text/html\" hx-target=\"#browse\" \
          hx-swap=\"innerHTML\">view file</button></nav>",
-        entry.target_iri,
+        esc(&entry.target_iri),
     ));
     // ⚠ A clean pass renders an EMPTY annotation panel, and an empty panel is
     // the shape of every other way this page can fail. The statement goes
@@ -2768,7 +2768,8 @@ fn review_tiers(config: &ExplainConfig) -> [MenuTier<'_>; 1] {
 /// backends serving one model key ONE pass. A menu of backends would offer a
 /// second review it cannot produce, and its no-op would read as a bug.
 fn options_panel_html(repo: &str, rel: &str, options: &[ModelOption]) -> String {
-    let review = review_iri(repo, rel);
+    // Attribute-escaped once: every row interpolates it into an `hx-get`.
+    let review = esc(&review_iri(repo, rel));
     let mut out = String::from("<div class=\"browse-review-menu-panel\">");
     out.push_str(
         "<p class=\"browse-review-menu-heading\">review with \
