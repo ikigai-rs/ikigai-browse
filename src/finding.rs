@@ -857,7 +857,8 @@ impl FindingEndpoint {
                 return Err(Error::InvalidArgument {
                     name: "severity".to_string(),
                     detail: format!(
-                        "`severity={chosen}` rates a finding, and decision={RETRACT} withdraws                          an answer without giving one — drop `severity`"
+                        "`severity={chosen}` rates a finding, and decision={RETRACT} withdraws \
+                         an answer without giving one — drop `severity`"
                     ),
                 })
             }
@@ -875,17 +876,20 @@ impl FindingEndpoint {
                 Some(chosen)
             }
             (_, None) if marking.is_some() => marking.as_ref().and_then(|d| d.severity.clone()),
-            (_, None) => Some(finding.severity.clone().ok_or_else(|| {
-                Error::InvalidArgument {
-                    name: "severity".to_string(),
-                    detail: format!(
+            (_, None) => Some(
+                finding
+                    .severity
+                    .clone()
+                    .ok_or_else(|| Error::InvalidArgument {
+                        name: "severity".to_string(),
+                        detail: format!(
                         "the model proposed no severity for `{}`, so a decision must state one — \
                          one of: {}",
                         finding_iri(&id),
                         SEVERITIES.join(", ")
                     ),
-                }
-            })?),
+                    })?,
+            ),
         };
         // Why a decline, in one contract word. An EMPTY value is "omitted",
         // exactly as for `severity`: a form's unselected picker submits one,

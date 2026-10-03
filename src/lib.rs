@@ -1555,7 +1555,8 @@ pub(crate) fn focus_input() -> ArgSpec {
         .optional()
         .class(XSD_STRING)
         .summary(
-            "html face: the id of an annotation on this target, whose card is marked as just              written and focused — where a successful annotate returns the reader to",
+            "html face: the id of an annotation on this target, whose card is marked as just \
+             written and focused — where a successful annotate returns the reader to the annotated view",
         )
 }
 
@@ -3656,6 +3657,15 @@ mod tests {
         assert!(source(&k, "urn:repo:demo:tree", &[], &demo_cap()).is_ok());
         assert!(source(&k, "urn:repo:demo:file:README.md", &[], &demo_cap()).is_ok());
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A string literal broken across source lines without its `\`
+    /// continuation carries the next line's indentation into the text
+    /// (ledger #736, minor).
+    #[test]
+    fn the_focus_summary_reads_as_one_sentence() {
+        let summary = focus_input().summary;
+        assert!(!summary.contains("  "), "{summary:?}");
     }
 
     #[test]
