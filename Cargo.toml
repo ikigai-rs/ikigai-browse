@@ -429,7 +429,12 @@ required-features = ["migrate"]
 # config_home` / `layered_paths_in`. Cargo would unify to it regardless, but a
 # pin naming a version this crate's dependency graph cannot actually satisfy
 # describes a build nobody has: state the real floor.
-ikigai-core = "0.1.56"
+#
+# 0.1.80 since judge-finding's no-judge refusal (ledger #702): it is a typed
+# `Error::Conflict` — well-formed, authorized, the finding exists, and the
+# host's STATE (no judge configured) refuses it — and that variant is new in
+# 0.1.80.
+ikigai-core = "0.1.80"
 # The accessibility config and the contrast-floor pass: `urn:repo:style`'s
 # themes and its contrast floor are read from the layered `a11y.toml` rather
 # than hard-coded, and each theme's own sub-floor colours are lifted to that
