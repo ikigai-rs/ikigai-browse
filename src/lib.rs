@@ -901,13 +901,16 @@ pub(crate) fn iri_decode(s: &str) -> Result<String> {
     })
 }
 
-/// A Turtle string literal (quote-and-escape).
+/// A Turtle string literal (quote-and-escape). A `"…"` literal may not hold
+/// a raw `"`, `\`, line feed or carriage return, so each is ESCAPED, never
+/// dropped: every Turtle face must state the stored value, and CRLF text is
+/// a stored value like any other (ledger #736).
 pub(crate) fn ttl_str(s: &str) -> String {
     format!(
         "\"{}\"",
         s.replace('\\', "\\\\")
             .replace('"', "\\\"")
-            .replace('\r', "")
+            .replace('\r', "\\r")
             .replace('\n', "\\n")
     )
 }
@@ -2329,6 +2332,24 @@ mod tests {
             "{html}"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `ttl_str` round-trips every character a `"…"` literal must escape
+    /// (ledger #736: the carriage return was dropped, so a CRLF quote's
+    /// Turtle face disagreed with the stored value).
+    #[test]
+    fn ttl_str_round_trips_through_a_turtle_parser() {
+        let value = "a \"quote\"\\ back\r\nCRLF\rCR\nLF\ttab é";
+        let doc = format!("<urn:s> <urn:p> {} .", ttl_str(value));
+        let store = oxigraph::store::Store::new().unwrap();
+        store
+            .load_from_reader(oxigraph::io::RdfFormat::Turtle, doc.as_bytes())
+            .unwrap();
+        let quad = store.iter().next().unwrap().unwrap();
+        match quad.object {
+            oxigraph::model::Term::Literal(l) => assert_eq!(l.value(), value, "{doc}"),
+            other => panic!("not a literal: {other}"),
+        }
     }
 
     #[test]
