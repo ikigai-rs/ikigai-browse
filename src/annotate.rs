@@ -2547,6 +2547,13 @@ impl AnnotationEndpoint {
             ),
         };
         granted(inv, &repo)?;
+        // An UPDATE is a write to the EXISTING annotation too, so it needs the
+        // grant on that annotation's repo, not only on the new target's: a
+        // tenant must not overwrite a note it cannot even read (ledger #736).
+        let existing = load_annotation(&self.archive, &id)?;
+        if let Some(existing) = &existing {
+            granted(inv, &existing.repo)?;
+        }
         // Pipeline citizenship: the note text is the `body` arg, with the
         // piped `content` as fallback.
         let body = inv
@@ -2602,7 +2609,7 @@ impl AnnotationEndpoint {
         let (prefix, suffix) = context_around(&text, &anchor);
 
         // An update keeps its original creation instant.
-        let created = match load_annotation(&self.archive, &id)? {
+        let created = match existing {
             Some(existing) if existing.created.is_some() => existing.created,
             _ => inv.now().map(|t| iso8601(t.as_millis())),
         };
@@ -2659,6 +2666,9 @@ impl AnnotationEndpoint {
     fn delete(&self, inv: &Invocation<'_>) -> Result<Representation> {
         let id = Self::id_binding(inv)?;
         let ann = self.load_required(&id)?;
+        // Deleting is gated like reading: on the annotation's own repo
+        // (ledger #736). The annotate key alone is not a grant on every root.
+        granted(inv, &ann.repo)?;
         remove_annotation(&self.archive, Family::Annotation, &id)?;
         Ok(repr_utf8("text/plain", format!("deleted {}", ann.iri())))
     }
@@ -2778,6 +2788,9 @@ fn annotation_description() -> Description {
             ActionSpec::new(Verb::Delete)
                 .summary("remove an annotation and its selectors from the store")
                 .requires(CAP_ANNOTATE)
+                // Gated on the annotation's repo, like Source: declared so the
+                // manifold does not offer Delete to a caller holding no root.
+                .requires(CAP_WILDCARD)
                 .input(
                     ArgSpec::new("id")
                         .binding()
@@ -5455,7 +5468,11 @@ mod tests {
                 .required
         );
         let delete = of(Verb::Delete);
-        assert_eq!(delete.requires, vec![CAP_ANNOTATE.to_string()]);
+        assert_eq!(
+            delete.requires,
+            vec![CAP_ANNOTATE.to_string(), CAP_WILDCARD.to_string()],
+            "Delete enforces the annotation's per-root grant, so it declares it (ledger #736)"
+        );
 
         // The listing is a plain single-verb read.
         let listing = annotations_description();
