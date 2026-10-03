@@ -2187,7 +2187,7 @@ fn minted_offset(text: &str, pass: &str, exact: &str, id: &str) -> Option<u64> {
     }
     let mut chars = 0u64;
     let mut last = 0usize;
-    for (byte, _) in text.match_indices(exact) {
+    for byte in annotate::occurrences(text, exact) {
         chars += text[last..byte].chars().count() as u64;
         last = byte;
         if annotate::finding_id(pass, chars, exact) == id {
@@ -3328,6 +3328,17 @@ mod finding_tests {
         let id = annotate::finding_id(&pass, second, "x");
         assert_eq!(minted_offset(text, &pass, "x", &id), Some(second));
         assert_eq!(minted_offset(text, &pass, "x", "nope"), None);
+    }
+
+    /// Ledger #736: a finding minted at an OVERLAPPING occurrence is found
+    /// again (`match_indices` skipped it, so the judge could not place it).
+    #[test]
+    fn the_minted_offset_of_an_overlapping_occurrence_is_found() {
+        let hash = format!("sha256:{}", "a".repeat(64));
+        let pass = crate::review::pass_iri("demo", "src/a.rs", &hash, "review-v5@m:30b");
+        let text = "aaaa";
+        let id = annotate::finding_id(&pass, 1, "aa");
+        assert_eq!(minted_offset(text, &pass, "aa", &id), Some(1));
     }
 
     /// ★★ With NO judge configured, judge-finding REFUSES (ledger #702,

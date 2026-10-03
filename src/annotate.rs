@@ -1599,6 +1599,27 @@ pub(crate) struct Anchor {
     pub(crate) line: u64,
 }
 
+/// Every byte offset at which `needle` occurs in `haystack`, OVERLAPPING
+/// occurrences included — `str::match_indices` skips those, so a
+/// self-overlapping quote (`    }\n    }` in a run of closing braces) would
+/// never offer its later copies as candidates (ledger #736). An empty needle
+/// occurs nowhere.
+pub(crate) fn occurrences<'a>(
+    haystack: &'a str,
+    needle: &'a str,
+) -> impl Iterator<Item = usize> + 'a {
+    let mut from = 0;
+    std::iter::from_fn(move || {
+        if needle.is_empty() {
+            return None;
+        }
+        let at = from + haystack.get(from..)?.find(needle)?;
+        // Resume one CHARACTER on, so the next search starts on a boundary.
+        from = at + haystack[at..].chars().next().map_or(1, char::len_utf8);
+        Some(at)
+    })
+}
+
 /// Find `exact` in `content`, deterministically: every occurrence is scored by
 /// how much of the given context matches (`prefix` immediately before it,
 /// `suffix` immediately after — empty context scores nothing), the best score
@@ -1608,7 +1629,7 @@ fn find_anchor(content: &str, exact: &str, prefix: &str, suffix: &str) -> Option
         return None;
     }
     let mut best: Option<(u8, usize)> = None;
-    for (idx, _) in content.match_indices(exact) {
+    for idx in occurrences(content, exact) {
         let mut score = 0u8;
         if !prefix.is_empty() && content[..idx].ends_with(prefix) {
             score += 1;
@@ -1816,17 +1837,12 @@ pub(crate) fn find_anchor_within(
     region: (usize, usize),
     note: &str,
 ) -> Option<DiffAnchor> {
-    let occurrences = |needle: &str| -> Vec<usize> {
-        if needle.is_empty() {
-            return Vec::new();
-        }
-        content.match_indices(needle).map(|(at, _)| at).collect()
-    };
-    let (needle, mut found, stripped) = match occurrences(exact) {
+    let hits_of = |needle: &str| -> Vec<usize> { occurrences(content, needle).collect() };
+    let (needle, mut found, stripped) = match hits_of(exact) {
         hits if !hits.is_empty() => (exact, hits, false),
         _ => {
             let bare = strip_leading_decoration(exact)?;
-            (bare, occurrences(bare), true)
+            (bare, hits_of(bare), true)
         }
     };
     if found.is_empty() {
@@ -4005,6 +4021,44 @@ mod tests {
     use futures::executor::block_on;
     use ikigai_core::{ArgRef, Capability, Kernel, Request};
     use oxigraph::model::vocab::rdf;
+
+    // Ledger #736, item 5: `match_indices` yields NON-OVERLAPPING matches, so
+    // a self-overlapping quote's later occurrence was never a candidate. Here
+    // the context names the second occurrence (byte 8, line 3) and the
+    // anchor landed on the first. Ported from the review-value experiment's
+    // reproductions (ledger #723, led arm b7), which fail on 0b1ec3e.
+    const OVERLAPPING: &str = "a\n    }\n    }\n    }\nb";
+    const OVERLAPPING_EXACT: &str = "    }\n    }";
+
+    #[test]
+    fn an_overlapping_occurrence_is_scored() {
+        let a = find_anchor(OVERLAPPING, OVERLAPPING_EXACT, "}\n", "\nb").expect("anchors");
+        assert_eq!(a.byte_start, 8);
+    }
+
+    #[test]
+    fn the_sink_surface_scores_an_overlapping_occurrence() {
+        let d = find_anchor_on(Surface::File, OVERLAPPING, OVERLAPPING_EXACT, "}\n", "\nb")
+            .expect("anchors");
+        assert_eq!(d.anchor.line, 3);
+    }
+
+    /// The review mint's region-scoped anchoring: the only occurrence inside
+    /// the region is the overlapping one.
+    #[test]
+    fn region_anchoring_sees_an_overlapping_occurrence() {
+        let d = find_anchor_within(OVERLAPPING, OVERLAPPING_EXACT, (8, OVERLAPPING.len()), "")
+            .expect("anchors");
+        assert_eq!(d.anchor.byte_start, 8);
+    }
+
+    #[test]
+    fn occurrences_overlap_and_respect_char_boundaries() {
+        assert_eq!(occurrences("aaaa", "aa").collect::<Vec<_>>(), [0, 1, 2]);
+        assert_eq!(occurrences("éaéa", "éa").collect::<Vec<_>>(), [0, 3]);
+        assert_eq!(occurrences("abc", "").count(), 0);
+        assert_eq!(occurrences("", "a").count(), 0);
+    }
     use oxigraph::model::GraphName;
     use oxigraph::store::Store;
     use std::path::PathBuf;
