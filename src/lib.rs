@@ -2055,7 +2055,10 @@ fn style_description() -> Description {
 struct GitState {
     /// `None` when the root is not a git repository, or on an unborn branch.
     head: Option<String>,
-    /// Repo-relative paths with uncommitted changes (`git status --porcelain`).
+    /// ROOT-relative paths with uncommitted changes, from `git status
+    /// --porcelain -z -- .` — only paths under the root, so a root below its
+    /// work tree's top never names a path its jail refuses (ledger #736). A
+    /// rename keeps its `old -> new` form when both sides are inside.
     dirty: Vec<String>,
     /// Whether the root is inside a git work tree at all.
     git: bool,
@@ -2067,7 +2070,10 @@ pub(crate) fn git(root: &Path, args: &[&str]) -> std::io::Result<std::process::O
 }
 
 fn git_state(root: &Path) -> Result<GitState> {
-    let status = git(root, &["status", "--porcelain"])
+    // `-- .` scopes the status to the root (git runs in it, via `-C`); `-z`
+    // gives NUL-terminated, UNQUOTED paths, which is what makes them
+    // strippable — the quoted form would hide the prefix inside the quote.
+    let status = git(root, &["status", "--porcelain", "-z", "--", "."])
         .map_err(|e| Error::Endpoint(format!("browse: could not run git: {e}")))?;
     if !status.status.success() {
         let stderr = String::from_utf8_lossy(&status.stderr);
@@ -2084,13 +2090,21 @@ fn git_state(root: &Path) -> Result<GitState> {
             stderr.trim()
         )));
     }
-    let dirty: Vec<String> = String::from_utf8_lossy(&status.stdout)
-        .lines()
-        // Porcelain v1: two status columns + a space, then the path (renames
-        // keep their full `old -> new` form).
-        .filter_map(|line| line.get(3..).map(str::to_string))
-        .filter(|path| !path.is_empty())
-        .collect();
+    // Porcelain paths are relative to the WORK TREE's top, whatever `-C`
+    // says; the root's own place in it is `--show-prefix` (`""` at the top,
+    // else `sub/dir/`).
+    let prefix = git(root, &["rev-parse", "--show-prefix"])
+        .map_err(|e| Error::Endpoint(format!("browse: could not run git: {e}")))?;
+    if !prefix.status.success() {
+        return Err(Error::Endpoint(format!(
+            "browse: git rev-parse --show-prefix exited {}: {}",
+            prefix.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&prefix.stderr).trim()
+        )));
+    }
+    let prefix = String::from_utf8_lossy(&prefix.stdout);
+    let prefix = prefix.strip_suffix('\n').unwrap_or(&prefix);
+    let dirty = porcelain_z_paths(&String::from_utf8_lossy(&status.stdout), prefix);
     // An unborn branch (init, no commits) has no HEAD — that is `head: None`
     // with `git: true`, distinct from a non-repo.
     let head = git(root, &["rev-parse", "HEAD"])
@@ -2102,6 +2116,37 @@ fn git_state(root: &Path) -> Result<GitState> {
         dirty,
         git: true,
     })
+}
+
+/// The root-relative paths of `git status --porcelain -z` output. Each record
+/// is `XY path`; a rename or copy (`R`/`C` in either column) is followed by a
+/// second record, the ORIGINAL path. A path outside `prefix` is never
+/// reported (the pathspec should already exclude it; a rename's origin is the
+/// one side it does not scope), and the root itself — wholly untracked — is
+/// `./`.
+fn porcelain_z_paths(out: &str, prefix: &str) -> Vec<String> {
+    let inside = |path: &str| -> Option<String> {
+        let rel = path.strip_prefix(prefix)?;
+        Some(if rel.is_empty() {
+            "./".to_string()
+        } else {
+            rel.to_string()
+        })
+    };
+    let mut records = out.split('\0').filter(|r| !r.is_empty());
+    let mut dirty = Vec::new();
+    while let Some(record) = records.next() {
+        let (Some(xy), Some(path)) = (record.get(..2), record.get(3..)) else {
+            continue;
+        };
+        let origin = xy.contains(['R', 'C']).then(|| records.next()).flatten();
+        let Some(path) = inside(path) else { continue };
+        dirty.push(match origin.and_then(inside) {
+            Some(from) => format!("{from} -> {path}"),
+            None => path,
+        });
+    }
+    dirty
 }
 
 fn state_endpoint(roots: &Roots) -> FnEndpoint {
@@ -2141,7 +2186,7 @@ fn state_description() -> Description {
             "The git state of a configured browse root — urn:repo:{repo}:state. One line: \
              the HEAD sha plus `clean` or `dirty:{n}` (or `not a git repository`); \
              as=application/json yields {head, dirty: [paths]} (head null off-git or on an \
-             unborn branch). Deliberately uncacheable: this is the cheap probe other \
+             unborn branch; paths root-relative, only those under the root). Deliberately uncacheable: this is the cheap probe other \
              resources key their freshness on.",
         )
         .verb(Verb::Source)
@@ -3426,6 +3471,74 @@ mod tests {
         assert!(after.ends_with(" clean"), "{after}");
         assert_ne!(after.split_whitespace().next().unwrap(), head1, "{after}");
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A root BELOW its work tree's top (ledger #736): `state` reports only
+    /// paths under the root, root-relative, never a dirty path outside it —
+    /// which the root's jail refuses to serve. Ported from the review-value
+    /// experiment's reproduction (ledger #723), which failed on 0b1ec3e.
+    #[test]
+    fn state_reports_only_paths_inside_the_root() {
+        let top = temp_dir();
+        run_git(&top, &["init"]);
+        std::fs::write(top.join("outside.txt"), "committed\n").unwrap();
+        let sub = top.join("pub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(sub.join("old.rs"), "fn old() {}\n").unwrap();
+        run_git(&top, &["add", "."]);
+        run_git(&top, &["commit", "-m", "first"]);
+        // Dirt on both sides of the root's edge.
+        std::fs::write(top.join("secret-plan.txt"), "outside the root\n").unwrap();
+        std::fs::write(top.join("outside.txt"), "changed\n").unwrap();
+        std::fs::write(sub.join("a.rs"), "fn a() { 1 }\n").unwrap();
+        std::fs::write(sub.join("sp ace.rs"), "fn s() {}\n").unwrap();
+        run_git(&top, &["mv", "pub/old.rs", "pub/new.rs"]);
+        let k = kernel(vec![("pub".to_string(), sub.clone())]);
+        let cap = Capability::scoped(["urn:cap:browse:read:pub"]);
+
+        // The jail refuses the outside file…
+        assert!(source(&k, "urn:repo:pub:file:..%2Fsecret-plan.txt", &[], &cap).is_err());
+        // …and the state face does not name it either.
+        let json = body(
+            &source(
+                &k,
+                "urn:repo:pub:state",
+                &[("as", "application/json")],
+                &cap,
+            )
+            .unwrap(),
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let mut dirty: Vec<&str> = parsed["dirty"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        dirty.sort_unstable();
+        assert_eq!(
+            dirty,
+            ["a.rs", "old.rs -> new.rs", "sp ace.rs"],
+            "root-relative, inside only: {json}"
+        );
+        let line = body(&source(&k, "urn:repo:pub:state", &[], &cap).unwrap());
+        assert!(line.ends_with(" dirty:3"), "{line}");
+        std::fs::remove_dir_all(&top).ok();
+    }
+
+    /// The pure half: porcelain `-z` records, prefix-stripped.
+    #[test]
+    fn porcelain_records_are_scoped_and_made_root_relative() {
+        let out = "R  pub/b.rs\0pub/a.rs\0A  pub/moved.rs\0R  pub/in.rs\0elsewhere.rs\0?? pub/\0 M pub/x y.rs\0";
+        assert_eq!(
+            porcelain_z_paths(out, "pub/"),
+            ["a.rs -> b.rs", "moved.rs", "in.rs", "./", "x y.rs"]
+        );
+        // At the work tree's top nothing is stripped.
+        assert_eq!(porcelain_z_paths(" M a.rs\0", ""), ["a.rs"]);
+        // A path outside the prefix is dropped.
+        assert!(porcelain_z_paths(" M other/a.rs\0", "pub/").is_empty());
     }
 
     #[test]
