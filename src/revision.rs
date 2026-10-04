@@ -256,6 +256,15 @@ pub(crate) fn parse_millis(at: &str) -> Option<u64> {
     Some(secs * 1000 + ms)
 }
 
+/// The sort key that orders optional timestamps by TIME, not by their text:
+/// the store serves an xsd:dateTime in canonical form (`…:38Z`, `…:38.5Z`),
+/// whose text order is not its time order within a second (ledger #736). No
+/// stamp sorts oldest, an unreadable one next (by its text), then every
+/// readable one by its milliseconds.
+pub(crate) fn time_key(at: Option<&str>) -> (Option<u64>, Option<&str>) {
+    (at.and_then(parse_millis), at)
+}
+
 // --- the walk: unconfirmed declines that still steer ------------------------
 
 /// The `summary=unconfirmed` reading of one listing: the UNCONFIRMED declines
@@ -477,6 +486,18 @@ mod tests {
         for bad in ["", "2026-09-23", "2026-13-01T00:00:00Z", "yesterday"] {
             assert_eq!(parse_millis(bad), None, "{bad}");
         }
+    }
+
+    /// `time_key` orders canonical xsd:dateTime text by TIME (ledger #736):
+    /// `…:00.5Z` is later than `…:00Z`, though it sorts first as text.
+    #[test]
+    fn time_key_orders_by_time_not_text() {
+        let (whole, half) = ("2026-10-01T10:00:00Z", "2026-10-01T10:00:00.5Z");
+        assert!(half < whole, "the text order is the trap");
+        assert!(time_key(Some(half)) > time_key(Some(whole)));
+        // No stamp sorts oldest, an unreadable one next, then readable ones.
+        assert!(time_key(None) < time_key(Some("yesterday")));
+        assert!(time_key(Some("yesterday")) < time_key(Some(whole)));
     }
 
     /// ★ The window rule's edges: three inside a second is a burst, two is

@@ -177,11 +177,12 @@ pub(crate) fn standing(
     let heads = passes_on(archive, repo, rel)?;
     // Newest first: derivation time, then IRI — a total order, so the choice
     // (and `superseded_by`) is deterministic. `None` sorts oldest.
-    let newest_first = |a: &&PassHead, b: &&PassHead| {
-        b.derived_at
-            .cmp(&a.derived_at)
-            .then_with(|| b.iri.cmp(&a.iri))
-    };
+    // By TIME, not text (ledger #736).
+    fn at(p: &PassHead) -> (Option<u64>, Option<&str>) {
+        crate::revision::time_key(p.derived_at.as_deref())
+    }
+    let newest_first =
+        |a: &&PassHead, b: &&PassHead| at(b).cmp(&at(a)).then_with(|| b.iri.cmp(&a.iri));
     let Some(newest) = heads.iter().min_by(newest_first) else {
         return Ok(None);
     };
