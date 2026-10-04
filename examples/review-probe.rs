@@ -192,7 +192,7 @@ fn main() {
 
     for path in paths {
         for i in 0..repeats {
-            let iri = format!("urn:repo:probe:review:{path}");
+            let iri = format!("urn:repo:probe:review:{}", encode_path(path));
             let started = Instant::now();
             let mut request = Request::new(Verb::Source, Iri::parse(&iri).expect("iri"))
                 .with_arg("debug", ArgRef::Inline(b"raw".to_vec()));
@@ -226,4 +226,21 @@ fn main() {
             }
         }
     }
+}
+
+/// Percent-encode a root-relative path for a `urn:repo:` IRI, exactly as the
+/// crate's own (crate-private) `iri_encode` does: a path with a space or a
+/// non-ASCII character is not IRI-legal as it stands, and `Iri::parse` would
+/// panic on it (ledger #736).
+fn encode_path(path: &str) -> String {
+    const SAFE: &[u8] = b"-._~/!$&'()*+,;=:@";
+    path.bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || SAFE.contains(&byte) {
+                (byte as char).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect()
 }
