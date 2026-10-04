@@ -1369,7 +1369,7 @@ fn explain_html(
         "<nav class=\"browse-actions\"><button class=\"browse-view-link\" \
          hx-get=\"/k/source {} as=text/html\" hx-target=\"#browse\" \
          hx-swap=\"innerHTML\">{}</button></nav>",
-        entry.target_iri,
+        esc(&entry.target_iri),
         if is_dir {
             "view directory"
         } else {
@@ -1777,7 +1777,7 @@ pub(crate) fn menu_html(repo: &str, rel: &str) -> String {
          <div class=\"browse-explain-menu-body\" hx-get=\"/k/source {iri} as=text/html\" \
          hx-trigger=\"toggle once from:closest details\" hx-target=\"this\" \
          hx-swap=\"innerHTML\"><p>loading options…</p></div></details>",
-        iri = versions_iri(repo, rel),
+        iri = esc(&versions_iri(repo, rel)),
     )
 }
 
@@ -1801,7 +1801,8 @@ fn menu_panel_html(
     entries: &[ArchiveEntry],
     current_hash: Option<&str>,
 ) -> String {
-    let explain = explain_iri(repo, rel);
+    // Attribute-escaped once: every row interpolates it into an `hx-get`.
+    let explain = esc(&explain_iri(repo, rel));
     let mut out = String::from("<div class=\"browse-explain-menu-panel\">");
 
     // --- already explained, at the CURRENT content ---------------------------
@@ -3376,6 +3377,46 @@ mod tests {
         );
         assert!(html.contains(">coder</button>"), "{html}");
         assert!(html.contains(">batch</button>"), "{html}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Ledger #736: every `hx-get` the explain page and its menu emit names
+    /// the file it is about once the browser has entity-decoded the
+    /// attribute — a file named `a&lt;b.rs` must not link `a<b.rs`.
+    #[test]
+    fn the_explain_page_and_menu_link_an_entity_shaped_name_faithfully() {
+        let root = temp_dir();
+        std::fs::write(root.join("a&lt;b.rs"), "// a\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let calls = Arc::new(AtomicU32::new(0));
+        let k = kernel_with_inventory(&root, &store, &log, INVENTORY, &calls, |c| c);
+        let page = menu(&k, "urn:repo:demo:explain:a&lt;b.rs");
+        let options = menu(&k, "urn:repo:demo:explain-versions:a&lt;b.rs");
+        for html in [&page, &options] {
+            let gets: Vec<String> = html
+                .split("hx-get=\"")
+                .skip(1)
+                .map(|rest| {
+                    rest[..rest.find('"').unwrap()]
+                        .replace("&lt;", "<")
+                        .replace("&gt;", ">")
+                        .replace("&quot;", "\"")
+                        .replace("&amp;", "&")
+                })
+                .collect();
+            assert!(!gets.is_empty(), "{html}");
+            for get in &gets {
+                assert!(
+                    !get.contains("a<b"),
+                    "decodes to another file: {get:?} in {html}"
+                );
+            }
+        }
+        assert!(
+            page.contains("hx-get=\"/k/source urn:repo:demo:file:a&amp;lt;b.rs as=text/html\""),
+            "the backlink: {page}"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

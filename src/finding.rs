@@ -402,7 +402,7 @@ pub(crate) fn findings_link_html(repo: &str, rel: &str) -> String {
         "<button class=\"browse-findings-link\" title=\"review findings awaiting a human — \
          publishing is never automatic\" hx-get=\"/k/source {iri} as=text/html state=all\" \
          hx-target=\"#browse\" hx-swap=\"innerHTML\">findings</button>",
-        iri = findings_iri(repo, rel),
+        iri = esc(&findings_iri(repo, rel)),
     )
 }
 
@@ -1940,7 +1940,7 @@ fn listing_html(
             "<button class=\"browse-findings-state{current}\" hx-get=\"/k/source {iri} \
              as=text/html state={option}\" hx-target=\"#browse\" \
              hx-swap=\"innerHTML\">{option}</button>",
-            iri = findings_iri(repo, rel),
+            iri = esc(&findings_iri(repo, rel)),
         ));
     }
     out.push_str("</nav>");
