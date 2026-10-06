@@ -1719,7 +1719,28 @@ pub(crate) fn bind(
         roots: Arc::clone(roots),
         config: Arc::clone(config),
     });
-    crate::bind_family(space, roots, options, None, Some("review-options:{path}"))
+    let space = crate::bind_family(space, roots, options, None, Some("review-options:{path}"));
+    let status: Arc<dyn Endpoint> = Arc::new(StatusEndpoint {
+        roots: Arc::clone(roots),
+        config: Arc::clone(config),
+    });
+    crate::bind_family(space, roots, status, None, Some("review-status:{path}"))
+}
+
+/// `urn:repo:{repo}:review-status:{path}` — the file face's pre-click answer
+/// for its review button.
+fn status_iri(repo: &str, rel: &str) -> String {
+    format!("urn:repo:{repo}:review-status:{}", iri_encode(rel))
+}
+
+/// The note a review click shows before its status has loaded, or if it
+/// fails.
+const GENERIC_BUSY: &str = "Reviewing… when this version has no archived review yet, a \
+     model reviews the file now, which may take a while.";
+
+/// The status slot the file face renders under its action row.
+pub(crate) fn status_slot_html(repo: &str, rel: &str) -> String {
+    crate::progress::status_slot("review", &status_iri(repo, rel), GENERIC_BUSY)
 }
 
 /// `urn:repo:{repo}:review:{path}` — the pass a Review button asks for, and
@@ -1747,8 +1768,9 @@ pub(crate) fn review_button_html(repo: &str, rel: &str) -> String {
     format!(
         "<button class=\"browse-review-link\" title=\"review this file — one model call, \
          findings minted as annotations\" hx-get=\"/k/source {iri} as=text/html\" \
-         hx-target=\"#browse\" hx-swap=\"innerHTML\">review</button>",
+         hx-target=\"#browse\" hx-swap=\"innerHTML\"{progress}>review</button>",
         iri = esc(&review_iri(repo, rel)),
+        progress = crate::progress::control_attrs("review"),
     )
 }
 
@@ -2760,6 +2782,14 @@ fn review_tiers(config: &ExplainConfig) -> [MenuTier<'_>; 1] {
     }]
 }
 
+/// The review menu's progress region (one per panel, and one panel per page).
+const MENU_BUSY_ID: &str = "browse-review-menu-busy";
+
+/// What a row shows while in flight — true whether or not that model already
+/// reviewed this version.
+const MENU_BUSY: &str = "Reviewing with the model you chose… each region it has not \
+     already reviewed is one model call, which may take a while.";
+
 /// The menu panel: one row per MODEL, each button sending
 /// `provider={iri}` to the very resource the plain button asks for.
 ///
@@ -2817,7 +2847,8 @@ fn options_panel_html(repo: &str, rel: &str, options: &[ModelOption]) -> String 
             out.push_str(&format!(
                 "<li><button class=\"browse-review-link\" hx-get=\"/k/source {review} \
                  as=text/html provider={provider}\" hx-target=\"#browse\" \
-                 hx-swap=\"innerHTML\">{label}</button>{detail}</li>",
+                 hx-swap=\"innerHTML\" hx-indicator=\"#{MENU_BUSY_ID}\">{label}</button>\
+                 {detail}</li>",
                 provider = esc(option.provider()),
                 label = esc(&label),
             ));
@@ -2829,6 +2860,9 @@ fn options_panel_html(repo: &str, rel: &str, options: &[ModelOption]) -> String 
         }
     }
     out.push_str("</ul>");
+    // Where a row's wait is announced — present from the moment the panel
+    // loads, so a click's note is announced (see `crate::progress`).
+    out.push_str(&crate::progress::busy_region(MENU_BUSY_ID, Some(MENU_BUSY)));
     out.push_str(
         "<p class=\"browse-review-menu-note\"><span class=\"browse-size\">One row per model, \
          not per backend: a pass is archived by the model and the prompt that made it, so two \
@@ -2875,6 +2909,205 @@ fn options_description() -> Description {
                 .optional()
                 .class(crate::XSD_STRING)
                 .summary("application/json for the structured rows, text/html for the option menu")
+                .one_of(["text/plain", "application/json", "text/html"])
+                .default_value("text/plain"),
+        )
+        .output("text/plain;charset=utf-8")
+        .output("application/json")
+        .output("text/html;charset=utf-8")
+}
+
+// --- the status: what a plain review click would do now ---------------------
+
+/// What a plain review click would do.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StatusState {
+    /// A pass under the current tag exists for the current content: the click
+    /// is a store read and mints nothing.
+    Archived,
+    /// No pass under the current tag: the click asks the model, region by
+    /// region (regions already on record are carried, not asked).
+    Derive,
+    /// The click is refused before any model call — a binary or empty file,
+    /// or a host whose configured review guidance runs only under `debug=raw`.
+    Refused,
+}
+
+impl StatusState {
+    fn label(self) -> &'static str {
+        match self {
+            StatusState::Archived => "archived",
+            StatusState::Derive => "derive",
+            StatusState::Refused => "refused",
+        }
+    }
+}
+
+/// `urn:repo:{repo}:review-status:{path}` — whether a plain review of a file
+/// would open an archived pass or derive one, by the SAME key the review
+/// endpoint computes (hash through the kernel, the configured provider, its
+/// model identity, `review-v*@{model}`). Refusals the review would make before
+/// any model call are reported as such, so the line never promises a wait for
+/// a click that answers at once with an error.
+struct StatusEndpoint {
+    roots: Roots,
+    config: Arc<ExplainConfig>,
+}
+
+#[async_trait]
+impl Endpoint for StatusEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        if inv.request.verb != Verb::Source {
+            return Err(Error::Endpoint(format!(
+                "browse-review-status does not support the {:?} verb",
+                inv.request.verb
+            )));
+        }
+        let (repo, root) = repo_root(inv, &self.roots)?;
+        granted(inv, repo)?;
+        let rel = path_binding(inv)?;
+        if rel.is_empty() {
+            return Err(Error::MissingArgument("path".to_string()));
+        }
+        let target = resolve(root, &rel)?;
+        if target.is_dir() {
+            return Err(Error::NotFound(format!(
+                "browse: `{rel}` is a directory — the review pass is file-grain (annotations \
+                 anchor in text)"
+            )));
+        }
+        let config = &self.config;
+        let provider = config.review_provider.clone();
+        let hash_repr = inv.source(&parse_iri(&hash_iri(repo, &rel))?).await?;
+        let hash = String::from_utf8_lossy(&hash_repr.bytes).trim().to_string();
+        let content = inv.source(&parse_iri(&file_iri(repo, &rel))?).await?;
+        // The review's own refusals, in the review's own order, before any
+        // model identity is resolved.
+        let refusal = match std::str::from_utf8(&content.bytes) {
+            Err(_) => Some("the file is binary, so there is nothing to review"),
+            Ok("") => Some("the file is empty, so there is nothing to review"),
+            Ok(_) if config.review_guidance.is_some() => Some(
+                "this host's review guidance runs only under debug=raw, so a plain review is \
+                 refused",
+            ),
+            Ok(_) => None,
+        };
+        let (state, tag, model) = match refusal {
+            Some(_) => (StatusState::Refused, None, None),
+            None => {
+                // The review endpoint's precedence, verbatim: the operator's
+                // label for the configured provider, else its resolved model,
+                // else the IRI heuristic.
+                let model = match &config.review_model_label {
+                    Some(label) => label.clone(),
+                    None => resolve_model(inv, &provider)
+                        .await
+                        .unwrap_or_else(|| provider_label(&provider)),
+                };
+                let tag = format!("{REVIEW_PROMPT_VERSION}@{model}");
+                let archived =
+                    load_pass(&config.archive, &pass_iri(repo, &rel, &hash, &tag))?.is_some();
+                let state = match archived {
+                    true => StatusState::Archived,
+                    false => StatusState::Derive,
+                };
+                (state, Some(tag), Some(model))
+            }
+        };
+        match inv.inline_str("as").unwrap_or("text/plain") {
+            t if t.starts_with("application/json") => Ok(repr(
+                "application/json",
+                serde_json::json!({
+                    "state": state.label(),
+                    "content_hash": hash,
+                    "version_tag": tag,
+                    "model": model,
+                    "provider": refusal.is_none().then_some(&provider),
+                    "reason": refusal,
+                })
+                .to_string(),
+            )),
+            t if t.starts_with("text/html") => {
+                let model = model.as_deref().unwrap_or("");
+                let (cost, note) = match state {
+                    StatusState::Archived => (
+                        format!(
+                            "review: already reviewed at this version by {model} — the findings \
+                             open instantly from the archive, no model call."
+                        ),
+                        None,
+                    ),
+                    StatusState::Derive => (
+                        format!(
+                            "review: not yet reviewed at this version — {model} will review it \
+                             region by region, which may take a while. After that it opens \
+                             instantly."
+                        ),
+                        Some(format!(
+                            "Reviewing with {model}… one model call per region not already on \
+                             record, which may take a while. Findings are minted as annotations."
+                        )),
+                    ),
+                    StatusState::Refused => {
+                        (format!("review: {}.", refusal.unwrap_or("refused")), None)
+                    }
+                };
+                Ok(repr_utf8(
+                    "text/html",
+                    crate::progress::status_html("review", &cost, note.as_deref()),
+                ))
+            }
+            _ => Ok(repr_utf8(
+                "text/plain",
+                format!(
+                    "{}\t{}\t{}",
+                    state.label(),
+                    tag.as_deref().unwrap_or("-"),
+                    model.as_deref().unwrap_or("-")
+                ),
+            )),
+        }
+    }
+
+    fn name(&self) -> &str {
+        "browse-review-status"
+    }
+
+    fn describe(&self) -> Description {
+        status_description()
+    }
+}
+
+/// `repo` is not an ArgSpec — see [`review_description`]'s note.
+fn status_description() -> Description {
+    Description::new("browse-review-status")
+        .title("What a review would do now")
+        .summary(
+            "Whether a plain review of a file would open an archived pass or derive one, and \
+             with which model — urn:repo:{repo}:review-status:{path}. Computed by the same key \
+             the review takes (content hash, the configured provider and its model identity, \
+             the version tag), so it agrees with the click it describes; derives nothing, asks \
+             no model and mints nothing. text/plain (default) is \
+             state<TAB>versionTag<TAB>model, state one of archived, derive, refused (a binary \
+             or empty file, or review guidance that runs only under debug=raw); \
+             as=application/json adds content_hash, provider and the refusal's reason; \
+             as=text/html is the cost line and progress region the file face loads under its \
+             review button.",
+        )
+        .verb(Verb::Source)
+        .verb(Verb::Meta)
+        .requires(CAP_WILDCARD)
+        .input(
+            ArgSpec::new("path")
+                .binding()
+                .class(crate::XSD_STRING)
+                .summary("path of the file within the root, percent-encoded"),
+        )
+        .input(
+            ArgSpec::new("as")
+                .optional()
+                .class(crate::XSD_STRING)
+                .summary("application/json for the structured status, text/html for the cost line")
                 .one_of(["text/plain", "application/json", "text/html"])
                 .default_value("text/plain"),
         )
@@ -3336,6 +3569,140 @@ mod tests {
         // A re-read is an archive hit: no review call, no judge call.
         json(&k, "urn:repo:demo:review:a.rs", &[]);
         assert_eq!(log.count(), 2);
+    }
+
+    // --- the status: what a plain review click would do -----------------------
+
+    const STATUS_DERIVE_HTML: &str = "<div class=\"browse-status\">\
+        <p class=\"browse-cost\" id=\"browse-review-cost\">review: not yet reviewed at this \
+        version — r1 will review it region by region, which may take a while. After that it \
+        opens instantly.</p>\
+        <p class=\"browse-busy\" id=\"browse-review-busy\" role=\"status\" aria-live=\"polite\">\
+        <span class=\"browse-busy-note\">Reviewing with r1… one model call per region not \
+        already on record, which may take a while. Findings are minted as annotations.</span>\
+        </p></div>";
+
+    const STATUS_ARCHIVED_HTML: &str = "<div class=\"browse-status\">\
+        <p class=\"browse-cost\" id=\"browse-review-cost\">review: already reviewed at this \
+        version by r1 — the findings open instantly from the archive, no model call.</p>\
+        <p class=\"browse-busy\" id=\"browse-review-busy\" role=\"status\" aria-live=\"polite\">\
+        </p></div>";
+
+    /// ★ The status agrees with the click: derive exactly when the review
+    /// derives, under the tag the review archives — and it asks nothing.
+    #[test]
+    fn the_review_status_agrees_with_the_click_and_pins_both_cases() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, TWO_FINDINGS);
+        let status = "urn:repo:demo:review-status:a.rs";
+        let html = |k: &Kernel| {
+            body(&issue(k, Verb::Source, status, &[("as", "text/html")], &cap()).unwrap())
+        };
+
+        let before = json(&k, status, &[]);
+        assert_eq!(before["state"], "derive", "{before}");
+        assert_eq!(before["version_tag"], "review-v5@r1");
+        assert_eq!(before["model"], "r1");
+        assert_eq!(before["provider"], PROVIDER);
+        assert_eq!(before["reason"], serde_json::Value::Null);
+        assert_eq!(html(&k), STATUS_DERIVE_HTML);
+        assert_eq!(log.count(), 0, "the status asked the model");
+
+        let reviewed = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        let after = json(&k, status, &[]);
+        assert_eq!(after["state"], "archived", "{after}");
+        assert_eq!(after["version_tag"], reviewed["version_tag"]);
+        assert_eq!(html(&k), STATUS_ARCHIVED_HTML);
+        assert_eq!(
+            body(&issue(&k, Verb::Source, status, &[], &cap()).unwrap()),
+            "archived\treview-v5@r1\tr1"
+        );
+        assert_eq!(log.count(), 1, "only the review asked");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A click the review refuses before any model call is reported as a
+    /// refusal, never as a wait: a binary file, an empty one, and a host
+    /// whose guidance runs only under `debug=raw`.
+    #[test]
+    fn the_review_status_reports_the_refusals_the_click_would_meet() {
+        let root = demo_root();
+        std::fs::write(root.join("blob.bin"), [0u8, 159, 146, 150]).unwrap();
+        std::fs::write(root.join("empty.rs"), "").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, TWO_FINDINGS);
+        for (path, reason) in [
+            ("blob.bin", "the file is binary"),
+            ("empty.rs", "the file is empty"),
+        ] {
+            let iri = format!("urn:repo:demo:review-status:{path}");
+            let status = json(&k, &iri, &[]);
+            assert_eq!(status["state"], "refused", "{path}: {status}");
+            assert!(
+                status["reason"].as_str().unwrap().starts_with(reason),
+                "{path}: {status}"
+            );
+            let html =
+                body(&issue(&k, Verb::Source, &iri, &[("as", "text/html")], &cap()).unwrap());
+            assert!(!html.contains("browse-busy-note"), "{path}: {html}");
+        }
+
+        let guided = ExplainConfig::new(Arc::clone(&store))
+            .review_model_label("r1")
+            .review_guidance("look harder");
+        let browse =
+            crate::space_with_explain(vec![("demo".to_string(), root.to_path_buf())], guided);
+        let k = Kernel::new(Arc::new(Fallback::new(vec![
+            Arc::new(browse),
+            Arc::new(llm_space(&log, TWO_FINDINGS)),
+        ])));
+        let status = json(&k, "urn:repo:demo:review-status:a.rs", &[]);
+        assert_eq!(status["state"], "refused", "{status}");
+        assert!(
+            issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).is_err(),
+            "the click the status calls refused is refused"
+        );
+        assert_eq!(log.count(), 0);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The review menu's rows name the panel's progress region, and the
+    /// region is a polite live region present from the moment the panel loads.
+    #[test]
+    fn the_review_menu_rows_name_the_panels_progress_region() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, TWO_FINDINGS);
+        let menu = body(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:review-options:a.rs",
+                &[("as", "text/html")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert!(
+            menu.contains(
+                "<p class=\"browse-busy\" id=\"browse-review-menu-busy\" role=\"status\" \
+                 aria-live=\"polite\"><span class=\"browse-busy-note\">"
+            ),
+            "{menu}"
+        );
+        let rows: Vec<&str> = menu.split("<li>").skip(1).collect();
+        assert!(!rows.is_empty(), "{menu}");
+        for row in rows {
+            assert!(
+                row.contains("hx-indicator=\"#browse-review-menu-busy\""),
+                "{row}"
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

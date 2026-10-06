@@ -33,7 +33,10 @@
 //! - `urn:repo:{repo}:explain[:{path}]` + `:explain-versions[:{path}]` — the
 //!   S1 **explanation archive** ([`space_with_explain`]): LLM-derived
 //!   orientation, derived once per `(path, content-hash, version-tag)` and
-//!   persisted in a host-injected Oxigraph store.
+//!   persisted in a host-injected Oxigraph store. `:explain-status[:{path}]`
+//!   says what a plain explain click would do now (archived, or derive with a
+//!   named model) by the explain's own key — the cost line the faces load
+//!   under their explain button (the private `progress` module).
 //! - `urn:iki:annotation:{id}` + `urn:repo:{repo}:annotations[:{path}]` — S2 **Web
 //!   Annotations** (`oa:`) on files ([`space_with_annotations`], and included
 //!   by [`space_with_explain`] — one shared store): quote + position selectors
@@ -49,7 +52,9 @@
 //!   review-tag)` so re-sourcing unchanged content mints nothing.
 //!   `review-options` is the host's `provider=` allowlist grouped by MODEL —
 //!   what the file face's "review with…" menu renders, derivation-free and
-//!   needing only the browse grant. ⚠ It is not a listing of archived passes:
+//!   needing only the browse grant. `:review-status:{path}` is the review
+//!   button's cost line, by the review's own key. ⚠ `review-options` is not a
+//!   listing of archived passes:
 //!   the findings listing already carries `creator` and `generated_by` on
 //!   every finding.
 //! - `urn:iki:finding:{id}` + `urn:repo:{repo}:findings[:{path}]` — the
@@ -172,6 +177,10 @@ mod layout;
 /// be a query, not a program. See the module docs.
 pub mod migrate;
 mod pr;
+/// What a model-backed control will cost before the click (the
+/// `explain-status`/`review-status` cost line) and what it is doing during the
+/// wait (a polite live region named by `hx-indicator`).
+mod progress;
 mod review;
 /// Revised and unconfirmed decisions (ledger #653): the computed `confirmed`
 /// flag, bursts, and the `summary=unconfirmed` walk.
@@ -486,7 +495,7 @@ impl Mount {
                     graph_name(graph.clone(), None, "Mount"),
                 ))
             });
-            let space = base_space(&roots, &ignore, archive.as_ref(), false, app, home);
+            let space = base_space(&roots, &ignore, archive.as_ref(), None, app, home);
             let space = match archive {
                 Some(archive) => {
                     finding::bind(annotate::bind(space, &roots, &archive), &roots, &archive)
@@ -508,7 +517,7 @@ impl Mount {
         ));
         config.archive = Arc::clone(&archive);
         let shared = Arc::new(config.clone());
-        let space = base_space(&roots, &ignore, Some(&archive), true, app, home);
+        let space = base_space(&roots, &ignore, Some(&archive), Some(&shared), app, home);
         let space = explain::bind(space, &roots, config);
         // The S4 review pass (machine-minted annotations) rides with the
         // explanation family: it needs the same LLM seam and the same store.
@@ -574,15 +583,18 @@ fn build_roots(roots: impl IntoIterator<Item = (String, PathBuf)>) -> Roots {
 /// lets the file HTML face render its annotations overlay; `explain` (the
 /// explanation family is mounted) lets the tree and file HTML faces render
 /// their explain affordances — on a plain mount the link would dangle (no
-/// bound grammar answers it), so it is simply not rendered.
+/// bound grammar answers it), so it is simply not rendered. The config itself
+/// rides along for the PR page, which says inline what its explain button
+/// will cost (it already holds the head commit that keys the archive).
 fn base_space(
     roots: &Roots,
     ignore: &Arc<BTreeSet<String>>,
     archive: Option<&Arc<Archive>>,
-    explain: bool,
+    config: Option<&Arc<ExplainConfig>>,
     app: Option<&str>,
     home: Option<&Path>,
 ) -> EndpointSpace {
+    let explain = config.is_some();
     let tree: Arc<dyn Endpoint> = Arc::new(tree_endpoint(roots, explain));
     let file: Arc<dyn Endpoint> = Arc::new(file_endpoint(roots, archive, explain));
     let state: Arc<dyn Endpoint> = Arc::new(state_endpoint(roots));
@@ -600,7 +612,7 @@ fn base_space(
     // The pull-request pages ride with every variant: they need no store and
     // no LLM — only ikigai-repo's pr facades resolved through the kernel at
     // runtime (unmounted facades answer a typed NotFound, not a panic).
-    pr::bind_pages(space, roots, archive, explain)
+    pr::bind_pages(space, roots, archive, config)
 }
 
 // --- grammar ----------------------------------------------------------------
@@ -1036,7 +1048,9 @@ fn tree_description(explain: bool) -> Description {
     if explain {
         summary.push_str(
             " The html face links the directory's explain resource and each entry's \
-             (urn:repo:{repo}:explain[:{path}]).",
+             (urn:repo:{repo}:explain[:{path}]), with the directory's cost line loaded \
+             after the page paints from urn:repo:{repo}:explain-status[:{path}] and a polite \
+             live region each explain control names in hx-indicator.",
         );
     }
     Description::new("browse-tree")
@@ -1140,17 +1154,37 @@ pub(crate) fn crumbs_html(repo: &str, rel: &str) -> String {
 /// mounted): a button that hx-gets the target's explain face into #browse,
 /// like every other navigation here. `title` names the target for the
 /// compact per-row `?` form; the header form is self-evident and passes
-/// none.
-fn explain_button(repo: &str, rel: &str, label: &str, title: Option<&str>) -> String {
+/// none. `progress` is the attribute pair that names where the wait is shown
+/// (see [`progress`]): the header's own region and cost line, or a row's.
+fn explain_button(
+    repo: &str,
+    rel: &str,
+    label: &str,
+    title: Option<&str>,
+    progress: &str,
+) -> String {
     let title = title
         .map(|t| format!(" title=\"{}\"", esc(t)))
         .unwrap_or_default();
     format!(
         "<button class=\"browse-explain-link\"{title} hx-get=\"/k/source {iri} \
-         as=text/html\" hx-target=\"#browse\" hx-swap=\"innerHTML\">{label}</button>",
+         as=text/html\" hx-target=\"#browse\" hx-swap=\"innerHTML\"{progress}>{label}</button>",
         iri = esc(&explain::explain_iri(repo, rel)),
     )
 }
+
+/// The progress region every row's `?` names on a tree page: ONE live region
+/// for the listing, not one per row (a thousand live regions would each be a
+/// place assistive technology watches). The row itself shows a short visual
+/// note beside its `?` while its request is in flight (`closest li`), hidden
+/// from assistive technology because this region already says it.
+const ENTRIES_BUSY_ID: &str = "browse-entries-busy";
+
+/// What a row's `?` shows while in flight. A row cannot say which kind its
+/// click will be without a status read per row, which a listing must not cost;
+/// so it says what is true of every row.
+const ENTRIES_BUSY: &str = "Explaining… when an entry has no archived explanation yet, a \
+     model writes one now, which may take a while.";
 
 /// The header strip under the crumbs on a FILE face: face-level actions (the
 /// explain and review links, when those families are mounted; empty
@@ -1173,13 +1207,24 @@ fn actions_html(repo: &str, rel: &str, explain: bool) -> String {
         return String::new();
     }
     format!(
-        "<nav class=\"browse-actions\">{}{}{}</nav>{}{}",
-        explain_button(repo, rel, "explain", None),
+        "<nav class=\"browse-actions\">{}{}{}</nav>{}{}{}{}",
+        explain_button(
+            repo,
+            rel,
+            "explain",
+            None,
+            &progress::control_attrs("explain")
+        ),
         review::review_button_html(repo, rel),
         // ★ Without this link the interim between this arc and gonk's Queue
         // page is a black hole: a click on `review` would appear to do nothing
         // at all, because its findings exist and nothing can see them.
         finding::findings_link_html(repo, rel),
+        // What each click will cost, loaded after the page paints, and where
+        // each one's wait is announced. Below the row, not in it: the row is a
+        // flex strip, and a sentence inside it wraps into a column on a phone.
+        explain::status_slot_html(repo, rel),
+        review::status_slot_html(repo, rel),
         explain::menu_html(repo, rel),
         review::menu_html(repo, rel),
     )
@@ -1193,7 +1238,13 @@ fn tree_html(repo: &str, rel: &str, entries: &[Entry], explain: bool) -> String 
     // bound; its data facades answer at resolution time).
     let mut actions = String::new();
     if explain {
-        actions.push_str(&explain_button(repo, rel, "explain", None));
+        actions.push_str(&explain_button(
+            repo,
+            rel,
+            "explain",
+            None,
+            &progress::control_attrs("explain"),
+        ));
     }
     if rel.is_empty() {
         actions.push_str(&format!(
@@ -1210,7 +1261,11 @@ fn tree_html(repo: &str, rel: &str, entries: &[Entry], explain: bool) -> String 
     // thousand disclosures, each of which would read the archive and the model
     // inventory the moment it opened.
     if explain {
+        out.push_str(&explain::status_slot_html(repo, rel));
         out.push_str(&explain::menu_html(repo, rel));
+        if !entries.is_empty() {
+            out.push_str(&progress::busy_region(ENTRIES_BUSY_ID, Some(ENTRIES_BUSY)));
+        }
     }
     out.push_str("<ul class=\"browse-entries\">");
     for e in entries {
@@ -1236,8 +1291,14 @@ fn tree_html(repo: &str, rel: &str, entries: &[Entry], explain: bool) -> String 
         // derived, so the row stays honest about cost only on first click.
         let explain_link = if explain {
             format!(
-                " {}",
-                explain_button(repo, &child, "?", Some(&format!("explain {}", e.name)))
+                " {}<span class=\"browse-busy-note\" aria-hidden=\"true\"> explaining…</span>",
+                explain_button(
+                    repo,
+                    &child,
+                    "?",
+                    Some(&format!("explain {}", e.name)),
+                    &format!(" hx-indicator=\"closest li, #{ENTRIES_BUSY_ID}\""),
+                )
             )
         } else {
             String::new()
@@ -1479,7 +1540,11 @@ fn file_description(has_store: bool, explain: bool) -> Description {
              (urn:repo:{repo}:explain:{path}) and its review pass \
              (urn:repo:{repo}:review:{path}), each beside a \"… with\" menu built from \
              urn:repo:{repo}:explain-versions:{path} and \
-             urn:repo:{repo}:review-options:{path} and fetched only when opened.",
+             urn:repo:{repo}:review-options:{path} and fetched only when opened, and \
+             each with a cost line loaded after the page paints from \
+             urn:repo:{repo}:explain-status:{path} and urn:repo:{repo}:review-status:{path} \
+             (archived and instant, or a named model's derivation) plus a polite live region \
+             its control names in hx-indicator.",
         );
     }
     let mut description = Description::new("browse-file")
@@ -2390,7 +2455,10 @@ mod tests {
         let pages = [
             ("tree", tree_html("demo", dir, &entries, true)),
             ("crumbs", crumbs_html("demo", &format!("{rel}/x"))),
-            ("explain button", explain_button("demo", &rel, "?", None)),
+            (
+                "explain button",
+                explain_button("demo", &rel, "?", None, ""),
+            ),
             ("explain menu", explain::menu_html("demo", &rel)),
             ("review button", review::review_button_html("demo", &rel)),
             ("review menu", review::menu_html("demo", &rel)),
@@ -3806,8 +3874,11 @@ mod tests {
             "urn:repo:demo:explain:{path}",
             "urn:repo:demo:explain-versions",
             "urn:repo:demo:explain-versions:{path}",
+            "urn:repo:demo:explain-status",
+            "urn:repo:demo:explain-status:{path}",
             "urn:repo:demo:review:{path}",
             "urn:repo:demo:review-options:{path}",
+            "urn:repo:demo:review-status:{path}",
             "urn:repo:demo:annotations",
             "urn:repo:demo:annotations:{path}",
             "urn:iki:annotation:{id}",

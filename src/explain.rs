@@ -900,6 +900,10 @@ pub(crate) fn bind(space: EndpointSpace, roots: &Roots, config: ExplainConfig) -
         roots: Arc::clone(roots),
         config: Arc::clone(&config),
     });
+    let status: Arc<dyn Endpoint> = Arc::new(StatusEndpoint {
+        roots: Arc::clone(roots),
+        config: Arc::clone(&config),
+    });
     let explain: Arc<dyn Endpoint> = Arc::new(ExplainEndpoint {
         roots: Arc::clone(roots),
         config,
@@ -910,6 +914,13 @@ pub(crate) fn bind(space: EndpointSpace, roots: &Roots, config: ExplainConfig) -
         versions,
         Some("explain-versions"),
         Some("explain-versions:{path}"),
+    );
+    let space = crate::bind_family(
+        space,
+        roots,
+        status,
+        Some("explain-status"),
+        Some("explain-status:{path}"),
     );
     crate::bind_family(
         space,
@@ -1009,10 +1020,7 @@ impl Endpoint for ExplainEndpoint {
         // — resolved ONCE per request; the same value serves the archive
         // lookup (hit path) and stamps a new entry (miss path). Binary stubs
         // involve no model, but a bad `provider=` still failed above.
-        let tier = match grain {
-            Grain::Directory => Tier::Dir,
-            _ => Tier::File,
-        };
+        let tier = Tier::of(grain);
         let provider = self.provider_for(tier, requested_provider.as_deref());
         let model = match grain {
             Grain::Binary => None,
@@ -1110,6 +1118,41 @@ enum Tier {
     Dir,
 }
 
+impl Tier {
+    /// The tier a grain asks: a directory rolls up, everything else is a file.
+    fn of(grain: Grain) -> Self {
+        match grain {
+            Grain::Directory => Tier::Dir,
+            _ => Tier::File,
+        }
+    }
+}
+
+/// [`ExplainEndpoint::model_label`]'s body, free so that `explain-status`
+/// computes the SAME tag the click it describes will compute. Two copies of
+/// this precedence would be two answers to "is it archived?", and the status
+/// line would then promise an instant answer the explain does not give.
+async fn tier_model_label(
+    inv: &Invocation<'_>,
+    config: &ExplainConfig,
+    tier: Tier,
+    provider: &str,
+) -> String {
+    let (configured, explicit) = match tier {
+        Tier::File => (&config.file_provider, &config.file_model_label),
+        Tier::Dir => (&config.dir_provider, &config.dir_model_label),
+    };
+    if provider == configured {
+        if let Some(label) = explicit {
+            return label.clone();
+        }
+    }
+    match resolve_model(inv, provider).await {
+        Some(model) => model,
+        None => provider_label(provider),
+    }
+}
+
 impl ExplainEndpoint {
     /// The `annotations=include` payload for this explain, when asked for — a
     /// file target folds its own annotations, a directory rollup its
@@ -1163,20 +1206,7 @@ impl ExplainEndpoint {
     /// wrong model identity into the archive KEY — and a wrong key is
     /// indistinguishable from a legitimate cache entry forever after.
     async fn model_label(&self, inv: &Invocation<'_>, tier: Tier, provider: &str) -> String {
-        let config = &self.config;
-        let (configured, explicit) = match tier {
-            Tier::File => (&config.file_provider, &config.file_model_label),
-            Tier::Dir => (&config.dir_provider, &config.dir_model_label),
-        };
-        if provider == configured {
-            if let Some(label) = explicit {
-                return label.clone();
-            }
-        }
-        match resolve_model(inv, provider).await {
-            Some(model) => model,
-            None => provider_label(provider),
-        }
+        tier_model_label(inv, &self.config, tier, provider).await
     }
 
     /// Derive a file-grain explanation: the grain's versioned prompt plus the
@@ -1788,6 +1818,15 @@ pub(crate) fn command_safe(value: &str) -> bool {
     !value.is_empty() && !value.chars().any(char::is_whitespace)
 }
 
+/// The explain menu's progress region (one per panel, and one panel per page).
+const MENU_BUSY_ID: &str = "browse-explain-menu-busy";
+
+/// What a derive row shows while in flight. The row's model may already be
+/// archived for this version (then the answer is instant and the note barely
+/// shows), so it says what is true either way.
+const MENU_BUSY: &str = "Explaining with the model you chose… if it has not explained \
+     this version yet, it writes an explanation now, which may take a while.";
+
 /// The menu panel: what the archive already holds for this path (free to
 /// reopen — a pure store read) above what could still be derived for it (one
 /// model call each, then archived forever). Both lists are keyed by MODEL,
@@ -1914,7 +1953,8 @@ fn menu_panel_html(
             out.push_str(&format!(
                 "<li><button class=\"browse-explain-link\" hx-get=\"/k/source {explain} \
                  as=text/html provider={provider}\" hx-target=\"#browse\" \
-                 hx-swap=\"innerHTML\">{label}</button>{detail}</li>",
+                 hx-swap=\"innerHTML\" hx-indicator=\"#{MENU_BUSY_ID}\">{label}</button>\
+                 {detail}</li>",
                 provider = esc(option.provider()),
                 label = esc(&label),
             ));
@@ -1926,6 +1966,11 @@ fn menu_panel_html(
         }
     }
     out.push_str("</ul>");
+    // Where a derive row's wait is announced. The panel is loaded when the
+    // disclosure opens, so the region exists before any row can be clicked —
+    // which is what makes its note an announcement rather than a silent
+    // insertion. A reopen row above needs none: it is a store read.
+    out.push_str(&crate::progress::busy_region(MENU_BUSY_ID, Some(MENU_BUSY)));
     // Secondary by construction: `browse-size` is the muted, smaller class the
     // faces already use for detail, so the note reads as a footnote on any
     // host that styles the family at all — without this crate inventing CSS.
@@ -2069,6 +2114,251 @@ fn versions_description() -> Description {
                 .optional()
                 .class(crate::XSD_STRING)
                 .summary("application/json for the structured rows, text/html for the option menu")
+                .one_of(["text/plain", "application/json", "text/html"])
+                .default_value("text/plain"),
+        )
+        .output("text/plain;charset=utf-8")
+        .output("application/json")
+        .output("text/html;charset=utf-8")
+}
+
+// --- the status: what a plain explain click would do now --------------------
+
+/// `urn:repo:{repo}:explain-status[:{path}]` — the explain page's pre-click
+/// answer: would a plain `explain` of this path open an archived entry, or
+/// derive one, and with which model.
+pub(crate) fn status_iri(repo: &str, rel: &str) -> String {
+    if rel.is_empty() {
+        format!("urn:repo:{repo}:explain-status")
+    } else {
+        format!("urn:repo:{repo}:explain-status:{}", iri_encode(rel))
+    }
+}
+
+/// What a plain explain click would do.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum StatusState {
+    /// An entry under the CURRENT tag exists for the current content: the
+    /// click is a store read.
+    Archived,
+    /// Nothing under the current tag: the click asks the model.
+    Derive,
+    /// A binary file with no stub yet: a canned line, no model call.
+    Stub,
+}
+
+impl StatusState {
+    fn label(self) -> &'static str {
+        match self {
+            StatusState::Archived => "archived",
+            StatusState::Derive => "derive",
+            StatusState::Stub => "stub",
+        }
+    }
+}
+
+/// The status, computed by the SAME steps the explain endpoint takes before it
+/// derives: the hash through the kernel, the grain, the tier's provider, the
+/// model identity by [`tier_model_label`] and the tag by [`version_tag`].
+/// Anything less would be a second opinion on the archive key, and a status
+/// that disagrees with the click is the lie this resource exists to remove.
+///
+/// ⚠ One gap, by the capability model rather than by the code: the status
+/// declares only the browse grant, and a provider that DISCOVERS its model
+/// answers `urn:llm:{p}:model` only to a caller holding `urn:cap:net:*`. A
+/// browse-only caller therefore gets the provider heuristic in the tag and may
+/// be told `derive` for an archived entry — the safe direction (it promises a
+/// wait, never an instant answer that is not), and that caller could not run
+/// the explain, which declares net, in any case. A pinned provider's `:model`
+/// needs no capability, so the common case agrees for every caller.
+struct Status {
+    state: StatusState,
+    grain: Grain,
+    hash: String,
+    tag: String,
+    /// `None` for a binary stub: no model is involved.
+    model: Option<String>,
+    provider: Option<String>,
+}
+
+/// The note a click shows before the status has loaded, or if it fails — true
+/// for every path, specific to none.
+pub(crate) const GENERIC_BUSY: &str = "Explaining… when this version has no archived \
+     explanation yet, a model writes one now, which may take a while.";
+
+/// The status slot a face renders under its action row.
+pub(crate) fn status_slot_html(repo: &str, rel: &str) -> String {
+    crate::progress::status_slot("explain", &status_iri(repo, rel), GENERIC_BUSY)
+}
+
+/// The status's html face: the cost line and the note a click will show.
+fn status_face_html(status: &Status) -> String {
+    let model = status.model.as_deref().unwrap_or("");
+    let dir = status.grain == Grain::Directory;
+    let (cost, note) = match status.state {
+        StatusState::Archived => (
+            format!(
+                "explain: already explained at this version{} — opens instantly from the \
+                 archive, no model call.",
+                if model.is_empty() {
+                    String::new()
+                } else {
+                    format!(" by {model}")
+                }
+            ),
+            None,
+        ),
+        StatusState::Stub => (
+            "explain: a binary file — described in one line, no model call.".to_string(),
+            None,
+        ),
+        StatusState::Derive if dir => (
+            format!(
+                "explain: not yet explained at this version — {model} will write it from its \
+                 entries' explanations, deriving any that are missing first, which may take a \
+                 while. After that it opens instantly."
+            ),
+            Some(format!(
+                "Explaining with {model}… writing this directory's explanation, and any of its \
+                 entries' that are missing, which may take a while."
+            )),
+        ),
+        StatusState::Derive => (
+            format!(
+                "explain: not yet explained at this version — {model} will write it, which may \
+                 take a while. After that it opens instantly."
+            ),
+            Some(format!(
+                "Explaining with {model}… writing a first explanation of this version, which \
+                 may take a while."
+            )),
+        ),
+    };
+    crate::progress::status_html("explain", &cost, note.as_deref())
+}
+
+struct StatusEndpoint {
+    roots: Roots,
+    config: Arc<ExplainConfig>,
+}
+
+#[async_trait]
+impl Endpoint for StatusEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        if inv.request.verb != Verb::Source {
+            return Err(Error::Endpoint(format!(
+                "browse-explain-status does not support the {:?} verb",
+                inv.request.verb
+            )));
+        }
+        let (repo, root) = repo_root(inv, &self.roots)?;
+        granted(inv, repo)?;
+        let rel = path_binding(inv)?;
+        let target = resolve(root, &rel)?;
+        let config = &self.config;
+
+        let hash_repr = inv.source(&parse_iri(&hash_iri(repo, &rel))?).await?;
+        let hash = String::from_utf8_lossy(&hash_repr.bytes).trim().to_string();
+        let grain = if target.is_dir() {
+            Grain::Directory
+        } else {
+            let content = inv.source(&parse_iri(&file_iri(repo, &rel))?).await?;
+            classify_file(&rel, std::str::from_utf8(&content.bytes).is_ok())
+        };
+        let tier = Tier::of(grain);
+        let provider = match tier {
+            Tier::File => config.file_provider.clone(),
+            Tier::Dir => config.dir_provider.clone(),
+        };
+        let (model, provider) = match grain {
+            Grain::Binary => (None, None),
+            _ => (
+                Some(tier_model_label(inv, config, tier, &provider).await),
+                Some(provider),
+            ),
+        };
+        let tag = version_tag(grain, model.as_deref().unwrap_or(""));
+        let archived = load_entry(&config.archive, &entry_iri(repo, &rel, &hash, &tag))?.is_some();
+        let state = match (archived, grain) {
+            (true, _) => StatusState::Archived,
+            (false, Grain::Binary) => StatusState::Stub,
+            (false, _) => StatusState::Derive,
+        };
+        let status = Status {
+            state,
+            grain,
+            hash,
+            tag,
+            model,
+            provider,
+        };
+        match inv.inline_str("as").unwrap_or("text/plain") {
+            t if t.starts_with("application/json") => Ok(repr(
+                "application/json",
+                serde_json::json!({
+                    "state": status.state.label(),
+                    "grain": status.grain.label(),
+                    "content_hash": status.hash,
+                    "version_tag": status.tag,
+                    "model": status.model,
+                    "provider": status.provider,
+                })
+                .to_string(),
+            )),
+            t if t.starts_with("text/html") => {
+                Ok(repr_utf8("text/html", status_face_html(&status)))
+            }
+            _ => Ok(repr_utf8(
+                "text/plain",
+                format!(
+                    "{}\t{}\t{}",
+                    status.state.label(),
+                    status.tag,
+                    status.model.as_deref().unwrap_or("-")
+                ),
+            )),
+        }
+    }
+
+    fn name(&self) -> &str {
+        "browse-explain-status"
+    }
+
+    fn describe(&self) -> Description {
+        status_description()
+    }
+}
+
+/// `repo` is not an ArgSpec — see [`explain_description`]'s note.
+fn status_description() -> Description {
+    Description::new("browse-explain-status")
+        .title("What an explain would do now")
+        .summary(
+            "Whether a plain explain of a path would open an archived explanation or derive \
+             one, and with which model — urn:repo:{repo}:explain-status[:{path}]. Computed by \
+             the same steps the explain takes before it derives (content hash, grain, the \
+             tier's provider and model identity, the version tag), so it agrees with the \
+             click it describes; derives nothing and asks no model. text/plain (default) is \
+             state<TAB>versionTag<TAB>model, state one of archived, derive, stub (a binary \
+             file: one canned line, no model); as=application/json adds grain, content_hash \
+             and provider; as=text/html is the cost line and progress region the browse \
+             faces load under their explain button.",
+        )
+        .verb(Verb::Source)
+        .verb(Verb::Meta)
+        .requires(CAP_WILDCARD)
+        .input(
+            ArgSpec::new("path")
+                .binding()
+                .optional()
+                .class(crate::XSD_STRING)
+                .summary("path within the root, percent-encoded (omitted = the root rollup)"),
+        )
+        .input(
+            ArgSpec::new("as")
+                .optional()
+                .class(crate::XSD_STRING)
+                .summary("application/json for the structured status, text/html for the cost line")
                 .one_of(["text/plain", "application/json", "text/html"])
                 .default_value("text/plain"),
         )
@@ -3607,6 +3897,272 @@ mod tests {
             "{:?}",
             face.one_of
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // --- the status: what a plain explain click would do ---------------------
+
+    const STATUS_DERIVE_HTML: &str = "<div class=\"browse-status\">\
+        <p class=\"browse-cost\" id=\"browse-explain-cost\">explain: not yet explained at this \
+        version — m1 will write it, which may take a while. After that it opens instantly.</p>\
+        <p class=\"browse-busy\" id=\"browse-explain-busy\" role=\"status\" aria-live=\"polite\">\
+        <span class=\"browse-busy-note\">Explaining with m1… writing a first explanation of this \
+        version, which may take a while.</span></p></div>";
+
+    const STATUS_ARCHIVED_HTML: &str = "<div class=\"browse-status\">\
+        <p class=\"browse-cost\" id=\"browse-explain-cost\">explain: already explained at this \
+        version by m1 — opens instantly from the archive, no model call.</p>\
+        <p class=\"browse-busy\" id=\"browse-explain-busy\" role=\"status\" aria-live=\"polite\">\
+        </p></div>";
+
+    /// ★ The status is only worth having if it AGREES with the click: it
+    /// says derive exactly when the explain derives, under the tag the explain
+    /// then archives, and it never asks the model itself.
+    #[test]
+    fn the_status_agrees_with_the_click_it_describes() {
+        let root = temp_dir();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "fn main() {}\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, |c| c);
+        let status = "urn:repo:demo:explain-status:src/lib.rs";
+
+        let before = json(&k, status, &[]);
+        assert_eq!(before["state"], "derive", "{before}");
+        assert_eq!(before["version_tag"], "code-v1@m1");
+        assert_eq!(before["model"], "m1");
+        assert_eq!(before["provider"], FILE_PROVIDER);
+        assert_eq!(before["grain"], "code");
+        assert_eq!(log.count(FILE_PROVIDER), 0, "the status asked the model");
+        assert_eq!(
+            body(&source(&k, status, &[], &cap()).unwrap()),
+            "derive\tcode-v1@m1\tm1"
+        );
+
+        let explained = json(&k, "urn:repo:demo:explain:src/lib.rs", &[]);
+        assert_eq!(explained["derived"], true);
+        let after = json(&k, status, &[]);
+        assert_eq!(after["state"], "archived", "{after}");
+        assert_eq!(after["version_tag"], explained["version_tag"]);
+        assert_eq!(after["content_hash"], explained["content_hash"]);
+
+        // An edit re-keys: the status says derive again, as the click would.
+        std::fs::write(root.join("src/lib.rs"), "fn main() { edited() }\n").unwrap();
+        assert_eq!(json(&k, status, &[])["state"], "derive");
+        assert_eq!(log.count(FILE_PROVIDER), 1, "only the explain asked");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_status_html_pins_both_cases() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "// a\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, |c| c);
+        let html = |k: &Kernel| {
+            body(
+                &source(
+                    k,
+                    "urn:repo:demo:explain-status:a.rs",
+                    &[("as", "text/html")],
+                    &cap(),
+                )
+                .unwrap(),
+            )
+        };
+        assert_eq!(html(&k), STATUS_DERIVE_HTML);
+        source(&k, "urn:repo:demo:explain:a.rs", &[], &cap()).unwrap();
+        assert_eq!(html(&k), STATUS_ARCHIVED_HTML);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_directory_status_names_the_rollup_tier_and_a_binary_needs_no_model() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "// a\n").unwrap();
+        std::fs::write(root.join("blob.bin"), [0u8, 159, 146, 150]).unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, |c| c);
+
+        let dir = json(&k, "urn:repo:demo:explain-status", &[]);
+        assert_eq!(dir["state"], "derive", "{dir}");
+        assert_eq!(dir["grain"], "directory");
+        assert_eq!(dir["version_tag"], "dir-v1@d1");
+        assert_eq!(dir["provider"], DIR_PROVIDER);
+        let html = body(
+            &source(
+                &k,
+                "urn:repo:demo:explain-status",
+                &[("as", "text/html")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert!(
+            html.contains("d1 will write it from its entries' explanations"),
+            "{html}"
+        );
+        assert!(html.contains("Explaining with d1…"), "{html}");
+
+        let blob = json(&k, "urn:repo:demo:explain-status:blob.bin", &[]);
+        assert_eq!(blob["state"], "stub", "{blob}");
+        assert_eq!(blob["model"], serde_json::Value::Null);
+        let html = body(
+            &source(
+                &k,
+                "urn:repo:demo:explain-status:blob.bin",
+                &[("as", "text/html")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert!(html.contains("no model call"), "{html}");
+        assert!(
+            !html.contains("browse-busy-note"),
+            "a click that asks no model shows no wait: {html}"
+        );
+        source(&k, "urn:repo:demo:explain:blob.bin", &[], &cap()).unwrap();
+        assert_eq!(
+            json(&k, "urn:repo:demo:explain-status:blob.bin", &[])["state"],
+            "archived"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// With no operator label the status resolves the model the SAME way the
+    /// explain does (through `urn:llm:{p}:model`), so the name on the line is
+    /// the name the click archives under.
+    #[test]
+    fn the_status_names_the_model_the_click_will_use() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "// a\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel_with_real_llm(&root, ExplainConfig::new(Arc::clone(&store)));
+        let status = json(&k, "urn:repo:demo:explain-status:a.rs", &[]);
+        assert_eq!(status["model"], "qwen-test:9b", "{status}");
+        let explained = json(&k, "urn:repo:demo:explain:a.rs", &[]);
+        assert_eq!(status["version_tag"], explained["version_tag"]);
+        assert_eq!(
+            json(&k, "urn:repo:demo:explain-status:a.rs", &[])["state"],
+            "archived"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Like `explain-versions`, the status derives nothing, so it asks no
+    /// network grant: a browse-only caller learns what a click would cost.
+    #[test]
+    fn the_status_needs_no_net_grant() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "// a\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, |c| c);
+        let browse_only = Capability::scoped(["urn:cap:browse:read:demo"]);
+        let status = source(&k, "urn:repo:demo:explain-status:a.rs", &[], &browse_only)
+            .expect("the status needs only the browse grant");
+        assert_eq!(body(&status), "derive\tcode-v1@m1\tm1");
+        let description = status_description();
+        assert_eq!(description.requires, vec![CAP_WILDCARD.to_string()]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The faces wire every model-backed control to a progress region: the
+    /// header button names its region and cost line, the page loads the
+    /// status in place, the rows share ONE listing region, and a menu's
+    /// derive rows name the panel's region (its reopen rows, a store read,
+    /// name none).
+    #[test]
+    fn every_model_backed_control_names_where_its_wait_is_shown() {
+        let root = temp_dir();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "fn main() {}\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, |c| c);
+        let page = |iri: &str| body(&source(&k, iri, &[("as", "text/html")], &cap()).unwrap());
+
+        let file = page("urn:repo:demo:file:src/lib.rs");
+        assert!(
+            file.contains(
+                "hx-get=\"/k/source urn:repo:demo:explain:src/lib.rs as=text/html\" \
+                 hx-target=\"#browse\" hx-swap=\"innerHTML\" \
+                 hx-indicator=\"#browse-explain-busy\" \
+                 aria-describedby=\"browse-explain-cost\">explain</button>"
+            ),
+            "{file}"
+        );
+        assert!(
+            file.contains(
+                "<div class=\"browse-status\" hx-get=\"/k/source \
+                 urn:repo:demo:explain-status:src/lib.rs as=text/html\" hx-trigger=\"load\" \
+                 hx-swap=\"outerHTML\"><p class=\"browse-cost\" id=\"browse-explain-cost\"></p>\
+                 <p class=\"browse-busy\" id=\"browse-explain-busy\" role=\"status\" \
+                 aria-live=\"polite\"><span class=\"browse-busy-note\">"
+            ),
+            "{file}"
+        );
+        assert!(
+            file.contains(
+                "hx-indicator=\"#browse-review-busy\" \
+                 aria-describedby=\"browse-review-cost\">review</button>"
+            ),
+            "{file}"
+        );
+        assert!(
+            file.contains("urn:repo:demo:review-status:src/lib.rs as=text/html"),
+            "{file}"
+        );
+        // One region per family and page: ids must not repeat.
+        for id in ["browse-explain-busy", "browse-review-busy"] {
+            assert_eq!(
+                file.matches(&format!("id=\"{id}\"")).count(),
+                1,
+                "{id}: {file}"
+            );
+        }
+
+        let tree = page("urn:repo:demo:tree:src");
+        assert!(
+            tree.contains("urn:repo:demo:explain-status:src as=text/html"),
+            "{tree}"
+        );
+        assert!(
+            tree.contains("hx-indicator=\"#browse-explain-busy\""),
+            "{tree}"
+        );
+        assert!(
+            tree.contains(
+                "hx-indicator=\"closest li, #browse-entries-busy\">?</button>\
+                 <span class=\"browse-busy-note\" aria-hidden=\"true\"> explaining…</span>"
+            ),
+            "{tree}"
+        );
+        assert_eq!(
+            tree.matches("id=\"browse-entries-busy\" role=\"status\"")
+                .count(),
+            1,
+            "{tree}"
+        );
+
+        // The menu: derive rows name the panel's region; reopen rows do not.
+        source(&k, "urn:repo:demo:explain:src/lib.rs", &[], &cap()).unwrap();
+        let menu = page("urn:repo:demo:explain-versions:src/lib.rs");
+        assert!(
+            menu.contains("id=\"browse-explain-menu-busy\" role=\"status\""),
+            "{menu}"
+        );
+        for row in menu.split("<li>").skip(1) {
+            let derives = row.contains("provider=");
+            assert_eq!(
+                row.contains("hx-indicator=\"#browse-explain-menu-busy\""),
+                derives,
+                "a derive row names the region and a reopen row does not: {row}"
+            );
+        }
         std::fs::remove_dir_all(&root).ok();
     }
 

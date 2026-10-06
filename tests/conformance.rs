@@ -129,13 +129,14 @@ const RAW_FACE_IS_A_PASS_THROUGH: &str =
      `the_raw_file_face_serves_the_extension_mapped_type`; remove this waiver when \
      `Description` grows a pass-through output marker (core PENDING §20)";
 
-/// Every description id this crate binds. A twenty-second endpoint bound without a
-/// line here is held to a weaker standard than the twenty-one; a listed id that
+/// Every description id this crate binds. A twenty-fourth endpoint bound without a
+/// line here is held to a weaker standard than the twenty-three; a listed id that
 /// binds nothing is a stale list.
-const ENDPOINTS: [&str; 21] = [
+const ENDPOINTS: [&str; 23] = [
     "annotation",
     "browse-annotations",
     "browse-explain",
+    "browse-explain-status",
     "browse-explain-versions",
     "browse-file",
     "browse-findings",
@@ -150,6 +151,7 @@ const ENDPOINTS: [&str; 21] = [
     "browse-prs-scoped",
     "browse-review",
     "browse-review-options",
+    "browse-review-status",
     "browse-state",
     "browse-style",
     "browse-tree",
@@ -355,6 +357,10 @@ fn suite(findings: &[String]) -> Suite {
         .fixture(Fixture::new("browse-hash", Verb::Source).binding("path", "README.md"))
         .fixture(Fixture::new("browse-explain", Verb::Source).binding("path", "README.md"))
         .fixture(Fixture::new("browse-explain-versions", Verb::Source).binding("path", "README.md"))
+        // The status resources read the path's hash and content, so they need a
+        // path that exists — the same files their actions are probed on.
+        .fixture(Fixture::new("browse-explain-status", Verb::Source).binding("path", "README.md"))
+        .fixture(Fixture::new("browse-review-status", Verb::Source).binding("path", "src/lib.rs"))
         .fixture(Fixture::new("browse-annotations", Verb::Source).binding("path", "README.md"))
         // The review's quote is in `src/lib.rs`, so the pass mints a finding
         // rather than reporting an unanchorable one.
@@ -515,6 +521,7 @@ fn conforms() {
             "browse-annotations source text/turtle",
             "browse-explain source text/plain",
             "browse-explain source text/turtle",
+            "browse-explain-status source text/plain",
             "browse-explain-versions source text/plain",
             // ★ The waived endpoint IS reached, under the very type OUTPUTS
             // reported — so the waiver subtracts one rule, not the endpoint.
@@ -529,6 +536,7 @@ fn conforms() {
             "browse-review source text/plain",
             "browse-review source text/turtle",
             "browse-review-options source text/plain",
+            "browse-review-status source text/plain",
             "browse-state source text/plain",
             "browse-style source text/css",
             "browse-tree source text/plain",
@@ -678,7 +686,7 @@ fn declared_outputs_are_the_media_types_served() {
     let scratch = Scratch::new();
     let (kernel, _watch) = seeded(&scratch);
     let root = Capability::root();
-    let calls: [(&str, &[(&str, &str)]); 27] = [
+    let calls: [(&str, &[(&str, &str)]); 33] = [
         ("urn:repo:demo:tree", &[]),
         ("urn:repo:demo:tree", &[("as", "text/html")]),
         ("urn:repo:demo:tree", &[("as", "text/turtle")]),
@@ -715,6 +723,24 @@ fn declared_outputs_are_the_media_types_served() {
         ),
         ("urn:repo:demo:explain:README.md", &[("as", "text/html")]),
         ("urn:repo:demo:explain:README.md", &[("as", "text/turtle")]),
+        ("urn:repo:demo:explain-status:README.md", &[]),
+        (
+            "urn:repo:demo:explain-status:README.md",
+            &[("as", "application/json")],
+        ),
+        (
+            "urn:repo:demo:explain-status:README.md",
+            &[("as", "text/html")],
+        ),
+        ("urn:repo:demo:review-status:src/lib.rs", &[]),
+        (
+            "urn:repo:demo:review-status:src/lib.rs",
+            &[("as", "application/json")],
+        ),
+        (
+            "urn:repo:demo:review-status:src/lib.rs",
+            &[("as", "text/html")],
+        ),
     ];
     let mut served: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
     for (target, args) in calls {
