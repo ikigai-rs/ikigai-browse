@@ -358,7 +358,18 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # additive; every call a 0.12.0 caller makes is byte-identical. gonk pins
 # `"0.12.0"` and `^0.12.0` is `<0.13.0`, so the hub moves its pin before a
 # queue row can carry a lens.
-version = "0.17.0"
+# 0.18.0 says what a model-backed click will cost, and says so while it runs. A first
+# explanation is a live model call (17.4 s measured through gonk on 2026-10-05, 0.07 s for
+# the archived read after it), and the page gave no sign of the difference. New
+# derivation-free resources answer what a click would do, by the SAME key the click
+# computes: `urn:repo:{repo}:explain-status[:{path}]` (archived / derive / stub) and
+# `urn:repo:{repo}:review-status:{path}` (archived / derive / refused). The file, tree and
+# PR faces show a cost line before the click and a polite live region during it (htmx
+# indicator; the CSS is in `urn:repo:style:layout`). No estimate is invented: the crate
+# records no derivation times, so it says "may take a while". ★ Why a minor: new resource
+# families and new face elements, additive; gonk pins `"0.17.0"`, and `^0.17.0` is
+# `<0.18.0`, so the hub moves its pin to show it.
+version = "0.18.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
