@@ -8,7 +8,7 @@
 //! two stylesheets is that both schemes read.
 //!
 //! It mounts THIS checkout, resolves the real tree, file, annotations,
-//! review-menu and review-queue faces through the kernel, and inlines the two stylesheet
+//! review-menu, review-queue and status faces through the kernel, and inlines the two stylesheet
 //! resources — `urn:repo:style` (the syntax theme) and `urn:repo:style:layout`
 //! (the page furniture). Nothing here writes markup of its own beyond the page
 //! shell and the section headings, so what you see is what a door serves.
@@ -105,6 +105,43 @@ fn main() {
             ),
         ),
     ];
+
+    // The cost lines and progress regions (crate `progress`): loaded lazily by
+    // the faces above (so inert here), resolved and inlined below, then shown
+    // again IN FLIGHT — with the `htmx-request` class htmx adds to a control's
+    // `hx-indicator` region, which is the one state a file can only fake. No
+    // llm is mounted, so the model named is the provider heuristic (`coder`).
+    let explain_status = source(
+        &kernel,
+        &cap,
+        "urn:repo:self:explain-status:src/layout.rs",
+        &[("as", "text/html")],
+    );
+    let review_status = source(
+        &kernel,
+        &cap,
+        "urn:repo:self:review-status:src/layout.rs",
+        &[("as", "text/html")],
+    );
+    let in_flight = |html: &str| {
+        html.replace(
+            "class=\"browse-busy\"",
+            "class=\"browse-busy htmx-request\"",
+        )
+    };
+    let mut sections = sections;
+    sections.push((
+        "cost lines — explain-status and review-status, as the file face loads them",
+        format!("{explain_status}{review_status}"),
+    ));
+    sections.push((
+        "the same, with each request in flight (htmx-request on the region)",
+        format!(
+            "{}{}",
+            in_flight(&explain_status),
+            in_flight(&review_status)
+        ),
+    ));
 
     let mut body = String::new();
     for (label, html) in &sections {

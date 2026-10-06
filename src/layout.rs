@@ -178,6 +178,22 @@ margin:0 0 .4rem;font-weight:600}\n\
 .browse-explain-choices,.browse-review-choices,.browse-explain-archived{margin:0}\n\
 .browse-explain-inert,.browse-review-inert{opacity:.6;cursor:not-allowed}\n\
 \
+/* What a model-backed click will cost, and its wait (crate::progress). The\n\
+   cost line keeps the door's own text color at full opacity, so its contrast\n\
+   is the page's body-text contrast; it is information, not decoration. The\n\
+   note is hidden until htmx marks its region in flight with `htmx-request` —\n\
+   stated HERE because gonk turns htmx's own indicator styles off. The region\n\
+   itself is never hidden: a live region that exists before its note appears\n\
+   is what makes the appearance an announcement. */\n\
+.browse-status{margin:0 0 .75rem}\n\
+.browse-cost{margin:.15rem 0;font-size:.9em;max-width:46rem}\n\
+.browse-cost:empty{display:none}\n\
+.browse-busy{margin:0}\n\
+.browse-busy-note{display:none}\n\
+.browse-busy.htmx-request>.browse-busy-note{display:block;margin:.4rem 0;\
+padding:.35rem .6rem;border-left:3px solid var(--browse-link);max-width:46rem}\n\
+.browse-entries li.htmx-request>.browse-busy-note{display:inline;font-size:.9em}\n\
+\
 /* Tree entries. */\n\
 .browse-entries{list-style:none;padding-left:0;margin:0}\n\
 .browse-entries li{padding:.1rem 0}\n\
@@ -570,6 +586,7 @@ mod tests {
             include_str!("finding.rs"),
             include_str!("group.rs"),
             include_str!("revision.rs"),
+            include_str!("progress.rs"),
         ];
         let mut emitted: BTreeSet<&str> = DYNAMIC_CLASSES.iter().copied().collect();
         for source in sources {

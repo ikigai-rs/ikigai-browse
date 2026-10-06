@@ -429,7 +429,7 @@ pub(crate) fn bind_pages(
     space: EndpointSpace,
     roots: &Roots,
     archive: Option<&Arc<Archive>>,
-    explain: bool,
+    config: Option<&Arc<ExplainConfig>>,
 ) -> EndpointSpace {
     let prs: Arc<dyn Endpoint> = Arc::new(PrsEndpoint {
         roots: Arc::clone(roots),
@@ -446,7 +446,8 @@ pub(crate) fn bind_pages(
     let page: Arc<dyn Endpoint> = Arc::new(PrEndpoint {
         roots: Arc::clone(roots),
         archive: archive.map(Arc::clone),
-        explain,
+        explain: config.is_some(),
+        config: config.map(Arc::clone),
     });
     for name in roots.keys() {
         space = space.bind_arc(PrPageRow::new(name), Arc::clone(&page));
@@ -1000,6 +1001,9 @@ struct PrEndpoint {
     roots: Roots,
     archive: Option<Arc<Archive>>,
     explain: bool,
+    /// The explanation config when that family is mounted: the PR page uses
+    /// it to say what its explain button will cost (see [`explain_status_html`]).
+    config: Option<Arc<ExplainConfig>>,
 }
 
 #[async_trait]
@@ -1036,9 +1040,15 @@ impl Endpoint for PrEndpoint {
                     })
                     .transpose()?;
                 let (marked, panel) = overlay.unwrap_or_default();
+                let status = match &self.config {
+                    Some(config) if self.explain => {
+                        Some(explain_status_html(inv, config, repo, n, &view).await?)
+                    }
+                    _ => None,
+                };
                 Ok(repr_utf8(
                     "text/html",
-                    pr_html(repo, n, &view, &diff, &marked, &panel, self.explain),
+                    pr_html(repo, n, &view, &diff, &marked, &panel, status.as_deref()),
                 ))
             }
             t if t.starts_with("application/json") => {
@@ -1173,6 +1183,59 @@ fn pr_description(has_store: bool, explain: bool) -> Description {
         .output("text/html;charset=utf-8")
 }
 
+/// The PR page's explain control's progress-and-cost family name: its ids are
+/// `browse-pr-explain-busy` / `browse-pr-explain-cost`.
+const PR_EXPLAIN_KIND: &str = "pr-explain";
+
+/// What the PR page's explain button will do, rendered INLINE rather than
+/// loaded from a status resource as the file face's are. The archive key here
+/// is the HEAD COMMIT, which this page has just read from GitHub; a separate
+/// status resource would have to read it again (a second `gh` call per page
+/// view) to answer the same question. The page is a live read already, so the
+/// cost added here is one model-identity resolve and one store read.
+///
+/// The key is computed exactly as [`PrExplainEndpoint`] computes it before it
+/// derives, so the line agrees with the click.
+async fn explain_status_html(
+    inv: &Invocation<'_>,
+    config: &ExplainConfig,
+    repo: &str,
+    n: u64,
+    view: &PrView,
+) -> Result<String> {
+    let model = model_label(inv, &config.pr_provider, &config.pr_model_label).await;
+    let tag = format!("{PR_PROMPT_VERSION}@{model}");
+    let archived = load_entry(
+        &config.archive,
+        &entry_iri(repo, &pr_rel(n), &view.head_oid, &tag),
+    )?
+    .is_some();
+    let (cost, note) = match archived {
+        true => (
+            format!(
+                "explain: already explained at this head commit by {model} — opens instantly \
+                 from the archive, no model call."
+            ),
+            None,
+        ),
+        false => (
+            format!(
+                "explain: not yet explained at this head commit — {model} will write it from \
+                 the diff, which may take a while. After that it opens instantly."
+            ),
+            Some(format!(
+                "Explaining with {model}… writing a first explanation of this pull request at \
+                 its head commit, which may take a while."
+            )),
+        ),
+    };
+    Ok(crate::progress::status_html(
+        PR_EXPLAIN_KIND,
+        &cost,
+        note.as_deref(),
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn pr_html(
     repo: &str,
@@ -1181,7 +1244,7 @@ fn pr_html(
     diff: &str,
     marked: &BTreeMap<u64, Vec<annotate::Marker>>,
     panel: &str,
-    explain: bool,
+    explain_status: Option<&str>,
 ) -> String {
     let mut out = String::from("<div class=\"browse\">");
     out.push_str(&pr_crumbs(repo, Some(n), None));
@@ -1190,14 +1253,16 @@ fn pr_html(
          hx-target=\"#browse\" hx-swap=\"innerHTML\">pull requests</button>",
         esc(&prs_iri(repo)),
     );
-    if explain {
+    if explain_status.is_some() {
         actions.push_str(&format!(
             "<button class=\"browse-explain-link\" hx-get=\"/k/source {} as=text/html\" \
-             hx-target=\"#browse\" hx-swap=\"innerHTML\">explain</button>",
+             hx-target=\"#browse\" hx-swap=\"innerHTML\"{}>explain</button>",
             esc(&pr_explain_iri(repo, n)),
+            crate::progress::control_attrs(PR_EXPLAIN_KIND),
         ));
     }
     out.push_str(&format!("<nav class=\"browse-actions\">{actions}</nav>"));
+    out.push_str(explain_status.unwrap_or_default());
     out.push_str(&format!(
         "<div class=\"browse-pr-meta\"><h3>#{} {}</h3>\
          <p class=\"browse-pr-line\">{}</p>\
@@ -2607,6 +2672,61 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// The PR page says what its explain button will do, inline, by the key
+    /// the explain computes (the head commit): derive before, instant after,
+    /// derive again when a new commit re-keys. Both cases pinned whole.
+    #[test]
+    fn the_pr_page_says_what_its_explain_will_cost() {
+        let root = temp_dir();
+        let store = Arc::new(Store::new().unwrap());
+        let state = FakeRepo::new();
+        let log = Arc::new(Log::default());
+        let k = explain_kernel(&root, &store, &state, &log, "This PR adds beta.");
+        let page =
+            |k: &Kernel| body(&source(k, "urn:repo:demo:pr:3", &[("as", "text/html")]).unwrap());
+
+        let before = page(&k);
+        assert!(
+            before.contains(
+                "hx-target=\"#browse\" hx-swap=\"innerHTML\" \
+                 hx-indicator=\"#browse-pr-explain-busy\" \
+                 aria-describedby=\"browse-pr-explain-cost\">explain</button>"
+            ),
+            "{before}"
+        );
+        assert!(
+            before.contains(
+                "<div class=\"browse-status\"><p class=\"browse-cost\" \
+                 id=\"browse-pr-explain-cost\">explain: not yet explained at this head commit — \
+                 p1 will write it from the diff, which may take a while. After that it opens \
+                 instantly.</p><p class=\"browse-busy\" id=\"browse-pr-explain-busy\" \
+                 role=\"status\" aria-live=\"polite\"><span class=\"browse-busy-note\">\
+                 Explaining with p1… writing a first explanation of this pull request at its \
+                 head commit, which may take a while.</span></p></div>"
+            ),
+            "{before}"
+        );
+        assert_eq!(log.count(), 0, "rendering the page asked the model");
+
+        json(&k, "urn:repo:demo:pr:3:explain", &[]);
+        let after = page(&k);
+        assert!(
+            after.contains(
+                "<div class=\"browse-status\"><p class=\"browse-cost\" \
+                 id=\"browse-pr-explain-cost\">explain: already explained at this head commit \
+                 by p1 — opens instantly from the archive, no model call.</p><p \
+                 class=\"browse-busy\" id=\"browse-pr-explain-busy\" role=\"status\" \
+                 aria-live=\"polite\"></p></div>"
+            ),
+            "{after}"
+        );
+
+        state.set_oid("fedcba9876543210fedcba9876543210fedcba98");
+        assert!(page(&k).contains("not yet explained at this head commit"));
+        assert_eq!(log.count(), 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     const TWO_FINDINGS: &str = "QUOTE: +fn beta() {}\nSEVERITY: major\nNOTE: The new function \
          lands without a caller - is it wired anywhere?\nQUOTE: @@ -1,3 +1,4 @@\nSEVERITY: \
          praise\nNOTE: A tight, single-hunk change - easy to review.\n";
@@ -2846,6 +2966,7 @@ index 3f9c2d1..8a41b77 100644
             )])),
             archive: None,
             explain: false,
+            config: None,
         };
         let description = page.describe();
         assert_eq!(description.requires, vec![CAP_WILDCARD.to_string()]);
