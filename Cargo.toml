@@ -502,16 +502,27 @@ notify = "6.1"
 [dev-dependencies]
 # The module recipe as one test (`tests/conformance.rs`): the suite walks every
 # endpoint this crate binds and reports every violation of the recipe at once.
-# 0.2.0 is a FLOOR, not just what resolves: `Suite::opt_out_check` arrived in it,
-# and `tests/conformance.rs` needs it. The 0.1.1 OUTPUTS check this pin's previous
-# comment anticipated did land, did report `browse-file`'s pass-through raw face,
-# and is waived per-rule there — with the whole endpoint still under the other
-# nine checks, which is exactly what only 0.2.0 can express.
-ikigai-conformance = "0.2.0"
+# 0.6.0 is the floor: `Suite::host_named_space` (SPACE-NAME, ledger #987) arrived
+# in it, and `tests/conformance.rs` declares every space constructor this crate
+# exports with it. ⚠ Under Cargo's 0.x caret rules this pin is ALSO a ceiling
+# (`<0.7.0`): the previous `"0.2.0"` meant `<0.3.0` and held this crate on the
+# 0.2 definition of "done" through four minor releases while the test stayed
+# green. Re-read it as a range whenever a new conformance minor ships.
+# (`Suite::opt_out_check`, the per-rule waiver on `browse-file`'s pass-through raw
+# face, is 0.2.0's and rides along.)
+#
+# ⚠ `[dependencies] ikigai-core` above is deliberately NOT raised to match: it
+# states the LIBRARY's true minimum (rule 5), and nothing in `src/` needs more.
+# This suite requires `ikigai-core ^0.1.89` itself, so every test build already
+# unifies to a core new enough for it (and for `Arc<S>: Space`, which the
+# host-named declarations lean on).
+ikigai-conformance = "0.6.0"
 # A FLOOR DECLARATION, not a code dependency: no line in this crate calls it.
 # The suite's `VOCABULARY` check reads `ikigai_vocab::VOCABULARY` as its oracle,
-# and the suite's own pin (`^0.1.66`) is the floor for the SUITE's API, not for
-# this module's terms. The review face uses `ik:Review`, `ik:orphanedItems`,
+# and the suite's own pin is the floor for the SUITE's API, not for this module's
+# terms. (Conformance 0.6.0 pins `^0.1.89`, so today the suite's floor is the
+# higher one and this line raises nothing; it stays as the statement of what
+# THIS crate's faces need, which survives a suite that lowers its own.) The review face uses `ik:Review`, `ik:orphanedItems`,
 # `ik:reviewedBytes` and `ik:totalBytes`, which landed in 0.1.69, and
 # `ik:suppressedItems`, which landed in **0.1.71** — below it
 # `tests/conformance.rs` goes red with an "invented term" finding that is
