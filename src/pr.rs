@@ -56,7 +56,8 @@ use crate::explain::{
     store_entry, truncate, truncated_len, ArchiveEntry, CAP_NET, SYSTEM_PROMPT,
 };
 use crate::review::{
-    answer_excerpt, load_pass, parse_findings, pass_iri, pass_turtle, store_pass, PassEntry,
+    answer_excerpt, body_ends, load_pass, parse_findings, pass_iri, pass_turtle, store_pass,
+    Answer, Ending, PassEntry,
 };
 use crate::{
     bind_family, esc, granted, highlight_html, repo_root, repr, repr_utf8, ExplainConfig, Roots,
@@ -348,7 +349,25 @@ async fn ask(
     prompt: &str,
     max_tokens: u32,
 ) -> Result<String> {
-    let request = Request::new(Verb::Source, parse_iri(provider)?)
+    let (text, _) = ask_ending(inv, config, provider, system, prompt, max_tokens, false).await?;
+    Ok(text)
+}
+
+/// [`ask`], plus how the answer ended at `max_tokens` ([`Answer::ending`]).
+/// With `envelope`, it asks for ikigai-llm's `as=application/json` face, so
+/// the answer says WHY it stopped (`finish_reason`, `usage`); a backend
+/// without that face answers text, and [`Answer::of`] takes either. The
+/// ending is read from the answer as it came back, before the text is trimmed.
+async fn ask_ending(
+    inv: &Invocation<'_>,
+    config: &ExplainConfig,
+    provider: &str,
+    system: &str,
+    prompt: &str,
+    max_tokens: u32,
+    envelope: bool,
+) -> Result<(String, Ending)> {
+    let mut request = Request::new(Verb::Source, parse_iri(provider)?)
         .with_arg("prompt", ArgRef::Inline(prompt.as_bytes().to_vec()))
         .with_arg("system", ArgRef::Inline(system.as_bytes().to_vec()))
         .with_arg(
@@ -359,15 +378,19 @@ async fn ask(
             "max_tokens",
             ArgRef::Inline(max_tokens.to_string().into_bytes()),
         );
-    let answer = inv.issue(request).await?;
-    let text = String::from_utf8_lossy(&answer.bytes).trim().to_string();
+    if envelope {
+        request = request.with_arg("as", ArgRef::Inline(b"application/json".to_vec()));
+    }
+    let answer = Answer::of(&inv.issue(request).await?);
+    let ending = answer.ending(max_tokens);
+    let text = answer.text.trim().to_string();
     if text.is_empty() {
         return Err(Error::Endpoint(format!(
             "browse: `{provider}` returned an empty answer (max_tokens {max_tokens} — thinking \
              models may need a higher ceiling); nothing archived"
         )));
     }
-    Ok(text)
+    Ok((text, ending))
 }
 
 /// The model identity for a PR-family tag: the explicit config label (the
@@ -1529,19 +1552,47 @@ impl Endpoint for PrReviewEndpoint {
             view.title,
             truncate(&diff, config.max_prompt_bytes),
         );
-        let answer = ask(
+        let (answer, ending) = ask_ending(
             inv,
             config,
             &config.review_provider,
             PR_REVIEW_SYSTEM_PROMPT,
             &prompt,
             config.review_max_tokens,
+            true,
         )
         .await?;
         if debug_raw {
             return Ok(repr_utf8("text/plain", answer));
         }
-        let (findings, malformed) = parse_findings(&answer);
+        let (mut findings, mut malformed) = parse_findings(&answer);
+        // ★ A finding cut off mid-sentence is REFUSED, not minted — the file
+        // pass's rule (ledger #695, #818), from the same evidence (ledger
+        // #1052). Only the LAST item can be cut by the output budget, and only
+        // when the answer could have reached it: refused, it is counted with
+        // the malformed items. An answer that provably stopped short of the
+        // budget keeps its last note however it ends.
+        //
+        // The file pass also withholds a cut region's MEMO. A diff pass has no
+        // equivalent to withhold: it writes no memo and carries nothing to a
+        // later head, which asks about its whole diff again. What remains is
+        // the case where the cut finding was the only one: the pass is then
+        // refused below and archives nothing, so the key stays re-derivable.
+        let cut = ending != Ending::Stopped && findings.last().is_some_and(|f| !body_ends(&f.note));
+        if cut {
+            findings.pop();
+            malformed += 1;
+        }
+        if findings.is_empty() && cut {
+            return Err(Error::Endpoint(format!(
+                "browse: `{}` answered pr {n} with one finding, cut at the output budget \
+                 mid-sentence (max_tokens {}); nothing archived. The answer began: \"{}\" — \
+                 re-source with debug=raw for the full unparsed answer",
+                config.review_provider,
+                config.review_max_tokens,
+                answer_excerpt(&answer)
+            )));
+        }
         if findings.is_empty() {
             // The error carries the answer's opening so the collapse is
             // diagnosable from the error itself (a label-free format, a
@@ -1956,6 +2007,8 @@ mod tests {
     #[derive(Default)]
     struct Log {
         asks: Mutex<Vec<(String, String, String)>>, // (prompt, system, max_tokens)
+        /// The `as` each ask named (empty when it named none).
+        faces: Mutex<Vec<String>>,
     }
 
     impl Log {
@@ -1968,7 +2021,8 @@ mod tests {
     }
 
     /// The coder-tier fake (both the pr explain and the review pass default
-    /// to `urn:llm:coder:ask`).
+    /// to `urn:llm:coder:ask`). A reply of `JSON:` + a body answers in
+    /// ikigai-llm's envelope face; any other reply is plain text.
     fn fake_llm_space(log: &Arc<Log>, reply: &str) -> EndpointSpace {
         let log = Arc::clone(log);
         let reply = reply.to_string();
@@ -1980,7 +2034,14 @@ mod tests {
                     inv.inline_str("system").unwrap_or("").to_string(),
                     inv.inline_str("max_tokens").unwrap_or("").to_string(),
                 ));
-                Ok(repr_utf8("text/plain", reply.clone()))
+                log.faces
+                    .lock()
+                    .unwrap()
+                    .push(inv.inline_str("as").unwrap_or("").to_string());
+                match reply.strip_prefix("JSON:") {
+                    Some(body) => Ok(repr_utf8("application/json", body.to_string())),
+                    None => Ok(repr_utf8("text/plain", reply.clone())),
+                }
             })
             .with_description(
                 Description::new("fake-llm")
@@ -2996,6 +3057,146 @@ index 3f9c2d1..8a41b77 100644
         // And the per-root grant is enforced on it like every browse row.
         let err = issue(&k, Verb::Source, "urn:repo:demo:prs:src", &[], &wrong_root).unwrap_err();
         assert!(matches!(err, Error::Denied(_)), "{err:?}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★ A PR review answer that could have been cut at the output budget
+    /// does not mint its unended last finding (ledger #1052) — the file
+    /// pass's rule (ledger #695, #818), from the same evidence:
+    /// `Answer::ending`. Each row: the reply, the output budget, and how many
+    /// of its two findings are minted. The second note never ends in
+    /// punctuation; whether it is kept depends only on whether the answer
+    /// could have reached the budget.
+    #[test]
+    fn a_pr_review_answer_cut_at_the_budget_does_not_mint_its_last_finding() {
+        const CUT: &str = "QUOTE: +fn beta() {}\nSEVERITY: major\nNOTE: The new function \
+             lands without a caller - is it wired anywhere?\nQUOTE: @@ -1,3 +1,4 @@\nSEVERITY: \
+             praise\nNOTE: A tight, single-hunk change that is easy to";
+        let envelope = |text: &str, reason: serde_json::Value, usage: serde_json::Value| {
+            format!(
+                "JSON:{}",
+                serde_json::json!({"text": text, "finish_reason": reason, "usage": usage})
+            )
+        };
+        let null = serde_json::Value::Null;
+        let used = |n: u64| serde_json::json!({"completion_tokens": n});
+        let rows: Vec<(&str, String, u32, usize)> = vec![
+            // A plain-text backend (no envelope) whose answer is long enough
+            // in bytes to have spent the budget: the punctuation heuristic.
+            ("plain, budget-sized", CUT.to_string(), 40, 1),
+            (
+                "plain, budget-sized, ended",
+                TWO_FINDINGS.to_string(),
+                40,
+                2,
+            ),
+            // Shorter in bytes than the budget in tokens: it cannot have been
+            // cut, so the last note is kept however it ends.
+            ("plain, under budget", CUT.to_string(), 800, 2),
+            // The backend says it was cut: the unended last finding is refused,
+            // a whole one is kept.
+            (
+                "length",
+                envelope(CUT, "length".into(), null.clone()),
+                800,
+                1,
+            ),
+            (
+                "length, ended",
+                envelope(TWO_FINDINGS, "length".into(), null.clone()),
+                800,
+                2,
+            ),
+            // The token count reached the budget.
+            (
+                "null reason, budget reached",
+                envelope(CUT, null.clone(), used(40)),
+                40,
+                1,
+            ),
+            // It provably stopped on its own: kept, ended or not.
+            ("stop", envelope(CUT, "stop".into(), null.clone()), 800, 2),
+            (
+                "null reason, under budget",
+                envelope(CUT, null.clone(), used(30)),
+                40,
+                2,
+            ),
+        ];
+        for (label, reply, max_tokens, kept) in rows {
+            let root = temp_dir();
+            let store = Arc::new(Store::new().unwrap());
+            let state = FakeRepo::new();
+            let log = Arc::new(Log::default());
+            let cfg = ExplainConfig::new(Arc::clone(&store))
+                .review_model_label("r1")
+                .review_max_tokens(max_tokens);
+            let browse = crate::space_with_explain(vec![("demo".to_string(), root.clone())], cfg);
+            let k = Kernel::new(Arc::new(Fallback::new(vec![
+                Arc::new(browse),
+                Arc::new(fake_repo_space(&state)),
+                Arc::new(fake_llm_space(&log, &reply)),
+            ])));
+            let pass = json(&k, "urn:repo:demo:pr:3:review", &[]);
+            assert_eq!(
+                pass["minted"].as_array().unwrap().len(),
+                kept,
+                "{label}: {pass}"
+            );
+            // A refused finding is counted, never silently dropped.
+            assert_eq!(pass["orphaned_items"], 2 - kept, "{label}: {pass}");
+            let rows = json(&k, "urn:repo:demo:findings", &[]);
+            assert_eq!(rows.as_array().unwrap().len(), kept, "{label}: {rows}");
+            if kept == 1 {
+                assert_eq!(
+                    rows[0]["body"],
+                    "The new function lands without a caller - is it wired anywhere?",
+                    "{label}: the whole finding is the one kept"
+                );
+            }
+            // The pass asks for the envelope face, so ikigai-llm says why the
+            // answer stopped.
+            assert_eq!(
+                log.faces.lock().unwrap().as_slice(),
+                ["application/json"],
+                "{label}"
+            );
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// An answer whose ONLY finding is cut mints nothing, archives nothing,
+    /// and says why — the same as an answer with no parseable finding, so the
+    /// key stays re-derivable. And `debug=raw` over the envelope face returns
+    /// the answer's text, not the envelope.
+    #[test]
+    fn a_pr_review_answer_whose_only_finding_is_cut_archives_nothing() {
+        let root = temp_dir();
+        let store = Arc::new(Store::new().unwrap());
+        let state = FakeRepo::new();
+        let log = Arc::new(Log::default());
+        let text = "QUOTE: +fn beta() {}\nSEVERITY: major\nNOTE: The new function lands without";
+        let reply = format!(
+            "JSON:{}",
+            serde_json::json!({"text": text, "finish_reason": "length"})
+        );
+        let k = explain_kernel(&root, &store, &state, &log, &reply);
+        let err = source(&k, "urn:repo:demo:pr:3:review", &[]).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("cut at the output budget"), "{msg}");
+        assert!(msg.contains("nothing archived"), "{msg}");
+        assert_eq!(
+            json(&k, "urn:repo:demo:findings", &[])
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        let raw = source(&k, "urn:repo:demo:pr:3:review", &[("debug", "raw")]).unwrap();
+        assert_eq!(body(&raw), text);
+        // Nothing was archived: the next ask derives again.
+        assert!(source(&k, "urn:repo:demo:pr:3:review", &[]).is_err());
+        assert_eq!(log.count(), 3);
         std::fs::remove_dir_all(&root).ok();
     }
 
