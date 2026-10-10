@@ -57,6 +57,16 @@
 //!   and `SKOLEM-RDF` off the crate's most security-relevant endpoint for a release
 //!   cycle. The waiver names its own removal condition (core PENDING §20) in the
 //!   reason string, so it travels into every report rather than living in a comment.
+//! * `host_named_space(..)` — every space constructor this crate exports, five of
+//!   them: [`ikigai_browse::space`], [`ikigai_browse::space_with_annotations`],
+//!   [`ikigai_browse::space_with_explain`], [`Mount::space`] and
+//!   [`Mount::space_watched`]. All are HOST-named (ledger #987): each is built
+//!   over the roots it is handed, and the `Mount` path also reads the config home,
+//!   so only the host knows which instance it holds and a name claimed here would
+//!   be a cache claim that is false across hosts. `SPACE-NAME` holds each to
+//!   claiming nothing — no `id()`, an anonymous topology root. The walked one is the
+//!   very `Arc` the kernel runs over; the other four are built over the same
+//!   scratch so the declaration is about the constructor, not a stand-in.
 //! * `cacheable("browse-style")` — the one representation in the crate that is
 //!   `.cacheable()`. Everything else reads a working tree and is `Expiry::Always`,
 //!   which is the honest spelling for a read of a tree nothing here watches; the
@@ -79,7 +89,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use ikigai_browse::{ExplainConfig, Mount, StyleWatch, CAP_ANNOTATE, CAP_WILDCARD, LAYOUT_IRI};
-use ikigai_conformance::{Check, Fixture, Suite};
+use ikigai_conformance::{Check, Fixture, SpaceNaming, Suite};
 use ikigai_core::{
     ArgRef, Capability, Description, EndpointSpace, Error, Exact, Expiry, Fallback, FnEndpoint,
     Iri, Kernel, ReprType, Representation, Request, Verb,
@@ -261,6 +271,13 @@ fn stub_llm() -> EndpointSpace {
 
 /// The kernel the walk runs over, plus the watch `urn:repo:style`'s threads promise.
 fn kernel_over(scratch: &Scratch) -> (Kernel, StyleWatch) {
+    let (kernel, watch, _space) = mounted(scratch);
+    (kernel, watch)
+}
+
+/// [`kernel_over`], plus the module's own space by the `Arc` the kernel holds, so
+/// `SPACE-NAME` is told about the instance the walk actually ran over.
+fn mounted(scratch: &Scratch) -> (Kernel, StyleWatch, Arc<EndpointSpace>) {
     let store = Arc::new(Store::new().expect("in-memory store"));
     // Every model label is pinned: unset, the version tag resolves
     // `urn:llm:{provider}:model` through the kernel, and the stub is an `:ask`.
@@ -274,19 +291,26 @@ fn kernel_over(scratch: &Scratch) -> (Kernel, StyleWatch) {
         .config_home(Some(scratch.home.clone()))
         .explain(config)
         .space_watched();
+    let space = Arc::new(space);
     let kernel = Kernel::new(Arc::new(Fallback::new(vec![
-        Arc::new(space),
+        space.clone(),
         Arc::new(stub_llm()),
     ])));
-    (kernel, watch)
+    (kernel, watch, space)
 }
 
 /// The kernel with the two annotations seeded — the state every RDF face reads.
 fn seeded(scratch: &Scratch) -> (Kernel, StyleWatch) {
     let (kernel, watch) = kernel_over(scratch);
+    seed(&kernel);
+    (kernel, watch)
+}
+
+/// Seed the two annotations into a kernel built by [`mounted`] or [`kernel_over`].
+fn seed(kernel: &Kernel) {
     for id in [SEED_ID, WALK_ID] {
         issue(
-            &kernel,
+            kernel,
             request(
                 Verb::Sink,
                 &format!("urn:iki:annotation:{id}"),
@@ -300,7 +324,6 @@ fn seeded(scratch: &Scratch) -> (Kernel, StyleWatch) {
         )
         .unwrap_or_else(|e| panic!("seeding `{id}`: {e}"));
     }
-    (kernel, watch)
 }
 
 // ---------------------------------------------------------------------------
@@ -424,6 +447,40 @@ fn suite(findings: &[String]) -> Suite {
     suite
 }
 
+/// The labels the five space constructors are declared under, in declaration order.
+const SPACES: [&str; 5] = [
+    "Mount::new(roots).explain(config).space_watched()",
+    "ikigai_browse::space(roots)",
+    "ikigai_browse::space_with_annotations(roots, store)",
+    "ikigai_browse::space_with_explain(roots, config)",
+    "Mount::new(roots).space()",
+];
+
+/// ★ `SPACE-NAME`: every exported space constructor, declared HOST-named.
+///
+/// None is configuration-free — each takes the roots it serves, and the `Mount`
+/// path resolves a config home — so by ledger #987's rule none may name itself,
+/// and naming one would be a new public behavior (a cache claim shared by every
+/// host that mounts different roots under the same name). The suite holds each to
+/// claiming nothing. `walked` is the `Arc` the kernel runs over.
+fn declare_spaces(suite: Suite, scratch: &Scratch, walked: Arc<EndpointSpace>) -> Suite {
+    let roots = || [(ROOT.to_string(), scratch.tree.clone())];
+    let store = || Arc::new(Store::new().expect("in-memory store"));
+    let home = Some(scratch.home.clone());
+    suite
+        .host_named_space(SPACES[0], walked)
+        .host_named_space(SPACES[1], ikigai_browse::space(roots()))
+        .host_named_space(
+            SPACES[2],
+            ikigai_browse::space_with_annotations(roots(), store()),
+        )
+        .host_named_space(
+            SPACES[3],
+            ikigai_browse::space_with_explain(roots(), ExplainConfig::new(store())),
+        )
+        .host_named_space(SPACES[4], Mount::new(roots()).config_home(home).space())
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -456,9 +513,10 @@ fn issue(
 #[test]
 fn conforms() {
     let scratch = Scratch::new();
-    let (kernel, _watch) = seeded(&scratch);
+    let (kernel, _watch, space) = mounted(&scratch);
+    seed(&kernel);
     let findings = pending_findings(&kernel);
-    let report = suite(&findings).run_blocking(&kernel);
+    let report = declare_spaces(suite(&findings), &scratch, space).run_blocking(&kernel);
     // Printed even when clean (`--nocapture`): the report is the record.
     eprintln!("{report}");
     assert!(report.is_clean(), "{report}");
@@ -492,6 +550,21 @@ fn conforms() {
             .collect::<Vec<_>>(),
         vec![("browse-file", Check::Outputs)],
         "the per-check waiver list changed: {report}"
+    );
+    // ★ Every exported constructor reached SPACE-NAME, each as host-named. A new
+    // constructor without a line in `SPACES` is a space nothing holds to its name.
+    assert_eq!(
+        report
+            .declared
+            .spaces
+            .iter()
+            .map(|s| (s.label.as_str(), s.naming))
+            .collect::<Vec<_>>(),
+        SPACES
+            .iter()
+            .map(|label| (*label, SpaceNaming::HostNamed))
+            .collect::<Vec<_>>(),
+        "the declared spaces changed: {report}"
     );
 
     // ★ **The walk REACHED the faces the waiver is about.** A clean report and a
