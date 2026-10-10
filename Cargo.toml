@@ -377,7 +377,16 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # answer's byte length (fewer bytes than the token budget cannot have reached it); only an
 # answer that may have reached the budget falls back to the punctuation heuristic. ★ Why a
 # patch: no public API or resource changes, only which findings a pass keeps.
-version = "0.18.1"
+# 0.18.2 never serves `.git` (ledger #1126). An ordinary `urn:cap:browse:read:{repo}` grant
+# read `.git/config` (which can carry a credentialed remote URL), the tree listed `.git`, and
+# explain, review and judge fed it to a model; every spelling got through (`./.git`, `%2Egit`,
+# `.GIT` on case-insensitive APFS, a submodule's `.git` file, symlinks into it). Now a path
+# with a `.git` component is a NotFound at every door under any capability, judged as written
+# and canonicalized, and the listing hides it. Deliberately not the explain ignore set, which
+# is host-configurable and exists for hash churn. ★ Why a patch: a security fix that removes
+# access nobody should have had; no Rust API, resource name or capability moves, and every
+# consumer pinning `"0.18.1"` takes it with a lock update alone.
+version = "0.18.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
