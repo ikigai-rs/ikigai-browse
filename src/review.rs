@@ -211,10 +211,12 @@
 //! and is COUNTED (`orphaned_items` in the entry and the json face) — one bad
 //! item must not kill the pass. So is a finding CUT OFF by the output budget
 //! (ledger #695): the pass asks for ikigai-llm's envelope face, and when the
-//! answer did not stop on its own (`finish_reason` other than `stop`, or a
-//! backend that does not say) an answer's last item whose note does not end
-//! a sentence is refused and counted; a region whose answer hit the budget is
-//! not memoized. And a quote that occurs more than once in the file anchors
+//! answer could have reached the budget (`finish_reason: length`, a token
+//! count at the budget, or — from a backend that says neither — an answer
+//! long enough in bytes to have spent it) an answer's last item whose note
+//! does not end a sentence is refused and counted; an answer that provably
+//! stopped short keeps it however it ends (ledger #818); a region whose
+//! answer hit the budget is not memoized. And a quote that occurs more than once in the file anchors
 //! in the REGION its call was shown, then near the code its note names
 //! (`annotate::find_anchor_within`), never simply on the file's first copy. But a pass in which NOTHING parses or NOTHING
 //! anchors is an error and is not archived: silently serving an empty review
@@ -1355,29 +1357,92 @@ pub(crate) fn answer_excerpt(answer: &str) -> String {
     format!("{}…", &flat[..end])
 }
 
-/// A model answer's text and, when the backend reported it, why generation
-/// stopped (`stop`, `length`, …). Reads ikigai-llm's `as=application/json`
-/// envelope (`{text, model, finish_reason, usage}`); any other answer — a
-/// backend without that face, a plain-text stub — is its own text with no
-/// reason, which [`body_ends`] then stands in for.
-pub(crate) fn answer_text(repr: &Representation) -> (String, Option<String>) {
-    if repr.repr_type.media_type == "application/json" {
-        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&repr.bytes) {
-            if let Some(text) = v["text"].as_str() {
-                return (
-                    text.to_string(),
-                    v["finish_reason"].as_str().map(str::to_string),
-                );
+/// A model answer's text and what the backend said about how it ended: why
+/// generation stopped (`stop`, `length`, …) and how many tokens it spent.
+/// Reads ikigai-llm's `as=application/json` envelope (`{text, model,
+/// finish_reason, usage}`); any other answer — a backend without that face, a
+/// plain-text stub — is its own text and says nothing else.
+pub(crate) struct Answer {
+    pub(crate) text: String,
+    pub(crate) finish_reason: Option<String>,
+    /// `usage.completion_tokens`, when the envelope carries it.
+    pub(crate) completion_tokens: Option<u64>,
+}
+
+/// Whether an answer could have been cut by the output budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Ending {
+    /// It stopped on its own: every finding in it is whole, punctuated or not.
+    Stopped,
+    /// It reached the budget: its last finding may be cut mid-sentence, and its
+    /// region gets no memo.
+    Cut,
+    /// Nothing says which, and the answer is long enough to have been cut:
+    /// [`body_ends`] stands in for the missing evidence.
+    Unknown,
+}
+
+impl Answer {
+    pub(crate) fn of(repr: &Representation) -> Answer {
+        if repr.repr_type.media_type == "application/json" {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&repr.bytes) {
+                if let Some(text) = v["text"].as_str() {
+                    return Answer {
+                        text: text.to_string(),
+                        finish_reason: v["finish_reason"].as_str().map(str::to_string),
+                        completion_tokens: v["usage"]["completion_tokens"].as_u64(),
+                    };
+                }
             }
         }
+        Answer {
+            text: String::from_utf8_lossy(&repr.bytes).to_string(),
+            finish_reason: None,
+            completion_tokens: None,
+        }
     }
-    (String::from_utf8_lossy(&repr.bytes).to_string(), None)
+
+    /// How this answer ended, asked at an output budget of `max_tokens`. The
+    /// evidence, strongest first (ledger #818):
+    ///
+    /// 1. The backend's `finish_reason`: `length` is cut, `stop` is stopped.
+    /// 2. Its token count: `usage.completion_tokens` below the budget is
+    ///    stopped, at or above it is cut.
+    /// 3. The answer's own length: a token decodes to at least one byte, so an
+    ///    answer of fewer bytes than the budget has tokens spent cannot have
+    ///    reached it. This is what lets a plain-text provider — the gonk Book's
+    ///    stub, a backend without the envelope — keep a last note that does
+    ///    not end in punctuation; before, every such note was refused.
+    ///
+    /// ⚠ Rule 3 is blind to tokens the answer does not show: a model that
+    /// spends hidden reasoning tokens against the same budget can be cut while
+    /// its visible text is short. ikigai-llm's envelope always reports
+    /// `finish_reason`, so rule 1 decides for it; rule 3 is only reached by a
+    /// provider that reports nothing at all.
+    ///
+    /// ```text
+    /// {"text": "…", "finish_reason": "length"}            → Cut
+    /// {"text": "…", "usage": {"completion_tokens": 40}}   → Cut at max_tokens 40
+    /// "QUOTE: …\nNOTE: no full stop" (60 bytes)           → Stopped at max_tokens 800
+    /// ```
+    pub(crate) fn ending(&self, max_tokens: u32) -> Ending {
+        let budget = u64::from(max_tokens);
+        match (self.finish_reason.as_deref(), self.completion_tokens) {
+            (Some("length"), _) => Ending::Cut,
+            (Some("stop"), _) => Ending::Stopped,
+            (_, Some(spent)) if spent >= budget => Ending::Cut,
+            (_, Some(_)) => Ending::Stopped,
+            _ if (self.text.len() as u64) < budget => Ending::Stopped,
+            _ => Ending::Unknown,
+        }
+    }
 }
 
 /// Whether a finding's note ENDS — closes on sentence punctuation, a closing
 /// bracket or quote, or a code span — rather than stopping mid-sentence. The
-/// heuristic half of truncation detection, used only where the backend did
-/// not say it stopped on its own.
+/// heuristic half of truncation detection, used only where nothing says
+/// whether the answer stopped on its own ([`Ending::Unknown`]) or where it
+/// says the answer was cut ([`Ending::Cut`]).
 pub(crate) fn body_ends(note: &str) -> bool {
     note.trim_end().chars().next_back().is_some_and(|c| {
         matches!(
@@ -2033,7 +2098,7 @@ impl Endpoint for ReviewEndpoint {
                 // The envelope face, so the answer says WHY it stopped: a
                 // `finish_reason` of `length` is an answer cut at max_tokens,
                 // whose last finding may be cut mid-sentence (ledger #695). A
-                // backend without the face answers text, and `answer_text`
+                // backend without the face answers text, and `Answer::of`
                 // takes either.
                 .with_arg("as", ArgRef::Inline(b"application/json".to_vec()));
             // ★ PARTIAL FAILURE IS RECORDED, NOT DISCARDED. Region 4 of 7 failing
@@ -2046,8 +2111,8 @@ impl Endpoint for ReviewEndpoint {
             // of the caller's capability, identical for every region, so
             // grinding through sixteen of them would turn one refusal into
             // sixteen and bury the reason.
-            let (answer, finish) = match inv.issue(request).await {
-                Ok(answer) => answer_text(&answer),
+            let answer = match inv.issue(request).await {
+                Ok(answer) => Answer::of(&answer),
                 Err(e @ Error::Denied(_)) => return Err(e),
                 Err(e) => {
                     collapsed.push(format!("region {}: {e}", index + 1));
@@ -2055,6 +2120,8 @@ impl Endpoint for ReviewEndpoint {
                     continue;
                 }
             };
+            let ending = answer.ending(config.review_max_tokens);
+            let answer = answer.text;
             if debug_raw {
                 raw_answers.push(match tiles.len() {
                     1 => answer,
@@ -2071,19 +2138,22 @@ impl Endpoint for ReviewEndpoint {
             // ★ A finding cut off mid-sentence is REFUSED, not minted (ledger
             // #695: `0975bd92` was stored ending "it's likely to result in").
             // Only the LAST item of an answer can be cut by the output budget,
-            // and only when the answer did not stop on its own: refused, it is
-            // counted with the malformed items. And a region whose answer hit
+            // and only when the answer could have reached it: refused, it is
+            // counted with the malformed items. An answer that provably
+            // stopped short of the budget keeps its last note however it ends
+            // — a plain-text provider says nothing about why it stopped, and
+            // its last unpunctuated note used to be refused (ledger #818; the
+            // evidence is in `Answer::ending`). And a region whose answer hit
             // the budget gets NO memo: the model stopped before it finished,
             // so the next pass must ask again rather than carry a partial
             // answer forward as the whole of what these bytes deserve.
-            let budget_hit = finish.as_deref() == Some("length");
-            if finish.as_deref() != Some("stop")
+            if ending != Ending::Stopped
                 && region_findings.last().is_some_and(|f| !body_ends(&f.note))
             {
                 region_findings.pop();
                 region_malformed += 1;
             }
-            if budget_hit {
+            if ending == Ending::Cut {
                 cut_regions.insert(index);
             }
             match region_findings.is_empty() {
@@ -3289,12 +3359,27 @@ mod tests {
         chunks: usize,
         replies: &[&str],
     ) -> Kernel {
+        scripted_kernel_at(root, store, log, bytes, chunks, 800, replies)
+    }
+
+    /// [`scripted_kernel`] at an output budget of `max_tokens`, for the tests
+    /// that ask whether an answer could have been cut by it.
+    fn scripted_kernel_at(
+        root: &std::path::Path,
+        store: &Arc<Store>,
+        log: &Arc<Log>,
+        bytes: usize,
+        chunks: usize,
+        max_tokens: u32,
+        replies: &[&str],
+    ) -> Kernel {
         // The judge is off: the replies are scripted one per call, in order,
         // and a judge call would consume one.
         let cfg = ExplainConfig::new(Arc::clone(store))
             .review_model_label("r1")
             .max_prompt_bytes(bytes)
             .review_max_chunks(chunks)
+            .review_max_tokens(max_tokens)
             .no_judge();
         let browse = crate::space_with_explain(vec![("demo".to_string(), root.to_path_buf())], cfg);
         Kernel::new(Arc::new(Fallback::new(vec![
@@ -3425,8 +3510,11 @@ mod tests {
     }
 
     /// The other two halves of the rule: a note that does not end, from a
-    /// backend that does not say why it stopped, is refused too — and one the
-    /// backend says STOPPED on its own is kept, ending or not.
+    /// backend that does not say why it stopped, is refused too when the
+    /// answer is long enough to have reached the budget (here 40 tokens, and
+    /// the answer is 61 bytes) — and one the backend says STOPPED on its own is
+    /// kept, ending or not. Below the budget it is kept either way: see
+    /// `the_last_finding_survives_unless_the_answer_could_have_been_cut`.
     #[test]
     fn an_unended_note_is_refused_unless_the_backend_says_it_stopped() {
         let unended = "QUOTE: fn one__() {}\nSEVERITY: major\nNOTE: This one is cut in";
@@ -3438,12 +3526,13 @@ mod tests {
             let root = six_line_root();
             let store = Arc::new(Store::new().unwrap());
             let log = Arc::new(Log::default());
-            let k = scripted_kernel(
+            let k = scripted_kernel_at(
                 &root,
                 &store,
                 &log,
                 REGION_BYTES,
                 16,
+                40,
                 &[&reply, CLEAN, CLEAN],
             );
             let result = issue(
@@ -3460,6 +3549,138 @@ mod tests {
         assert!(body_ends("It ends in `code`"));
         assert!(!body_ends("it is likely to result in"));
         assert!(!body_ends("and then:"));
+    }
+
+    /// ★ The LAST finding of an answer that could not have been cut survives,
+    /// punctuated or not (ledger #818). A plain-text provider — the gonk
+    /// Book's stub, any backend without ikigai-llm's envelope — says nothing
+    /// about why it stopped, and its last note was refused unless it ended in
+    /// punctuation. Each row: the reply, the output budget, whether the last
+    /// finding is kept, and whether the region is memoized. A region whose
+    /// only finding is refused said neither "here is a finding" nor "nothing
+    /// above threshold", so it is not counted as reviewed and is asked again;
+    /// a region whose answer reached the budget keeps its whole findings but
+    /// gets no memo.
+    #[test]
+    fn the_last_finding_survives_unless_the_answer_could_have_been_cut() {
+        const ENDED: &str = "QUOTE: fn one__() {}\nSEVERITY: major\nNOTE: This one ends.\n";
+        const UNENDED: &str =
+            "QUOTE: fn one__() {}\nSEVERITY: major\nNOTE: This one ends without punctuation\n";
+        let envelope = |text: &str, reason: serde_json::Value, usage: serde_json::Value| {
+            format!(
+                "JSON:{}",
+                serde_json::json!({"text": text, "finish_reason": reason, "usage": usage})
+            )
+        };
+        let null = serde_json::Value::Null;
+        let used = |n: u64| serde_json::json!({"completion_tokens": n});
+        let rows: Vec<(&str, String, u32, bool, bool)> = vec![
+            // No finish_reason, shorter in bytes than the budget in tokens: it
+            // cannot have been cut, so a note is kept however it ends.
+            ("plain, ended", ENDED.to_string(), 800, true, true),
+            ("plain, unended", UNENDED.to_string(), 800, true, true),
+            (
+                "plain, unended, no newline",
+                UNENDED.trim_end().to_string(),
+                800,
+                true,
+                true,
+            ),
+            (
+                "null reason, no usage",
+                envelope(UNENDED, null.clone(), null.clone()),
+                800,
+                true,
+                true,
+            ),
+            (
+                "null reason, under budget",
+                envelope(UNENDED, null.clone(), used(30)),
+                40,
+                true,
+                true,
+            ),
+            (
+                "stop",
+                envelope(UNENDED, "stop".into(), null.clone()),
+                800,
+                true,
+                true,
+            ),
+            // How a truly cut answer is still recognized: the backend says so,
+            // the token count reached the budget, or — with neither — the
+            // answer is long enough to have been cut and its note does not end.
+            (
+                "length",
+                envelope(UNENDED, "length".into(), null.clone()),
+                800,
+                false,
+                false,
+            ),
+            (
+                "length, ended",
+                envelope(ENDED, "length".into(), null.clone()),
+                800,
+                true,
+                false,
+            ),
+            (
+                "null reason, budget reached",
+                envelope(UNENDED, null.clone(), used(40)),
+                40,
+                false,
+                false,
+            ),
+            (
+                "null reason, budget reached, ended",
+                envelope(ENDED, null.clone(), used(40)),
+                40,
+                true,
+                false,
+            ),
+            (
+                "plain, unended, budget-sized",
+                UNENDED.to_string(),
+                40,
+                false,
+                false,
+            ),
+            (
+                "plain, ended, budget-sized",
+                ENDED.to_string(),
+                40,
+                true,
+                true,
+            ),
+        ];
+        for (label, reply, max_tokens, kept, memoized) in rows {
+            let root = six_line_root();
+            let store = Arc::new(Store::new().unwrap());
+            let log = Arc::new(Log::default());
+            let k = scripted_kernel_at(
+                &root,
+                &store,
+                &log,
+                REGION_BYTES,
+                16,
+                max_tokens,
+                &[&reply, CLEAN, CLEAN],
+            );
+            let pass = json(&k, "urn:repo:demo:review:a.rs", &[]);
+            let rows = json(&k, "urn:repo:demo:findings:a.rs", &[]);
+            assert_eq!(
+                rows.as_array().unwrap().len(),
+                usize::from(kept),
+                "{label}: {pass}"
+            );
+            let reviewed = if kept { 84 } else { 56 };
+            assert_eq!(pass["reviewed_bytes"], reviewed, "{label}: {pass}");
+            assert_eq!(
+                pass["derived_regions"],
+                2 + u64::from(memoized),
+                "{label}: {pass}"
+            );
+        }
     }
 
     /// A fake model that answers a REVIEW prompt with `review` and a JUDGE
