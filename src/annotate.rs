@@ -1517,11 +1517,22 @@ fn list_annotations(archive: &Archive, repo: &str, rel: Option<&str>) -> Result<
 
 /// Every PENDING-FINDING record for one repo, optionally narrowed to a path.
 ///
-/// Filtered on BOTH discriminators — `rdf:type prov:Entity` and the
+/// ★ Selected by the ROOT first (ledger #966): the walk starts from the
+/// `ik:repo "<repo>"` triples — one indexed pattern on the object — so a read
+/// costs what one root holds, not what the archive holds. It used to walk
+/// every `prov:Entity` in the graph and load each finding before dropping the
+/// other roots' ones, so a root with no findings paid as much as the largest
+/// (~0.85 s on gonk's live store, 48 roots, every Queue view).
+///
+/// The root name is matched as the PLAIN literal every writer in this crate
+/// mints (`store_annotation`, and `migrate`'s rename). A node whose `ik:repo`
+/// is another kind of literal is not one browse wrote, and is not listed.
+///
+/// Filtered on BOTH discriminators as well — `rdf:type prov:Entity` and the
 /// `urn:iki:finding:` prefix — for the same reason [`list_annotations`] filters
 /// on type: one shared store holds explanation entries, review passes,
-/// annotations and findings, and a listing that keyed on only one of them
-/// would eventually pick up something else's node.
+/// annotations and findings, all of which carry `ik:repo`, and a listing that
+/// keyed on only one of them would eventually pick up something else's node.
 ///
 /// Order is TRIAGE order, not reading order: severity rank first (critical
 /// before praise), then path and position. ★ Severity stopped being a gate
@@ -1533,18 +1544,39 @@ pub(crate) fn list_findings(
     rel: Option<&str>,
 ) -> Result<Vec<Annotation>> {
     use oxigraph::model::vocab::rdf;
+    use oxigraph::model::NamedOrBlankNode;
     let entity = NamedNode::new(format!("{PROV}Entity")).map_err(store_err)?;
+    let root = Literal::new_simple_literal(repo);
     let mut out = Vec::new();
-    for quad in archive.quads_for_pattern(None, Some(rdf::TYPE), Some(entity.as_ref().into())) {
+    for quad in
+        archive.quads_for_pattern(None, Some(ik("repo").as_ref()), Some(root.as_ref().into()))
+    {
         let quad = quad.map_err(store_err)?;
-        let subject = quad.subject.to_string();
-        let iri = subject.trim_start_matches('<').trim_end_matches('>');
-        let Some(id) = iri.strip_prefix(Family::Finding.prefix()) else {
+        let NamedOrBlankNode::NamedNode(subject) = &quad.subject else {
             continue;
         };
+        let Some(id) = subject.as_str().strip_prefix(Family::Finding.prefix()) else {
+            continue;
+        };
+        // The type is still required, as it was when the walk started from it.
+        let typed = archive
+            .quads_for_pattern(
+                Some(subject.as_ref().into()),
+                Some(rdf::TYPE),
+                Some(entity.as_ref().into()),
+            )
+            .next()
+            .transpose()
+            .map_err(store_err)?
+            .is_some();
+        if !typed {
+            continue;
+        }
         let Some(finding) = load_record(archive, Family::Finding, id)? else {
             continue;
         };
+        // Kept: a node carrying two `ik:repo` values reads back as the one
+        // the loader settles on, exactly as the full walk compared it.
         if finding.repo == repo && rel.is_none_or(|rel| finding.rel == rel) {
             out.push(finding);
         }
@@ -5829,5 +5861,282 @@ mod tests {
         let hit = find_anchor_within(text, "⚠ fn mid() {}", (0, text.len()), "").unwrap();
         assert_eq!(hit.stored_exact.as_deref(), Some("fn mid() {}"));
         assert!(find_anchor_within(text, "absent", (0, text.len()), "").is_none());
+    }
+
+    // --- one root's findings, not the archive's (ledger #966) -------------
+
+    /// The listing as it was before ledger #966: walk EVERY `prov:Entity` in
+    /// the graph, load each finding, keep one repo's. Kept here as the
+    /// reference the indexed read must agree with, row for row.
+    fn list_findings_by_scan(
+        archive: &Archive,
+        repo: &str,
+        rel: Option<&str>,
+    ) -> Result<Vec<Annotation>> {
+        let entity = NamedNode::new(format!("{PROV}Entity")).unwrap();
+        let mut out = Vec::new();
+        for quad in archive.quads_for_pattern(None, Some(rdf::TYPE), Some(entity.as_ref().into())) {
+            let quad = quad.map_err(store_err)?;
+            let subject = quad.subject.to_string();
+            let iri = subject.trim_start_matches('<').trim_end_matches('>');
+            let Some(id) = iri.strip_prefix(Family::Finding.prefix()) else {
+                continue;
+            };
+            let Some(finding) = load_record(archive, Family::Finding, id)? else {
+                continue;
+            };
+            if finding.repo == repo && rel.is_none_or(|rel| finding.rel == rel) {
+                out.push(finding);
+            }
+        }
+        sort_findings(&mut out);
+        Ok(out)
+    }
+
+    /// Mint one pending finding through the real mint path: `n` picks the
+    /// file (one of `files`) and the quoted line.
+    fn mint_numbered(archive: &Archive, repo: &str, n: usize, files: usize) -> String {
+        let rel = format!("src/f{}.rs", n % files);
+        let text = format!("fn f{n}() {{}}\n");
+        let exact = format!("fn f{n}() {{}}");
+        let pass = crate::review::pass_iri(repo, &rel, "sha256:fixture", "tag");
+        let severity = crate::finding::SEVERITIES[n % crate::finding::SEVERITIES.len()];
+        match mint_pending_finding(
+            archive,
+            &format!("urn:repo:{repo}:file:{rel}"),
+            repo,
+            &rel,
+            &text,
+            &content_hash(text.as_bytes()),
+            &exact,
+            &format!("note {n}"),
+            Some(severity),
+            "fixture-model",
+            &pass,
+            None,
+            Surface::File,
+        )
+        .unwrap()
+        {
+            Mint::Minted(iri) => iri,
+            _ => panic!("finding {n} for {repo} did not mint"),
+        }
+    }
+
+    fn ids(findings: &[Annotation]) -> Vec<String> {
+        findings.iter().map(|f| f.id.clone()).collect()
+    }
+
+    /// ★ Ledger #966: reading one root's findings must return EXACTLY what
+    /// the whole-archive scan returned — same rows, same order — for every
+    /// root and every path filter, including the shapes the scan's two
+    /// discriminators (type and prefix) were there to keep out.
+    #[test]
+    fn one_roots_findings_are_the_scans_findings_for_every_root() {
+        let store = Arc::new(Store::new().unwrap());
+        let archive = Archive::new(Arc::clone(&store), GraphName::DefaultGraph);
+        // Roots whose names prefix one another, so a match that were not
+        // exact on the literal would leak rows between them.
+        for (repo, count) in [("demo", 12), ("demo-2", 5), ("other", 7)] {
+            for n in 0..count {
+                mint_numbered(&archive, repo, n, 3);
+            }
+        }
+        // A PR-family finding: no path, keyed to the PR record.
+        let diff = "+fn beta() {}\n";
+        let pr_pass = crate::review::pass_iri("demo", "pr:3", "deadbeef", "tag");
+        assert!(matches!(
+            mint_pending_finding(
+                &archive,
+                "urn:repo:demo:pr:3",
+                "demo",
+                "",
+                diff,
+                &content_hash(diff.as_bytes()),
+                "+fn beta() {}",
+                "a PR note",
+                Some("minor"),
+                "fixture-model",
+                &pr_pass,
+                None,
+                Surface::Diff,
+            )
+            .unwrap(),
+            Mint::Minted(_)
+        ));
+        // Decoys that carry `ik:repo "demo"` and must never be listed:
+        let g = archive.graph().clone();
+        let lit = |v: &str| Term::Literal(Literal::new_simple_literal(v));
+        let put = |s: &str, p: NamedNode, o: Term, graph: &GraphName| {
+            store
+                .insert(Quad::new(NamedNode::new(s).unwrap(), p, o, graph.clone()).as_ref())
+                .unwrap();
+        };
+        let entity = Term::NamedNode(NamedNode::new(format!("{PROV}Entity")).unwrap());
+        let description = NamedNode::new(DCTERMS_DESCRIPTION).unwrap();
+        // (1) a published annotation — the other family;
+        put(
+            "urn:iki:annotation:decoy",
+            rdf::TYPE.into_owned(),
+            Term::NamedNode(oa("Annotation")),
+            &g,
+        );
+        put(
+            "urn:iki:annotation:decoy",
+            oa("bodyValue"),
+            lit("an annotation"),
+            &g,
+        );
+        put("urn:iki:annotation:decoy", ik("repo"), lit("demo"), &g);
+        put("urn:iki:annotation:decoy", ik("path"), lit("src/f0.rs"), &g);
+        // (2) a finding-shaped node with no `rdf:type prov:Entity`;
+        put(
+            "urn:iki:finding:untyped",
+            description.clone(),
+            lit("no type"),
+            &g,
+        );
+        put("urn:iki:finding:untyped", ik("repo"), lit("demo"), &g);
+        put("urn:iki:finding:untyped", ik("path"), lit("src/f0.rs"), &g);
+        // (3) a typed `prov:Entity` that is not a finding (a review pass's
+        // namespace);
+        put(
+            "urn:ikigai:browse:not-a-finding",
+            rdf::TYPE.into_owned(),
+            entity.clone(),
+            &g,
+        );
+        put(
+            "urn:ikigai:browse:not-a-finding",
+            description.clone(),
+            lit("x"),
+            &g,
+        );
+        put(
+            "urn:ikigai:browse:not-a-finding",
+            ik("repo"),
+            lit("demo"),
+            &g,
+        );
+        // (4) a whole finding in SOMEONE ELSE'S graph;
+        let theirs = GraphName::NamedNode(NamedNode::new("urn:iki:graph:another-tenant").unwrap());
+        put(
+            "urn:iki:finding:theirs",
+            rdf::TYPE.into_owned(),
+            entity.clone(),
+            &theirs,
+        );
+        put(
+            "urn:iki:finding:theirs",
+            description.clone(),
+            lit("not ours"),
+            &theirs,
+        );
+        put("urn:iki:finding:theirs", ik("repo"), lit("demo"), &theirs);
+        put(
+            "urn:iki:finding:theirs",
+            ik("path"),
+            lit("src/f0.rs"),
+            &theirs,
+        );
+        // (5) a typed finding whose root name is a LANGUAGE-TAGGED literal,
+        // under a root of its own — see the deliberate difference below.
+        put("urn:iki:finding:tagged", rdf::TYPE.into_owned(), entity, &g);
+        put("urn:iki:finding:tagged", description, lit("tagged"), &g);
+        put(
+            "urn:iki:finding:tagged",
+            ik("repo"),
+            Term::Literal(Literal::new_language_tagged_literal("stray", "en").unwrap()),
+            &g,
+        );
+
+        let expected = [("demo", 13), ("demo-2", 5), ("other", 7), ("absent", 0)];
+        for (repo, total) in expected {
+            for rel in [
+                None,
+                Some("src/f0.rs"),
+                Some("src/f2.rs"),
+                Some(""),
+                Some("missing"),
+            ] {
+                let indexed = list_findings(&archive, repo, rel).unwrap();
+                let scanned = list_findings_by_scan(&archive, repo, rel).unwrap();
+                assert_eq!(ids(&indexed), ids(&scanned), "{repo} {rel:?}");
+                assert_eq!(
+                    indexed.iter().map(Annotation::iri).collect::<Vec<_>>(),
+                    scanned.iter().map(Annotation::iri).collect::<Vec<_>>(),
+                );
+                if rel.is_none() {
+                    assert_eq!(indexed.len(), total, "{repo}: every finding, nothing else");
+                }
+            }
+        }
+        // ⚠ The ONE deliberate difference: the read matches the root name as
+        // the plain literal every writer here mints (`store_annotation`, and
+        // `migrate`'s rename), so a node whose `ik:repo` is some other kind of
+        // literal is not listed. The scan compared the literal's lexical value
+        // and listed it. Nothing browse writes has that shape.
+        assert_eq!(
+            list_findings_by_scan(&archive, "stray", None)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(list_findings(&archive, "stray", None).unwrap().is_empty());
+        // Not vacuous: the filters select real, distinct subsets.
+        assert_eq!(
+            list_findings(&archive, "demo", Some("src/f0.rs"))
+                .unwrap()
+                .len(),
+            4
+        );
+        assert_eq!(list_findings(&archive, "demo", Some("")).unwrap().len(), 1);
+        assert_eq!(
+            list_findings(&archive, "demo-2", Some("src/f2.rs"))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// ★ The measurement behind ledger #966, kept runnable:
+    /// `cargo test --release --lib -- --ignored --nocapture findings_read_cost`.
+    /// An archive of 48 roots and 40,000 findings (one root holding 855, as
+    /// the live one did), then one root's read, timed, against the scan.
+    #[test]
+    #[ignore = "a timing harness, not a gate: run by hand to measure"]
+    fn findings_read_cost_tracks_the_root_not_the_archive() {
+        let store = Arc::new(Store::new().unwrap());
+        let archive = Archive::new(Arc::clone(&store), GraphName::DefaultGraph);
+        let started = std::time::Instant::now();
+        mint_numbered_many(&archive, "big", 855);
+        let rest = 40_000 - 855;
+        for r in 0..46 {
+            mint_numbered_many(&archive, &format!("root-{r}"), rest / 46);
+        }
+        eprintln!(
+            "archive: {} quads, built in {:?}",
+            store.len().unwrap(),
+            started.elapsed()
+        );
+        for repo in ["empty", "big", "root-0"] {
+            let t = std::time::Instant::now();
+            let indexed = list_findings(&archive, repo, None).unwrap();
+            let indexed_took = t.elapsed();
+            let t = std::time::Instant::now();
+            let scanned = list_findings_by_scan(&archive, repo, None).unwrap();
+            let scan_took = t.elapsed();
+            assert_eq!(ids(&indexed), ids(&scanned));
+            eprintln!(
+                "{repo:>7}: {:>4} findings  indexed {indexed_took:>10.2?}  scan {scan_took:>10.2?}",
+                indexed.len()
+            );
+        }
+    }
+
+    fn mint_numbered_many(archive: &Archive, repo: &str, count: usize) {
+        for n in 0..count {
+            mint_numbered(archive, repo, n, 40);
+        }
     }
 }
