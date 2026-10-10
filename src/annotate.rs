@@ -1487,26 +1487,53 @@ fn load_decision(archive: &Archive, iri: &str) -> Result<Option<Decision>> {
 }
 
 /// Every annotation in the store for one repo — optionally narrowed to one
-/// path. Filters by `rdf:type oa:Annotation` (the shared store also holds
-/// `ik:Explanation` entries with `ik:repo`/`ik:about` triples — type is the
-/// discriminator). Sorted by (path, start, id) for a stable reading order.
+/// path. Sorted by (path, start, id) for a stable reading order.
+///
+/// Selected by the ROOT first, as [`list_findings`] is (ledger #966): the walk
+/// starts from the `ik:repo "<repo>"` triples, one indexed pattern on the
+/// object, so a read costs what one root holds rather than loading every
+/// `oa:Annotation` in the archive and dropping the other roots' ones. The root
+/// name is matched as the PLAIN literal every writer in this crate mints.
+///
+/// Filtered on BOTH discriminators as well — the `urn:iki:annotation:` prefix
+/// and `rdf:type oa:Annotation` — because the shared store also holds
+/// explanation entries, review passes and findings, all of which carry
+/// `ik:repo`.
 fn list_annotations(archive: &Archive, repo: &str, rel: Option<&str>) -> Result<Vec<Annotation>> {
     use oxigraph::model::vocab::rdf;
+    use oxigraph::model::NamedOrBlankNode;
+    let class = oa("Annotation");
+    let root = Literal::new_simple_literal(repo);
     let mut out = Vec::new();
-    for quad in archive.quads_for_pattern(
-        None,
-        Some(rdf::TYPE),
-        Some(oa("Annotation").as_ref().into()),
-    ) {
+    for quad in
+        archive.quads_for_pattern(None, Some(ik("repo").as_ref()), Some(root.as_ref().into()))
+    {
         let quad = quad.map_err(store_err)?;
-        let subject = quad.subject.to_string();
-        let iri = subject.trim_start_matches('<').trim_end_matches('>');
-        let Some(id) = iri.strip_prefix("urn:iki:annotation:") else {
+        let NamedOrBlankNode::NamedNode(subject) = &quad.subject else {
             continue;
         };
+        let Some(id) = subject.as_str().strip_prefix(Family::Annotation.prefix()) else {
+            continue;
+        };
+        // The type is still required, as it was when the walk started from it.
+        let typed = archive
+            .quads_for_pattern(
+                Some(subject.as_ref().into()),
+                Some(rdf::TYPE),
+                Some(class.as_ref().into()),
+            )
+            .next()
+            .transpose()
+            .map_err(store_err)?
+            .is_some();
+        if !typed {
+            continue;
+        }
         let Some(ann) = load_annotation(archive, id)? else {
             continue;
         };
+        // Kept: a node carrying two `ik:repo` values reads back as the one
+        // the loader settles on, exactly as the full walk compared it.
         if ann.repo == repo && rel.is_none_or(|rel| ann.rel == rel) {
             out.push(ann);
         }
@@ -6138,5 +6165,340 @@ mod tests {
         for n in 0..count {
             mint_numbered(archive, repo, n, 40);
         }
+    }
+
+    // --- one root's annotations, not the archive's (ledger #966) ----------
+
+    /// The listing as it was before: walk EVERY `oa:Annotation` in the graph,
+    /// load each, keep one repo's. Kept as the reference the indexed read
+    /// must agree with, row for row.
+    fn list_annotations_by_scan(
+        archive: &Archive,
+        repo: &str,
+        rel: Option<&str>,
+    ) -> Result<Vec<Annotation>> {
+        let mut out = Vec::new();
+        for quad in archive.quads_for_pattern(
+            None,
+            Some(rdf::TYPE),
+            Some(oa("Annotation").as_ref().into()),
+        ) {
+            let quad = quad.map_err(store_err)?;
+            let subject = quad.subject.to_string();
+            let iri = subject.trim_start_matches('<').trim_end_matches('>');
+            let Some(id) = iri.strip_prefix("urn:iki:annotation:") else {
+                continue;
+            };
+            let Some(ann) = load_annotation(archive, id)? else {
+                continue;
+            };
+            if ann.repo == repo && rel.is_none_or(|rel| ann.rel == rel) {
+                out.push(ann);
+            }
+        }
+        out.sort_by(|a, b| (&a.rel, a.start, &a.id).cmp(&(&b.rel, b.start, &b.id)));
+        Ok(out)
+    }
+
+    /// Mint one finding through the real mint path, then publish it the way
+    /// `finding::promote` does: the same id, re-stored as the annotation
+    /// family. The pending finding stays in the graph beside it, under the
+    /// same root, which is the commonest neighbor a listing has to skip.
+    fn annotate_numbered(archive: &Archive, repo: &str, n: usize, files: usize) -> String {
+        let finding = mint_numbered(archive, repo, n, files);
+        let id = finding.strip_prefix(Family::Finding.prefix()).unwrap();
+        let mut ann = load_record(archive, Family::Finding, id).unwrap().unwrap();
+        ann.family = Family::Annotation;
+        ann.motivation = Some(MOTIVATION_REVIEW.to_string());
+        ann.derived_from = Some(finding);
+        store_annotation(archive, &ann).unwrap();
+        ann.iri()
+    }
+
+    /// ★ Reading one root's annotations must return EXACTLY what the
+    /// whole-archive scan returned — same rows, same order — for every root
+    /// and every path filter, past the shapes the scan's two discriminators
+    /// (type and prefix) were there to keep out.
+    #[test]
+    fn one_roots_annotations_are_the_scans_annotations_for_every_root() {
+        let store = Arc::new(Store::new().unwrap());
+        let archive = Archive::new(Arc::clone(&store), GraphName::DefaultGraph);
+        // Roots whose names prefix one another, so a match that were not
+        // exact on the literal would leak rows between them.
+        for (repo, count) in [("demo", 12), ("demo-2", 5), ("other", 7)] {
+            for n in 0..count {
+                annotate_numbered(&archive, repo, n, 3);
+            }
+        }
+        // A PR-family annotation: no path, keyed to the PR record.
+        let pr = Annotation {
+            family: Family::Annotation,
+            id: "pr-note".to_string(),
+            body: "a PR note".to_string(),
+            target_iri: "urn:repo:demo:pr:3".to_string(),
+            repo: "demo".to_string(),
+            rel: String::new(),
+            hash: content_hash(b"+fn beta() {}\n"),
+            prefix: String::new(),
+            exact: "+fn beta() {}".to_string(),
+            suffix: String::new(),
+            start: 0,
+            end: 13,
+            created: None,
+            reanchored: false,
+            orphaned: false,
+            creator: None,
+            motivation: Some(MOTIVATION_HUMAN.to_string()),
+            generated_by: None,
+            severity: None,
+            derived_from: None,
+            decision: None,
+            history: Vec::new(),
+            prior: None,
+            superseded_by: None,
+            judges: Vec::new(),
+        };
+        store_annotation(&archive, &pr).unwrap();
+        // Decoys that carry `ik:repo "demo"` and must never be listed (the
+        // pending findings minted above are one more):
+        let g = archive.graph().clone();
+        let lit = |v: &str| Term::Literal(Literal::new_simple_literal(v));
+        let put = |s: &str, p: NamedNode, o: Term, graph: &GraphName| {
+            store
+                .insert(Quad::new(NamedNode::new(s).unwrap(), p, o, graph.clone()).as_ref())
+                .unwrap();
+        };
+        let class = Term::NamedNode(oa("Annotation"));
+        // (1) an annotation-shaped node with no `rdf:type oa:Annotation`;
+        put(
+            "urn:iki:annotation:untyped",
+            oa("bodyValue"),
+            lit("no type"),
+            &g,
+        );
+        put("urn:iki:annotation:untyped", ik("repo"), lit("demo"), &g);
+        put(
+            "urn:iki:annotation:untyped",
+            ik("path"),
+            lit("src/f0.rs"),
+            &g,
+        );
+        // (2) a typed `oa:Annotation` that is not under the prefix (an
+        // old-namespace row);
+        put(
+            "urn:annotation:legacy",
+            rdf::TYPE.into_owned(),
+            class.clone(),
+            &g,
+        );
+        put("urn:annotation:legacy", oa("bodyValue"), lit("legacy"), &g);
+        put("urn:annotation:legacy", ik("repo"), lit("demo"), &g);
+        // (3) a whole annotation in SOMEONE ELSE'S graph;
+        let theirs = GraphName::NamedNode(NamedNode::new("urn:iki:graph:another-tenant").unwrap());
+        put(
+            "urn:iki:annotation:theirs",
+            rdf::TYPE.into_owned(),
+            class.clone(),
+            &theirs,
+        );
+        put(
+            "urn:iki:annotation:theirs",
+            oa("bodyValue"),
+            lit("not ours"),
+            &theirs,
+        );
+        put(
+            "urn:iki:annotation:theirs",
+            ik("repo"),
+            lit("demo"),
+            &theirs,
+        );
+        put(
+            "urn:iki:annotation:theirs",
+            ik("path"),
+            lit("src/f0.rs"),
+            &theirs,
+        );
+        // (4) a typed annotation whose root name is a LANGUAGE-TAGGED literal,
+        // under a root of its own — see the deliberate difference below.
+        put(
+            "urn:iki:annotation:tagged",
+            rdf::TYPE.into_owned(),
+            class,
+            &g,
+        );
+        put(
+            "urn:iki:annotation:tagged",
+            oa("bodyValue"),
+            lit("tagged"),
+            &g,
+        );
+        put(
+            "urn:iki:annotation:tagged",
+            ik("repo"),
+            Term::Literal(Literal::new_language_tagged_literal("stray", "en").unwrap()),
+            &g,
+        );
+
+        let expected = [("demo", 13), ("demo-2", 5), ("other", 7), ("absent", 0)];
+        for (repo, total) in expected {
+            for rel in [
+                None,
+                Some("src/f0.rs"),
+                Some("src/f2.rs"),
+                Some(""),
+                Some("missing"),
+            ] {
+                let indexed = list_annotations(&archive, repo, rel).unwrap();
+                let scanned = list_annotations_by_scan(&archive, repo, rel).unwrap();
+                assert_eq!(ids(&indexed), ids(&scanned), "{repo} {rel:?}");
+                assert_eq!(
+                    indexed.iter().map(Annotation::iri).collect::<Vec<_>>(),
+                    scanned.iter().map(Annotation::iri).collect::<Vec<_>>(),
+                );
+                assert!(indexed.iter().all(|a| a.family == Family::Annotation));
+                if rel.is_none() {
+                    assert_eq!(
+                        indexed.len(),
+                        total,
+                        "{repo}: every annotation, nothing else"
+                    );
+                }
+            }
+        }
+        // ⚠ The ONE deliberate difference, as for findings: the read matches
+        // the root name as the plain literal every writer here mints, so a
+        // node whose `ik:repo` is some other kind of literal is not listed.
+        // The scan compared the literal's lexical value and listed it.
+        assert_eq!(
+            list_annotations_by_scan(&archive, "stray", None)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(list_annotations(&archive, "stray", None)
+            .unwrap()
+            .is_empty());
+        // Not vacuous: the filters select real, distinct subsets, and the
+        // pending findings under the same roots are still there to skip.
+        assert_eq!(
+            list_annotations(&archive, "demo", Some("src/f0.rs"))
+                .unwrap()
+                .len(),
+            4
+        );
+        assert_eq!(
+            list_annotations(&archive, "demo", Some("")).unwrap().len(),
+            1
+        );
+        assert_eq!(list_findings(&archive, "demo", None).unwrap().len(), 12);
+    }
+
+    /// The measurement behind moving the annotation listing onto the root,
+    /// kept runnable:
+    /// `cargo test --release --lib -- --ignored --nocapture annotations_read_cost`.
+    #[test]
+    #[ignore = "a timing harness, not a gate: run by hand to measure"]
+    fn annotations_read_cost_tracks_the_root_not_the_archive() {
+        let store = Arc::new(Store::new().unwrap());
+        let archive = Archive::new(Arc::clone(&store), GraphName::DefaultGraph);
+        let started = std::time::Instant::now();
+        // 48 roots, 4,000 published annotations (one root holding 400), each
+        // beside the finding it was published from.
+        for n in 0..400 {
+            annotate_numbered(&archive, "big", n, 40);
+        }
+        for r in 0..46 {
+            for n in 0..78 {
+                annotate_numbered(&archive, &format!("root-{r}"), n, 40);
+            }
+        }
+        eprintln!(
+            "archive: {} quads, built in {:?}",
+            store.len().unwrap(),
+            started.elapsed()
+        );
+        for repo in ["empty", "big", "root-0"] {
+            let t = std::time::Instant::now();
+            let indexed = list_annotations(&archive, repo, None).unwrap();
+            let indexed_took = t.elapsed();
+            let t = std::time::Instant::now();
+            let scanned = list_annotations_by_scan(&archive, repo, None).unwrap();
+            let scan_took = t.elapsed();
+            assert_eq!(ids(&indexed), ids(&scanned));
+            eprintln!(
+                "{repo:>7}: {:>4} annotations  indexed {indexed_took:>10.2?}  scan {scan_took:>10.2?}",
+                indexed.len()
+            );
+        }
+    }
+
+    // --- the diff shadow's line indices (published annotation db73e162) ---
+
+    /// Claim: `lines[first]` / `lines[last]` in [`find_anchor_in_diff`] can
+    /// index out of bounds (an empty diff, a hit past the last line, first >
+    /// last). Driven exhaustively over every small diff built from the shapes
+    /// that matter — empty lines, marker-only lines, a missing final newline,
+    /// multibyte text — and every needle that can hit its shadow: every
+    /// substring of the shadow at character boundaries, each also carried
+    /// with a marker. No call may panic, and every hit must be a whole-line
+    /// span on character boundaries that holds the needle's text.
+    #[test]
+    fn the_diff_shadow_indices_stay_in_bounds_for_every_hit() {
+        let shapes = ["", "+", "-", " ", "x", "+x", "-é", " xé", "+\u{1F600}y"];
+        let mut diffs = vec![String::new()];
+        for a in shapes {
+            for b in shapes {
+                for c in ["", "\n"] {
+                    diffs.push(format!("{a}{c}"));
+                    diffs.push(format!("{a}\n{b}{c}"));
+                    diffs.push(format!("{a}\n\n{b}{c}"));
+                }
+            }
+        }
+        let mut hits = 0usize;
+        for diff in &diffs {
+            let shadow: String = diff
+                .split_inclusive('\n')
+                .map(|line| {
+                    let body = line.strip_suffix('\n').unwrap_or(line);
+                    let nl = if body.len() != line.len() { "\n" } else { "" };
+                    format!("{}{nl}", strip_marker(body))
+                })
+                .collect();
+            let bounds: Vec<usize> = shadow
+                .char_indices()
+                .map(|(i, _)| i)
+                .chain([shadow.len()])
+                .collect();
+            let mut needles = vec![String::new(), "+".to_string(), "\n".to_string()];
+            for (i, &from) in bounds.iter().enumerate() {
+                for &to in &bounds[i + 1..] {
+                    let sub = &shadow[from..to];
+                    needles.push(sub.to_string());
+                    needles.push(format!("+{sub}"));
+                    needles.push(format!("- {sub}"));
+                }
+            }
+            for needle in &needles {
+                let Some(hit) = find_anchor_in_diff(diff, needle, "", "") else {
+                    continue;
+                };
+                hits += 1;
+                let a = &hit.anchor;
+                assert!(a.byte_start <= a.byte_end && a.byte_end <= diff.len());
+                assert!(diff.is_char_boundary(a.byte_start) && diff.is_char_boundary(a.byte_end));
+                if let Some(stored) = &hit.stored_exact {
+                    assert_eq!(
+                        stored,
+                        &diff[a.byte_start..a.byte_end],
+                        "{diff:?} {needle:?}"
+                    );
+                    assert!(a.byte_start == 0 || diff.as_bytes()[a.byte_start - 1] == b'\n');
+                }
+            }
+        }
+        // Not vacuous: the shadow stages were reached, many times over.
+        assert!(hits > 1000, "{hits}");
     }
 }
