@@ -111,6 +111,21 @@
 //! `..` and absolute segments are rejected lexically, and the canonicalized
 //! target must stay inside the canonicalized root, so a symlink cannot escape.
 //!
+//! **`.git` is never served** (ledger #1126). A path any of whose components is
+//! `.git` (ASCII case-insensitively: the default macOS volume is
+//! case-insensitive, so `.GIT/config` opens the same file) is a `NotFound` at
+//! every door that touches the filesystem — file, tree, hash, explain, review,
+//! judge, and the annotation Sink's anchoring read — judged on the path as
+//! written AND on its canonical form, so a symlink inside the tree that points
+//! into `.git` is refused too. `.git/config` can carry a credentialed remote URL,
+//! and nothing under `.git` is source this crate exists to show. The listing
+//! hides the same entries (a `.git` directory or file, and a symlink that
+//! resolves into one), so the enumerator never offers what the resolver refuses.
+//! ★ This is NOT the explain config's ignore set: that set (`target`,
+//! `node_modules`, …) exists to keep churn out of the archive's hash, it is
+//! host-configurable, and `target/` is legitimately browsable. A host that
+//! empties the ignore set still never serves `.git`.
+//!
 //! ## Manifold citizenship
 //!
 //! Roots are known at bind time, so the space enumerates **per-configured-root
@@ -775,6 +790,11 @@ pub(crate) fn lexical_jail(rel: &str) -> Result<()> {
 /// within the canonical root, so a symlink component cannot escape.
 pub(crate) fn resolve(root: &Path, rel: &str) -> Result<PathBuf> {
     lexical_jail(rel)?;
+    // Judged on the path AS WRITTEN first, before the filesystem is touched, so
+    // a `.git` path that exists and one that does not answer alike.
+    if names_git_dir(Path::new(rel)) {
+        return Err(git_dir_refusal(rel));
+    }
     let canonical_root = root
         .canonicalize()
         .map_err(|e| Error::Endpoint(format!("browse: root `{}`: {e}", root.display())))?;
@@ -782,12 +802,47 @@ pub(crate) fn resolve(root: &Path, rel: &str) -> Result<PathBuf> {
     let canonical = target
         .canonicalize()
         .map_err(|_| Error::NotFound(format!("browse: no such path `{rel}`")))?;
-    if !canonical.starts_with(&canonical_root) {
+    let Ok(inside) = canonical.strip_prefix(&canonical_root) else {
         return Err(Error::Endpoint(format!(
             "browse: `{rel}` resolves outside its root"
         )));
+    };
+    // And on the CANONICAL path: a symlink inside the tree (`cfg -> .git/config`,
+    // `gitdir -> .git`) passes the lexical check and lands here.
+    if names_git_dir(inside) {
+        return Err(git_dir_refusal(rel));
     }
     Ok(canonical)
+}
+
+/// The name of git's own directory (or, in a submodule or linked worktree, the
+/// FILE naming it). Compared ASCII case-insensitively, because on a
+/// case-insensitive volume `.GIT` opens `.git`; on a case-sensitive one a
+/// directory really named `.GIT` is refused too, which costs nothing real.
+const GIT_DIR: &str = ".git";
+
+/// Is this one entry name git's directory? The listing's half of the rule.
+pub(crate) fn is_git_dir_name(name: &std::ffi::OsStr) -> bool {
+    name.as_encoded_bytes()
+        .eq_ignore_ascii_case(GIT_DIR.as_bytes())
+}
+
+/// Does any component of a root-relative path name git's directory? The
+/// resolver's half of the rule, which [`is_git_dir_name`] mirrors per entry.
+fn names_git_dir(rel: &Path) -> bool {
+    rel.components()
+        .any(|c| matches!(c, Component::Normal(name) if is_git_dir_name(name)))
+}
+
+/// A `.git` path is ABSENT from the browsed space, not forbidden to this
+/// caller: no capability reaches it, the root's included, so it is a
+/// `NotFound` (the tree never lists it either) rather than a `Denied`, which
+/// would say a different grant could open it.
+fn git_dir_refusal(rel: &str) -> Error {
+    Error::NotFound(format!(
+        "browse: `{rel}` is not served — nothing under a `.git` directory is browsable \
+         (it can carry credentials)"
+    ))
 }
 
 fn bad_path(detail: &str) -> Error {
@@ -967,12 +1022,20 @@ pub(crate) struct Entry {
 }
 
 /// List a directory: directories first, then files and links, each
-/// alphabetical. Non-UTF-8 names are skipped rather than mangled.
+/// alphabetical. Non-UTF-8 names are skipped rather than mangled, and a `.git`
+/// entry (directory or file) is never listed: [`resolve`] refuses it, and this
+/// listing is what the tree, the hash's merkle walk and the explain rollup all
+/// enumerate, so none of them can offer or fold in what the resolver will not
+/// serve. Symlinks that resolve INTO `.git` need the root to judge, so the tree
+/// face drops those itself ([`tree_endpoint`]).
 pub(crate) fn list_entries(dir: &Path) -> Result<Vec<Entry>> {
     let read = std::fs::read_dir(dir)
         .map_err(|e| Error::Endpoint(format!("browse: read {}: {e}", dir.display())))?;
     let mut entries = Vec::new();
     for entry in read.flatten() {
+        if is_git_dir_name(&entry.file_name()) {
+            continue;
+        }
         let Ok(name) = entry.file_name().into_string() else {
             continue;
         };
@@ -1016,7 +1079,15 @@ fn tree_endpoint(roots: &Roots, explain: bool) -> FnEndpoint {
                 file_iri(repo, &rel)
             )));
         }
-        let entries = list_entries(&dir)?;
+        let mut entries = list_entries(&dir)?;
+        // A symlink whose target lies under `.git` would be listed as a link
+        // and then refused on click: drop it, so the enumerator stays within
+        // the resolver (ledger #1126). Only the `.git` refusal hides a link —
+        // an escaping or dangling one is still listed and refused at
+        // resolution, as before.
+        entries.retain(|e| {
+            e.kind != Kind::Link || !resolves_into_git_dir(root, &child_rel(&rel, &e.name))
+        });
         match inv.inline_str("as").unwrap_or("text/plain") {
             t if t.starts_with("text/turtle") => {
                 Ok(repr("text/turtle", tree_turtle(repo, &rel, &entries)))
@@ -1029,6 +1100,27 @@ fn tree_endpoint(roots: &Roots, explain: bool) -> FnEndpoint {
         }
     })
     .with_description(tree_description(explain))
+}
+
+/// A root-relative child path (`""` is the root).
+fn child_rel(rel: &str, name: &str) -> String {
+    if rel.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}/{name}", rel.trim_end_matches('/'))
+    }
+}
+
+/// Does `rel` (a link) canonicalize to somewhere under a `.git` component of
+/// the root? Exactly the case [`resolve`] refuses on its canonical half.
+fn resolves_into_git_dir(root: &Path, rel: &str) -> bool {
+    let (Ok(canonical_root), Ok(target)) = (root.canonicalize(), root.join(rel).canonicalize())
+    else {
+        return false;
+    };
+    target
+        .strip_prefix(&canonical_root)
+        .is_ok_and(names_git_dir)
 }
 
 /// NOTE (the manifold contract): `repo` is deliberately NOT an ArgSpec. Every

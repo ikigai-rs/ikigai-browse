@@ -36,6 +36,11 @@ a clean resolution *miss* (the grammar refuses to match; other mounted spaces
 may still answer), never an error from here. Paths are **jailed** to their
 root: `..` and absolute segments are rejected lexically, and the canonicalized
 target must stay inside the canonicalized root, so a symlink cannot escape.
+**`.git` is never served**: a path with a `.git` component (ASCII
+case-insensitively, as written or once canonicalized, so a symlink into it is
+refused too) is a `NotFound` at every door that reads the filesystem, under any
+capability, and the tree never lists it, whatever the explain config's ignore
+set says — `.git/config` can carry a credentialed remote URL.
 Paths in IRIs are percent-encoded (`hello%20world.txt`); bindings are decoded
 before they touch the filesystem.
 
