@@ -369,7 +369,15 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # records no derivation times, so it says "may take a while". ★ Why a minor: new resource
 # families and new face elements, additive; gonk pins `"0.17.0"`, and `^0.17.0` is
 # `<0.18.0`, so the hub moves its pin to show it.
-version = "0.18.0"
+# 0.18.1 keeps a review answer's last finding when the answer cannot have been cut (ledger
+# #818). A provider that reports no `finish_reason` (a plain-text stub, a backend without
+# ikigai-llm's envelope) had its last finding refused unless the note ended in punctuation,
+# and a region whose only finding was refused counted as unreviewed. The pass now decides
+# from `finish_reason`, then `usage.completion_tokens` against the budget, then the
+# answer's byte length (fewer bytes than the token budget cannot have reached it); only an
+# answer that may have reached the budget falls back to the punctuation heuristic. ★ Why a
+# patch: no public API or resource changes, only which findings a pass keeps.
+version = "0.18.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
