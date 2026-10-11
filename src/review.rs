@@ -939,10 +939,7 @@ pub(crate) fn store_region(
             g.clone(),
         ));
     }
-    for quad in &quads {
-        archive.insert(quad).map_err(store_err)?;
-    }
-    Ok(())
+    archive.insert_all(quads).map_err(store_err)
 }
 
 /// Load one region memo by its key — `None` on a miss (no `ik:versionTag`
@@ -1575,10 +1572,7 @@ pub(crate) fn store_pass(archive: &Archive, entry: &PassEntry) -> Result<()> {
             g,
         ));
     }
-    for quad in &quads {
-        archive.insert(quad).map_err(store_err)?;
-    }
-    Ok(())
+    archive.insert_all(quads).map_err(store_err)
 }
 
 /// Load one archived pass by its key IRI — `None` on a miss (no

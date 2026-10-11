@@ -28,23 +28,42 @@
 //! complete one (`crate::migrate`), and it is pinned by
 //! `every_quad_browse_writes_has_a_browse_minted_subject`.
 //!
-//! # Which thread a write commits on
+//! # How a write commits: one record, one transaction, one thread
 //!
-//! Every quad browse inserts or removes commits on **the archive's one long-lived writer
-//! thread**, never on the thread the request happens to run on (ledger #1131). RocksDB
-//! draws each memtable skiplist node's height from a thread-local generator seeded from a
-//! hash of the thread's id, and a thread spawned after the previous one exited usually gets
-//! the same id back. A host that runs each request on a thread of its own (the socket door
-//! spawns one per connection) therefore had every browse write draw the same few heights,
-//! and every later read walked the degenerated skiplists until the memtable flushed:
-//! `tests/post_bulk_read.rs` measured 6x to 68x after 750 annotations, against 1.0x when the
-//! same writes came from one thread. `ikigai-store` 0.2.12 fixed its own doors the same way
-//! (ikigai-rs/ikigai-store PR #32); browse writes through the raw handle a host injects, so
-//! it needs its own writer. Reads stay on the caller's thread.
+//! Every write goes through [`Archive::write`], which runs it as **one transaction** on the
+//! archive's [`SharedWriter`] (`ikigai-store`, ledger #1207):
+//!
+//! - **A record is one commit.** An annotation, a decision, an explanation, a review pass, a
+//!   region memo, a verdict: each is stored (or replaced, or removed) in one transaction, so a
+//!   reader sees all of it or none of it. Before 0.18.5 every quad was a commit of its own, 8
+//!   to 34 per record, and a rewrite removed the old record before it stored the new one, so a
+//!   reader in between found no record at all (`every_record_is_one_commit` and
+//!   `a_reader_never_sees_a_record_missing_or_half_rewritten` pin both).
+//! - **On one long-lived writer thread**, never the thread the request happens to run on
+//!   (ledger #1131). RocksDB draws each memtable skiplist node's height from a thread-local
+//!   generator seeded from a hash of the thread's id, and a thread spawned after the previous
+//!   one exited usually gets the same id back. A host that runs each request on a thread of
+//!   its own (the socket door spawns one per connection) therefore had every browse write
+//!   draw the same few heights, and every later read walked the degenerated skiplists until
+//!   the memtable flushed: `tests/post_bulk_read.rs` measured 6x to 68x after 750
+//!   annotations, against 1.0x when the same writes came from one thread. 0.18.4 carried a
+//!   writer thread of its own for this; the store's `SharedWriter::over` is the same thread,
+//!   kept in one place for every raw-handle host. Reads stay on the caller's thread.
+//! - **Only into the graphs this mount writes.** The writer is declared with the default graph
+//!   (always writable) and, for a mount that names one, that graph; a write anywhere else is
+//!   refused and the whole transaction rolled back. [`Record::insert`]'s debug assertion
+//!   catches the same mistake earlier, in every test.
+//!
+//! ⚠ The writer is browse's own (`over`), not a host's `DurableStore::shared_writer`: a host
+//! that injects a handle `open_shared_declaring` gave it (gonk does) gets a second writer
+//! thread and lock beside the store's, exactly as 0.18.4 had. Taking the host's writer instead
+//! is a `Mount` change ledger #1207 names as later work.
 
-use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 
+use ikigai_store::{DeclaredTransaction, SharedWriter, SharerWrites};
 use oxigraph::model::{GraphName, NamedNodeRef, NamedOrBlankNodeRef, Quad, TermRef};
 use oxigraph::store::{QuadIter, StorageError, Store};
 
@@ -60,8 +79,10 @@ pub(crate) struct Archive {
     /// exception and why it is not one.
     store: Arc<Store>,
     graph: GraphName,
-    /// Where every [`Archive::insert`] and [`Archive::remove`] commits; see the module doc.
-    writer: Writer,
+    /// Where every [`Archive::write`] commits; see the module doc. Its thread starts on the
+    /// first write, so an archive that never writes (the one [`crate::ExplainConfig::new`]
+    /// builds before a mount replaces it) never starts one.
+    writer: SharedWriter,
     /// The thread each write committed on, in order: what the tests pin.
     #[cfg(test)]
     committed_on: Arc<Mutex<Vec<std::thread::ThreadId>>>,
@@ -71,10 +92,21 @@ impl Archive {
     /// Bind `store`'s `graph` — `GraphName::DefaultGraph` for a host that has
     /// not asked for a named one.
     pub(crate) fn new(store: Arc<Store>, graph: GraphName) -> Self {
+        // The default graph is always writable (it has no IRI to declare). A blank-node graph
+        // can be declared by nothing, so a mount bound to one would have every write refused;
+        // no `Mount` builds one.
+        let declared = match &graph {
+            GraphName::NamedNode(iri) => {
+                SharerWrites::only_the_default_graph().and_named_graph(iri.as_str())
+            }
+            GraphName::DefaultGraph | GraphName::BlankNode(_) => {
+                SharerWrites::only_the_default_graph()
+            }
+        };
         Archive {
+            writer: SharedWriter::over(Arc::clone(&store), declared),
             store,
             graph,
-            writer: Writer::default(),
             #[cfg(test)]
             committed_on: Arc::default(),
         }
@@ -94,50 +126,33 @@ impl Archive {
         &self.store
     }
 
-    /// Insert a quad — one built with [`Archive::graph`] as its graph name.
+    /// Run `record` as ONE transaction on the writer thread, and commit it if it returns `Ok`
+    /// (see the module doc). On `Err`, or a write outside the mount's graphs, nothing it asked
+    /// for is written.
     ///
-    /// The debug assertion is the cheap half of the confinement claim: in a
-    /// debug build (so, in every test and every CI run) a quad that reached
-    /// here carrying some other graph name fails loudly rather than landing
-    /// quietly outside the mount's graph.
-    ///
-    /// Commits on the writer thread (see the module doc) and returns once it has.
-    pub(crate) fn insert(&self, quad: &Quad) -> Result<(), StorageError> {
-        debug_assert_eq!(
-            quad.graph_name, self.graph,
-            "browse: a quad not built with Archive::graph() reached Archive::insert"
-        );
-        let (store, quad) = (Arc::clone(&self.store), quad.clone());
-        self.commit(move || store.insert(&quad).map(drop))
-    }
-
-    /// Remove a quad — in practice one that came back from
-    /// [`Archive::quads_for_pattern`], so it is already in this graph.
-    ///
-    /// Commits on the writer thread (see the module doc) and returns once it has.
-    pub(crate) fn remove(&self, quad: &Quad) -> Result<(), StorageError> {
-        let (store, quad) = (Arc::clone(&self.store), quad.clone());
-        self.commit(move || store.remove(&quad).map(drop))
-    }
-
-    fn commit(
+    /// `record` runs on the writer thread, so it takes what it needs by value and must not
+    /// write through this archive itself: the store refuses a write asked for from inside one.
+    pub(crate) fn write<T: Send + 'static>(
         &self,
-        write: impl FnOnce() -> Result<(), StorageError> + Send + 'static,
-    ) -> Result<(), StorageError> {
+        record: impl FnOnce(&mut Record<'_, '_>) -> Result<T, StorageError> + Send + 'static,
+    ) -> Result<T, StorageError> {
+        let graph = self.graph.clone();
         #[cfg(test)]
-        let write = {
-            let committed_on = Arc::clone(&self.committed_on);
-            move || {
-                let on = std::thread::current().id();
-                committed_on.lock().unwrap().push(on);
-                write()
-            }
-        };
-        self.writer.run(write).unwrap_or_else(|| {
-            Err(StorageError::Io(std::io::Error::other(
-                "browse: the archive's writer thread ended without answering",
-            )))
-        })
+        let committed_on = Arc::clone(&self.committed_on);
+        self.writer
+            .write_declared(move |txn: &mut DeclaredTransaction<'_>| {
+                #[cfg(test)]
+                committed_on
+                    .lock()
+                    .unwrap()
+                    .push(std::thread::current().id());
+                record(&mut Record { txn, graph: &graph })
+            })
+    }
+
+    /// Store `quads` — one record's, each built with [`Archive::graph`] — as one transaction.
+    pub(crate) fn insert_all(&self, quads: Vec<Quad>) -> Result<(), StorageError> {
+        self.write(move |record| quads.iter().try_for_each(|quad| record.insert(quad)))
     }
 
     /// Every matching quad **in this mount's graph**.
@@ -154,73 +169,60 @@ impl Archive {
         self.store
             .quads_for_pattern(subject, predicate, object, Some(self.graph.as_ref()))
     }
+
+    /// How many writes have committed through this archive: what the record pins count.
+    #[cfg(test)]
+    pub(crate) fn commits(&self) -> usize {
+        self.committed_on.lock().unwrap().len()
+    }
 }
 
-/// A write queued for the writer thread.
-type Job = Box<dyn FnOnce() + Send + 'static>;
-
-/// One long-lived thread that runs every write handed to it, in order (ledger #1131).
-///
-/// - **Started on the first write**, so an archive that never writes (the one
-///   [`crate::ExplainConfig::new`] builds before a mount replaces it) never starts one.
-/// - **Gone with the archive**: dropping it drops the queue's sender, and the thread exits
-///   once the queue is empty. It holds no store handle of its own between jobs, so a store
-///   can be reopened at the same path as soon as the archive and the host have dropped it.
-/// - **A panic in a write is the caller's**: it is caught on the writer thread, which lives
-///   on, and resumed on the thread that asked.
-/// - **If no thread can be started** (the process is out of threads), the write runs on the
-///   caller's thread: slower reads later are better than a refused write now.
-///
-/// Writes were never concurrent in a way that mattered (each is one tiny RocksDB
-/// transaction), so queueing them costs a channel round trip per quad, not parallelism.
-#[derive(Default)]
-struct Writer {
-    queue: Mutex<Option<Sender<Job>>>,
+/// One record's transaction, confined to the mount's graph the way [`Archive`] is: a read
+/// sees only that graph (and this transaction's own writes), and a write must be built with
+/// it.
+pub(crate) struct Record<'t, 'a> {
+    txn: &'t mut DeclaredTransaction<'a>,
+    graph: &'t GraphName,
 }
 
-impl Writer {
-    /// Run `work` on the writer thread and return its answer, or `None` if the thread
-    /// ended without giving one (which nothing here does on purpose).
-    fn run<T: Send + 'static>(&self, work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
-        let (answer, answered) = mpsc::sync_channel(1);
-        let job: Job = Box::new(move || {
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
-            // The caller waits for this; it can only be gone if it panicked itself.
-            let _ = answer.send(outcome);
-        });
-        if let Err(job) = self.submit(job) {
-            job();
-        }
-        match answered.recv().ok()? {
-            Ok(value) => Some(value),
-            Err(panic) => std::panic::resume_unwind(panic),
-        }
+impl Record<'_, '_> {
+    /// Add a quad built with [`Archive::graph`]. The debug assertion is the cheap half of the
+    /// confinement claim, as it has been since 0.4.0: in a debug build (every test and every
+    /// CI run) a quad carrying some other graph name fails loudly here. In a release build the
+    /// writer's declaration refuses it, and the record with it.
+    pub(crate) fn insert(&mut self, quad: &Quad) -> Result<(), StorageError> {
+        debug_assert_eq!(
+            &quad.graph_name, self.graph,
+            "browse: a quad not built with Archive::graph() reached Record::insert"
+        );
+        self.txn.insert(quad)
     }
 
-    /// Queue `job`, first starting the thread if there is none (or it is gone). Hands the
-    /// job back when no thread can be started.
-    fn submit(&self, job: Job) -> Result<(), Job> {
-        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
-        let job = match queue.as_ref() {
-            Some(sender) => match sender.send(job) {
-                Ok(()) => return Ok(()),
-                Err(mpsc::SendError(job)) => job,
-            },
-            None => job,
-        };
-        let (sender, jobs) = mpsc::channel::<Job>();
-        let started = std::thread::Builder::new()
-            .name("ikigai-browse-writer".to_string())
-            .spawn(move || {
-                for job in jobs {
-                    job();
-                }
-            });
-        if started.is_err() {
-            return Err(job);
+    /// Remove a quad, in practice one [`Record::quads_for_pattern`] found.
+    pub(crate) fn remove(&mut self, quad: &Quad) -> Result<(), StorageError> {
+        self.txn.remove(quad)
+    }
+
+    /// Every matching quad in the mount's graph, as this transaction sees it.
+    pub(crate) fn quads_for_pattern(
+        &self,
+        subject: Option<NamedOrBlankNodeRef<'_>>,
+        predicate: Option<NamedNodeRef<'_>>,
+        object: Option<TermRef<'_>>,
+    ) -> Result<Vec<Quad>, StorageError> {
+        self.txn
+            .quads_for_pattern(subject, predicate, object, Some(self.graph.as_ref()))
+            .collect()
+    }
+
+    /// Remove every quad whose subject is `subject`, in the mount's graph.
+    pub(crate) fn remove_subject(
+        &mut self,
+        subject: NamedOrBlankNodeRef<'_>,
+    ) -> Result<(), StorageError> {
+        for quad in self.quads_for_pattern(Some(subject), None, None)? {
+            self.remove(&quad)?;
         }
-        sender.send(job).map_err(|mpsc::SendError(job)| job)?;
-        *queue = Some(sender);
         Ok(())
     }
 }
@@ -232,39 +234,11 @@ mod tests {
     use std::thread::ThreadId;
 
     /// ★ THE PIN (ledger #1131): writes asked for from many short-lived threads, the way a
-    /// socket door asks, all commit on ONE thread that is none of them. Without the writer
-    /// every write commits on the thread that asked, and this fails on every run.
+    /// socket door asks, all commit on ONE thread that is none of them, inserts and removes
+    /// alike, and land in order. Fails if a write stops going through the writer (nothing is
+    /// recorded) or the writer runs work where it is asked (the threads match).
     #[test]
-    fn every_write_commits_on_one_thread_whatever_thread_asks() {
-        let writer = Arc::new(Writer::default());
-        let on_a_fresh_thread = || {
-            let writer = Arc::clone(&writer);
-            std::thread::spawn(move || {
-                let asked = std::thread::current().id();
-                let ran: ThreadId = writer.run(|| std::thread::current().id()).unwrap();
-                (asked, ran)
-            })
-            .join()
-            .unwrap()
-        };
-        let (asked, first) = on_a_fresh_thread();
-        assert_ne!(first, asked, "a write committed on the thread that asked");
-        assert_ne!(first, std::thread::current().id());
-        for _ in 0..8 {
-            let (asked, ran) = on_a_fresh_thread();
-            assert_ne!(ran, asked, "a write committed on the thread that asked");
-            assert_eq!(ran, first, "a write committed on a thread of its own");
-        }
-        assert_eq!(writer.run(|| std::thread::current().id()).unwrap(), first);
-    }
-
-    /// The same pin through the archive's own doors: inserts and removes asked for from
-    /// fresh threads land, in order, and every one of them committed on one thread that is
-    /// none of the threads that asked. Fails if `insert` or `remove` stops going through the
-    /// writer (nothing is recorded) or the writer runs work where it is asked (the threads
-    /// match).
-    #[test]
-    fn inserts_and_removes_from_fresh_threads_commit_on_the_writer() {
+    fn writes_from_fresh_threads_all_commit_on_one_writer_thread() {
         let archive = Arc::new(Archive::new(
             Arc::new(Store::new().unwrap()),
             GraphName::DefaultGraph,
@@ -278,28 +252,32 @@ mod tests {
         let from_a_fresh_thread = |remove: bool| {
             let (archive, quad) = (Arc::clone(&archive), quad.clone());
             std::thread::spawn(move || {
-                let outcome = if remove {
-                    archive.remove(&quad)
-                } else {
-                    archive.insert(&quad)
-                };
-                outcome.unwrap();
+                archive
+                    .write(move |record| {
+                        if remove {
+                            record.remove(&quad)
+                        } else {
+                            record.insert(&quad)
+                        }
+                    })
+                    .unwrap();
                 std::thread::current().id()
             })
             .join()
             .unwrap()
         };
-        let mut asked = vec![from_a_fresh_thread(false)];
-        assert!(archive.store().contains(&quad).unwrap());
-        asked.push(from_a_fresh_thread(true));
-        assert!(!archive.store().contains(&quad).unwrap());
-        asked.push(from_a_fresh_thread(false));
-        assert!(archive.store().contains(&quad).unwrap());
+        let mut asked = Vec::new();
+        for round in 0..4 {
+            asked.push(from_a_fresh_thread(false));
+            assert!(archive.store().contains(&quad).unwrap(), "round {round}");
+            asked.push(from_a_fresh_thread(true));
+            assert!(!archive.store().contains(&quad).unwrap(), "round {round}");
+        }
 
         let committed_on = archive.committed_on.lock().unwrap().clone();
         assert_eq!(
             committed_on.len(),
-            3,
+            asked.len(),
             "a write did not go through the writer"
         );
         assert!(
@@ -310,17 +288,336 @@ mod tests {
             asked.iter().all(|asker| *asker != committed_on[0]),
             "a write committed on the thread that asked"
         );
+        assert_ne!(committed_on[0], std::thread::current().id());
     }
 
-    /// A panic in a write reaches the caller, and the writer survives it.
+    /// A panic in a write reaches the caller, writes nothing, and the writer lives on: the
+    /// next write commits on the same thread.
     #[test]
     fn a_panicking_write_reaches_its_caller_and_the_writer_lives_on() {
-        let writer = Writer::default();
-        let before = writer.run(|| std::thread::current().id()).unwrap();
+        let archive = Archive::new(Arc::new(Store::new().unwrap()), GraphName::DefaultGraph);
+        let quad = Quad::new(
+            NamedNode::new("urn:ikigai:browse:test:s").unwrap(),
+            NamedNode::new("urn:ikigai:browse:test:p").unwrap(),
+            NamedNode::new("urn:ikigai:browse:test:o").unwrap(),
+            GraphName::DefaultGraph,
+        );
+        let on_writer =
+            || -> ThreadId { archive.write(|_| Ok(std::thread::current().id())).unwrap() };
+        let before = on_writer();
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            writer.run(|| panic!("a write that panics"))
+            let quad = quad.clone();
+            archive.write(move |record| -> Result<(), StorageError> {
+                record.insert(&quad)?;
+                panic!("a write that panics")
+            })
         }));
         assert!(caught.is_err(), "the panic did not reach the caller");
-        assert_eq!(writer.run(|| std::thread::current().id()).unwrap(), before);
+        assert!(
+            !archive.store().contains(&quad).unwrap(),
+            "a panicked record was committed"
+        );
+        assert_eq!(on_writer(), before);
+    }
+
+    /// A record that fails part way writes nothing: the quads it stored before the failure
+    /// are rolled back with it.
+    #[test]
+    fn a_record_that_fails_part_way_writes_nothing() {
+        let archive = Archive::new(Arc::new(Store::new().unwrap()), GraphName::DefaultGraph);
+        let quad = Quad::new(
+            NamedNode::new("urn:ikigai:browse:test:s").unwrap(),
+            NamedNode::new("urn:ikigai:browse:test:p").unwrap(),
+            NamedNode::new("urn:ikigai:browse:test:o").unwrap(),
+            GraphName::DefaultGraph,
+        );
+        let refused = archive.write(move |record| {
+            record.insert(&quad)?;
+            Err::<(), _>(StorageError::Io(std::io::Error::other(
+                "the next quad failed",
+            )))
+        });
+        assert!(refused.is_err());
+        assert!(
+            archive.store().is_empty().unwrap(),
+            "a failed record left quads behind"
+        );
+    }
+
+    /// A write outside the graphs the mount writes is refused by the writer, and rolls back
+    /// the record it was part of. The bad quad goes straight to the transaction, past
+    /// `Record::insert`'s debug assertion (the other half of the same claim), because a
+    /// release build has no assertion and this refusal is all there is.
+    #[test]
+    fn a_write_outside_the_mounts_graph_is_refused_with_its_record() {
+        let mine = NamedNode::new("urn:ikigai:browse:test:mine").unwrap();
+        let archive = Archive::new(
+            Arc::new(Store::new().unwrap()),
+            GraphName::NamedNode(mine.clone()),
+        );
+        let node = NamedNode::new("urn:ikigai:browse:test:s").unwrap();
+        let (inside, outside) = (
+            Quad::new(node.clone(), node.clone(), node.clone(), mine),
+            Quad::new(
+                node.clone(),
+                node.clone(),
+                node,
+                NamedNode::new("urn:ikigai:browse:test:other").unwrap(),
+            ),
+        );
+        let refused = archive.write(move |record| {
+            record.insert(&inside)?;
+            record.txn.insert(&outside)
+        });
+        assert!(ikigai_store::UndeclaredGraph::of(&refused.unwrap_err()).is_some());
+        assert!(archive.store().is_empty().unwrap());
+    }
+
+    /// One of each record browse writes, as the faces build them. The fixtures only need to
+    /// be well-formed: what the pins below count is commits and what a reader can see.
+    mod records {
+        use crate::annotate::{
+            record_iri, revision_iri, Annotation, Decision, Family, Made, Outcome,
+        };
+        use crate::explain::ArchiveEntry;
+        use crate::judge::{Answer, Cannot, Verdict};
+        use crate::review::{PassEntry, RegionEntry};
+
+        pub(super) const AT: &str = "2026-10-11T00:00:00Z";
+
+        pub(super) fn annotation(family: Family, id: &str, body: &str) -> Annotation {
+            Annotation {
+                family,
+                id: id.to_string(),
+                body: body.to_string(),
+                target_iri: "urn:repo:demo:file:a.rs".to_string(),
+                repo: "demo".to_string(),
+                rel: "a.rs".to_string(),
+                hash: "sha256:00".to_string(),
+                prefix: "// a\\n".to_string(),
+                exact: "fn target()".to_string(),
+                suffix: " {}".to_string(),
+                start: 5,
+                end: 16,
+                created: Some(AT.to_string()),
+                reanchored: false,
+                orphaned: false,
+                creator: Some("someone".to_string()),
+                motivation: None,
+                generated_by: None,
+                severity: (family == Family::Finding).then(|| "major".to_string()),
+                derived_from: None,
+                decision: None,
+                history: Vec::new(),
+                prior: None,
+                superseded_by: None,
+                judges: Vec::new(),
+            }
+        }
+
+        pub(super) fn decision(finding_id: &str, minted: &str) -> Decision {
+            Decision {
+                iri: revision_iri(finding_id, 0),
+                outcome: Outcome::Published,
+                severity: Some("major".to_string()),
+                at: Some(AT.to_string()),
+                revises: None,
+                made: Some(Made::Single),
+                confirmed: false,
+                burst: None,
+                note: Some("a note".to_string()),
+                reason: None,
+                minted: Some(minted.to_string()),
+                reproduced: true,
+            }
+        }
+
+        pub(super) fn entry() -> ArchiveEntry {
+            ArchiveEntry {
+                iri: crate::explain::entry_iri("demo", "a.rs", "sha256:00", "file-v1@m"),
+                repo: "demo".to_string(),
+                rel: "a.rs".to_string(),
+                target_iri: "urn:repo:demo:file:a.rs".to_string(),
+                hash: "sha256:00".to_string(),
+                tag: "file-v1@m".to_string(),
+                model: "m".to_string(),
+                kind: "code".to_string(),
+                text: "an explanation".to_string(),
+                derived_at: Some(AT.to_string()),
+            }
+        }
+
+        pub(super) fn pass(minted: &str) -> PassEntry {
+            PassEntry {
+                iri: crate::review::pass_iri("demo", "a.rs", "sha256:00", "review-v1@m"),
+                repo: "demo".to_string(),
+                rel: "a.rs".to_string(),
+                target_iri: "urn:repo:demo:file:a.rs".to_string(),
+                hash: "sha256:00".to_string(),
+                tag: "review-v1@m".to_string(),
+                model: "m".to_string(),
+                minted: vec![minted.to_string()],
+                carried: Vec::new(),
+                reused_regions: Vec::new(),
+                derived_regions: Vec::new(),
+                orphaned_items: 0,
+                suppressed_items: 0,
+                reviewed_bytes: Some(16),
+                total_bytes: Some(16),
+                derived_at: Some(AT.to_string()),
+                superseded: 0,
+            }
+        }
+
+        pub(super) fn region(minted: &str, pass: &str) -> RegionEntry {
+            RegionEntry {
+                iri: crate::review::region_iri("demo", "a.rs", "sha256:00", "review-v1@m"),
+                tag: "review-v1@m".to_string(),
+                hash: "sha256:00".to_string(),
+                len: 16,
+                findings: vec![minted.to_string()],
+                generated_by: Some(pass.to_string()),
+            }
+        }
+
+        pub(super) fn cannot(finding: &str) -> Cannot {
+            Cannot {
+                iri: crate::judge::verdict_iri(finding, "judge-v2@m"),
+                reason: "the version it was reviewed against is gone".to_string(),
+                basis: "sha256:00".to_string(),
+                tag: "judge-v2@m".to_string(),
+                model: "m".to_string(),
+                at: Some(AT.to_string()),
+            }
+        }
+
+        pub(super) fn verdict(finding: &str) -> Verdict {
+            Verdict {
+                iri: crate::judge::verdict_iri(finding, "judge-v2@m"),
+                verdict: "refuted".to_string(),
+                stated: Some("refuted".to_string()),
+                tag: "judge-v2@m".to_string(),
+                model: "m".to_string(),
+                judged_at: Some(AT.to_string()),
+                test_code: false,
+                answers: vec![Answer {
+                    question: "code".to_string(),
+                    answer: "no".to_string(),
+                    reason: "it is not".to_string(),
+                }],
+                raw: "the raw answer".to_string(),
+            }
+        }
+
+        pub(super) fn finding_iri(id: &str) -> String {
+            record_iri(Family::Finding, id)
+        }
+    }
+
+    /// ★ THE RECORD PIN (ledger #1207): every record browse stores, replaces or removes is ONE
+    /// commit, so a reader sees all of it or none of it. Before 0.18.5 each quad was a commit
+    /// of its own: an annotation took one per quad, and a rewrite one per quad removed plus
+    /// one per quad stored, with the record absent or half-written in between.
+    #[test]
+    fn every_record_is_one_commit() {
+        use crate::annotate::{
+            append_decision, remove_annotation, rewrite_annotation, store_annotation, Family,
+        };
+        let archive = Archive::new(Arc::new(Store::new().unwrap()), GraphName::DefaultGraph);
+        let mut counted: Vec<(&str, usize)> = Vec::new();
+        let mut count = |label: &'static str, write: &mut dyn FnMut()| {
+            let before = archive.commits();
+            write();
+            counted.push((label, archive.commits() - before));
+        };
+        let finding = records::annotation(Family::Finding, "f1", "a claim");
+        let finding_iri = records::finding_iri("f1");
+        let mut published = records::annotation(Family::Annotation, "f1", "a claim");
+        count("store a finding", &mut || {
+            store_annotation(&archive, &finding).unwrap()
+        });
+        count("store an annotation", &mut || {
+            store_annotation(&archive, &published).unwrap()
+        });
+        published.body = "a claim, reworded".to_string();
+        count("rewrite an annotation", &mut || {
+            rewrite_annotation(&archive, &published).unwrap()
+        });
+        count("append a decision", &mut || {
+            let decision = records::decision("f1", &published.iri());
+            append_decision(&archive, &finding_iri, &decision).unwrap()
+        });
+        count("remove an annotation", &mut || {
+            remove_annotation(&archive, Family::Annotation, "f1").unwrap()
+        });
+        count("store an explanation", &mut || {
+            crate::explain::store_entry(&archive, &records::entry()).unwrap()
+        });
+        let pass = records::pass(&finding_iri);
+        count("store a review pass", &mut || {
+            crate::review::store_pass(&archive, &pass).unwrap()
+        });
+        count("store a region memo", &mut || {
+            let region = records::region(&finding_iri, &pass.iri);
+            crate::review::store_region(&archive, &region, "demo", "a.rs", "m").unwrap()
+        });
+        count("store a cannot", &mut || {
+            crate::judge::store_cannot(&archive, &finding_iri, &records::cannot(&finding_iri))
+                .unwrap()
+        });
+        count("store a verdict over a cannot", &mut || {
+            crate::judge::store_verdict(&archive, &finding_iri, &records::verdict(&finding_iri))
+                .unwrap()
+        });
+        assert!(
+            counted.iter().all(|(_, commits)| *commits == 1),
+            "a record took other than one commit: {counted:?}"
+        );
+    }
+
+    /// ★ A rewrite is atomic (ledger #1207): a reader looking while a record is replaced, over
+    /// and over, finds it every time, in its old form or its new one. Before 0.18.5 the old
+    /// quads were removed one commit at a time and the new ones stored after, so a reader in
+    /// the gap found no record, or one with some of its quads.
+    #[test]
+    fn a_reader_never_sees_a_record_missing_or_half_rewritten() {
+        use crate::annotate::{load_annotation, rewrite_annotation, store_annotation, Family};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let archive = Arc::new(Archive::new(
+            Arc::new(Store::new().unwrap()),
+            GraphName::DefaultGraph,
+        ));
+        let mut ann = records::annotation(Family::Annotation, "n", "body 0");
+        store_annotation(&archive, &ann).unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let (archive, done) = (Arc::clone(&archive), Arc::clone(&done));
+            std::thread::spawn(move || {
+                let (mut reads, mut torn) = (0usize, Vec::new());
+                while !done.load(Ordering::Relaxed) || reads == 0 {
+                    reads += 1;
+                    match load_annotation(&archive, "n").unwrap() {
+                        None => torn.push("missing".to_string()),
+                        Some(seen) if seen.exact != "fn target()" || seen.end != 16 => {
+                            torn.push(format!("half-written: {seen:?}"))
+                        }
+                        Some(_) => {}
+                    }
+                }
+                (reads, torn)
+            })
+        };
+        for n in 1..=300 {
+            ann.body = format!("body {n}");
+            rewrite_annotation(&archive, &ann).unwrap();
+        }
+        done.store(true, Ordering::Relaxed);
+        let (reads, torn) = reader.join().unwrap();
+        assert!(
+            torn.is_empty(),
+            "{} of {reads} reads saw a torn record, first: {}",
+            torn.len(),
+            torn[0]
+        );
     }
 }

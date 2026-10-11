@@ -845,8 +845,17 @@ fn store_err(e: impl std::fmt::Display) -> Error {
 }
 
 /// Insert the annotation's quads (the annotation node plus both selector
-/// nodes). Flags are stored only when true — absence means false.
+/// nodes) as ONE transaction (ledger #1207). Flags are stored only when true —
+/// absence means false.
 pub(crate) fn store_annotation(archive: &Archive, ann: &Annotation) -> Result<()> {
+    archive
+        .insert_all(record_quads(archive, ann)?)
+        .map_err(store_err)
+}
+
+/// The quads [`store_annotation`] stores: the annotation node plus both
+/// selector nodes, in the archive's graph.
+fn record_quads(archive: &Archive, ann: &Annotation) -> Result<Vec<Quad>> {
     use oxigraph::model::vocab::{rdf, xsd};
     let subject = NamedNode::new(ann.iri()).map_err(store_err)?;
     let quote = NamedNode::new(quote_iri(ann.family, &ann.id)).map_err(store_err)?;
@@ -1028,10 +1037,7 @@ pub(crate) fn store_annotation(archive: &Archive, ann: &Annotation) -> Result<()
     // ⚠ No decision node here. A record is re-stored whenever drift moves
     // its anchor (`rewrite_annotation`), and a decision is never re-stored:
     // [`append_decision`] writes each node once, and nothing removes one.
-    for quad in &quads {
-        archive.insert(quad).map_err(store_err)?;
-    }
-    Ok(())
+    Ok(quads)
 }
 
 /// Write ONE decision node — the first answer on a finding, or a revision
@@ -1131,10 +1137,7 @@ pub(crate) fn append_decision(
     if let Some(minted) = &decision.minted {
         quads.push(Quad::new(node, named(PROV_GENERATED)?, named(minted)?, g));
     }
-    for quad in &quads {
-        archive.insert(quad).map_err(store_err)?;
-    }
-    Ok(())
+    archive.insert_all(quads).map_err(store_err)
 }
 
 /// The IRI of a severity value. ⚠ An OBJECT, not a vocabulary term: the
@@ -1158,30 +1161,43 @@ const DECLINE_REASON_PREFIX: &str = "urn:iki:decline-reason:";
 /// ([`rewrite_annotation`]) or deleted from the ANNOTATION family, which has
 /// none.
 pub(crate) fn remove_annotation(archive: &Archive, family: Family, id: &str) -> Result<()> {
-    let subjects = [
-        record_iri(family, id),
-        quote_iri(family, id),
-        position_iri(family, id),
-    ];
-    for iri in subjects {
-        let subject = NamedNode::new(&iri).map_err(store_err)?;
-        let quads: Vec<Quad> = archive
-            .quads_for_pattern(Some(subject.as_ref().into()), None, None)
-            .collect::<std::result::Result<_, _>>()
-            .map_err(store_err)?;
-        for quad in &quads {
-            archive.remove(quad).map_err(store_err)?;
-        }
-    }
-    Ok(())
+    replace_record(archive, record_subjects(family, id)?, Vec::new())
 }
 
 /// Replace the annotation's stored state (the update path and the
 /// re-anchor/orphan persistence path). A finding's decision nodes are not
 /// part of it and are left exactly as they are.
+///
+/// ★ ONE transaction (ledger #1207): the old record's quads are removed and
+/// the new record's stored in the same commit, so a reader sees the record
+/// before or after, never missing and never half-written. Before 0.18.5 it
+/// was a remove and then a store, one commit per quad.
 pub(crate) fn rewrite_annotation(archive: &Archive, ann: &Annotation) -> Result<()> {
-    remove_annotation(archive, ann.family, &ann.id)?;
-    store_annotation(archive, ann)
+    let quads = record_quads(archive, ann)?;
+    replace_record(archive, record_subjects(ann.family, &ann.id)?, quads)
+}
+
+/// The three subjects a record's quads hang from: the record and both
+/// selectors.
+fn record_subjects(family: Family, id: &str) -> Result<[NamedNode; 3]> {
+    let node = |iri: String| NamedNode::new(iri).map_err(store_err);
+    Ok([
+        node(record_iri(family, id))?,
+        node(quote_iri(family, id))?,
+        node(position_iri(family, id))?,
+    ])
+}
+
+/// Remove every quad under `subjects`, then store `quads`, as one transaction.
+fn replace_record(archive: &Archive, subjects: [NamedNode; 3], quads: Vec<Quad>) -> Result<()> {
+    archive
+        .write(move |record| {
+            for subject in &subjects {
+                record.remove_subject(subject.as_ref().into())?;
+            }
+            quads.iter().try_for_each(|quad| record.insert(quad))
+        })
+        .map_err(store_err)
 }
 
 /// Load one annotation by id — `None` when the store holds no `oa:bodyValue`
