@@ -386,7 +386,14 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # is host-configurable and exists for hash churn. ★ Why a patch: a security fix that removes
 # access nobody should have had; no Rust API, resource name or capability moves, and every
 # consumer pinning `"0.18.1"` takes it with a lock update alone.
-version = "0.18.2"
+# 0.18.3 lists a link iff it is served (ledger #1130): the tree resolves each symlink through
+# the jail and drops an escaping, dangling or looping one, and offers a link to an in-root
+# directory under `tree:` (the file door refused it). Adds `doctor::git_dir_records` (and the
+# `git-dir-doctor` example over an N-Quads dump) to list records minted against a `.git` path
+# before 0.18.2. ★ Why a patch: one public module ADDED, nothing removed or changed in the Rust
+# API, no resource name or capability moves; the tree only stops offering entries every door
+# already refused, and every consumer pinning `"0.18.x"` takes it with a lock update alone.
+version = "0.18.3"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
