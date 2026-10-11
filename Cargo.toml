@@ -393,7 +393,15 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # before 0.18.2. ★ Why a patch: one public module ADDED, nothing removed or changed in the Rust
 # API, no resource name or capability moves; the tree only stops offering entries every door
 # already refused, and every consumer pinning `"0.18.x"` takes it with a lock update alone.
-version = "0.18.3"
+# 0.18.4 commits every browse write on one long-lived writer thread (ledger #1131). RocksDB
+# seeds memtable skiplist heights per thread from the thread id, and a host that runs each
+# request on a fresh thread (the socket door spawns one per connection) reuses ids, so every
+# write drew the same heights and later reads walked degenerated skiplists until the memtable
+# flushed: 6x to 68x after 750 annotations, 1.0x after. ikigai-store 0.2.12 fixed its own
+# doors; browse writes through the raw handle, so it needed its own. ★ Stacked on 0.18.3,
+# which was still unpublished when this was prepared: publishing 0.18.4 from main carries
+# both. ★ Why a patch: no Rust API, resource name or capability moves.
+version = "0.18.4"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
