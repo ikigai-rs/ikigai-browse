@@ -410,7 +410,16 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # its record. ★ Why a patch: no Rust API, resource name or capability moves; one new
 # dependency (ikigai-store, default-features = false, so no RocksDB), and every consumer
 # pinning `"0.18.x"` takes it with a lock update alone.
-version = "0.18.5"
+# 0.18.6 adds `Mount::annotations_through(SharedWriter)` (ledger #1252): a host that opened its
+# store with `DurableStore::open_shared_declaring` (gonk) gives browse the store's OWN writer,
+# so every browse write commits on the store's one thread under its one lock. Through
+# `Mount::annotations`, browse's own `SharedWriter::over` was a second thread and lock beside
+# the store's, and on RocksDB a door's read-modify-write could leave a browse record half
+# written (`tests/host_writer.rs`: 15 quads reduced to 1). Building the space now refuses,
+# naming both, a mount graph the writer's declaration does not name and an `ExplainConfig` on
+# another store handle. ★ Why a patch: additive, nothing existing moves; `ikigai_store::
+# SharedWriter` enters the public API, already a dependency at "0.2.15".
+version = "0.18.6"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
