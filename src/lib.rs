@@ -119,8 +119,20 @@
 //! written AND on its canonical form, so a symlink inside the tree that points
 //! into `.git` is refused too. `.git/config` can carry a credentialed remote URL,
 //! and nothing under `.git` is source this crate exists to show. The listing
-//! hides the same entries (a `.git` directory or file, and a symlink that
-//! resolves into one), so the enumerator never offers what the resolver refuses.
+//! hides the same entries (a `.git` directory or file), so the enumerator never
+//! offers what the resolver refuses.
+//!
+//! **A link is listed iff it is served** (ledger #1130). The tree face resolves
+//! every symlink it lists through the jail and drops the ones it refuses — into
+//! `.git`, out of the root, dangling, looping — and offers a link to an in-root
+//! directory under the tree door. Every other enumerator (the merkle hash, the
+//! explain rollup, the judge's test index) skips links outright.
+//! ⚠ A HARDLINK is not a link: it is the same file under a second name, and
+//! nothing distinguishes it from one, so a hardlink to `.git/config` placed
+//! inside the tree is served as an ordinary file. That is out of scope by
+//! design: whoever can create a hardlink in the tree can equally COPY the file
+//! there, and no check on names or inodes can see a copy. The jail governs
+//! which NAMES resolve, not where the bytes behind a name came from.
 //! ★ This is NOT the explain config's ignore set: that set (`target`,
 //! `node_modules`, …) exists to keep churn out of the archive's hash, it is
 //! host-configurable, and `target/` is legitimately browsable. A host that
@@ -170,6 +182,10 @@ use syntect::util::LinesWithEndings;
 
 mod annotate;
 mod archive;
+/// Store checks that list and never write — today, the records minted against
+/// a `.git` path before 0.18.2 refused it (ledger #1130). Public so a host or
+/// the `git-dir-doctor` example can run them over any store.
+pub mod doctor;
 mod explain;
 mod finding;
 /// Finding GROUPS — `group=` on the findings face: the machine proposes a set
@@ -1019,6 +1035,10 @@ pub(crate) struct Entry {
     kind: Kind,
     /// Byte size — files only (a directory's disk size is not its meaning).
     size: Option<u64>,
+    /// A link whose target is a directory inside the root, so the tree door
+    /// (not the file door) serves it. Set by the tree face, which resolves
+    /// every link it lists ([`tree_endpoint`]); `false` everywhere else.
+    to_dir: bool,
 }
 
 /// List a directory: directories first, then files and links, each
@@ -1026,8 +1046,9 @@ pub(crate) struct Entry {
 /// entry (directory or file) is never listed: [`resolve`] refuses it, and this
 /// listing is what the tree, the hash's merkle walk and the explain rollup all
 /// enumerate, so none of them can offer or fold in what the resolver will not
-/// serve. Symlinks that resolve INTO `.git` need the root to judge, so the tree
-/// face drops those itself ([`tree_endpoint`]).
+/// serve. Whether a symlink is served needs the root to judge, so the tree face
+/// resolves each one itself ([`tree_endpoint`]); every other enumerator skips
+/// links outright.
 pub(crate) fn list_entries(dir: &Path) -> Result<Vec<Entry>> {
     let read = std::fs::read_dir(dir)
         .map_err(|e| Error::Endpoint(format!("browse: read {}: {e}", dir.display())))?;
@@ -1055,7 +1076,12 @@ pub(crate) fn list_entries(dir: &Path) -> Result<Vec<Entry>> {
         let size = (kind == Kind::File)
             .then(|| entry.metadata().ok().map(|m| m.len()))
             .flatten();
-        entries.push(Entry { name, kind, size });
+        entries.push(Entry {
+            name,
+            kind,
+            size,
+            to_dir: false,
+        });
     }
     entries.sort_by(|a, b| {
         let rank = |e: &Entry| (e.kind != Kind::Dir) as u8;
@@ -1080,13 +1106,24 @@ fn tree_endpoint(roots: &Roots, explain: bool) -> FnEndpoint {
             )));
         }
         let mut entries = list_entries(&dir)?;
-        // A symlink whose target lies under `.git` would be listed as a link
-        // and then refused on click: drop it, so the enumerator stays within
-        // the resolver (ledger #1126). Only the `.git` refusal hides a link —
-        // an escaping or dangling one is still listed and refused at
-        // resolution, as before.
-        entries.retain(|e| {
-            e.kind != Kind::Link || !resolves_into_git_dir(root, &child_rel(&rel, &e.name))
+        // The enumerator never outruns the resolver: a link is listed iff
+        // [`resolve`] serves its path, judged by resolve itself so the two
+        // cannot drift. That drops a link into `.git` (ledger #1126) and an
+        // escaping, dangling or looping one (ledger #1130) — nothing a caller
+        // can hold opens those, so they are absent, as `.git` is — and marks a
+        // link to an in-root directory, which the tree door serves and the
+        // file door refuses.
+        entries.retain_mut(|e| {
+            if e.kind != Kind::Link {
+                return true;
+            }
+            match resolve(root, &child_rel(&rel, &e.name)) {
+                Ok(target) => {
+                    e.to_dir = target.is_dir();
+                    true
+                }
+                Err(_) => false,
+            }
         });
         match inv.inline_str("as").unwrap_or("text/plain") {
             t if t.starts_with("text/turtle") => {
@@ -1109,18 +1146,6 @@ fn child_rel(rel: &str, name: &str) -> String {
     } else {
         format!("{}/{name}", rel.trim_end_matches('/'))
     }
-}
-
-/// Does `rel` (a link) canonicalize to somewhere under a `.git` component of
-/// the root? Exactly the case [`resolve`] refuses on its canonical half.
-fn resolves_into_git_dir(root: &Path, rel: &str) -> bool {
-    let (Ok(canonical_root), Ok(target)) = (root.canonicalize(), root.join(rel).canonicalize())
-    else {
-        return false;
-    };
-    target
-        .strip_prefix(&canonical_root)
-        .is_ok_and(names_git_dir)
 }
 
 /// NOTE (the manifold contract): `repo` is deliberately NOT an ArgSpec. Every
@@ -1368,6 +1393,7 @@ fn tree_html(repo: &str, rel: &str, entries: &[Entry], explain: bool) -> String 
         };
         let (iri, label) = match e.kind {
             Kind::Dir => (tree_iri(repo, &child), format!("{}/", esc(&e.name))),
+            Kind::Link if e.to_dir => (tree_iri(repo, &child), format!("{}/", esc(&e.name))),
             _ => (file_iri(repo, &child), esc(&e.name)),
         };
         // Escaped like every attribute value: `iri_encode` keeps `&` (it is
@@ -1452,6 +1478,7 @@ fn tree_turtle(repo: &str, rel: &str, entries: &[Entry]) -> String {
     let mut ttl = String::from("@prefix ik: <https://ikigai-rs.dev/ns#> .\n");
     let child_iri = |e: &Entry, child: &str| match e.kind {
         Kind::Dir => tree_iri(repo, child),
+        Kind::Link if e.to_dir => tree_iri(repo, child),
         _ => file_iri(repo, child),
     };
     let mut props = vec![
@@ -2537,11 +2564,13 @@ mod tests {
                 name: file.to_string(),
                 kind: Kind::File,
                 size: None,
+                to_dir: false,
             },
             Entry {
                 name: "sub&gt;".to_string(),
                 kind: Kind::Dir,
                 size: None,
+                to_dir: false,
             },
         ];
         let pages = [

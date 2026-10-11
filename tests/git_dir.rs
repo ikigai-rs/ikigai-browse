@@ -320,3 +320,53 @@ fn an_annotation_cannot_anchor_in_git() {
         Err(e) => assert!(!e.to_string().contains("x-access-token"), "{e}"),
     }
 }
+
+#[test]
+fn every_spelling_is_refused_by_the_git_rule_not_by_absence() {
+    // On a case-SENSITIVE volume (Linux CI) `.GIT/config` does not exist, so a
+    // bare "is it a NotFound" check passes even with the case-insensitive
+    // compare removed: the path is refused for being absent, not for naming
+    // `.git`. Pinning the refusal's own words makes the rule, not the volume,
+    // what each spelling is tested against, on every OS (ledger #1130).
+    let root = scratch_root();
+    let prompts = Arc::new(Prompts::default());
+    let k = kernel(&root, &prompts);
+    // And paths that exist on NO volume: a `.git` path that exists and one that
+    // does not must answer alike (no existence oracle), which only the
+    // as-written half can do. These go red on macOS too if the compare loses
+    // its case-insensitivity, where the canonical half would otherwise mask it
+    // (APFS canonicalizes `.GIT` to the stored `.git`).
+    let absent = [".git/no-such-file", ".GIT/no-such-file", "src/.Git/x"];
+    for p in git_paths().into_iter().chain(absent) {
+        let err = source(&k, &format!("urn:repo:demo:file:{p}"), &[], &grant()).unwrap_err();
+        if p.contains("..") {
+            assert!(matches!(err, Error::InvalidArgument { .. }), "{p}: {err:?}");
+            continue;
+        }
+        assert!(
+            matches!(&err, Error::NotFound(m) if m.contains("nothing under a `.git` directory")),
+            "{p}: refused for another reason than the .git rule: {err:?}"
+        );
+    }
+}
+
+/// ⚠ The documented boundary, pinned so that changing it is a decision: a
+/// HARDLINK is the same file under a second name, so a hardlink to
+/// `.git/config` placed inside the tree is served as an ordinary file. Out of
+/// scope by design (see the crate docs): whoever can make the link can copy
+/// the file, and no check on names or inodes sees a copy. Measured on
+/// 2026-10-10 across the 50 ikigai checkouts on the hub machine: 0 of 11,626
+/// work-tree files had a link count above 1, and git never writes one.
+#[cfg(unix)]
+#[test]
+fn a_hardlink_is_a_file_and_the_jail_does_not_judge_it() {
+    let root = scratch_root();
+    std::fs::hard_link(root.join(".git/config"), root.join("copy-of-config")).unwrap();
+    let prompts = Arc::new(Prompts::default());
+    let k = kernel(&root, &prompts);
+    let served = source(&k, "urn:repo:demo:file:copy-of-config", &[], &grant()).unwrap();
+    assert!(
+        served.contains(TOKEN),
+        "the documented boundary moved: {served}"
+    );
+}

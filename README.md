@@ -41,6 +41,17 @@ case-insensitively, as written or once canonicalized, so a symlink into it is
 refused too) is a `NotFound` at every door that reads the filesystem, under any
 capability, and the tree never lists it, whatever the explain config's ignore
 set says — `.git/config` can carry a credentialed remote URL.
+**A link is listed iff it is served**: the tree resolves every symlink it lists
+through the jail and drops the ones it refuses (into `.git`, out of the root,
+dangling, looping), and offers a link to an in-root directory under `tree:`,
+so no entry in any face points at a refusal. ⚠ A **hardlink** is not a link but
+the same file under a second name, so a hardlink to `.git/config` placed in the
+tree is served as an ordinary file. That is out of scope by design: whoever can
+create one can copy the file instead, and no check on names or inodes sees a
+copy (the jail governs which names resolve, not where the bytes came from).
+Records minted against a `.git` path before 0.18.2 refused it stay in a store;
+`ikigai_browse::doctor::git_dir_records` lists them, and the `git-dir-doctor`
+example runs it over an N-Quads dump (a host's backup), never a live store.
 Paths in IRIs are percent-encoded (`hello%20world.txt`); bindings are decoded
 before they touch the filesystem.
 
