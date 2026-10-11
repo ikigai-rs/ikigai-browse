@@ -174,6 +174,7 @@ use ikigai_core::{
     ArgSpec, Bindings, Description, Endpoint, EndpointSpace, Error, FnEndpoint, Grammar,
     Invocation, Iri, ReprType, Representation, Result, UriTemplate, Verb,
 };
+use ikigai_store::SharedWriter;
 use oxigraph::model::{GraphName, NamedNode};
 use oxigraph::store::Store;
 use syntect::html::{css_for_theme_with_class_style, line_tokens_to_classed_spans, ClassStyle};
@@ -314,6 +315,9 @@ pub struct Mount {
     app: Option<String>,
     config_home: ConfigHome,
     store: Option<Arc<Store>>,
+    /// The HOST's writer, when it gave one ([`Mount::annotations_through`]): every browse write
+    /// then commits on it instead of on a writer of browse's own (ledger #1252).
+    writer: Option<SharedWriter>,
     /// The graph the mount owns, as STATED by the host. `None` is not "the
     /// default graph chosen" but "the host said nothing", which is what lets
     /// [`Mount::space_watched`] tell a real disagreement with an
@@ -359,6 +363,7 @@ impl Mount {
             app: None,
             config_home: ConfigHome::Ambient,
             store: None,
+            writer: None,
             graph: None,
             explain: None,
         }
@@ -417,8 +422,91 @@ impl Mount {
 
     /// Mount the S2 **annotation** family over a host-injected Oxigraph store.
     /// See [`space_with_annotations`].
+    ///
+    /// Browse commits its writes on a writer of its OWN over `store` (`SharedWriter::over`):
+    /// right for a host that opened the `Store` itself and holds nothing else. ⚠ A handle a
+    /// `DurableStore` gave out (`open_shared_declaring`) has a writer already, and a second
+    /// one beside it orders nothing against it: give the mount that one with
+    /// [`Mount::annotations_through`] instead.
     pub fn annotations(mut self, store: Arc<Store>) -> Self {
         self.store = Some(store);
+        self.writer = None;
+        self
+    }
+
+    /// Mount the S2 **annotation** family over the store `writer` writes, committing every
+    /// browse write THROUGH that writer: the host's, from `DurableStore::shared_writer`
+    /// (ledger #1252).
+    ///
+    /// # Why
+    ///
+    /// A store opened with `DurableStore::open_shared_declaring` (or `open_shared`) commits
+    /// its own writes (`urn:iki:store:update`, `graph-update`, `load`) on ONE writer thread
+    /// under ONE write lock. [`Mount::annotations`] would give browse a second thread and a
+    /// second lock beside them, and on RocksDB nothing else excludes two writers: a
+    /// transaction reads a snapshot and commits a batch, so a door's read-modify-write can
+    /// commit over a browse record written in between and leave half of it
+    /// (`tests/host_writer.rs` reproduces exactly that). Through the host's writer, browse's
+    /// write waits its turn instead. It is also the thread that keeps RocksDB's skiplists
+    /// healthy (ledger #1131): every write to the store, browse's included, advances one
+    /// generator.
+    ///
+    /// # What is checked when the space is built
+    ///
+    /// The writer carries the host's `SharerWrites` declaration, the promise that lets the
+    /// store cache scoped reads of every graph its sharer does not write. Browse's graph
+    /// ([`Mount::graph`], the default graph if unstated) must be one the declaration names,
+    /// or every browse write would be refused at the store, record by record, long after
+    /// startup. So [`Mount::space`] refuses it at once, naming both. A declaration naming
+    /// MORE graphs than browse's is accepted (it covers everything that writes through the
+    /// host's handle, and a wider one costs only cacheability), and a writer from
+    /// `open_shared` declares nothing and refuses nothing.
+    ///
+    /// The same store may ride in an [`ExplainConfig`] too: it must be the writer's
+    /// (the same `Arc`, as [`SharedWriter::store`] returns it), or the space refuses that
+    /// as well.
+    ///
+    /// ```
+    /// use ikigai_browse::Mount;
+    /// use ikigai_store::{DurableStore, SharerWrites};
+    /// use oxigraph::model::NamedNode;
+    ///
+    /// let browse = "urn:iki:browse:graph:default";
+    /// // The host declares where browse writes, once, where it opens the store
+    /// // (`open_shared_declaring` on disk; in memory here).
+    /// let (store, _handle) = DurableStore::in_memory_shared_declaring(
+    ///     SharerWrites::only_the_default_graph().and_named_graph(browse),
+    /// )?;
+    /// let writer = store.shared_writer().expect("a shared store has a writer");
+    /// let root = std::env::temp_dir();
+    ///
+    /// // Browse's graph is one the writer may write: the space is built, and every browse
+    /// // write commits on the store's own writer thread.
+    /// let _space = Mount::new([("demo".to_string(), root.clone())])
+    ///     .annotations_through(writer.clone())
+    ///     .graph(NamedNode::new(browse)?)
+    ///     .space();
+    ///
+    /// // A graph the declaration does not name is refused when the space is built, and
+    /// // the refusal names both sides.
+    /// let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    ///     Mount::new([("demo".to_string(), root)])
+    ///         .annotations_through(writer)
+    ///         .graph(NamedNode::new("urn:iki:browse:graph:elsewhere").unwrap())
+    ///         .space()
+    /// }))
+    /// .err()
+    /// .expect("an undeclared graph was accepted");
+    /// let message = refused.downcast_ref::<String>().unwrap();
+    /// assert!(message.contains("this mount writes graph <urn:iki:browse:graph:elsewhere>"));
+    /// assert!(message.contains(
+    ///     "the host's writer declares the default graph and <urn:iki:browse:graph:default>"
+    /// ));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn annotations_through(mut self, writer: SharedWriter) -> Self {
+        self.store = Some(Arc::clone(writer.store()));
+        self.writer = Some(writer);
         self
     }
 
@@ -509,6 +597,7 @@ impl Mount {
             app,
             config_home,
             store,
+            writer,
             graph,
             explain,
         } = self;
@@ -521,8 +610,9 @@ impl Mount {
         let Some(mut config) = explain else {
             let ignore = Arc::new(hash::default_ignore());
             let archive = store.map(|store| {
-                Arc::new(Archive::new(
+                Arc::new(archive_for(
                     store,
+                    writer,
                     graph_name(graph.clone(), None, "Mount"),
                 ))
             });
@@ -542,8 +632,9 @@ impl Mount {
         // Rebuilding it here (rather than trusting the config's) is what makes
         // `Mount::graph` and `ExplainConfig::graph` a single decision with one
         // answer instead of two knobs that can drift apart unnoticed.
-        let archive = Arc::new(Archive::new(
+        let archive = Arc::new(archive_for(
             Arc::clone(config.archive.store()),
+            writer,
             graph_name(graph, config.graph.clone(), "Mount"),
         ));
         config.archive = Arc::clone(&archive);
@@ -590,6 +681,28 @@ fn graph_name(mount: Option<NamedNode>, config: Option<NamedNode>, who: &str) ->
         (None, Some(b)) => GraphName::NamedNode(b),
         (None, None) => GraphName::DefaultGraph,
     }
+}
+
+/// The one archive a mount writes through: over the host's writer when it gave one
+/// ([`Mount::annotations_through`]), else over a writer of browse's own.
+///
+/// # Panics
+///
+/// When the host's writer is over a different store than `store` (an [`ExplainConfig`] built
+/// on another handle), or its declaration does not let it write `graph`. Fails loud at mount
+/// time, like a bad root name or two graphs: either way every browse write would go wrong
+/// later, one request at a time.
+fn archive_for(store: Arc<Store>, writer: Option<SharedWriter>, graph: GraphName) -> Archive {
+    let Some(writer) = writer else {
+        return Archive::new(store, graph);
+    };
+    assert!(
+        Arc::ptr_eq(writer.store(), &store),
+        "browse: Mount::annotations_through's writer and ExplainConfig::new's store are two \
+         different store handles; a mount writes ONE store, so build the ExplainConfig on \
+         the writer's own (`SharedWriter::store`)"
+    );
+    Archive::through(writer, graph).unwrap_or_else(|refused| panic!("{refused}"))
 }
 
 fn build_roots(roots: impl IntoIterator<Item = (String, PathBuf)>) -> Roots {

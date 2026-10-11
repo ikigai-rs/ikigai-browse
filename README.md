@@ -510,6 +510,31 @@ in another view.
 > that lost their findings, and nothing anywhere reporting a failure. Existing
 > stores need the one-shot below.
 
+### Sharing a `DurableStore`: write through the host's writer (0.18.6)
+
+A host that opens its dataset with `ikigai-store`'s `DurableStore::open_shared_declaring`
+already has a writer: one thread and one write lock that the store's own doors
+(`urn:iki:store:update`, `graph-update`, `load`) commit on. Give browse THAT writer:
+
+```rust,ignore
+let (store, _handle) = DurableStore::open_shared_declaring(path, writes)?;
+let space = Mount::new(roots)
+    .annotations_through(store.shared_writer().expect("a shared store has a writer"))
+    .graph(browse_graph)
+    .space();
+```
+
+`Mount::annotations(handle)` still works, and is right for a host that opened the
+`Store` itself, but it gives browse a writer of its own, and two writers on one
+RocksDB store exclude nothing: a door's read-modify-write can commit over a browse
+record written in between and leave half of it (`tests/host_writer.rs` shows a
+15-quad record reduced to 1). Through the host's writer browse waits its turn.
+
+The space is refused when it is built, naming both, if the writer's `SharerWrites`
+declaration does not let it write the mount's graph (every browse write would
+otherwise be refused at the store later, one request at a time), or if an
+`ExplainConfig` on the same mount was built on a different store handle.
+
 ### Migrating a pre-0.3.0 store
 
 ```text
