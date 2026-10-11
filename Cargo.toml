@@ -401,7 +401,16 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # doors; browse writes through the raw handle, so it needed its own. ★ Stacked on 0.18.3,
 # which was still unpublished when this was prepared: publishing 0.18.4 from main carries
 # both. ★ Why a patch: no Rust API, resource name or capability moves.
-version = "0.18.4"
+# 0.18.5 writes each record as ONE transaction (ledger #1207). The archive holds ikigai-store
+# 0.2.15's `SharedWriter::over` (the same long-lived writer thread 0.18.4 carried, now kept in
+# the store for every raw-handle host) and drops `archive::Writer`. An annotation was 17
+# commits and a rewrite 34, with the record ABSENT between its remove and its store (2590 of
+# 3303 concurrent reads saw it missing); now each is 1 commit and a reader sees it before or
+# after. The writer is declared with the mount's graphs, so a write elsewhere is refused with
+# its record. ★ Why a patch: no Rust API, resource name or capability moves; one new
+# dependency (ikigai-store, default-features = false, so no RocksDB), and every consumer
+# pinning `"0.18.x"` takes it with a lock update alone.
+version = "0.18.5"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
