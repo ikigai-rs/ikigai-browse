@@ -1215,7 +1215,6 @@ fn answer_iri(verdict: &str, question: &str) -> String {
 /// record that this judge could not judge it, which a judgment supersedes.
 pub(crate) fn store_verdict(archive: &Archive, finding_iri: &str, v: &Verdict) -> Result<()> {
     use oxigraph::model::vocab::{rdf, xsd};
-    clear_cannot(archive, &v.iri)?;
     let g = archive.graph().clone();
     let subject = NamedNode::new(&v.iri).map_err(store_err)?;
     let node = |iri: &str| NamedNode::new(iri).map_err(store_err);
@@ -1309,10 +1308,7 @@ pub(crate) fn store_verdict(archive: &Archive, finding_iri: &str, v: &Verdict) -
             ));
         }
     }
-    for quad in &quads {
-        archive.insert(quad).map_err(store_err)?;
-    }
-    Ok(())
+    store_over_cannot(archive, &v.iri, quads)
 }
 
 /// Every verdict on a finding, oldest first (then by tag) — found from the
@@ -1479,28 +1475,32 @@ fn is_cannot(archive: &Archive, subject: &NamedNode) -> Result<bool> {
         .is_some())
 }
 
-/// Remove the `cannot` record at `iri`, if there is one — and ONLY one: a
-/// verdict at that IRI is never touched.
-fn clear_cannot(archive: &Archive, iri: &str) -> Result<()> {
+/// Store `quads` at `iri` as ONE transaction (ledger #1207), first removing
+/// the `cannot` record at `iri` if that is what is there — and ONLY a cannot:
+/// a verdict at that IRI is never touched. The look and the replacement are
+/// one commit, so a reader sees the cannot or its replacement, never neither.
+fn store_over_cannot(archive: &Archive, iri: &str, quads: Vec<Quad>) -> Result<()> {
     let subject = NamedNode::new(iri).map_err(store_err)?;
-    if !is_cannot(archive, &subject)? {
-        return Ok(());
-    }
-    let quads: Vec<Quad> = archive
-        .quads_for_pattern(Some(subject.as_ref().into()), None, None)
-        .collect::<std::result::Result<_, _>>()
-        .map_err(store_err)?;
-    for quad in &quads {
-        archive.remove(quad).map_err(store_err)?;
-    }
-    Ok(())
+    let cannot = NamedNode::new(CANNOT_TYPE).map_err(store_err)?;
+    archive
+        .write(move |record| {
+            let typed_cannot = record.quads_for_pattern(
+                Some(subject.as_ref().into()),
+                Some(dcterms("type").as_ref()),
+                Some(cannot.as_ref().into()),
+            )?;
+            if !typed_cannot.is_empty() {
+                record.remove_subject(subject.as_ref().into())?;
+            }
+            quads.iter().try_for_each(|quad| record.insert(quad))
+        })
+        .map_err(store_err)
 }
 
 /// Store a `cannot` on `finding_iri`, replacing an older one at the same IRI
 /// (a retry under a changed basis that still cannot judge).
 pub(crate) fn store_cannot(archive: &Archive, finding_iri: &str, c: &Cannot) -> Result<()> {
     use oxigraph::model::vocab::{rdf, xsd};
-    clear_cannot(archive, &c.iri)?;
     let g = archive.graph().clone();
     let subject = NamedNode::new(&c.iri).map_err(store_err)?;
     let node = |iri: &str| NamedNode::new(iri).map_err(store_err);
@@ -1556,10 +1556,7 @@ pub(crate) fn store_cannot(archive: &Archive, finding_iri: &str, c: &Cannot) -> 
             g,
         ));
     }
-    for quad in &quads {
-        archive.insert(quad).map_err(store_err)?;
-    }
-    Ok(())
+    store_over_cannot(archive, &c.iri, quads)
 }
 
 /// The `cannot` record at `iri`, if that is what is there.

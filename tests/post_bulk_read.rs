@@ -12,7 +12,8 @@
 //! fixed its own doors (ikigai-rs/ikigai-store PR #32); browse writes through the RAW handle
 //! a host injects, so it did not inherit that fix.
 //!
-//! **The fix** (`archive::Writer`): every quad browse inserts or removes commits on the
+//! **The fix** (0.18.4's `archive::Writer`, since 0.18.5 `ikigai-store`'s `SharedWriter::over`,
+//! ledger #1207): every record browse stores or removes commits, as one transaction, on the
 //! mount's one long-lived writer thread, whatever thread the request runs on.
 //!
 //! # What this file can and cannot promise
@@ -21,7 +22,7 @@
 //! so a slow runner has to be slow on every read to fail it. It cannot catch the regression on
 //! every run: how bad the degeneration gets depends on which seed a run reuses. The
 //! deterministic half is `archive`'s unit test that every write commits on one thread whatever
-//! thread asked (`every_write_commits_on_one_thread_whatever_thread_asks`). This file measures
+//! thread asked (`writes_from_fresh_threads_all_commit_on_one_writer_thread`). This file measures
 //! the symptom; that one pins the mechanism.
 //!
 //! The measurement, kept so it can be re-run when oxigraph or RocksDB moves:

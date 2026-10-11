@@ -777,10 +777,7 @@ pub(crate) fn store_entry(archive: &Archive, entry: &ArchiveEntry) -> Result<()>
             g.clone(),
         ));
     }
-    for quad in &quads {
-        archive.insert(quad).map_err(store_err)?;
-    }
-    Ok(())
+    archive.insert_all(quads).map_err(store_err)
 }
 
 /// Load one archived entry by its key IRI — `None` on a miss (no
