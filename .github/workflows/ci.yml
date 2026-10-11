@@ -10,3 +10,8 @@ jobs:
     uses: ikigai-rs/.github/.github/workflows/rust.yml@main
     with:
       features: migrate
+      # Every live browse host runs on macOS, whose default volume is
+      # case-insensitive: there `.GIT/config` opens the real `.git/config`, and
+      # tests/git_dir.rs proves it is refused on the volume it is deployed on,
+      # not only on Linux's, where that path does not exist (ledger #1130).
+      macos: true
