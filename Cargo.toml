@@ -419,7 +419,12 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # naming both, a mount graph the writer's declaration does not name and an `ExplainConfig` on
 # another store handle. ★ Why a patch: additive, nothing existing moves; `ikigai_store::
 # SharedWriter` enters the public API, already a dependency at "0.2.15".
-version = "0.18.6"
+# 0.18.7 (ledger #1303): a review pass whose unchanged regions CARRY findings from their memos
+# is archived even when every fresh quote misquotes, with the misquotes counted as
+# `orphaned_items`; before, it errored, archived nothing, and every later read of the same
+# file hash re-paid the fresh calls. Reused clean memos alone still error. ★ Why a patch: a
+# behavior fix inside one resource; no Rust API, resource name or capability moves.
+version = "0.18.7"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
