@@ -222,7 +222,11 @@
 //! anchors is an error and is not archived: silently serving an empty review
 //! under a key that will never re-derive would poison the archive. A pass
 //! whose unchanged regions CARRY findings from their memos is not that case
-//! (ledger #1303): it is archived with its misquotes counted.
+//! (ledger #1303): it is archived with its misquotes counted. And a pass that
+//! IS that error still keeps the memos of its clean regions (ledger #1312):
+//! each is the model's own all-clear for exactly those bytes, so the next read
+//! asks only the region that misquoted. Such a memo names no generating pass,
+//! since none was archived.
 //!
 //! ## Capabilities
 //!
@@ -872,7 +876,10 @@ pub(crate) struct RegionEntry {
     pub(crate) len: u64,
     /// The finding IRIs the call over these bytes minted, sorted.
     pub(crate) findings: Vec<String>,
-    /// The pass that derived it.
+    /// The pass that derived it. `None` for a clean region of a pass that
+    /// errored with nothing anchored (ledger #1312): the memo is kept, the pass
+    /// was never archived, and its key is the one a later pass over the same
+    /// bytes is archived under, so naming it would claim that later pass.
     pub(crate) generated_by: Option<String>,
 }
 
@@ -1190,6 +1197,15 @@ pub(crate) struct PassEntry {
     /// this pass), in key order. A collapsed region and a region whose every
     /// quote misquoted write none.
     pub(crate) derived_regions: Vec<String>,
+    /// The bytes the memos in `reused_regions` and `derived_regions` cover,
+    /// summed over the two sets (each memo once). COMPUTED, never stored: the
+    /// derivation sums the memos it holds and [`load_pass`] sums the memos it
+    /// loads, so a stored pass and its fresh derivation agree. What it is for:
+    /// `reviewed_bytes` minus this is the reviewed bytes that earned NO memo (a
+    /// region whose every quote misquoted, or whose answer was cut), which is
+    /// how the statement knows the region count it can see is short (ledger
+    /// #1312). 0 for a diff pass, which has no regions.
+    pub(crate) memo_bytes: u64,
     pub(crate) orphaned_items: u64,
     /// How many of the model's items were WITHHELD as exact repeats of a
     /// finding a human had already declined on the same line of this file —
@@ -1320,11 +1336,27 @@ impl PassEntry {
         // read it — the memo's own number. The denominator is the regions on
         // record (reused + derived); a collapsed region is in neither and is
         // already declared by the coverage note.
-        match self.reused_regions.len() {
-            0 => coverage,
-            reused => format!(
-                "{coverage} · {reused} of {} regions unchanged",
-                reused + self.derived_regions.len()
+        //
+        // ⚠ Unless a REVIEWED region earned no memo (ledger #1312): one whose
+        // every quote misquoted, or whose answer was cut at the budget. It is
+        // in neither set either, so a three-region file with one such region
+        // read "2 of 2 regions unchanged". A stored pass cannot recount those
+        // regions (no published term records how many regions a pass had, and
+        // a vocabulary term is a core arc), but it can see their bytes: what
+        // it reviewed beyond what its memos cover. So it says what it can
+        // prove, "at least" one more region, and what those bytes are.
+        let remembered = self.reused_regions.len() + self.derived_regions.len();
+        let unremembered = self
+            .reviewed_bytes
+            .map_or(0, |reviewed| reviewed.saturating_sub(self.memo_bytes));
+        match (self.reused_regions.len(), unremembered) {
+            (0, _) => coverage,
+            (reused, 0) => format!("{coverage} · {reused} of {remembered} regions unchanged"),
+            (reused, bytes) => format!(
+                "{coverage} · {reused} of at least {} regions unchanged ({bytes} reviewed \
+                 bytes have no memo: every quote misquoted or the answer was cut, so the \
+                 next pass asks again)",
+                remembered + 1
             ),
         }
     }
@@ -1596,6 +1628,7 @@ pub(crate) fn load_pass(archive: &Archive, iri: &str) -> Result<Option<PassEntry
         carried: Vec::new(),
         reused_regions: Vec::new(),
         derived_regions: Vec::new(),
+        memo_bytes: 0,
         orphaned_items: 0,
         suppressed_items: 0,
         reviewed_bytes: None,
@@ -1665,6 +1698,7 @@ pub(crate) fn load_pass(archive: &Archive, iri: &str) -> Result<Option<PassEntry
     // memos, never copied onto the pass, so one record stays one record.
     for iri in &entry.reused_regions {
         if let Some(region) = load_region(archive, iri)? {
+            entry.memo_bytes += region.len;
             entry.carried.extend(region.findings);
         }
     }
@@ -1685,6 +1719,15 @@ pub(crate) fn load_pass(archive: &Archive, iri: &str) -> Result<Option<PassEntry
         }
     }
     entry.derived_regions.sort();
+    // Their bytes too, each memo once: with the reused ones above, the sum the
+    // derivation computed (see [`PassEntry::memo_bytes`]).
+    for iri in &entry.derived_regions {
+        if entry.reused_regions.binary_search(iri).is_err() {
+            if let Some(region) = load_region(archive, iri)? {
+                entry.memo_bytes += region.len;
+            }
+        }
+    }
     Ok(Some(entry))
 }
 
@@ -2052,6 +2095,8 @@ impl Endpoint for ReviewEndpoint {
         let mut fresh: Vec<(usize, Vec<Finding>)> = Vec::new();
         let mut carried: Vec<String> = Vec::new();
         let mut reused_regions: Vec<String> = Vec::new();
+        // Each reused memo's length, by key: half of `PassEntry::memo_bytes`.
+        let mut reused_lens: std::collections::BTreeMap<String, u64> = Default::default();
         let mut malformed = 0u64;
         let mut reviewed = 0usize;
         let mut collapsed: Vec<String> = Vec::new();
@@ -2068,6 +2113,7 @@ impl Endpoint for ReviewEndpoint {
                 reviewed += region.len();
                 carried.extend(memo.findings.iter().cloned());
                 reused_regions.push(memo.iri.clone());
+                reused_lens.insert(memo.iri.clone(), memo.len);
                 continue;
             }
             let prompt = format!(
@@ -2334,6 +2380,26 @@ impl Endpoint for ReviewEndpoint {
         // "nothing above threshold", a claim the model never made about the
         // regions that misquoted.
         if parsed > 0 && minted.is_empty() && suppressed_items == 0 && carried.is_empty() {
+            // ★ But the CLEAN regions keep their memos (ledger #1312). Each
+            // one is the model's own "nothing above threshold" about exactly
+            // its bytes, keyed by their sha256, and that answer is true
+            // whatever happened in another region; dropping it re-asked every
+            // clean region on the next read of the same bytes. Only clean
+            // memos reach here: no item minted or was withheld, so no region
+            // has members, and a region whose quotes misquoted never gets a
+            // memo (above). Nothing here claims anything about the misquoted
+            // region: it has no memo and the pass is not archived, so no
+            // record says "clean" about its bytes or about the file, and the
+            // next read asks that region alone.
+            //
+            // ⚠ They name NO generating pass. This pass is never archived, and
+            // its key is the one the next successful read of the same bytes is
+            // archived under, so `prov:wasGeneratedBy <key>` would make that
+            // later pass count these memos as derived by it as well as reused.
+            for memo in &mut memos {
+                memo.generated_by = None;
+                store_region(&config.archive, memo, repo, &rel, &model)?;
+            }
             return Err(Error::Endpoint(format!(
                 "browse: none of the {parsed} finding(s) for `{rel}` anchored (every quote \
                  was misquoted); nothing archived"
@@ -2345,6 +2411,13 @@ impl Endpoint for ReviewEndpoint {
         memos.dedup_by(|a, b| a.iri == b.iri);
         reused_regions.sort();
         reused_regions.dedup();
+        // Each memo once across both sets, exactly as `load_pass` sums them.
+        let memo_bytes: u64 = reused_lens.values().sum::<u64>()
+            + memos
+                .iter()
+                .filter(|m| !reused_lens.contains_key(&m.iri))
+                .map(|m| m.len)
+                .sum::<u64>();
 
         // ★ THE CLEAN PASS — and with regions it is a UNION, which is the one
         // place the naive implementation is wrong. `minted` and `carried` both
@@ -2368,6 +2441,7 @@ impl Endpoint for ReviewEndpoint {
             carried,
             reused_regions,
             derived_regions: memos.iter().map(|m| m.iri.clone()).collect(),
+            memo_bytes,
             orphaned_items,
             suppressed_items,
             reviewed_bytes,
@@ -4908,6 +4982,122 @@ mod tests {
             assert!(format!("{err:?}").contains("anchored"), "{err:?}");
             assert_eq!(log.count(), asks, "nothing archived, so it asks again");
         }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★ An ERRORING pass keeps the memos of its clean regions (ledger #1312).
+    /// Regions 1 and 2 answer "nothing above threshold"; region 3's one quote
+    /// misquotes, so nothing anchored and the pass is the "nothing anchored"
+    /// error, archiving nothing. Before, the clean regions' memos were thrown
+    /// away with it and the next read of the SAME bytes asked all three
+    /// regions again. Now it asks region 3 alone: regions 1 and 2 were
+    /// genuinely reviewed clean, by the model's own words about exactly
+    /// their bytes.
+    ///
+    /// The second half pins why such a memo names NO generating pass: when
+    /// region 3 finally anchors, the pass archived under that same key (same
+    /// file hash, same tag) must count regions 1 and 2 as REUSED only. A memo
+    /// pointing at the key would have read back as derived by it as well.
+    #[test]
+    fn an_erroring_pass_keeps_the_memos_of_its_clean_regions() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &[
+                CLEAN,
+                CLEAN,
+                &finding_on("fn nope__() {}"),
+                // The second read: only region 3 is asked, and misquotes again.
+                &finding_on("fn nope__() {}"),
+                // The third: region 3 alone again, and this time it anchors.
+                &finding_on("fn five_() {}"),
+            ],
+        );
+        let err = issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).unwrap_err();
+        assert!(format!("{err:?}").contains("anchored"), "{err:?}");
+        assert_eq!(log.count(), 3);
+
+        let err = issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).unwrap_err();
+        assert!(format!("{err:?}").contains("anchored"), "{err:?}");
+        assert_eq!(log.count(), 4, "one call: the clean regions were memoized");
+        let (prompt, _, _) = log.last();
+        assert!(
+            prompt.contains("Region: part 3 of 3, lines 5 to 6"),
+            "{prompt}"
+        );
+
+        let third = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 5, "one call, for region 3");
+        assert_eq!(third["minted"].as_array().unwrap().len(), 1, "{third}");
+        assert_eq!(third["memo_regions"], 2, "{third}");
+        assert_eq!(third["derived_regions"], 1, "{third}");
+        assert_eq!(
+            third["statement"],
+            format!(
+                "1 finding · reviewed the whole file ({} bytes) · 2 of 3 regions unchanged",
+                SIX_LINES.len()
+            )
+        );
+        let hit = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 5, "an archive hit");
+        assert_eq!(hit["memo_regions"], 2, "{hit}");
+        assert_eq!(
+            hit["derived_regions"], 1,
+            "reused, never also derived: {hit}"
+        );
+        assert_eq!(hit["statement"], third["statement"]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★ "N of M regions unchanged" counts EVERY region (ledger #1312). Region
+    /// 3 changed and its one quote misquoted: it was reviewed (its bytes
+    /// count) but earned no memo, so it is neither reused nor derived. The
+    /// statement used to read "2 of 2 regions unchanged" for a three-region
+    /// file. A pass on record cannot recount its memo-less regions (no stored
+    /// term says how many there were), so it says what it can prove: at least
+    /// one more region, and how many reviewed bytes carry no memo. The archive
+    /// hit says the same words.
+    #[test]
+    fn the_region_count_includes_a_region_that_earned_no_memo() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &[
+                &finding_on("fn one__() {}"),
+                CLEAN,
+                CLEAN,
+                &finding_on("fn nope__() {}"),
+            ],
+        );
+        json(&k, "urn:repo:demo:review:a.rs", &[]);
+        let edited = SIX_LINES.replace("fn six__() {}", "fn six_2() {}");
+        std::fs::write(root.join("a.rs"), &edited).unwrap();
+        let second = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 4);
+        assert_eq!(
+            second["statement"],
+            format!(
+                "1 finding (1 carried forward) · reviewed the whole file ({} bytes) · 2 of at \
+                 least 3 regions unchanged (28 reviewed bytes have no memo: every quote \
+                 misquoted or the answer was cut, so the next pass asks again)",
+                edited.len()
+            )
+        );
+        let hit = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(hit["derived"], false);
+        assert_eq!(hit["statement"], second["statement"]);
         std::fs::remove_dir_all(&root).ok();
     }
 

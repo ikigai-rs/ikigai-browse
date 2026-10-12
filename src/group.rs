@@ -741,6 +741,7 @@ mod tests {
                 carried: Vec::new(),
                 reused_regions: Vec::new(),
                 derived_regions: Vec::new(),
+                memo_bytes: 0,
                 orphaned_items: 0,
                 suppressed_items: 0,
                 reviewed_bytes: Some(text.len() as u64),
