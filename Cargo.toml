@@ -434,12 +434,16 @@ categories = ["development-tools", "filesystem"]
 exclude = ["tests/corpus/judge/"]
 
 [features]
-# The one-shot store migration (`migrate-annotation-ns`). It is the ONLY thing
-# in this crate that opens a store on DISK, and RocksDB is what the host's
-# persistent store is — so the binary, and only the binary, needs oxigraph's
-# `rocksdb` feature and the C++ toolchain that comes with it. The library's
-# `migrate` module is feature-free and tested against the in-memory store, so
-# ordinary CI proves the transform without ever building RocksDB.
+# The one-shot store migrations and their rehearsals: the two `migrate-*`
+# binaries, the two rehearsal examples, the RocksDB round-trip test in the
+# `migrate` module, and the on-disk tests in `tests/post_bulk_read.rs` and
+# `tests/host_writer.rs`. They are the ONLY things in this crate that open a
+# store on DISK, every one of them is gated on this feature, and RocksDB is what the
+# host's persistent store is — so they, and only they, need oxigraph's
+# `rocksdb` feature and the C++ toolchain that comes with it. The library
+# itself never opens a store on disk (a host hands it one), and the `migrate`
+# module's transform is feature-free and tested against the in-memory store,
+# so ordinary CI proves the transform without ever building RocksDB.
 migrate = ["oxigraph/rocksdb"]
 
 # The migration binary is gated: a default `cargo build` of this crate must
@@ -452,8 +456,8 @@ path = "src/bin/migrate-annotation-ns.rs"
 required-features = ["migrate"]
 
 # The cross-store move: a browse archive from one host's store into another's,
-# renaming repository roots on the way. Same gate and the same reason — it is
-# the second thing in this crate that opens a store on DISK. Build it with:
+# renaming repository roots on the way. Same gate and the same reason: it
+# opens a store on DISK too. Build it with:
 #     cargo build --release --features migrate --bin migrate-archive-roots
 [[bin]]
 name = "migrate-archive-roots"
