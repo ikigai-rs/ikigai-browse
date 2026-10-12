@@ -88,9 +88,11 @@
 //!
 //! File grain → the `coder` provider (`urn:llm:coder:ask`); directory rollup →
 //! the default `urn:llm:ask`. Provider IDs are CONFIG, never hardcoded.
-//! Per-call `max_tokens` ceilings are MANDATORY (thinking models burn a small
-//! budget on reasoning and return nothing): file ~400, rollup ~600, both
-//! config. `temperature=0.2`.
+//! Per-call `max_tokens` ceilings are MANDATORY: every call states its own, so
+//! the budget is a configured number. The failure to size against is a ceiling
+//! too SMALL: a thinking model spends the budget on reasoning and returns
+//! nothing, which is an error and archives nothing. File ~400, rollup ~600,
+//! both config. `temperature=0.2`.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -366,9 +368,10 @@ impl ExplainConfig {
         self
     }
 
-    /// The file-grain `max_tokens` ceiling (default 400). Mandatory on every
-    /// call — thinking models with no ceiling burn the budget on reasoning
-    /// and return nothing.
+    /// The file-grain `max_tokens` ceiling (default 400), sent on every call.
+    /// Too SMALL is the failure to watch for: a thinking model spends the
+    /// budget on reasoning and returns nothing, which is an error and archives
+    /// nothing, so the remedy for empty answers is a higher ceiling.
     pub fn file_max_tokens(mut self, tokens: u32) -> Self {
         self.file_max_tokens = tokens;
         self
