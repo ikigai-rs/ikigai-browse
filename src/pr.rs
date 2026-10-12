@@ -1662,6 +1662,7 @@ impl Endpoint for PrReviewEndpoint {
             carried: Vec::new(),
             reused_regions: Vec::new(),
             derived_regions: Vec::new(),
+            memo_bytes: 0,
             orphaned_items,
             suppressed_items,
             reviewed_bytes: Some(truncated_len(&diff, config.max_prompt_bytes) as u64),
