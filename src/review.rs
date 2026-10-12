@@ -220,7 +220,9 @@
 //! in the REGION its call was shown, then near the code its note names
 //! (`annotate::find_anchor_within`), never simply on the file's first copy. But a pass in which NOTHING parses or NOTHING
 //! anchors is an error and is not archived: silently serving an empty review
-//! under a key that will never re-derive would poison the archive.
+//! under a key that will never re-derive would poison the archive. A pass
+//! whose unchanged regions CARRY findings from their memos is not that case
+//! (ledger #1303): it is archived with its misquotes counted.
 //!
 //! ## Capabilities
 //!
@@ -2320,7 +2322,18 @@ impl Endpoint for ReviewEndpoint {
         // ⚠ Withheld is not orphaned: a pass whose every item was an exact
         // repeat of a decline DID review the file and found only what a human
         // had already answered. That is a pass to archive, with its count.
-        if parsed > 0 && minted.is_empty() && suppressed_items == 0 {
+        //
+        // ⚠ And neither is CARRIED (ledger #1303): findings an unchanged
+        // region's memo carries are real and on file, so a pass that carries
+        // some has something true to record even when every FRESH quote
+        // misquoted. It is archived with the misquotes as `orphaned_items`,
+        // exactly like a pass that minted one finding beside them, and the
+        // misquoted regions earn no memo. Refusing it instead archived
+        // nothing and re-paid every fresh call on every later read. Reused
+        // CLEAN memos do not count: with nothing carried, the pass would read
+        // "nothing above threshold", a claim the model never made about the
+        // regions that misquoted.
+        if parsed > 0 && minted.is_empty() && suppressed_items == 0 && carried.is_empty() {
             return Err(Error::Endpoint(format!(
                 "browse: none of the {parsed} finding(s) for `{rel}` anchored (every quote \
                  was misquoted); nothing archived"
@@ -4800,6 +4813,101 @@ mod tests {
         assert_eq!(second["derived_regions"], 2, "{second}");
         assert_eq!(second["minted"].as_array().unwrap().len(), 1);
         assert_eq!(second["carried"].as_array().unwrap().len(), 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★ A pass that CARRIES findings from its memos is archived even when
+    /// every fresh quote misquoted (ledger #1303). Region 1 carries its
+    /// finding, region 2 its clean memo; region 3 changed and its one quote
+    /// does not anchor. The pass has something real to record (the carried
+    /// finding, and the misquote as `orphaned_items`), so it is archived and
+    /// the next read is a hit. Before, the "nothing anchored" error ignored
+    /// `carried`, archived nothing, and every later read re-paid region 3's
+    /// call. The misquoted region still earns no memo.
+    #[test]
+    fn a_pass_with_carried_findings_is_archived_when_every_fresh_quote_misquotes() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &[
+                &finding_on("fn one__() {}"),
+                CLEAN,
+                CLEAN,
+                // Pass two: only the changed region is asked, and misquotes.
+                &finding_on("fn nope__() {}"),
+            ],
+        );
+        let first = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 3);
+        assert_eq!(first["minted"].as_array().unwrap().len(), 1);
+        assert_eq!(first["derived_regions"], 3);
+
+        std::fs::write(
+            root.join("a.rs"),
+            SIX_LINES.replace("fn six__() {}", "fn six_2() {}"),
+        )
+        .unwrap();
+        let second = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 4, "one call, for the changed region");
+        assert_eq!(second["minted"].as_array().unwrap().len(), 0, "{second}");
+        assert_eq!(second["carried"].as_array().unwrap().len(), 1, "{second}");
+        assert_eq!(second["orphaned_items"], 1, "{second}");
+        assert_eq!(second["memo_regions"], 2, "{second}");
+        assert_eq!(second["derived_regions"], 0, "no memo for the misquote");
+        let said = second["statement"].as_str().unwrap();
+        assert!(said.starts_with("1 finding (1 carried forward)"), "{said}");
+
+        let hit = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(log.count(), 4, "an archive hit: the call is not re-paid");
+        assert_eq!(hit["derived"], false, "{hit}");
+        assert_eq!(hit["orphaned_items"], 1, "{hit}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The boundary of the rule above: reused CLEAN memos are not something
+    /// to record. A pass whose memos carry no finding and whose fresh quotes
+    /// all misquote would archive as "nothing above threshold", a clean claim
+    /// the model never made about the changed region. It stays the error it
+    /// was, and the next read asks again.
+    #[test]
+    fn a_pass_with_only_clean_memos_and_every_fresh_quote_misquoted_is_still_an_error() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &[
+                CLEAN,
+                CLEAN,
+                CLEAN,
+                &finding_on("fn nope__() {}"),
+                &finding_on("fn nope__() {}"),
+            ],
+        );
+        let first = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        let said = first["statement"].as_str().unwrap();
+        assert!(said.starts_with("nothing above threshold"), "{said}");
+        std::fs::write(
+            root.join("a.rs"),
+            SIX_LINES.replace("fn six__() {}", "fn six_2() {}"),
+        )
+        .unwrap();
+        for asks in [4, 5] {
+            let err =
+                issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).unwrap_err();
+            assert!(format!("{err:?}").contains("anchored"), "{err:?}");
+            assert_eq!(log.count(), asks, "nothing archived, so it asks again");
+        }
         std::fs::remove_dir_all(&root).ok();
     }
 
