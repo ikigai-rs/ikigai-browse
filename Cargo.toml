@@ -424,7 +424,12 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # `orphaned_items`; before, it errored, archived nothing, and every later read of the same
 # file hash re-paid the fresh calls. Reused clean memos alone still error. ★ Why a patch: a
 # behavior fix inside one resource; no Rust API, resource name or capability moves.
-version = "0.18.7"
+# 0.18.8 (ledger #1312): a pass that errors with nothing anchored keeps the memos of its clean
+# regions (naming no generating pass), so the next read asks only the region that misquoted;
+# and "N of M regions unchanged" no longer reads "2 of 2" when a reviewed region earned no memo:
+# it says "at least M+1" and names those bytes. ★ Why a patch: behavior inside one resource; no
+# Rust API, resource name, capability or stored term moves.
+version = "0.18.8"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
