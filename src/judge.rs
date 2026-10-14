@@ -1314,23 +1314,8 @@ pub(crate) fn store_verdict(archive: &Archive, finding_iri: &str, v: &Verdict) -
 /// Every verdict on a finding, oldest first (then by tag) — found from the
 /// finding inward along `prov:used`, the way its decisions are.
 pub(crate) fn load_verdicts(archive: &Archive, finding_iri: &str) -> Result<Vec<Verdict>> {
-    let Ok(finding) = NamedNode::new(finding_iri) else {
-        return Ok(Vec::new());
-    };
-    let used = NamedNode::new(format!("{PROV}used")).map_err(store_err)?;
-    let prefix = format!("{finding_iri}:judge:");
-    let mut iris = BTreeSet::new();
-    for quad in archive.quads_for_pattern(None, Some(used.as_ref()), Some(finding.as_ref().into()))
-    {
-        let quad = quad.map_err(store_err)?;
-        let subject = quad.subject.to_string();
-        let iri = subject.trim_start_matches('<').trim_end_matches('>');
-        if iri.starts_with(&prefix) && !iri.contains(":answer:") {
-            iris.insert(iri.to_string());
-        }
-    }
     let mut out = Vec::new();
-    for iri in iris {
+    for iri in judge_records(archive, finding_iri)? {
         if let Some(v) = load_verdict(archive, &iri)? {
             out.push(v);
         }
@@ -1425,6 +1410,27 @@ fn load_verdict(archive: &Archive, iri: &str) -> Result<Option<Verdict>> {
     v.answers
         .sort_by_key(|a| QUESTIONS.iter().position(|q| *q == a.question));
     Ok(Some(v))
+}
+
+/// The IRI of every judge record on a finding, verdict or `cannot`: the
+/// subjects at `{finding}:judge:{tag}` that `prov:used` it.
+fn judge_records(archive: &Archive, finding_iri: &str) -> Result<BTreeSet<String>> {
+    let Ok(finding) = NamedNode::new(finding_iri) else {
+        return Ok(BTreeSet::new());
+    };
+    let used = NamedNode::new(format!("{PROV}used")).map_err(store_err)?;
+    let prefix = format!("{finding_iri}:judge:");
+    let mut iris = BTreeSet::new();
+    for quad in archive.quads_for_pattern(None, Some(used.as_ref()), Some(finding.as_ref().into()))
+    {
+        let quad = quad.map_err(store_err)?;
+        let subject = quad.subject.to_string();
+        let iri = subject.trim_start_matches('<').trim_end_matches('>');
+        if iri.starts_with(&prefix) && !iri.contains(":answer:") {
+            iris.insert(iri.to_string());
+        }
+    }
+    Ok(iris)
 }
 
 // --- the record of a finding that could not be judged (ledger #702) -------------
@@ -1587,6 +1593,41 @@ pub(crate) fn load_cannot(archive: &Archive, iri: &str) -> Result<Option<Cannot>
         }
     }
     Ok(Some(c))
+}
+
+/// Every `cannot` on a finding, oldest first (then by tag): the records
+/// [`load_verdicts`] skips, found the same way.
+pub(crate) fn load_cannots(archive: &Archive, finding_iri: &str) -> Result<Vec<Cannot>> {
+    let mut out = Vec::new();
+    for iri in judge_records(archive, finding_iri)? {
+        if let Some(c) = load_cannot(archive, &iri)? {
+            out.push(c);
+        }
+    }
+    fn at(c: &Cannot) -> (Option<u64>, Option<&str>) {
+        crate::revision::time_key(c.at.as_deref())
+    }
+    out.sort_by(|a, b| (at(a), &a.tag).cmp(&(at(b), &b.tag)));
+    Ok(out)
+}
+
+/// A `cannot` as JSON: each entry of `judge_cannot` on a finding row
+/// (ledger #709).
+///
+/// ```json
+/// {"iri": "urn:iki:finding:{id}:judge:judge-v2@qwen3-coder:30b",
+///  "tag": "judge-v2@qwen3-coder:30b", "model": "qwen3-coder:30b",
+///  "reason": "the version it was reviewed against (…) is neither …",
+///  "at": "2026-10-01T23:00:00.000Z"}
+/// ```
+pub(crate) fn cannot_json(c: &Cannot) -> serde_json::Value {
+    serde_json::json!({
+        "iri": c.iri,
+        "tag": c.tag,
+        "model": c.model,
+        "reason": c.reason,
+        "at": c.at,
+    })
 }
 
 /// A verdict as JSON — the shape of `judge` (and each entry of `judges`) on a
@@ -1857,7 +1898,110 @@ pub(crate) fn bind(
         roots: Arc::clone(roots),
         config: Arc::clone(config),
     });
-    crate::bind_family(space, roots, one, None, Some("judge-finding:{id}"))
+    let space = crate::bind_family(space, roots, one, None, Some("judge-finding:{id}"));
+    let tag: Arc<dyn Endpoint> = Arc::new(JudgeTagEndpoint {
+        roots: Arc::clone(roots),
+        config: Arc::clone(config),
+    });
+    crate::bind_family(space, roots, tag, Some("judge-tag"), None)
+}
+
+// --- the resource: which judge is current (ledger #709) ------------------------
+
+/// `urn:repo:{repo}:judge-tag` — the tag the CONFIGURED judge archives its
+/// verdicts under (`{prompt version}@{model}`), resolved exactly as a judgment
+/// resolves it, and asking no model.
+///
+/// It exists so a host can tell a current verdict from a stale one without a
+/// call per finding: a row's `judge.tag` (and each `judge_cannot[].tag`) equal
+/// to this one is the current judge's. With the judge off the answer is a
+/// value saying so (`tag: null`), never a refusal: "no judge" is a legitimate
+/// state, and a refusal is never cached.
+///
+/// ```json
+/// {"tag": "judge-v2@qwen3-coder:30b", "prompt_version": "judge-v2",
+///  "model": "qwen3-coder:30b", "provider": "urn:llm:coder:ask"}
+/// ```
+struct JudgeTagEndpoint {
+    roots: Roots,
+    config: Arc<ExplainConfig>,
+}
+
+#[async_trait]
+impl Endpoint for JudgeTagEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        if inv.request.verb != Verb::Source {
+            return Err(Error::Endpoint(format!(
+                "browse-judge-tag does not support the {:?} verb",
+                inv.request.verb
+            )));
+        }
+        let (repo, _) = repo_root(inv, &self.roots)?;
+        granted(inv, repo)?;
+        let answer = match self.config.judge_provider.as_deref() {
+            Some(provider) => {
+                let (tag, model) = identity(inv, &self.config, provider).await;
+                serde_json::json!({
+                    "tag": tag,
+                    "prompt_version": JUDGE_PROMPT_VERSION,
+                    "model": model,
+                    "provider": provider,
+                })
+            }
+            None => serde_json::json!({
+                "tag": null,
+                "prompt_version": JUDGE_PROMPT_VERSION,
+                "model": null,
+                "provider": null,
+            }),
+        };
+        if inv
+            .inline_str("as")
+            .is_ok_and(|a| a.starts_with("text/plain"))
+        {
+            let line = answer["tag"].as_str().unwrap_or("none");
+            return Ok(repr_utf8("text/plain", format!("{line}\n")));
+        }
+        Ok(crate::repr(
+            "application/json",
+            serde_json::to_string(&answer).unwrap_or_default(),
+        ))
+    }
+
+    fn name(&self) -> &str {
+        "browse-judge-tag"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("browse-judge-tag")
+            .title("The configured judge's tag")
+            .summary(
+                "The tag the configured judge archives its verdicts under, \
+                 {prompt version}@{model}, resolved as a judgment resolves it and with no model \
+                 call: compare it with a finding row's judge.tag (or a judge_cannot entry's tag) \
+                 to tell the current judge's verdicts from an older judge's. With no judge \
+                 configured, tag, model and provider are null (a value, not a refusal). \
+                 application/json (default): {tag, prompt_version, model, provider}; \
+                 text/plain: the tag, or `none`.",
+            )
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .requires(CAP_WILDCARD)
+            // Resolving the model reads `urn:llm:{provider}:model`, as a judgment
+            // does: without the net grant the tag would silently fall back to the
+            // provider's label and name a judge nobody runs.
+            .requires(CAP_NET)
+            .input(
+                ArgSpec::new("as")
+                    .optional()
+                    .class(crate::XSD_STRING)
+                    .summary("the face to render")
+                    .one_of(["application/json", "text/plain"])
+                    .default_value("application/json"),
+            )
+            .output("application/json")
+            .output("text/plain;charset=utf-8")
+    }
 }
 
 /// `urn:repo:{repo}:judge:{path}` — the judge, asked about ANY claim against
@@ -1923,11 +2067,13 @@ impl Endpoint for JudgeEndpoint {
                 }
                 requested.to_string()
             }
-            Err(_) => self
-                .config
-                .judge_provider
-                .clone()
-                .unwrap_or_else(|| self.config.review_provider.clone()),
+            // ★ Never the review tier in the judge's place (ledger #709), as
+            // judge-finding refuses (ledger #702): a host that turned the judge
+            // off gets a typed refusal, not a judgment it did not ask for.
+            Err(_) => match self.config.judge_provider.clone() {
+                Some(provider) => provider,
+                None => return Err(no_judge(&file_iri(repo, &rel))),
+            },
         };
         let content = inv.source(&parse_iri(&file_iri(repo, &rel))?).await?;
         let Ok(text) = String::from_utf8(content.bytes.clone()) else {
@@ -2023,6 +2169,8 @@ fn judge_description(config: &ExplainConfig) -> Description {
              `stated`. Temperature 0. Nothing is archived: the review pass runs the same \
              judgment on each serious finding it mints and attaches the verdict to the finding \
              (`judge` on its json row), and nothing is dropped or withheld because of one. \
+             With no judge configured and no provider= named it refuses (Conflict) and never \
+             judges with the review tier in its place. \
              application/json (default) is the verdict object plus `raw` (the answer) and \
              `prompt_bytes`; text/plain is a digest.",
         )
@@ -2479,14 +2627,15 @@ impl JudgeFindingEndpoint {
     }
 }
 
-/// The refusal judge-finding answers when there is no judge to ask: none
-/// configured and no `provider=` named (ledger #702). A [`Error::Conflict`]:
-/// the request is well-formed and authorized, the finding exists, and the
-/// host's STATE refuses it — a host with a judge answers the same request.
-fn no_judge(finding: &str) -> Error {
+/// The refusal judge-finding (ledger #702) and judge:{path} (ledger #709)
+/// answer when there is no judge to ask: none configured and no `provider=`
+/// named. A [`Error::Conflict`]: the request is well-formed and authorized,
+/// its target exists, and the host's STATE refuses it — a host with a judge
+/// answers the same request.
+fn no_judge(target: &str) -> Error {
     Error::Conflict(format!(
-        "browse: no judge is configured on this host, so `{finding}` cannot be judged — \
-         judge-finding never falls back to the review tier. Configure a judge \
+        "browse: no judge is configured on this host, so `{target}` cannot be judged — \
+         the judge never falls back to the review tier. Configure a judge \
          (ExplainConfig::judge_provider), or name one this host offers with provider="
     ))
 }
@@ -2691,7 +2840,8 @@ fn judge_finding_description(config: &ExplainConfig) -> Description {
              history by its sha256 — and when it cannot be recovered (never committed, a \
              pull-request diff), the answer says so (status cannot, with the reason). A \
              cannot is archived at the verdict IRI with its reason (never as a verdict: not \
-             on the finding's judge/judges, and Exists stays false) and a re-read answers it \
+             on the finding's judge/judges but on its judge_cannot, and Exists stays false) \
+             and a re-read answers it \
              from the archive; it is retried when the judge tag changes or its search basis \
              does (the file's current content and the commits that touch its path), and a \
              failure to read git history is never archived. With no judge configured and no \
@@ -3375,6 +3525,142 @@ mod finding_tests {
         .unwrap();
         assert_eq!(named["status"], "judged", "{named}");
         assert_eq!(log.judge_calls().len(), 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★★ judge:{path} refuses with no judge, as judge-finding does (ledger
+    /// #709): before, it fell back to the REVIEW tier silently, so a host that
+    /// had turned the judge off still got judgments from the measurement seam.
+    /// A provider NAMED with `provider=` is an explicit choice, and is honored.
+    #[test]
+    fn with_no_judge_configured_judge_on_a_path_refuses_and_never_asks_the_review_tier() {
+        let root = temp_dir();
+        git(&root, &["init", "-q"]);
+        commit(&root, V1, "one");
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel(&root, &store, &log, false);
+        let args = [("quote", "let x = 1;"), ("claim", "This overflows.")];
+
+        let err = issue(&k, Verb::Source, "urn:repo:demo:judge:a.rs", &args).unwrap_err();
+        assert!(matches!(err, Error::Conflict(_)), "{err:?}");
+        assert!(err.to_string().contains("no judge is configured"), "{err}");
+        assert!(
+            err.to_string().contains("urn:repo:demo:file:a.rs"),
+            "the refusal names what could not be judged: {err}"
+        );
+        assert!(log.judge_calls().is_empty(), "the review tier was asked");
+
+        let mut named = args.to_vec();
+        named.push(("provider", PROVIDER));
+        let answer: serde_json::Value = serde_json::from_str(
+            &issue(&k, Verb::Source, "urn:repo:demo:judge:a.rs", &named).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(answer["verdict"], "refuted", "{answer}");
+        assert_eq!(log.judge_calls().len(), 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★ A `cannot` rides on the finding's row (ledger #709): `judge_cannot`
+    /// carries the archived record with its tag and reason, so a host need
+    /// not remember which findings it found unjudgeable. A verdict later
+    /// stored under the same tag replaces it, and the row says so.
+    #[test]
+    fn a_cannot_rides_on_the_finding_row_until_a_verdict_replaces_it() {
+        let root = temp_dir();
+        git(&root, &["init", "-q"]);
+        commit(&root, "// something else\n", "zero");
+        std::fs::write(root.join("a.rs"), V1).unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let id = queued(&root, &store, &log);
+        commit(&root, V2, "two");
+        let resource = format!("urn:repo:demo:judge-finding:{id}");
+        let finding = format!("urn:iki:finding:{id}");
+        let k = kernel(&root, &store, &log, true);
+
+        assert_eq!(
+            json(&k, &finding)["judge_cannot"],
+            serde_json::json!([]),
+            "nothing on file before the judge looked"
+        );
+        let first = json(&k, &resource);
+        assert_eq!(first["status"], "cannot", "{first}");
+        let row = json(&k, &finding);
+        let cannot = row["judge_cannot"].as_array().expect("an array");
+        assert_eq!(cannot.len(), 1, "{row}");
+        assert_eq!(cannot[0]["iri"], first["record"], "{row}");
+        assert_eq!(cannot[0]["tag"], "judge-v2@r1", "{row}");
+        assert_eq!(cannot[0]["model"], "r1", "{row}");
+        assert_eq!(cannot[0]["reason"], first["reason"], "{row}");
+        // `at` is the record's time, null here: this kernel carries no clock.
+        assert!(cannot[0].get("at").is_some(), "{row}");
+        assert!(row["judge"].is_null(), "a cannot is not a verdict: {row}");
+
+        git(&root, &["checkout", "-q", "-b", "side"]);
+        commit(&root, V1, "one, late");
+        git(&root, &["checkout", "-q", "-"]);
+        assert_eq!(json(&k, &resource)["status"], "judged");
+        let row = json(&k, &finding);
+        assert_eq!(row["judge_cannot"], serde_json::json!([]), "{row}");
+        assert_eq!(row["judge"]["verdict"], "refuted", "{row}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★ The judge tag is readable without a judgment (ledger #709): it is
+    /// the tag a judgment archives its verdict under, read with no model
+    /// call, and with the judge off it says so as a value.
+    #[test]
+    fn the_judge_tag_is_the_tag_a_verdict_is_archived_under() {
+        let root = temp_dir();
+        git(&root, &["init", "-q"]);
+        commit(&root, V1, "one");
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let id = queued(&root, &store, &log);
+        let k = kernel(&root, &store, &log, true);
+
+        let current = json(&k, "urn:repo:demo:judge-tag");
+        assert_eq!(current["tag"], "judge-v2@r1", "{current}");
+        assert_eq!(current["prompt_version"], JUDGE_PROMPT_VERSION);
+        assert_eq!(current["model"], "r1");
+        assert_eq!(current["provider"], PROVIDER);
+        assert!(
+            log.judge_calls().is_empty(),
+            "reading the tag asked the model"
+        );
+        assert_eq!(
+            issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:judge-tag",
+                &[("as", "text/plain")]
+            )
+            .unwrap(),
+            "judge-v2@r1\n"
+        );
+
+        let judged = json(&k, &format!("urn:repo:demo:judge-finding:{id}"));
+        assert_eq!(judged["judge"]["tag"], current["tag"], "{judged}");
+
+        let off = kernel(&root, &store, &log, false);
+        let none = json(&off, "urn:repo:demo:judge-tag");
+        assert!(none["tag"].is_null(), "{none}");
+        assert!(
+            none["model"].is_null() && none["provider"].is_null(),
+            "{none}"
+        );
+        assert_eq!(
+            issue(
+                &off,
+                Verb::Source,
+                "urn:repo:demo:judge-tag",
+                &[("as", "text/plain")]
+            )
+            .unwrap(),
+            "none\n"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

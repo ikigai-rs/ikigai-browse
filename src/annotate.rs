@@ -757,6 +757,11 @@ pub(crate) struct Annotation {
     /// state, rating or queue membership here depends on it — routing on a
     /// verdict is the host's decision.
     pub(crate) judges: Vec<crate::judge::Verdict>,
+    /// Every `cannot` on file for a finding, oldest first: a judge that found
+    /// it unjudgeable for a LASTING reason, one record per judge tag (ledger
+    /// #709). Never a verdict, so never in [`Annotation::judges`]; a verdict
+    /// later stored under the same tag replaces it. Empty on an annotation.
+    pub(crate) cannots: Vec<crate::judge::Cannot>,
 }
 
 /// What an annotation's recorded target IS — derived from the stored
@@ -789,7 +794,9 @@ impl Annotation {
         }
     }
 
-    /// The rating that governs: the human's, once there is one.
+    /// The rating that governs: the human's, once there is one, else the
+    /// model's proposal. A RESOLVED value (ledger #463): on an undecided
+    /// finding it is the model's word, so it never says what a human chose.
     pub(crate) fn effective_severity(&self) -> Option<&str> {
         match &self.decision {
             Some(d) => d.severity.as_deref(),
@@ -1239,6 +1246,7 @@ pub(crate) fn load_record(
         prior: None,
         superseded_by: None,
         judges: Vec::new(),
+        cannots: Vec::new(),
     };
     let mut prior_id: Option<String> = None;
     let literal = |term: &Term| match term {
@@ -1335,6 +1343,7 @@ pub(crate) fn load_record(
         ann.history = load_decisions(archive, id)?;
         ann.settle();
         ann.judges = crate::judge::load_verdicts(archive, &record_iri(family, id))?;
+        ann.cannots = crate::judge::load_cannots(archive, &record_iri(family, id))?;
         if let Some(twin) = prior_id {
             ann.prior = Some(Prior {
                 finding: record_iri(Family::Finding, &twin),
@@ -2737,6 +2746,7 @@ impl AnnotationEndpoint {
             prior: None,
             superseded_by: None,
             judges: Vec::new(),
+            cannots: Vec::new(),
         };
         rewrite_annotation(&self.archive, &ann)?;
         match inv.inline_str("as").unwrap_or("text/plain") {
@@ -3016,6 +3026,9 @@ pub(crate) fn annotation_json(ann: &Annotation, line: Option<u64>) -> serde_json
         // PROPOSAL on a finding (and the human's final on a published
         // annotation), `decision.severity` is what the human settled on.
         // A consumer that wants one number takes `effective_severity`.
+        // ⚠ It is RESOLVED, never a human's answer by itself (ledger #463):
+        // on an undecided finding it IS the model's proposal, so a "human"
+        // column renders from `decision.severity`, null until someone decides.
         "severity": ann.severity,
         "effective_severity": ann.effective_severity(),
         "state": ann.state(),
@@ -3062,6 +3075,15 @@ pub(crate) fn annotation_json(ann: &Annotation, line: Option<u64>) -> serde_json
         "judge": ann.judges.last().map(crate::judge::verdict_json),
         // Every verdict, oldest first — one per judge tag.
         "judges": ann.judges.iter().map(crate::judge::verdict_json).collect::<Vec<_>>(),
+        // ★ Every `cannot` on file, oldest first, one per judge tag (ledger
+        // #709): judge-finding found the finding unjudgeable for a lasting
+        // reason under that tag (a pull-request finding, reviewed bytes no
+        // commit carries). Not a verdict, so never in `judge`/`judges`; a
+        // verdict later stored under the same tag replaces it. A host that
+        // compares each entry's `tag` with `urn:repo:{repo}:judge-tag` knows
+        // which findings the CURRENT judge cannot judge, without asking it.
+        // See `crate::judge::cannot_json`.
+        "judge_cannot": ann.cannots.iter().map(crate::judge::cannot_json).collect::<Vec<_>>(),
     })
 }
 
@@ -3895,6 +3917,7 @@ pub(crate) fn mint_pending_finding_within(
         prior,
         superseded_by: None,
         judges: Vec::new(),
+        cannots: Vec::new(),
     };
     store_annotation(archive, &ann)?;
     Ok(Mint::Minted(ann.iri()))
@@ -6273,6 +6296,7 @@ mod tests {
             prior: None,
             superseded_by: None,
             judges: Vec::new(),
+            cannots: Vec::new(),
         };
         store_annotation(&archive, &pr).unwrap();
         // Decoys that carry `ik:repo "demo"` and must never be listed (the

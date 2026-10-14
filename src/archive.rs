@@ -531,6 +531,7 @@ mod tests {
                 prior: None,
                 superseded_by: None,
                 judges: Vec::new(),
+                cannots: Vec::new(),
             }
         }
 

@@ -139,10 +139,10 @@ const RAW_FACE_IS_A_PASS_THROUGH: &str =
      `the_raw_file_face_serves_the_extension_mapped_type`; remove this waiver when \
      `Description` grows a pass-through output marker (core PENDING §20)";
 
-/// Every description id this crate binds. A twenty-fourth endpoint bound without a
-/// line here is held to a weaker standard than the twenty-three; a listed id that
+/// Every description id this crate binds. A twenty-fifth endpoint bound without a
+/// line here is held to a weaker standard than the twenty-four; a listed id that
 /// binds nothing is a stale list.
-const ENDPOINTS: [&str; 23] = [
+const ENDPOINTS: [&str; 24] = [
     "annotation",
     "browse-annotations",
     "browse-explain",
@@ -153,6 +153,7 @@ const ENDPOINTS: [&str; 23] = [
     "browse-hash",
     "browse-judge",
     "browse-judge-finding",
+    "browse-judge-tag",
     "browse-layout",
     "browse-pr",
     "browse-pr-explain",
@@ -612,6 +613,7 @@ fn conforms() {
             "browse-judge source application/json",
             "browse-judge-finding exists text/plain",
             "browse-judge-finding source application/json",
+            "browse-judge-tag source application/json",
             "browse-layout source text/css",
             "browse-review source text/plain",
             "browse-review source text/turtle",
