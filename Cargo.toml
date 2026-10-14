@@ -429,7 +429,19 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # and "N of M regions unchanged" no longer reads "2 of 2" when a reviewed region earned no memo:
 # it says "at least M+1" and names those bytes. ★ Why a patch: behavior inside one resource; no
 # Rust API, resource name, capability or stored term moves.
-version = "0.18.8"
+# 0.18.9 (ledger #1324, #1055, #1061): browse on `ikigai-store` 0.2.18's one writer per store
+# handle. `Mount::annotations_through` narrows the host's writer to the mount's graphs (an
+# `over` on its handle, which joins it), so a write to another graph the host declares is
+# refused in a release build too; browse's own writer is made at its first write, so the
+# throwaway archives `ExplainConfig::new`/`::graph` build can no longer register a narrower
+# declaration first (on 0.2.18, over a handle the host opened itself, that refused every
+# write to a mount's named graph). A PR explanation the output budget cut is refused,
+# not archived as complete. ★ Why a patch: no Rust API, resource name, capability or stored
+# term moves; the `ikigai-store` floor rises within its caret (`"0.2.15"` -> `"0.2.18"`), and
+# every consumer pinning `"0.18.x"` takes it with a lock update. ⚠ A consumer that already
+# resolves store 0.2.18+ under browse 0.18.8 and builds `ExplainConfig` on a handle it opened
+# itself with a named graph has every browse write refused today: this release is its fix.
+version = "0.18.9"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
