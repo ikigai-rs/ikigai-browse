@@ -544,11 +544,16 @@ sha2 = "0.10"
 oxigraph = { version = "0.5", default-features = false }
 # The archive's WRITER (ledger #1207): `SharedWriter::over` gives browse's injected handle one
 # long-lived writer thread (the RocksDB seed trap, ledger #1131) and hands each record ONE
-# transaction checked against the graphs the mount writes. "0.2.15" is the true floor: `over`
-# and `write_declared` arrived there (0.2.14 had only `DurableStore::shared_writer`). ⚠ And a
-# CEILING: `^0.2.15` is `<0.3.0`. default-features = false keeps RocksDB out (the crate's
-# default is already empty; stated so a future default cannot pull it in), as above.
-ikigai-store = { version = "0.2.15", default-features = false }
+# transaction checked against the graphs the mount writes. "0.2.18" is the true floor (ledger
+# #1324): `over` on a handle a `DurableStore` shared constructor gave out JOINS the store's own
+# writer (0.2.16, ledger #1276), and every later `over` on a handle the host opened itself joins
+# the first (0.2.17), the two unpublished releases 0.2.18 carries. `Mount::annotations_through`
+# narrows the host's writer with an `over` on its handle, which below 0.2.18 would be a SECOND
+# writer thread beside the host's: the RocksDB lost update it exists to prevent. (`over` and
+# `write_declared` themselves arrived in 0.2.15.) ⚠ And a CEILING: `^0.2.18` is `<0.3.0`.
+# default-features = false keeps RocksDB out (the crate's default is already empty; stated so a
+# future default cannot pull it in), as above.
+ikigai-store = { version = "0.2.18", default-features = false }
 # async trait objects for the explain endpoint (it must await sub-requests —
 # FnEndpoint is sync-only), matching ikigai-core's own endpoint plumbing.
 async-trait = "0.1"

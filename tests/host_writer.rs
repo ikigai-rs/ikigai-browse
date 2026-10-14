@@ -1,13 +1,19 @@
 //! Two writers on one store can lose a browse record; the host's ONE writer cannot (ledger
-//! #1252).
+//! #1252, #1324).
 //!
 //! # What happened
 //!
 //! A host that opens its store with `DurableStore::open_shared_declaring` (gonk does) hands
 //! browse the raw `Arc<Store>`, and through 0.18.5 `Mount::annotations` was the only way in:
-//! it builds browse's own `SharedWriter::over` on that handle, a second writer thread and a
-//! second write lock beside the store's own. `ikigai-store` warns against exactly that: a
-//! write through a store door can then lose an update made through `over`.
+//! it builds browse's own `SharedWriter::over` on that handle, which through `ikigai-store`
+//! 0.2.15 was a second writer thread and a second write lock beside the store's own. A write
+//! through a store door could then lose an update made through `over`.
+//!
+//! Since `ikigai-store` 0.2.18 the store keeps one writer per `Arc<Store>` (ledger #1276,
+//! #1324): an `over` on a handle it gave out, or on a handle an earlier `over` was made on,
+//! joins that writer. So browse's own writer on the host's handle no longer races; one on a
+//! handle the store never saw (a `Store` clone in a new `Arc`) still does, and that is what
+//! the reproduction below now holds open.
 //!
 //! # The reproduction
 //!
@@ -21,12 +27,14 @@
 //! browse's graph, and then removes what it read (a scoped `CLEAR GRAPH`, in effect). Between
 //! the read and the commit it waits, and in that window browse rewrites an annotation:
 //!
-//! - **On browse's own writer** (`Mount::annotations`), the rewrite commits in the window, and
-//!   the door's commit then removes the quads the rewrite stored unchanged: what is left is
-//!   half a record, which no serial order of the two writes produces (one order leaves the
-//!   whole new record, the other leaves nothing). That is the lost update.
-//! - **On the host's writer** (`Mount::annotations_through`), the rewrite waits for the door,
-//!   then commits whole.
+//! - **On a writer of browse's own over another handle** to the same dataset, the rewrite
+//!   commits in the window, and the door's commit then removes the quads the rewrite stored
+//!   unchanged: what is left is half a record, which no serial order of the two writes
+//!   produces (one order leaves the whole new record, the other leaves nothing). That is the
+//!   lost update.
+//! - **On the host's writer** (`Mount::annotations_through`), or on browse's own writer over
+//!   the host's very handle (`Mount::annotations`, since store 0.2.18), the rewrite waits for
+//!   the door, then commits whole.
 //!
 //! The window is held open on purpose, so neither outcome depends on timing: the first case
 //! WAITS for browse's rewrite to finish before the door commits, and the second asserts the
@@ -200,12 +208,52 @@ mod race {
         (done_rx, rewriting)
     }
 
-    /// ★ THE REPRODUCTION (ledger #1252): browse's own writer beside the host's loses half a
-    /// record to a door's read-modify-write. Pinned as it stands so the warning on
-    /// `Mount::annotations` stays true: if this ever stops reproducing, that warning is
-    /// stale.
+    /// The race, held open: the door reads browse's graph on `host`, browse rewrites
+    /// annotation `id` meanwhile, then the door removes what it read. Answers how many quads
+    /// of browse's graph are left.
+    ///
+    /// `waits` says whether browse's writer is expected to wait for the host's. If not, the
+    /// door holds its commit until the rewrite has committed (a POSITIVE wait with a generous
+    /// bound, so load cannot fail it). If so, the rewrite must NOT finish while the door holds
+    /// the writer (a NEGATIVE wait: no load can make it finish early, only a regression can).
+    fn race(kernel: &Arc<Kernel>, store: &Store, host: SharedWriter, waits: bool) -> usize {
+        let whole = quads_in_graph(store);
+        let (read_tx, read_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel();
+        let door = door(host, read_tx, go_rx);
+        read_rx.recv().unwrap();
+
+        let (done, rewriting) = rewrite_in_the_background(kernel, "raced");
+        if waits {
+            assert!(
+                done.recv_timeout(Duration::from_millis(300)).is_err(),
+                "browse committed while the host's writer was held: it is not that writer"
+            );
+        } else {
+            done.recv_timeout(Duration::from_secs(60)).expect(
+                "browse's writer waited for one on another handle: they are one writer now, \
+                 and the ⚠ on `Mount::annotations` is stale",
+            );
+        }
+
+        go_tx.send(()).unwrap();
+        assert_eq!(door.join().unwrap().unwrap(), whole);
+        rewriting.join().unwrap();
+        let left = quads_in_graph(store);
+        eprintln!("one record is {whole} quads; after the race, {left} remain");
+        left
+    }
+
+    /// ★ THE REPRODUCTION (ledger #1252, #1324): a writer on ANOTHER `Arc` over the same
+    /// dataset (a `Store` clone re-wrapped) is a handle the store never recorded, so browse's
+    /// own writer is a second thread beside the host's, and a door's read-modify-write loses
+    /// half a record. Pinned as it stands so the ⚠ on `Mount::annotations` stays true: if this
+    /// ever stops reproducing, that warning is stale.
+    ///
+    /// Through `ikigai-store` 0.2.15 the SAME `Arc` did this too; since 0.2.18 it joins (the
+    /// next test), which is what made the old warning stale.
     #[test]
-    fn browse_own_writer_beside_the_hosts_loses_half_a_record() {
+    fn browse_own_writer_on_another_handle_to_the_dataset_loses_half_a_record() {
         let whole = one_record();
         let store = durable("over");
         let kernel = Arc::new(Kernel::new(Arc::new(
@@ -217,22 +265,8 @@ mod race {
         annotate(&kernel, "raced", "the first body");
         assert_eq!(quads_in_graph(&store), whole, "one record before the race");
 
-        let (read_tx, read_rx) = mpsc::channel();
-        let (go_tx, go_rx) = mpsc::channel();
-        let door = door(host_writer(&store), read_tx, go_rx);
-        read_rx.recv().unwrap();
-
-        // browse's writer is not the host's, so the rewrite commits while the door waits.
-        let (done, rewriting) = rewrite_in_the_background(&kernel, "raced");
-        done.recv_timeout(Duration::from_secs(60))
-            .expect("browse's own writer does not wait for the host's");
-        rewriting.join().unwrap();
-
-        go_tx.send(()).unwrap();
-        assert_eq!(door.join().unwrap().unwrap(), whole);
-
-        let left = quads_in_graph(&store);
-        eprintln!("one record is {whole} quads; after the race, {left} remain");
+        let rewrapped = Arc::new(Store::clone(&store));
+        let left = race(&kernel, &store, host_writer(&rewrapped), false);
         assert!(
             left > 0 && left < whole,
             "expected half a record (neither 0 nor {whole} quads, the two serial outcomes); \
@@ -240,8 +274,32 @@ mod race {
         );
     }
 
+    /// ★ THE FIX, store side (ledger #1324): on the SAME `Arc` the host's writer was made on,
+    /// browse's own writer (`Mount::annotations`) joins it, so the rewrite waits for the door
+    /// and then commits whole. Browse writes first here, so the host's `over` is the one that
+    /// joins: either order is one writer.
+    #[test]
+    fn browse_own_writer_on_the_hosts_handle_joins_it_and_lands_whole() {
+        let whole = one_record();
+        let store = durable("joined");
+        let kernel = Arc::new(Kernel::new(Arc::new(
+            ikigai_browse::Mount::new([("demo".to_string(), root("joined"))])
+                .annotations(Arc::clone(&store))
+                .graph(graph())
+                .space(),
+        )));
+        annotate(&kernel, "raced", "the first body");
+        assert_eq!(quads_in_graph(&store), whole, "one record before the race");
+
+        let left = race(&kernel, &store, host_writer(&store), true);
+        assert_eq!(left, whole, "the record is not whole");
+        assert_eq!(body_of(&kernel, "raced"), "the edited body");
+    }
+
     /// ★ THE FIX (ledger #1252): through the host's writer the same rewrite waits for the
-    /// door, then commits whole, so the record is the one a serial order produces.
+    /// door, then commits whole, so the record is the one a serial order produces. Since
+    /// ledger #1324 browse commits on a narrowed `over` of that writer, which must still be
+    /// the same writer: this is the test that says so on RocksDB.
     #[test]
     fn through_the_hosts_writer_the_rewrite_waits_and_lands_whole() {
         let whole = one_record();
@@ -256,24 +314,8 @@ mod race {
         annotate(&kernel, "raced", "the first body");
         assert_eq!(quads_in_graph(&store), whole, "one record before the race");
 
-        let (read_tx, read_rx) = mpsc::channel();
-        let (go_tx, go_rx) = mpsc::channel();
-        let door = door(host, read_tx, go_rx);
-        read_rx.recv().unwrap();
-
-        // The door holds the one writer, so the rewrite cannot commit. A negative wait: no
-        // load can make it finish early, only a regression can.
-        let (done, rewriting) = rewrite_in_the_background(&kernel, "raced");
-        assert!(
-            done.recv_timeout(Duration::from_millis(300)).is_err(),
-            "browse committed while the host's writer was held: it is not writing through it"
-        );
-
-        go_tx.send(()).unwrap();
-        assert_eq!(door.join().unwrap().unwrap(), whole);
-        rewriting.join().unwrap();
-
-        assert_eq!(quads_in_graph(&store), whole, "the record is not whole");
+        let left = race(&kernel, &store, host, true);
+        assert_eq!(left, whole, "the record is not whole");
         assert_eq!(body_of(&kernel, "raced"), "the edited body");
     }
 }
@@ -349,4 +391,67 @@ fn an_explain_config_on_the_writers_store_is_accepted() {
         body_of(&kernel, "explained"),
         "a note beside the explanations"
     );
+}
+
+/// A host that made a NARROWER `over` on its own handle first holds browse's own writer to it
+/// (ledger #1324: every later `over` joins the first and is narrowed to its declaration). The
+/// refusal says why, rather than naming only a declaration browse never asked for.
+#[test]
+fn a_narrower_host_writer_made_first_refuses_browse_and_says_why() {
+    let store = Arc::new(Store::new().unwrap());
+    let _host = ikigai_store::SharedWriter::over(
+        Arc::clone(&store),
+        SharerWrites::only_the_default_graph(),
+    );
+    let kernel = Kernel::new(Arc::new(
+        ikigai_browse::Mount::new([("demo".to_string(), root("narrower"))])
+            .annotations(Arc::clone(&store))
+            .graph(graph())
+            .space(),
+    ));
+    let request = [
+        ("target", "urn:repo:demo:file:lib.rs"),
+        ("exact", "fn annotated_line() {}"),
+        ("body", "a note"),
+    ]
+    .into_iter()
+    .fold(
+        Request::new(
+            Verb::Sink,
+            Iri::parse("urn:iki:annotation:narrowed").unwrap(),
+        ),
+        |request, (name, value)| request.with_arg(name, ArgRef::Inline(value.as_bytes().to_vec())),
+    );
+    let cap = Capability::scoped([
+        "urn:cap:browse:read:demo".to_string(),
+        ikigai_browse::CAP_ANNOTATE.to_string(),
+    ]);
+    let refused = block_on(kernel.issue(request, &cap))
+        .expect_err("browse wrote a graph the first writer on the handle did not declare")
+        .to_string();
+    assert!(
+        refused.contains(&format!("this mount writes graph <{GRAPH}>"))
+            && refused.contains("joined an earlier writer on the same store handle")
+            && refused.contains("declares the default graph only"),
+        "the refusal does not say why: {refused}"
+    );
+    assert!(store.is_empty().unwrap());
+}
+
+/// …and the ORDER a host builds a mount in does not matter to browse's own throwaway
+/// archives: `ExplainConfig::new` and `ExplainConfig::graph` each bind an archive before the
+/// mount replaces it, and neither makes a writer, so neither narrows the mount's.
+#[test]
+fn an_explain_config_built_first_does_not_narrow_the_mounts_writer() {
+    let store = Arc::new(Store::new().unwrap());
+    let kernel = Kernel::new(Arc::new(
+        ikigai_browse::Mount::new([("demo".to_string(), root("config-first"))])
+            .annotations(Arc::clone(&store))
+            .explain(ikigai_browse::ExplainConfig::new(Arc::clone(&store)))
+            .graph(graph())
+            .space(),
+    ));
+    annotate(&kernel, "config-first", "a note");
+    assert_eq!(body_of(&kernel, "config-first"), "a note");
+    assert!(store.contains_named_graph(graph().as_ref()).unwrap());
 }

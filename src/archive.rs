@@ -51,24 +51,29 @@
 //!   kept in one place for every raw-handle host. Reads stay on the caller's thread.
 //! - **Only into the graphs this mount writes.** The writer is declared with the default graph
 //!   (always writable) and, for a mount that names one, that graph; a write anywhere else is
-//!   refused and the whole transaction rolled back. [`Record::insert`]'s debug assertion
+//!   refused and the whole transaction rolled back, through the host's writer too
+//!   ([`Archive::through`] narrows it, ledger #1324). [`Record::insert`]'s debug assertion
 //!   catches the same mistake earlier, in every test.
 //!
-//! # Whose writer: browse's own, or the host's (ledger #1252)
+//! # Whose writer: one per store handle (ledger #1252, #1324)
 //!
-//! [`Archive::new`] builds browse's OWN writer (`SharedWriter::over`) on the handle it is
-//! given, which is right for a host that opened the `Store` itself and holds nothing else.
-//! It is WRONG for a handle a `DurableStore` gave out (`open_shared_declaring`, gonk's case):
-//! that store has a writer thread and a write lock of its own, and a second pair beside it
-//! orders nothing against it. On RocksDB a transaction reads a snapshot and commits a batch,
-//! with no exclusion between two threads, so a door's read-modify-write can then commit over a
-//! browse record written in between and leave half of it (`tests/host_writer.rs` reproduces
-//! exactly that). [`Archive::through`] takes the host's `DurableStore::shared_writer` instead,
-//! so every browse write commits on the store's one thread under its one lock.
+//! On RocksDB a transaction reads a snapshot and commits a batch, with no exclusion between two
+//! threads, so two writers on one store can lose an update: a door's read-modify-write can
+//! commit over a browse record written in between and leave half of it. What keeps a record
+//! whole is that every write to the store commits on ONE writer thread under ONE lock.
+//!
+//! Since `ikigai-store` 0.2.18 the store keeps that per `Arc<Store>`: `SharedWriter::over` on
+//! a handle a `DurableStore` shared constructor gave out joins the store's own writer, and on a
+//! handle the host opened itself every later `over` joins the first, narrowed to the first's
+//! declaration. So [`Archive::new`] (browse's own `over`, made at the first write) and
+//! [`Archive::through`] (the host's writer, narrowed to the mount's graphs) both commit on the
+//! one writer the handle has. ⚠ The store knows the `Arc`, not the dataset: a `Store` clone
+//! re-wrapped in a new `Arc` is a handle nobody recorded, and a writer on it is a second
+//! thread that races the first (`tests/host_writer.rs` reproduces exactly that).
 
-use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
+use std::sync::{Arc, OnceLock};
 
 use ikigai_store::{DeclaredTransaction, SharedWriter, SharerWrites};
 use oxigraph::model::{GraphName, NamedNodeRef, NamedOrBlankNodeRef, Quad, TermRef};
@@ -86,10 +91,14 @@ pub(crate) struct Archive {
     /// exception and why it is not one.
     store: Arc<Store>,
     graph: GraphName,
-    /// Where every [`Archive::write`] commits; see the module doc. Its thread starts on the
-    /// first write, so an archive that never writes (the one [`crate::ExplainConfig::new`]
-    /// builds before a mount replaces it) never starts one.
-    writer: SharedWriter,
+    /// Where every [`Archive::write`] commits; see the module doc. Made at the FIRST write
+    /// for an archive of browse's own ([`Archive::new`]), so an archive that never writes
+    /// (the ones [`crate::ExplainConfig::new`] and [`crate::ExplainConfig::graph`] build
+    /// before a mount replaces them) never makes one. That matters since `ikigai-store`
+    /// 0.2.18: every later `SharedWriter::over` on a handle joins the first and is narrowed
+    /// to the first's declaration (ledger #1324), so a throwaway writer declaring only the
+    /// default graph, made first, would leave the mount's named graph refused.
+    writer: OnceLock<SharedWriter>,
     /// The thread each write committed on, in order: what the tests pin.
     #[cfg(test)]
     committed_on: Arc<Mutex<Vec<std::thread::ThreadId>>>,
@@ -100,19 +109,8 @@ impl Archive {
     /// not asked for a named one — writing through a writer of browse's OWN (see the module
     /// doc for when that is wrong, and [`Archive::through`] for the other way).
     pub(crate) fn new(store: Arc<Store>, graph: GraphName) -> Self {
-        // The default graph is always writable (it has no IRI to declare). A blank-node graph
-        // can be declared by nothing, so a mount bound to one would have every write refused;
-        // no `Mount` builds one.
-        let declared = match &graph {
-            GraphName::NamedNode(iri) => {
-                SharerWrites::only_the_default_graph().and_named_graph(iri.as_str())
-            }
-            GraphName::DefaultGraph | GraphName::BlankNode(_) => {
-                SharerWrites::only_the_default_graph()
-            }
-        };
         Archive {
-            writer: SharedWriter::over(Arc::clone(&store), declared),
+            writer: OnceLock::new(),
             store,
             graph,
             #[cfg(test)]
@@ -120,7 +118,7 @@ impl Archive {
         }
     }
 
-    /// Bind `graph` in the store `writer` writes, committing through THAT writer: the host's
+    /// Bind `graph` in the store `writer` writes, committing on THAT writer: the host's
     /// (`DurableStore::shared_writer`), so browse's writes share the store's one writer thread
     /// and its one write lock (ledger #1252).
     ///
@@ -129,6 +127,14 @@ impl Archive {
     /// after the host built the mount. A declaration that names MORE than `graph` is accepted:
     /// it is the host's promise about everything that writes through its handle, and a wider
     /// one costs only cacheability. A writer that declares nothing refuses nothing.
+    ///
+    /// ★ **Narrowed to the mount's graphs** (ledger #1324). Browse does not write through the
+    /// host's writer as given: it makes `SharedWriter::over` on the writer's own handle,
+    /// declaring only the default graph and `graph`, which JOINS the host's writer (its thread
+    /// and its lock, since `ikigai-store` 0.2.18) and carries browse's narrower declaration.
+    /// So a quad browse builds for another graph the host declares is refused at the store in
+    /// a release build too, where [`Record::insert`]'s debug assertion is compiled out, and so
+    /// is a [`Record::remove`] there, which carries no assertion at all.
     pub(crate) fn through(writer: SharedWriter, graph: GraphName) -> Result<Self, String> {
         if let Some(declared) = writer.declared() {
             let agrees = match &graph {
@@ -148,9 +154,15 @@ impl Archive {
                 ));
             }
         }
+        let store = Arc::clone(writer.store());
+        // `over` on the host writer's own `Arc` joins it rather than starting a second thread:
+        // a handle a shared constructor gave out, or one an `over` was made on, is recorded by
+        // the store while a writer on it lives, and the host's `writer` is alive right here.
+        let narrowed = SharedWriter::over(Arc::clone(&store), declared_for(&graph));
+        drop(writer);
         Ok(Archive {
-            store: Arc::clone(writer.store()),
-            writer,
+            store,
+            writer: OnceLock::from(narrowed),
             graph,
             #[cfg(test)]
             committed_on: Arc::default(),
@@ -181,18 +193,25 @@ impl Archive {
         &self,
         record: impl FnOnce(&mut Record<'_, '_>) -> Result<T, StorageError> + Send + 'static,
     ) -> Result<T, StorageError> {
+        let writer = self
+            .writer
+            .get_or_init(|| SharedWriter::over(Arc::clone(&self.store), declared_for(&self.graph)));
+        if let (GraphName::NamedNode(iri), Some(declared)) = (&self.graph, writer.declared()) {
+            if !declared.may_write(iri.as_str()) {
+                return Err(narrowed_away(&self.graph, declared));
+            }
+        }
         let graph = self.graph.clone();
         #[cfg(test)]
         let committed_on = Arc::clone(&self.committed_on);
-        self.writer
-            .write_declared(move |txn: &mut DeclaredTransaction<'_>| {
-                #[cfg(test)]
-                committed_on
-                    .lock()
-                    .unwrap()
-                    .push(std::thread::current().id());
-                record(&mut Record { txn, graph: &graph })
-            })
+        writer.write_declared(move |txn: &mut DeclaredTransaction<'_>| {
+            #[cfg(test)]
+            committed_on
+                .lock()
+                .unwrap()
+                .push(std::thread::current().id());
+            record(&mut Record { txn, graph: &graph })
+        })
     }
 
     /// Store `quads` — one record's, each built with [`Archive::graph`] — as one transaction.
@@ -220,6 +239,36 @@ impl Archive {
     pub(crate) fn commits(&self) -> usize {
         self.committed_on.lock().unwrap().len()
     }
+}
+
+/// What browse's own writers declare: the default graph, which is always writable (it has no
+/// IRI to declare), and the mount's graph when it names one. A blank-node graph can be declared
+/// by nothing, so a mount bound to one would have every write refused; no `Mount` builds one.
+fn declared_for(graph: &GraphName) -> SharerWrites {
+    match graph {
+        GraphName::NamedNode(iri) => {
+            SharerWrites::only_the_default_graph().and_named_graph(iri.as_str())
+        }
+        GraphName::DefaultGraph | GraphName::BlankNode(_) => SharerWrites::only_the_default_graph(),
+    }
+}
+
+/// The refusal for a writer that joined an earlier one on the same handle and was narrowed to
+/// a declaration without the mount's graph (ledger #1324): the store would refuse every write
+/// anyway, naming only the declaration, which is not the one browse asked for.
+fn narrowed_away(graph: &GraphName, declared: &SharerWrites) -> StorageError {
+    StorageError::Io(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "browse: this mount writes {}, but its writer joined an earlier writer on the same \
+             store handle, which declares {}: the store narrows every later \
+             `SharedWriter::over` on a handle to the first's declaration. Nothing was written. \
+             Make the widest writer on the handle first, or give the mount the host's writer \
+             (`Mount::annotations_through`)",
+            describe_graph(graph),
+            describe_declared(declared),
+        ),
+    ))
 }
 
 /// A graph name in a sentence, for a refusal.
@@ -692,9 +741,10 @@ mod tests {
         );
     }
 
-    /// The host's writer (ledger #1252): an archive built [`Archive::through`] a store's
-    /// `shared_writer` commits on the SAME thread as the host's own writes, where one built
-    /// [`Archive::new`] on the same handle commits on a second thread of its own.
+    /// The host's writer (ledger #1252, #1324): an archive built [`Archive::through`] a
+    /// store's `shared_writer` commits on the SAME thread as the host's own writes, and since
+    /// `ikigai-store` 0.2.18 so does one built [`Archive::new`] on the same handle: its own
+    /// `over` joins the store's writer. Through 0.2.15 it was a second thread of its own.
     #[test]
     fn an_archive_through_the_hosts_writer_commits_on_the_hosts_thread() {
         use ikigai_store::DurableStore;
@@ -716,9 +766,9 @@ mod tests {
 
         let own = Archive::new(Arc::clone(&handle), GraphName::DefaultGraph);
         let own_thread = own.write(|_| Ok(std::thread::current().id())).unwrap();
-        assert_ne!(
+        assert_eq!(
             own_thread, host_thread,
-            "browse's own writer is a second thread: the reason `through` exists"
+            "browse's own writer on a shared store's handle did not join the store's writer"
         );
     }
 
@@ -758,5 +808,71 @@ mod tests {
         assert!(host.declared().is_none());
         let graph = GraphName::NamedNode(NamedNode::new("urn:iki:test:anything").unwrap());
         assert!(Archive::through(host, graph).is_ok());
+    }
+
+    /// ★ The graph fence through the host's writer (ledger #1324): a host's declaration may
+    /// name MORE graphs than the mount's (it covers everything that writes through its
+    /// handle), and an archive built `through` it must still write only its own. The write
+    /// here goes through the transaction directly, which is what [`Record::insert`] does in a
+    /// release build, where its debug assertion is compiled out; [`Record::remove`] carries
+    /// no assertion at all. Both are refused, and the neighbor's graph is untouched.
+    #[test]
+    fn through_a_wider_host_writer_a_write_outside_the_mount_graph_is_refused() {
+        use ikigai_store::{DurableStore, UndeclaredGraph};
+        const MOUNTED: &str = "urn:iki:test:mounted";
+        const NEIGHBOR: &str = "urn:iki:test:neighbor";
+        let (store, handle) = DurableStore::in_memory_shared_declaring(
+            SharerWrites::only_the_default_graph()
+                .and_named_graph(MOUNTED)
+                .and_named_graph(NEIGHBOR),
+        )
+        .unwrap();
+        let host = store.shared_writer().unwrap();
+        let neighbor = GraphName::NamedNode(NamedNode::new(NEIGHBOR).unwrap());
+        let quad = |o: &str| {
+            Quad::new(
+                NamedNode::new("urn:iki:test:subject").unwrap(),
+                NamedNode::new("urn:iki:test:p").unwrap(),
+                NamedNode::new(o).unwrap(),
+                neighbor.clone(),
+            )
+        };
+        // The neighbor's quad, written by the host, as the declaration lets it.
+        let theirs = quad("urn:iki:test:theirs");
+        let stored = theirs.clone();
+        host.write_declared(move |txn| txn.insert(&stored)).unwrap();
+
+        let archive =
+            Archive::through(host, GraphName::NamedNode(NamedNode::new(MOUNTED).unwrap())).unwrap();
+
+        let stray = quad("urn:iki:test:stray");
+        let refused = archive
+            .write(move |record| record.txn.insert(&stray))
+            .expect_err("browse wrote the neighbor's graph through the host's writer");
+        assert_eq!(
+            UndeclaredGraph::of(&refused).map(UndeclaredGraph::graph),
+            Some("<urn:iki:test:neighbor>")
+        );
+
+        let removed = theirs.clone();
+        let refused = archive
+            .write(move |record| record.remove(&removed))
+            .expect_err("browse removed the neighbor's quad through the host's writer");
+        assert_eq!(
+            UndeclaredGraph::of(&refused).map(UndeclaredGraph::graph),
+            Some("<urn:iki:test:neighbor>")
+        );
+
+        assert!(
+            handle.contains(&theirs).unwrap(),
+            "the neighbor lost a quad"
+        );
+        assert_eq!(
+            handle
+                .quads_for_pattern(None, None, None, Some(neighbor.as_ref()))
+                .count(),
+            1,
+            "the neighbor's graph gained a quad"
+        );
     }
 }

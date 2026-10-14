@@ -423,11 +423,22 @@ impl Mount {
     /// Mount the S2 **annotation** family over a host-injected Oxigraph store.
     /// See [`space_with_annotations`].
     ///
-    /// Browse commits its writes on a writer of its OWN over `store` (`SharedWriter::over`):
-    /// right for a host that opened the `Store` itself and holds nothing else. ⚠ A handle a
-    /// `DurableStore` gave out (`open_shared_declaring`) has a writer already, and a second
-    /// one beside it orders nothing against it: give the mount that one with
-    /// [`Mount::annotations_through`] instead.
+    /// Browse commits its writes through `SharedWriter::over` on `store`, made at its first
+    /// write and declaring the default graph and the mount's graph. Since `ikigai-store` 0.2.18
+    /// that joins whatever writer the handle already has (ledger #1324): on a handle a
+    /// `DurableStore` shared constructor gave out, the store's own writer; on a handle the
+    /// host opened itself, the first `over` anyone made on it. So it commits on the handle's
+    /// one thread under its one lock either way.
+    ///
+    /// ⚠ Two things it cannot do, and [`Mount::annotations_through`] can:
+    /// - **A joining writer is narrowed to the FIRST writer's declaration.** If the host made
+    ///   an `over` on this handle declaring fewer graphs than the mount writes, every browse
+    ///   write to the rest is refused (the refusal says so). Make the widest writer first, or
+    ///   give the mount the host's writer.
+    /// - **The store recognizes the `Arc`, not the dataset.** Pass the very `Arc` the host's
+    ///   writers were made on: a `Store` clone re-wrapped in a new `Arc` is a handle nobody
+    ///   recorded, and browse's writer on it is a second thread beside the host's, which on
+    ///   RocksDB can leave a browse record half written (`tests/host_writer.rs`).
     pub fn annotations(mut self, store: Arc<Store>) -> Self {
         self.store = Some(store);
         self.writer = None;
@@ -442,14 +453,24 @@ impl Mount {
     ///
     /// A store opened with `DurableStore::open_shared_declaring` (or `open_shared`) commits
     /// its own writes (`urn:iki:store:update`, `graph-update`, `load`) on ONE writer thread
-    /// under ONE write lock. [`Mount::annotations`] would give browse a second thread and a
-    /// second lock beside them, and on RocksDB nothing else excludes two writers: a
-    /// transaction reads a snapshot and commits a batch, so a door's read-modify-write can
-    /// commit over a browse record written in between and leave half of it
-    /// (`tests/host_writer.rs` reproduces exactly that). Through the host's writer, browse's
-    /// write waits its turn instead. It is also the thread that keeps RocksDB's skiplists
-    /// healthy (ledger #1131): every write to the store, browse's included, advances one
-    /// generator.
+    /// under ONE write lock. On RocksDB nothing else excludes two writers: a transaction reads
+    /// a snapshot and commits a batch, so a door's read-modify-write can commit over a browse
+    /// record written in between and leave half of it (`tests/host_writer.rs` reproduces
+    /// exactly that with a second writer). Through the host's writer, browse's write waits its
+    /// turn instead. It is also the thread that keeps RocksDB's skiplists healthy (ledger
+    /// #1131): every write to the store, browse's included, advances one generator.
+    ///
+    /// Since `ikigai-store` 0.2.18 [`Mount::annotations`] on the same handle joins that writer
+    /// too (ledger #1324), so the difference is no longer the thread. It is that the host's
+    /// writer is CHECKED here, and its declaration is the ceiling browse is held to.
+    ///
+    /// # Browse writes only its own graphs
+    ///
+    /// The host's declaration may name more graphs than browse's. Browse does not write
+    /// through the writer as given: it makes `SharedWriter::over` on the writer's handle
+    /// (`SharedWriter::store`), declaring only the default graph and the mount's graph, which
+    /// joins the host's writer and refuses every other graph (ledger #1324). A quad browse
+    /// built for a neighbor's graph is refused at the store in a release build too.
     ///
     /// # What is checked when the space is built
     ///
