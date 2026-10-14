@@ -340,21 +340,8 @@ async fn view(inv: &Invocation<'_>, root: &Path, n: u64) -> Result<PrView> {
 }
 
 /// One ask through the kernel — system + prompt + temperature + the mandatory
-/// `max_tokens` ceiling; an empty answer errors and archives nothing.
-async fn ask(
-    inv: &Invocation<'_>,
-    config: &ExplainConfig,
-    provider: &str,
-    system: &str,
-    prompt: &str,
-    max_tokens: u32,
-) -> Result<String> {
-    let (text, _) = ask_ending(inv, config, provider, system, prompt, max_tokens, false).await?;
-    Ok(text)
-}
-
-/// [`ask`], plus how the answer ended at `max_tokens` ([`Answer::ending`]).
-/// With `envelope`, it asks for ikigai-llm's `as=application/json` face, so
+/// `max_tokens` ceiling; an empty answer errors and archives nothing — and how
+/// the answer ended at `max_tokens` ([`Answer::ending`]). With `envelope`, it asks for ikigai-llm's `as=application/json` face, so
 /// the answer says WHY it stopped (`finish_reason`, `usage`); a backend
 /// without that face answers text, and [`Answer::of`] takes either. The
 /// ending is read from the answer as it came back, before the text is trimmed.
@@ -1354,15 +1341,32 @@ impl Endpoint for PrExplainEndpoint {
             view.base_ref,
             truncate(&diff, config.max_prompt_bytes),
         );
-        let text = ask(
+        let (text, ending) = ask_ending(
             inv,
             config,
             &config.pr_provider,
             SYSTEM_PROMPT,
             &prompt,
             config.pr_max_tokens,
+            true,
         )
         .await?;
+        // ★ An explanation the output budget CUT is refused, not archived (ledger #1055): the
+        // key is the head commit, so an archived fragment would be served as the whole
+        // explanation of that head for as long as it is the head, and nothing would re-derive
+        // it. The evidence is the review passes' (`Answer::ending`, ledger #818, #1052): the
+        // backend's `finish_reason` or token count says cut, or, when nothing says why it
+        // stopped and the answer is long enough to have reached the budget, it does not end.
+        if ending == Ending::Cut || (ending == Ending::Unknown && !body_ends(&text)) {
+            return Err(Error::Endpoint(format!(
+                "browse: `{}`'s explanation of pr {n} was cut at the output budget \
+                 (max_tokens {}); nothing archived. Raise `ExplainConfig::pr_max_tokens` for \
+                 this provider. The answer began: \"{}\"",
+                config.pr_provider,
+                config.pr_max_tokens,
+                answer_excerpt(&text)
+            )));
+        }
         let entry = ArchiveEntry {
             iri,
             repo: repo.to_string(),
@@ -2732,6 +2736,114 @@ mod tests {
         assert!(ttl.contains("a ik:Explanation"), "{ttl}");
         assert!(ttl.contains("ik:about <urn:repo:demo:pr:3>"), "{ttl}");
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★ A PR explanation the output budget cut is NOT archived as complete (ledger #1055):
+    /// it is refused, nothing is stored, and the key stays re-derivable. The evidence is
+    /// `Answer::ending`, the review passes' (ledger #818, #1052); with nothing to say why the
+    /// answer stopped, the punctuation heuristic stands in. Each row: the reply, the budget,
+    /// and whether the explanation is archived.
+    #[test]
+    fn a_pr_explanation_cut_at_the_budget_is_not_archived() {
+        const CUT: &str = "This PR adds beta, a function that nothing calls yet, and the";
+        const ENDED: &str = "This PR adds beta, a function that nothing calls yet.";
+        let envelope = |text: &str, reason: serde_json::Value, usage: serde_json::Value| {
+            format!(
+                "JSON:{}",
+                serde_json::json!({"text": text, "finish_reason": reason, "usage": usage})
+            )
+        };
+        let null = serde_json::Value::Null;
+        let used = |n: u64| serde_json::json!({"completion_tokens": n});
+        let rows: Vec<(&str, String, u32, bool)> = vec![
+            // The backend says it was cut: refused, however the text ends.
+            (
+                "length",
+                envelope(CUT, "length".into(), null.clone()),
+                600,
+                false,
+            ),
+            (
+                "length, ended",
+                envelope(ENDED, "length".into(), null.clone()),
+                600,
+                false,
+            ),
+            // The token count reached the budget.
+            (
+                "budget reached",
+                envelope(CUT, null.clone(), used(16)),
+                16,
+                false,
+            ),
+            // A plain-text backend whose answer is long enough in bytes to have spent the
+            // budget: an unended answer is refused, an ended one kept.
+            ("plain, budget-sized", CUT.to_string(), 16, false),
+            ("plain, budget-sized, ended", ENDED.to_string(), 16, true),
+            // It provably stopped on its own: archived, ended or not.
+            (
+                "stop",
+                envelope(CUT, "stop".into(), null.clone()),
+                600,
+                true,
+            ),
+            ("plain, under budget", CUT.to_string(), 600, true),
+            (
+                "under budget",
+                envelope(CUT, null.clone(), used(12)),
+                16,
+                true,
+            ),
+        ];
+        for (label, reply, max_tokens, archived) in rows {
+            let root = temp_dir();
+            let store = Arc::new(Store::new().unwrap());
+            let state = FakeRepo::new();
+            let log = Arc::new(Log::default());
+            let cfg = ExplainConfig::new(Arc::clone(&store))
+                .pr_model_label("p1")
+                .pr_max_tokens(max_tokens);
+            let browse = crate::space_with_explain(vec![("demo".to_string(), root.clone())], cfg);
+            let k = Kernel::new(Arc::new(Fallback::new(vec![
+                Arc::new(browse),
+                Arc::new(fake_repo_space(&state)),
+                Arc::new(fake_llm_space(&log, &reply)),
+            ])));
+            match source(
+                &k,
+                "urn:repo:demo:pr:3:explain",
+                &[("as", "application/json")],
+            ) {
+                Ok(first) => {
+                    assert!(
+                        archived,
+                        "{label}: a cut explanation was served: {}",
+                        body(&first)
+                    );
+                    // Archived: the second read is a hit, no new ask.
+                    let hit = json(&k, "urn:repo:demo:pr:3:explain", &[]);
+                    assert_eq!(hit["derived"], false, "{label}");
+                    assert_eq!(log.count(), 1, "{label}");
+                }
+                Err(err) => {
+                    assert!(!archived, "{label}: refused: {err:?}");
+                    let msg = format!("{err:?}");
+                    assert!(msg.contains("cut at the output budget"), "{label}: {msg}");
+                    assert!(msg.contains("nothing archived"), "{label}: {msg}");
+                    // Nothing was archived: the next read asks again.
+                    assert!(source(&k, "urn:repo:demo:pr:3:explain", &[]).is_err());
+                    assert_eq!(log.count(), 2, "{label}");
+                }
+            }
+            // The explain asks for the envelope face, so ikigai-llm says why it stopped.
+            assert_eq!(
+                log.faces.lock().unwrap().first().map(String::as_str),
+                Some("application/json"),
+                "{label}"
+            );
+            assert!(store.is_empty().unwrap() != archived, "{label}");
+            std::fs::remove_dir_all(&root).ok();
+        }
     }
 
     /// The PR page says what its explain button will do, inline, by the key
