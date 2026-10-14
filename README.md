@@ -1006,16 +1006,17 @@ domain typed every review as an explanation.
 
 This crate **passes [`ikigai-conformance`](https://github.com/ikigai-rs/ikigai-conformance)**:
 one test (`tests/conformance.rs`) walks every endpoint the mount binds, fires
-every action it can, and holds all eight checks — ArgSpecs, declared-equals-
-enforced, skolemization, vocabulary, cacheability, pipeline citizenship,
-naming. It went from 40 findings to 0.
+every action it can, and holds every check the suite has (fourteen as of 0.8.0) —
+ArgSpecs, declared-equals-enforced, authority, outputs, skolemization, vocabulary,
+cacheability, pipeline citizenship, required inputs, naming, name validity, space
+naming, declarations. It went from 40 findings to 0.
 
 Three things a reader of that test should know:
 
-* **The `oa:` namespace is registered.** The W3C Web Annotation Data Model is
-  not in the suite's well-known list, and the annotation overlay speaks it end
-  to end — eleven standard terms would otherwise read as invented, 31 findings
-  of noise.
+* **Required inputs are dropped from the writes too** (`required_on_mutating`):
+  every write lands in the fixture's in-memory store, so dropping `annotation`'s
+  `target` and `exact` or `finding`'s `decision` can mutate nothing real, and each
+  is refused with a typed `MissingArgument` or `InvalidArgument`.
 * **The pull-request family is opted out of the invoking checks**, because on a
   real host those five endpoints resolve `urn:repo:pr:*` and shell out to `gh`.
   The one check an opt-out should not drop — that each is refused with a typed
