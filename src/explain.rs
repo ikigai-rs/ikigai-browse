@@ -317,9 +317,11 @@ impl ExplainConfig {
     /// opting in costs a host that shares the dataset with a graph-scoped
     /// store, and [`crate::migrate`] for moving an existing store's quads.
     ///
-    /// Stating it on BOTH this and [`crate::Mount::graph`] is allowed while
-    /// they agree; a disagreement panics at mount time rather than splitting a
-    /// host's data across two graphs.
+    /// ★ State it in exactly ONE place, this or [`crate::Mount::graph`]. Both
+    /// is allowed while they agree, but a disagreement panics at mount time
+    /// rather than splitting a host's data across two graphs, so the safe
+    /// pattern is one knob, never two kept carefully in step.
+    /// [`crate::Mount::graph_name`] reads back the graph the mount resolved.
     pub fn graph(mut self, graph: NamedNode) -> Self {
         self.archive = Arc::new(Archive::new(
             Arc::clone(self.archive.store()),
