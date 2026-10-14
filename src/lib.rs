@@ -159,6 +159,29 @@
 //! Declared = enforced: the kernel baseline-checks the wildcard before
 //! dispatch, and the per-root check here does the rest.
 //!
+//! ## Reads that write: the drift pass
+//!
+//! ⚠ **Some Sources write the store.** Every face that shows annotations or
+//! findings runs the drift pass first (ledger #252): when the content a stored
+//! selector anchors to has moved, the record is RE-ANCHORED (or flagged
+//! orphaned, or whole again) and that is persisted before the answer is built.
+//! Repeat reads of unchanged content write nothing. Those endpoints are
+//! [`REANCHORING_READS`], by description id.
+//!
+//! That is the one read that REWRITES a record. The derivations (explain,
+//! review, judge-finding and their pull-request layers) also write on a read,
+//! but only to ADD what they derived, archived under a key that changes when
+//! their input does; their families say so where they are documented above.
+//!
+//! It cannot be a golden-thread cut instead: an endpoint cuts a thread by
+//! resolving `urn:kernel:cut`, which needs `urn:cap:kernel:cut`, and a reader
+//! holds the browse grant, not that one. So the fact is DECLARED here for the
+//! host, and the consequence is the host's: a host that caches any of these
+//! reads in front of browse must not, or must cut its entries on a write to
+//! the store. Every browse Source declares itself uncacheable but
+//! `urn:repo:style` and `urn:repo:style:layout`, so a kernel that only honors
+//! browse's own declarations is already right.
+//!
 //! ## Platforms
 //!
 //! Native-only by design: it reads the filesystem directly (the roots are the
@@ -238,6 +261,29 @@ pub const CAP_WILDCARD: &str = "urn:cap:browse:read:*";
 
 /// The grant prefix: `urn:cap:browse:read:{repo}` grants one configured root.
 pub const CAP_PREFIX: &str = "urn:cap:browse:read:";
+
+/// The endpoints whose **Source can write the store**, by description id: each
+/// runs the drift pass over the annotations or findings it shows, and persists a
+/// record whose anchor moved (see "Reads that write" in the crate docs). A host
+/// cache in front of any of them goes stale on a re-anchor unless it cuts on a
+/// store write. No other browse read rewrites a stored record (a derivation adds
+/// its own, under a new key).
+///
+/// The writing faces are: `annotation`, `finding`, `browse-annotations`,
+/// `browse-findings`, `browse-review` and `browse-pr-review` (their minted
+/// findings), `browse-file` and `browse-pr` (their overlays), and
+/// `browse-explain` with `annotations=include`.
+pub const REANCHORING_READS: [&str; 9] = [
+    "annotation",
+    "browse-annotations",
+    "browse-explain",
+    "browse-file",
+    "browse-findings",
+    "browse-pr",
+    "browse-pr-review",
+    "browse-review",
+    "finding",
+];
 
 /// The datatype every scalar input in this crate declares.
 ///
@@ -558,9 +604,55 @@ impl Mount {
     /// that moved only the writes would have left browse writing into its own
     /// graph and still answering out of anyone else's. See [`crate::migrate`]
     /// for moving an existing store's quads into the graph named here.
+    ///
+    /// ★ Name the graph here OR on [`ExplainConfig::graph`], not both: two
+    /// knobs that must agree are one more thing to keep in step, and a
+    /// disagreement panics when the space is built. [`Mount::graph_name`] reads
+    /// back the graph the mount resolved, whichever way it was stated.
     pub fn graph(mut self, graph: NamedNode) -> Self {
         self.graph = Some(graph);
         self
+    }
+
+    /// The graph this mount WILL write and read: browse's answer, from the one function
+    /// [`Mount::space`] resolves it with, so a host can derive a promise from what browse
+    /// does rather than from what the host told it (ledger #377).
+    ///
+    /// The default graph when neither [`Mount::graph`] nor [`ExplainConfig::graph`] named
+    /// one; otherwise the graph named. ★ A host that states a graph should state it in
+    /// exactly ONE of those two places. Both is legal while they agree, but it is two
+    /// knobs to keep in step, and a disagreement panics here and in [`Mount::space`].
+    ///
+    /// ```
+    /// use ikigai_browse::{ExplainConfig, Mount};
+    /// use oxigraph::model::{GraphName, NamedNode};
+    /// use oxigraph::store::Store;
+    /// use std::sync::Arc;
+    ///
+    /// let roots = || [("demo".to_string(), std::env::temp_dir())];
+    /// let store = Arc::new(Store::new()?);
+    /// // Nothing named: browse writes the store's default graph.
+    /// let plain = Mount::new(roots()).annotations(Arc::clone(&store));
+    /// assert_eq!(plain.graph_name(), GraphName::DefaultGraph);
+    ///
+    /// // Named on the explain config alone: that is the graph the mount uses.
+    /// let browse = NamedNode::new("urn:iki:browse:graph:default")?;
+    /// let named = Mount::new(roots())
+    ///     .explain(ExplainConfig::new(Arc::clone(&store)).graph(browse.clone()));
+    /// assert_eq!(named.graph_name(), GraphName::NamedNode(browse));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// When [`Mount::graph`] and [`ExplainConfig::graph`] name different graphs, as
+    /// [`Mount::space`] does.
+    pub fn graph_name(&self) -> GraphName {
+        graph_name(
+            self.graph.clone(),
+            self.explain.as_ref().and_then(|c| c.graph.clone()),
+            "Mount",
+        )
     }
 
     /// Mount the S1 **explanation** family (and the S4 review pass, and the
@@ -613,13 +705,16 @@ impl Mount {
     /// environment a second time: a watch over a different directory than the
     /// endpoint reads would cut threads nothing declared.
     pub fn space_watched(self) -> (EndpointSpace, StyleWatch) {
+        // ONE resolution, and the same one `graph_name` answers a host with: what browse
+        // reports is what it does (ledger #377).
+        let graph = self.graph_name();
         let Mount {
             roots,
             app,
             config_home,
             store,
             writer,
-            graph,
+            graph: _,
             explain,
         } = self;
         // The ambient read, if there is one, happens HERE — once, in the host's
@@ -630,13 +725,7 @@ impl Mount {
         let home = home.as_deref();
         let Some(mut config) = explain else {
             let ignore = Arc::new(hash::default_ignore());
-            let archive = store.map(|store| {
-                Arc::new(archive_for(
-                    store,
-                    writer,
-                    graph_name(graph.clone(), None, "Mount"),
-                ))
-            });
+            let archive = store.map(|store| Arc::new(archive_for(store, writer, graph.clone())));
             let space = base_space(&roots, &ignore, archive.as_ref(), None, app, home);
             let space = match archive {
                 Some(archive) => {
@@ -656,7 +745,7 @@ impl Mount {
         let archive = Arc::new(archive_for(
             Arc::clone(config.archive.store()),
             writer,
-            graph_name(graph, config.graph.clone(), "Mount"),
+            graph,
         ));
         config.archive = Arc::clone(&archive);
         let shared = Arc::new(config.clone());
@@ -1075,7 +1164,20 @@ pub(crate) fn esc(s: &str) -> String {
 /// `/` and the URN-safe punctuation stay literal; everything else (spaces,
 /// `%`, non-ASCII) is encoded so the emitted IRI is RFC 3987-valid and the
 /// encode/decode pair round-trips any UTF-8 filename.
-pub(crate) fn iri_encode(path: &str) -> String {
+///
+/// Public so a host builds a browse IRI the way browse does instead of
+/// mirroring the encoder (ledger #252): a host that names a golden thread per
+/// file, or posts to `urn:repo:{repo}:review:{path}`, needs these exact bytes.
+///
+/// ```
+/// use ikigai_browse::{iri_decode, iri_encode};
+///
+/// assert_eq!(iri_encode("src/lib.rs"), "src/lib.rs");
+/// assert_eq!(iri_encode("docs/a b%.md"), "docs/a%20b%25.md");
+/// assert_eq!(iri_encode("ü.txt"), "%C3%BC.txt");
+/// assert_eq!(iri_decode(&iri_encode("docs/a b%ü.md")).unwrap(), "docs/a b%ü.md");
+/// ```
+pub fn iri_encode(path: &str) -> String {
     const SAFE: &[u8] = b"-._~/!$&'()*+,;=:@";
     let mut out = String::with_capacity(path.len());
     for byte in path.bytes() {
@@ -1088,9 +1190,18 @@ pub(crate) fn iri_encode(path: &str) -> String {
     out
 }
 
-/// Percent-decode a `{path}` binding. Malformed escapes pass through
-/// literally; the decoded bytes must be UTF-8.
-pub(crate) fn iri_decode(s: &str) -> Result<String> {
+/// Percent-decode a `{path}` binding: the inverse of [`iri_encode`].
+/// Malformed escapes pass through literally; the decoded bytes must be UTF-8,
+/// or it is refused as an invalid `path`.
+///
+/// ```
+/// use ikigai_browse::iri_decode;
+///
+/// assert_eq!(iri_decode("docs/a%20b.md").unwrap(), "docs/a b.md");
+/// assert_eq!(iri_decode("100%").unwrap(), "100%");
+/// assert!(iri_decode("%FF").is_err());
+/// ```
+pub fn iri_decode(s: &str) -> Result<String> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -1132,8 +1243,16 @@ pub(crate) fn ttl_str(s: &str) -> String {
     )
 }
 
-/// The tree IRI for a repo + root-relative directory path (`""` = the root).
-pub(crate) fn tree_iri(repo: &str, rel: &str) -> String {
+/// The tree IRI browse serves for a configured root (`repo`) and a
+/// root-relative directory path (`""` = the root), encoded by [`iri_encode`].
+///
+/// ```
+/// use ikigai_browse::tree_iri;
+///
+/// assert_eq!(tree_iri("core", ""), "urn:repo:core:tree");
+/// assert_eq!(tree_iri("core", "src/a b"), "urn:repo:core:tree:src/a%20b");
+/// ```
+pub fn tree_iri(repo: &str, rel: &str) -> String {
     if rel.is_empty() {
         format!("urn:repo:{repo}:tree")
     } else {
@@ -1141,7 +1260,18 @@ pub(crate) fn tree_iri(repo: &str, rel: &str) -> String {
     }
 }
 
-pub(crate) fn file_iri(repo: &str, rel: &str) -> String {
+/// The file IRI browse serves for a configured root (`repo`) and a
+/// root-relative file path, encoded by [`iri_encode`]: the name a host maps a
+/// changed path to when it cuts a per-file golden thread rather than a
+/// per-root one (ledger #252).
+///
+/// ```
+/// use ikigai_browse::file_iri;
+///
+/// assert_eq!(file_iri("core", "src/lib.rs"), "urn:repo:core:file:src/lib.rs");
+/// assert_eq!(file_iri("core", "notes/día 1.md"), "urn:repo:core:file:notes/d%C3%ADa%201.md");
+/// ```
+pub fn file_iri(repo: &str, rel: &str) -> String {
     format!("urn:repo:{repo}:file:{}", iri_encode(rel))
 }
 
