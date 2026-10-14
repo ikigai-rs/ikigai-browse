@@ -609,10 +609,23 @@ oxttl = "0.2"
 # counts the option menu is written against: `urn:llm:models` reports a
 # provider whose model is not pinned as a null `model` rather than omitting it
 # (a provider may name only its server and discover what it serves), which is
-# exactly the "unknown model" row the menu must not collapse; and the inventory
-# is cacheable only while no provider is discovering, which is what makes
-# opening a menu one sub-request instead of one probe per backend. A caret pin
-# on "0.10" would let CI resolve a registry index where neither holds.
-ikigai-llm = "0.12"
+# exactly the "unknown model" row the menu must not collapse; and opening a menu
+# is one sub-request (the inventory) instead of one probe per backend. A caret
+# pin on "0.10" would let CI resolve a registry index where neither holds.
+#
+# **"0.13.1" now** (ledger #1061): "0.12" was a 0.x CEILING (`<0.13.0`) that held
+# these tests on the line before the audit's security fixes (0.13.0, ledger #884:
+# port-scoped net grants enforced, the key sent on every request, URL credentials
+# redacted) and 0.13.1's error-body redaction (ledger #178). Checked against what
+# 0.13 changed for the explain path: a port-less `urn:cap:net:localhost` grant (the
+# explain demo's) still reaches every port on its host; browse sends `temperature`
+# "0.2" and a positive `max_tokens`, which 0.13 accepts (it now refuses a
+# non-finite temperature and a non-positive max_tokens that 0.12 dropped); and the
+# inventory is now UNCACHEABLE whenever building it asked a server (a pinned
+# `vendor: "ollama"` provider probes on every resolve), which costs a menu its
+# cache but not its single sub-request. ⚠ Also a ceiling, `<0.14.0`: ikigai-llm's
+# main carries 0.14.0 (typed failures, `as=` by essence), unpublished as of
+# 2026-10-13. Re-read this pin when it ships.
+ikigai-llm = "0.13.1"
 ikigai-http = "0.1.7"
 ureq = "2"
