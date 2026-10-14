@@ -582,21 +582,21 @@ notify = "6.1"
 [dev-dependencies]
 # The module recipe as one test (`tests/conformance.rs`): the suite walks every
 # endpoint this crate binds and reports every violation of the recipe at once.
-# 0.6.0 is the floor: `Suite::host_named_space` (SPACE-NAME, ledger #987) arrived
-# in it, and `tests/conformance.rs` declares every space constructor this crate
-# exports with it. ⚠ Under Cargo's 0.x caret rules this pin is ALSO a ceiling
-# (`<0.7.0`): the previous `"0.2.0"` meant `<0.3.0` and held this crate on the
-# 0.2 definition of "done" through four minor releases while the test stayed
-# green. Re-read it as a range whenever a new conformance minor ships.
-# (`Suite::opt_out_check`, the per-rule waiver on `browse-file`'s pass-through raw
-# face, is 0.2.0's and rides along.)
+# 0.8.0 is the floor: `Suite::required_on_mutating` (the REQUIRED check, ledger
+# #329) arrived in it, and so did `oa:` as a well-known namespace (ledger #343),
+# which is why `tests/conformance.rs` no longer registers it. ⚠ Under Cargo's 0.x
+# caret rules this pin is ALSO a ceiling (`<0.9.0`): the previous `"0.6.0"` meant
+# `<0.7.0` and held this crate below VALIDATE (0.7) and REQUIRED (0.8) while the
+# test stayed green, as `"0.2.0"` had before it. Re-read it as a range whenever a
+# new conformance minor ships. (`Suite::host_named_space`, 0.6.0's, and
+# `Suite::opt_out_check`, 0.2.0's, ride along.)
 #
 # ⚠ `[dependencies] ikigai-core` above is deliberately NOT raised to match: it
 # states the LIBRARY's true minimum (rule 5), and nothing in `src/` needs more.
-# This suite requires `ikigai-core ^0.1.89` itself, so every test build already
+# This suite requires `ikigai-core ^0.1.100` itself, so every test build already
 # unifies to a core new enough for it (and for `Arc<S>: Space`, which the
 # host-named declarations lean on).
-ikigai-conformance = "0.6.0"
+ikigai-conformance = "0.8.0"
 # A FLOOR DECLARATION, not a code dependency: no line in this crate calls it.
 # The suite's `VOCABULARY` check reads `ikigai_vocab::VOCABULARY` as its oracle,
 # and the suite's own pin is the floor for the SUITE's API, not for this module's

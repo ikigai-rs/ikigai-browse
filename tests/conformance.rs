@@ -42,13 +42,16 @@
 //!
 //! ## Declarations
 //!
-//! * `namespace("http://www.w3.org/ns/oa#")` — the W3C Web Annotation Data Model,
-//!   which the annotation overlay speaks end to end. It is not in the suite's
-//!   well-known list, and without it eleven standard `oa:` terms are reported as
-//!   invented on every face that serves an annotation (conformance PENDING #141:
-//!   31 findings of pure noise). `Suite::namespace` documents itself as "a
-//!   vocabulary this module serves"; this one is published by the W3C and merely
-//!   spoken here, so the use is a stated deviation rather than a clean fit.
+//! * No `namespace(..)`. The annotation overlay speaks the W3C Web Annotation Data
+//!   Model end to end, and until `ikigai-conformance` 0.8.0 this suite registered
+//!   `oa:` so its eleven standard terms were not reported as invented (conformance
+//!   PENDING #141: 31 findings of pure noise). 0.8.0 lists `oa:` as well known
+//!   (ledger #343), and its `DECLARATIONS` check reported the registration as
+//!   accounting for no term, so it is gone.
+//! * `required_on_mutating()` — `REQUIRED` drops each required input from the
+//!   writes as well as the reads. Every write here lands in the fixture's in-memory
+//!   store and the only model the kernel reaches is the stub, so a wrongly accepted
+//!   drop mutates scratch state and nothing else.
 //! * `opt_out_check("browse-file", Check::Outputs, …)` — the ONE per-rule waiver,
 //!   on the one endpoint whose raw face is a pass-through (see
 //!   [`the_raw_file_face_serves_the_extension_mapped_type`]). `opt_out` would have
@@ -108,9 +111,6 @@ const SEED_ID: &str = "seed";
 /// The annotation the `annotation` entry's fixture binds: the Source probe reads
 /// it and the pipeline probe rewrites its body to the probe's `content`.
 const WALK_ID: &str = "walk";
-
-/// The W3C Web Annotation Data Model, which the suite's well-known list omits.
-const OA: &str = "http://www.w3.org/ns/oa#";
 
 /// The provider IRIs `ExplainConfig`'s defaults ask, bound here to a stub.
 const PROVIDERS: [&str; 2] = ["urn:llm:coder:ask", "urn:llm:ask"];
@@ -427,7 +427,14 @@ fn suite(findings: &[String]) -> Suite {
                 .binding("id", findings.last().expect("two findings"))
                 .arg("decision", "decline"),
         )
-        .namespace(OA)
+        // ★ REQUIRED reaches the WRITES too. Every mutating action here lands in
+        // the fixture's in-memory store (an annotation, a finding's decision), and
+        // the only model the kernel can reach is the stub, so a drop that were
+        // wrongly accepted would mutate scratch state and nothing else. That is the
+        // condition `Suite::required_on_mutating` asks for, and without it the
+        // three required write inputs (`annotation`'s `target` and `exact`,
+        // `finding`'s `decision`) are never dropped.
+        .required_on_mutating()
         .cacheable("browse-style")
         .cacheable("browse-layout")
         // ★ The layout sheet is a BUILD CONSTANT — no configuration, no
@@ -439,7 +446,7 @@ fn suite(findings: &[String]) -> Suite {
         // ★ ONE check, on ONE endpoint. `opt_out` would have been the wrong lever
         // here and this crate already knows why: it cost `browse-review` ENFORCED,
         // CACHEABLE and SKOLEM-RDF for a release cycle over a single legitimately
-        // red VOCABULARY. `browse-file` keeps all nine of the others.
+        // red VOCABULARY. `browse-file` keeps every other check.
         .opt_out_check("browse-file", Check::Outputs, RAW_FACE_IS_A_PASS_THROUGH);
     for (id, _) in PR_FACADES {
         suite = suite.opt_out(id, None, REACHES_GITHUB);
@@ -991,7 +998,8 @@ fn the_review_graph_introduces_no_undefined_term() {
     assert!(!triples.is_empty(), "the pass minted a graph to check");
     let undefined: BTreeSet<String> = ikigai_conformance::rdf::terms(&triples)
         .into_iter()
-        .filter(|t| !ikigai_conformance::rdf::is_defined(t, &[OA.to_string()]))
+        // `oa:` is well known since conformance 0.8.0, so no module namespace.
+        .filter(|t| !ikigai_conformance::rdf::is_defined(t, &[]))
         .collect();
     assert_eq!(
         undefined,
