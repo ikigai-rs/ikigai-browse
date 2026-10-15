@@ -600,8 +600,15 @@ fn reason_options(current: Option<&str>) -> String {
 /// confirm (decline again, with a word), reverse (publish), or retract — each
 /// naming the decision it revises, so the Sink accepts it and keeps both.
 ///
-/// ★ Two forms, not one: a retraction states no rating and is refused one,
-/// so it cannot share the form whose severity menu always submits a value.
+/// ★ Three forms, not one, because each verb takes different fields and a
+/// browser submits EVERY field of the form a button sits in:
+/// - **decline (confirm)** carries the reason picker, preselected with the
+///   word on file;
+/// - **publish instead** carries NO reason: a reason beside a publish is
+///   refused by name, and when the two shared a form the preselected decline
+///   word rode along and the reversal was refused (ledger #743);
+/// - **retract** states no rating, and is refused one.
+///
 /// Behind `<details>`, because a decline is usually final and the record is
 /// what a reader came for. Markup only, like every other S0 face — and it
 /// stamps no `made=`: how a decision was made is the host's to say at its
@@ -619,22 +626,27 @@ fn revise_html(id: &str, decision: &Decision) -> String {
             "<option value=\"{severity}\"{selected}>{severity}</option>"
         ));
     }
+    let open = format!(
+        "hx-post=\"/k/sink {iri}\" hx-target=\"#browse\" hx-swap=\"innerHTML\">\
+         <input type=\"hidden\" name=\"revises\" value=\"{revises}\">"
+    );
     format!(
         "<details class=\"browse-finding-revise\"><summary>revise this decision</summary>\
-         <form class=\"browse-finding-decide\" hx-post=\"/k/sink {iri}\" hx-target=\"#browse\" \
-         hx-swap=\"innerHTML\">\
-         <input type=\"hidden\" name=\"revises\" value=\"{revises}\">\
+         <form class=\"browse-finding-decide\" {open}\
          <label class=\"browse-finding-label\">severity \
          <select name=\"severity\">{options}</select></label>\
-         <label class=\"browse-finding-label\">reason (decline only) \
+         <label class=\"browse-finding-label\">reason \
          <select name=\"reason\">{reasons}</select></label>\
          <textarea name=\"content\" placeholder=\"why (optional; kept either way)\"></textarea>\
          <button type=\"submit\" name=\"decision\" value=\"{DECLINE}\">decline (confirm)</button>\
+         </form>\
+         <form class=\"browse-finding-decide\" {open}\
+         <label class=\"browse-finding-label\">severity \
+         <select name=\"severity\">{options}</select></label>\
+         <textarea name=\"content\" placeholder=\"why publish it after all (optional)\"></textarea>\
          <button type=\"submit\" name=\"decision\" value=\"{PUBLISH}\">publish instead</button>\
          </form>\
-         <form class=\"browse-finding-retract\" hx-post=\"/k/sink {iri}\" hx-target=\"#browse\" \
-         hx-swap=\"innerHTML\">\
-         <input type=\"hidden\" name=\"revises\" value=\"{revises}\">\
+         <form class=\"browse-finding-retract\" {open}\
          <textarea name=\"content\" placeholder=\"why withdraw it (optional)\"></textarea>\
          <button type=\"submit\" name=\"decision\" value=\"{RETRACT}\">retract</button>\
          </form></details>",
@@ -2972,6 +2984,102 @@ mod tests {
             .find(|iri| of(k, iri)["exact"] == exact)
             .unwrap_or_else(|| panic!("no finding on {exact}"))
             .clone()
+    }
+
+    /// The fields a browser submits when `button` (its `value`) is clicked in
+    /// `html`: the hidden inputs, each select's selected option (else its
+    /// first), each textarea (empty) of THE FORM THE BUTTON IS IN, plus the
+    /// button's own name/value. Enough of HTML form submission for this
+    /// crate's markup, which writes every attribute double-quoted.
+    fn submitted(html: &str, button: &str) -> Vec<(String, String)> {
+        let attr = |tag: &str, name: &str| -> Option<String> {
+            let key = format!("{name}=\"");
+            let at = tag.find(&key)? + key.len();
+            Some(tag[at..at + tag[at..].find('"')?].to_string())
+        };
+        let form = html
+            .split("<form")
+            .skip(1)
+            .map(|f| &f[..f.find("</form>").expect("a closed form")])
+            .find(|f| {
+                f.contains(&format!(
+                    "<button type=\"submit\" name=\"decision\" value=\"{button}\""
+                ))
+            })
+            .unwrap_or_else(|| panic!("no form holds a `{button}` button: {html}"));
+        let mut fields = Vec::new();
+        for tag in form.split('<').skip(1) {
+            if tag.starts_with("input") || tag.starts_with("textarea") {
+                let value = attr(tag, "value").unwrap_or_default();
+                fields.push((attr(tag, "name").expect("a named field"), value));
+            } else if let Some(rest) = tag.strip_prefix("select") {
+                let name = attr(rest, "name").expect("a named select");
+                let options = &form[form.find(rest).unwrap()..];
+                let options = &options[..options.find("</select>").unwrap()];
+                let chosen = options
+                    .split("<option")
+                    .skip(1)
+                    .find(|o| o.contains(" selected"))
+                    .or_else(|| options.split("<option").nth(1))
+                    .and_then(|o| attr(o, "value"))
+                    .unwrap_or_default();
+                fields.push((name, chosen));
+            } else if tag.starts_with("button") && attr(tag, "value").as_deref() == Some(button) {
+                fields.push((attr(tag, "name").unwrap(), button.to_string()));
+            }
+        }
+        fields
+    }
+
+    /// ★★ Each revision button on a declined finding's card submits a
+    /// request the Sink ACCEPTS (ledger #743). The revise form used to be one
+    /// form with two buttons, and its reason picker was preselected with the
+    /// decline's word: so "publish instead" submitted `reason=<word>` beside
+    /// `decision=publish`, which the Sink refuses by name, and a human could
+    /// not reverse a decline that had a reason from the card at all.
+    #[test]
+    fn every_revision_button_on_a_declined_card_submits_what_the_sink_accepts() {
+        for (button, outcome) in [
+            ("publish", "published"),
+            ("decline", "declined"),
+            ("retract", "retracted"),
+        ] {
+            let root = demo_root();
+            let store = Arc::new(Store::new().unwrap());
+            let k = kernel(&root, &store);
+            let findings = pass(&k);
+            let alpha = finding_on(&k, &findings, "fn alpha() {}");
+            issue(
+                &k,
+                Verb::Sink,
+                &alpha,
+                &[("decision", "decline"), ("reason", "restates")],
+            )
+            .expect("the decline");
+
+            let html = body(&issue(&k, Verb::Source, &alpha, &[("as", "text/html")]).unwrap());
+            let fields = submitted(&html, button);
+            if button == "publish" {
+                assert!(
+                    fields.iter().all(|(name, _)| name != "reason"),
+                    "the publish form carries a reason: {fields:?}"
+                );
+            }
+            let args: Vec<(&str, &str)> = fields
+                .iter()
+                .map(|(n, v)| (n.as_str(), v.as_str()))
+                .collect();
+            issue(&k, Verb::Sink, &alpha, &args).unwrap_or_else(|e| {
+                panic!("`{button}` from the card was refused: {e} (submitted {fields:?})")
+            });
+            // The answer given from the card is the chain's latest (a
+            // retraction leaves the finding undecided, so `decision` is null).
+            let row = of(&k, &alpha);
+            let chain = row["decisions"].as_array().unwrap();
+            assert_eq!(chain.len(), 2, "{button}: {row}");
+            assert_eq!(chain[1]["outcome"], outcome, "{button}: {row}");
+            std::fs::remove_dir_all(&root).ok();
+        }
     }
 
     /// ★ The reason words are the CONTRACT's, read exactly the way gonk reads
