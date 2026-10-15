@@ -2209,7 +2209,14 @@ pub(crate) fn findings_description() -> Description {
              word from the finding Sink's reason one_of, never applied: nothing here \
              decides anything, and a host fans a batch out to the finding Sink one call \
              per member. \
-             application/json (default) is the structured rows carrying BOTH ratings; \
+             application/json (default) is the structured rows carrying BOTH ratings: \
+             severity is the model's proposal and decision.severity the human's (null until \
+             someone decides). ⚠ effective_severity is a RESOLVED value for sorting and \
+             filtering — the human's rating once a decision stands, else the model's \
+             proposal — so on a pending row it is the MODEL's word, never a human's; render a \
+             human rating from decision.severity. Each row also carries judge (the latest \
+             verdict), judges, and judge_cannot (the judges that found it unjudgeable, by \
+             tag; urn:repo:{repo}:judge-tag names the current one); \
              as=text/html the queue page with each card's decision form; as=text/plain a \
              triage digest; as=text/turtle the findings and their decision graphs.",
         )
@@ -2420,7 +2427,13 @@ mod tests {
             .find(|iri| of(&k, iri)["exact"] == "fn alpha() {}")
             .unwrap()
             .clone();
-        assert_eq!(of(&k, &alpha)["severity"], "major");
+        let pending = of(&k, &alpha);
+        assert_eq!(pending["severity"], "major");
+        // ★ RESOLVED, not human (ledger #463): with no decision the
+        // effective rating IS the model's proposal, and the human's column is
+        // `decision.severity`, null until someone answers.
+        assert_eq!(pending["effective_severity"], "major");
+        assert!(pending["decision"].is_null(), "{pending}");
 
         let minted = body(
             &issue(
