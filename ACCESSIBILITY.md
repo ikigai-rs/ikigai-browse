@@ -82,7 +82,7 @@ From that axe run and from reading the source on 2026-10-15:
 | 2026-08-09 | Class-based highlighting and `urn:repo:style`, light and dark ([PR 14](https://github.com/ikigai-rs/ikigai-browse/pull/14)). |
 | 2026-08-15 | Each theme in its own scheme block; the floor pass from `ikigai-a11y` ([PR 15](https://github.com/ikigai-rs/ikigai-browse/pull/15), [PR 17](https://github.com/ikigai-rs/ikigai-browse/pull/17)). |
 | 2026-10-05 | Cost lines and live progress notes ([PR 78](https://github.com/ikigai-rs/ikigai-browse/pull/78)). |
-| 2026-10-15 | This file (this pull request). |
+| 2026-10-15 | This file ([PR 111](https://github.com/ikigai-rs/ikigai-browse/pull/111)). |
 
 ## Contributing
 
