@@ -1027,6 +1027,12 @@ Three things a reader of that test should know:
   (a closed list) has no way to say. The declaration is the three faces the
   endpoint chooses for itself, and the extension contract is pinned separately.
 
+## Accessibility
+
+[ACCESSIBILITY.md](ACCESSIBILITY.md) says which parts of a browse page this crate writes and which
+the host does, the rules that output follows, how it is tested, what is known to fail today (text
+dimmed by opacity, among other things), and how to report a barrier.
+
 ## License
 
 Licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT).
