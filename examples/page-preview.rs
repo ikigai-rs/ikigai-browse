@@ -20,13 +20,25 @@
 //! and inlined separately below, so its rules are visible too. The
 //! pull-request faces are not rendered at all: they resolve `urn:repo:pr:*`
 //! through the kernel and nothing mounts those here.
+//!
+//! ★ **The review queue shows real finding cards** (ledger #458). A finding can
+//! only be minted by a review pass, which needs a model, so the preview loads a
+//! FIXTURE graph instead (`examples/fixtures/preview-findings.ttl`): two findings
+//! a pass minted over `src/layout.rs`, one pending and one declined. A finding is
+//! just RDF, so no model is called; `tests/preview_fixture.rs` keeps the fixture
+//! rendering.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use ikigai_browse::{ExplainConfig, Mount, CAP_ANNOTATE};
 use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request, Verb};
+use oxigraph::io::RdfFormat;
 use oxigraph::store::Store;
+
+/// Two findings on `src/layout.rs`, one pending and one declined: see the
+/// fixture's own header.
+const FINDINGS: &str = include_str!("fixtures/preview-findings.ttl");
 
 fn main() {
     let out = std::env::args()
@@ -34,6 +46,11 @@ fn main() {
         .map_or_else(|| PathBuf::from("browse-preview.html"), PathBuf::from);
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let store = Arc::new(Store::new().expect("an in-memory store"));
+    // The findings go straight into the store: the default graph, which is the
+    // one this mount reads, since it names no graph.
+    store
+        .load_from_reader(RdfFormat::Turtle, FINDINGS.as_bytes())
+        .expect("the finding fixture is Turtle");
     let space = Mount::new([("self".to_string(), root)])
         .annotations(Arc::clone(&store))
         // The explain family mounted is what makes the file face render its
@@ -88,20 +105,35 @@ fn main() {
                 &[("as", "text/html")],
             ),
         ),
-        // ⚠ EMPTY here, and honestly so: this preview mounts annotations
-        // WITHOUT the explain family, so no review pass can run and no
-        // finding can exist. What it does show is the queue's page shell —
-        // the state nav, the not-a-gate note and the empty message. The
-        // finding CARD (severity badges, the decision form) has no visual
-        // check yet; `every_emitted_class_is_styled` only proves each class
-        // has a rule, not that the rule looks right.
+        // The finding CARDS (ledger #458): the fixture's pending finding with
+        // both severity badges and its decision form, and its declined one with
+        // the record and the revise forms. `every_emitted_class_is_styled`
+        // proves each class has a rule; this is where a person sees the rules.
         (
-            "review queue (empty) — urn:repo:self:findings",
+            "review queue, pending — urn:repo:self:findings",
             source(
                 &kernel,
                 &cap,
                 "urn:repo:self:findings",
                 &[("as", "text/html")],
+            ),
+        ),
+        (
+            "review queue, declined — urn:repo:self:findings state=declined",
+            source(
+                &kernel,
+                &cap,
+                "urn:repo:self:findings",
+                &[("as", "text/html"), ("state", "declined")],
+            ),
+        ),
+        (
+            "file face with the pending finding drawn as a proposal — proposals=major",
+            source(
+                &kernel,
+                &cap,
+                "urn:repo:self:file:src/layout.rs",
+                &[("as", "text/html"), ("proposals", "major")],
             ),
         ),
     ];

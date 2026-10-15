@@ -1,0 +1,94 @@
+# Two review FINDINGS on src/layout.rs, for examples/page-preview.rs (ledger #458).
+#
+# A finding is RDF, so the preview loads this graph straight into its store and
+# needs no model call. It was produced by a real review pass over this checkout
+# with a stub model standing in, then one finding was declined, and the store was
+# dumped: the major one is PENDING (its card shows both severity badges and the
+# publish/decline form), the minor one is DECLINED with a reason (its card shows
+# the record and the revise forms). The review pass record is kept because a
+# pending finding must be in the standing set of its file's current pass, or it
+# reads as superseded.
+#
+# The content hash and offsets are this file's as it stood then. The drift pass
+# re-anchors both quotes against the file as it stands now; a quote that is gone
+# renders flagged as orphaned. tests/preview_fixture.rs loads this graph and
+# checks both cards still render, so a change to the record format reddens a test
+# rather than silently emptying the preview.
+
+@prefix oa: <http://www.w3.org/ns/oa#> .
+@prefix prov: <http://www.w3.org/ns/prov#> .
+@prefix dcterms: <http://purl.org/dc/terms/> .
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix ik: <https://ikigai-rs.dev/ns#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+<urn:iki:finding:2f8cfa5eb5169797bd6d74ac>
+    a prov:Entity ;
+    dcterms:creator "qwen3-coder:30b" ;
+    dcterms:description "The endpoint is rebuilt on every bind, so two mounts hold two copies of a build constant." ;
+    ik:annotates <urn:repo:self:file:src/layout.rs> ;
+    ik:contentHash "sha256:d4b9871afcc9e75e51d2533e456f036cbae55dd934cf1b8a3f3627ed5e719584" ;
+    ik:path "src/layout.rs" ;
+    ik:repo "self" ;
+    oa:hasSelector <urn:iki:finding:2f8cfa5eb5169797bd6d74ac:selector:position> ;
+    oa:hasSelector <urn:iki:finding:2f8cfa5eb5169797bd6d74ac:selector:quote> ;
+    prov:wasGeneratedBy <urn:ikigai:browse:review:self:sha256:d4b9871afcc9e75e51d2533e456f036cbae55dd934cf1b8a3f3627ed5e719584:review-v5@qwen3-coder:30b:src/layout.rs> ;
+    sh:resultSeverity <urn:iki:severity:minor> .
+
+<urn:iki:finding:4afdddf1bc3d4b44f1b0444b>
+    a prov:Entity ;
+    dcterms:creator "qwen3-coder:30b" ;
+    dcterms:description "The IRI is a public constant, but nothing pins it against the IRI the endpoint is bound at; a rename of one leaves the other dangling." ;
+    ik:annotates <urn:repo:self:file:src/layout.rs> ;
+    ik:contentHash "sha256:d4b9871afcc9e75e51d2533e456f036cbae55dd934cf1b8a3f3627ed5e719584" ;
+    ik:path "src/layout.rs" ;
+    ik:repo "self" ;
+    oa:hasSelector <urn:iki:finding:4afdddf1bc3d4b44f1b0444b:selector:position> ;
+    oa:hasSelector <urn:iki:finding:4afdddf1bc3d4b44f1b0444b:selector:quote> ;
+    prov:wasGeneratedBy <urn:ikigai:browse:review:self:sha256:d4b9871afcc9e75e51d2533e456f036cbae55dd934cf1b8a3f3627ed5e719584:review-v5@qwen3-coder:30b:src/layout.rs> ;
+    sh:resultSeverity <urn:iki:severity:major> .
+
+<urn:iki:finding:2f8cfa5eb5169797bd6d74ac:decision>
+    a prov:Activity ;
+    dcterms:description "A build constant is cheap to rebuild; the copy costs nothing." ;
+    dcterms:subject <urn:iki:decline-reason:no-issue> ;
+    dcterms:type <urn:iki:finding:outcome:declined> ;
+    prov:used <urn:iki:finding:2f8cfa5eb5169797bd6d74ac> ;
+    sh:resultSeverity <urn:iki:severity:minor> .
+
+<urn:iki:finding:2f8cfa5eb5169797bd6d74ac:selector:position>
+    a oa:TextPositionSelector ;
+    oa:end "21755"^^xsd:integer ;
+    oa:start "21708"^^xsd:integer .
+
+<urn:iki:finding:2f8cfa5eb5169797bd6d74ac:selector:quote>
+    a oa:TextQuoteSelector ;
+    oa:exact "pub(crate) fn layout_endpoint() -> FnEndpoint {" ;
+    oa:prefix "exactly as for the theme sheet.\n" ;
+    oa:suffix "\n    FnEndpoint::new(\"browse-lay" .
+
+<urn:iki:finding:4afdddf1bc3d4b44f1b0444b:selector:position>
+    a oa:TextPositionSelector ;
+    oa:end "5174"^^xsd:integer ;
+    oa:start "5121"^^xsd:integer .
+
+<urn:iki:finding:4afdddf1bc3d4b44f1b0444b:selector:quote>
+    a oa:TextQuoteSelector ;
+    oa:exact "pub const LAYOUT_IRI: &str = \"urn:repo:style:layout\";" ;
+    oa:prefix "layout` is\n/// not one of them.\n" ;
+    oa:suffix "\n\n/// The layout rules for every" .
+
+<urn:ikigai:browse:review:self:sha256:d4b9871afcc9e75e51d2533e456f036cbae55dd934cf1b8a3f3627ed5e719584:review-v5@qwen3-coder:30b:src/layout.rs>
+    a ik:Review ;
+    ik:contentHash "sha256:d4b9871afcc9e75e51d2533e456f036cbae55dd934cf1b8a3f3627ed5e719584" ;
+    ik:model "qwen3-coder:30b" ;
+    ik:orphanedItems "0"^^xsd:integer ;
+    ik:path "src/layout.rs" ;
+    ik:repo "self" ;
+    ik:reviewedBytes "35314"^^xsd:integer ;
+    ik:suppressedItems "0"^^xsd:integer ;
+    ik:totalBytes "35314"^^xsd:integer ;
+    ik:versionTag "review-v5@qwen3-coder:30b" ;
+    prov:generated <urn:iki:finding:2f8cfa5eb5169797bd6d74ac> ;
+    prov:generated <urn:iki:finding:4afdddf1bc3d4b44f1b0444b> ;
+    prov:used <urn:repo:self:file:src/layout.rs> .
