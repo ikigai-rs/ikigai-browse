@@ -20,7 +20,7 @@
 //! [`Scratch::new`]'s `git init` and `urn:repo:demo:state`'s own oracle. That is
 //! the same posture `ikigai-repo`'s adoption took, and it is the opposite of
 //! #139's hazard: the hazard is a walk spawning a process by SURPRISE, in a tree
-//! the test does not own.
+//! the test does not own. The `gh`-backed facades are stubs here (see below).
 //!
 //! The two LLM-derived endpoints (`browse-explain`, `browse-review`) are fired
 //! against a **deterministic stub** bound at the configured provider IRIs, rather
@@ -28,18 +28,17 @@
 //! That is the whole reason their `text/turtle` faces are probed here at all —
 //! the review pass's `prov:`/`dcterms:` graph had never been under an RDF check.
 //!
-//! ## What is NOT fired, and why
+//! ## The pull-request family, fired against stub facades (ledger #189)
 //!
-//! The five pull-request facades. They resolve `urn:repo:pr:*` / `urn:repo:log`
-//! **through the kernel**, so in this fixture (where those are unbound) they would
-//! reach nothing — but on any real host they shell out to `gh`, which is network
-//! and GitHub auth, and an opt-out that is true of the module rather than of this
-//! fixture is the honest one. `Suite::opt_out` also drops ENFORCED, which is the
-//! one invoking check that never reaches `gh` (the capability floor is checked
-//! before anything is spawned), so
-//! [`the_pull_request_family_is_denied_under_no_grants`] pins that half by hand
-//! (conformance PENDING #21/#46).
-//!
+//! The five pull-request endpoints resolve `urn:repo:pr:*` / `urn:repo:log`
+//! **through the kernel**, and on a real host those shell out to `gh` (network and
+//! GitHub auth). Until ledger #189 they were opted out of the walk whole, which
+//! also dropped ENFORCED. They are now fired like every other endpoint, against
+//! [`stub_repo`]: the five facades bound IN the fixture, answering canned `gh`
+//! output, so the walk reaches their faces and still spawns nothing and opens no
+//! socket. [`the_pull_request_family_is_denied_under_no_grants`] stays, for the
+//! permanence of the refusal.
+
 //! ## Declarations
 //!
 //! * No `namespace(..)`. The annotation overlay speaks the W3C Web Annotation Data
@@ -123,9 +122,6 @@ const PR_FACADES: [(&str, &str); 5] = [
     ("browse-pr-explain", "urn:repo:demo:pr:1:explain"),
     ("browse-pr-review", "urn:repo:demo:pr:1:review"),
 ];
-
-/// Why they are not fired: true of the module, not of this fixture.
-const REACHES_GITHUB: &str = "resolves urn:repo:pr:* / urn:repo:log, which shell out to `gh`";
 
 /// Why `browse-file` waives `OUTPUTS` and nothing else, printed in every report.
 ///
@@ -270,6 +266,85 @@ fn stub_llm() -> EndpointSpace {
     space
 }
 
+/// The head commit the stub `pr:view` reports: the archive key of the PR layers.
+const STUB_OID: &str = "0123456789abcdef0123456789abcdef01234567";
+
+/// A deterministic stand-in for `ikigai-repo`'s pull-request facades, each
+/// answering canned `gh` output in the shape `ikigai-browse` reads (ledger #189):
+/// `pr:list` (tab-separated, or `gh`'s JSON with `as=application/json`),
+/// `pr:view` (JSON with `headRefOid` and an `author` OBJECT), `pr:diff` (a
+/// unified diff that ADDS the line the stub model quotes, so a PR review mints
+/// findings on the diff), `pr:files` (one path per line) and `log` (JSON).
+///
+/// ★ Nothing here spawns a process or opens a socket: the five facades are
+/// bound IN the fixture, so the walk fires the pull-request family against them
+/// instead of against `gh`. Each declares `urn:cap:exec:gh`, as the real module
+/// does, so the capability that reaches them is the real composition's.
+fn stub_repo() -> EndpointSpace {
+    const LIST: &str = "1\tAdd demo\tfeature/demo\t2026-10-01T12:00:00Z\n";
+    const LIST_JSON: &str = r#"[{"number":1,"title":"Add demo","state":"OPEN","headRefName":"feature/demo","updatedAt":"2026-10-01T12:00:00Z"}]"#;
+    const DIFF: &str = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n\
+                        @@ -1 +1,2 @@\n+pub fn demo() {}\n pub fn other() {}\n";
+    const LOG_JSON: &str = r#"[{"hash":"89abcdef0123456789abcdef0123456789abcdef","author":"Test","date":"2026-09-30T12:00:00Z","subject":"Add other (#1)"}]"#;
+    let view = serde_json::json!({
+        "number": 1,
+        "title": "Add demo",
+        "state": "OPEN",
+        "isDraft": false,
+        "headRefName": "feature/demo",
+        "headRefOid": STUB_OID,
+        "baseRefName": "main",
+        "author": {"login": "fixture", "name": "Fixture", "is_bot": false},
+        "updatedAt": "2026-10-01T12:00:00Z",
+        "url": "https://example.com/demo/pull/1",
+        "body": "Adds demo.",
+    })
+    .to_string();
+    let text = |body: &str| {
+        Representation::new(
+            ReprType::new("text/plain").with_param("charset", "utf-8"),
+            body.as_bytes().to_vec(),
+        )
+    };
+    let json = |body: &str| {
+        Representation::new(ReprType::new("application/json"), body.as_bytes().to_vec())
+    };
+    let mut space = EndpointSpace::new();
+    for facade in [
+        "urn:repo:pr:list",
+        "urn:repo:pr:view",
+        "urn:repo:pr:diff",
+        "urn:repo:pr:files",
+        "urn:repo:log",
+    ] {
+        let view = view.clone();
+        space = space.bind(
+            Exact::new(facade),
+            FnEndpoint::new("stub-repo", move |inv| {
+                let want_json = inv
+                    .inline_str("as")
+                    .is_ok_and(|a| a.starts_with("application/json"));
+                Ok(match facade {
+                    "urn:repo:pr:list" if want_json => json(LIST_JSON),
+                    "urn:repo:pr:list" => text(LIST),
+                    "urn:repo:pr:view" => json(&view),
+                    "urn:repo:pr:diff" => text(DIFF),
+                    "urn:repo:pr:files" => text("src/lib.rs\n"),
+                    _ => json(LOG_JSON),
+                })
+            })
+            .with_description(
+                Description::new("stub-repo")
+                    .verb(Verb::Source)
+                    .requires("urn:cap:exec:gh")
+                    .output("text/plain;charset=utf-8")
+                    .output("application/json"),
+            ),
+        );
+    }
+    space
+}
+
 /// The kernel the walk runs over, plus the watch `urn:repo:style`'s threads promise.
 fn kernel_over(scratch: &Scratch) -> (Kernel, StyleWatch) {
     let (kernel, watch, _space) = mounted(scratch);
@@ -296,6 +371,7 @@ fn mounted(scratch: &Scratch) -> (Kernel, StyleWatch, Arc<EndpointSpace>) {
     let kernel = Kernel::new(Arc::new(Fallback::new(vec![
         space.clone(),
         Arc::new(stub_llm()),
+        Arc::new(stub_repo()),
     ])));
     (kernel, watch, space)
 }
@@ -373,7 +449,7 @@ fn pending_findings(kernel: &Kernel) -> Vec<String> {
 }
 
 fn suite(findings: &[String]) -> Suite {
-    let mut suite = Suite::new()
+    let suite = Suite::new()
         // Bindings are per ENTRY and the verb on a binding-only fixture is
         // ignored (conformance PENDING #2): one binding per template variable.
         .fixture(Fixture::new("browse-tree", Verb::Source).binding("path", "src"))
@@ -422,6 +498,13 @@ fn suite(findings: &[String]) -> Suite {
         // reason). ⚠ They bind DIFFERENT findings on purpose — a decided
         // finding is decided, and a probe that read one the other had just
         // answered would be walking a state nobody meant to test.
+        // The pull-request family (ledger #189), fired against the stub facades:
+        // PR 1 is the one the stub lists, views and diffs, and `src` is a path
+        // its changed files touch.
+        .fixture(Fixture::new("browse-pr", Verb::Source).binding("n", "1"))
+        .fixture(Fixture::new("browse-pr-explain", Verb::Source).binding("n", "1"))
+        .fixture(Fixture::new("browse-pr-review", Verb::Source).binding("n", "1"))
+        .fixture(Fixture::new("browse-prs-scoped", Verb::Source).binding("path", "src"))
         .fixture(Fixture::new("finding", Verb::Source).binding("id", &findings[0]))
         .fixture(
             Fixture::new("finding", Verb::Sink)
@@ -449,9 +532,6 @@ fn suite(findings: &[String]) -> Suite {
         // CACHEABLE and SKOLEM-RDF for a release cycle over a single legitimately
         // red VOCABULARY. `browse-file` keeps every other check.
         .opt_out_check("browse-file", Check::Outputs, RAW_FACE_IS_A_PASS_THROUGH);
-    for (id, _) in PR_FACADES {
-        suite = suite.opt_out(id, None, REACHES_GITHUB);
-    }
     suite
 }
 
@@ -529,11 +609,11 @@ fn conforms() {
     eprintln!("{report}");
     assert!(report.is_clean(), "{report}");
 
-    // The stub provider is walked as a module endpoint (conformance PENDING #17):
-    // this crate's, plus one of the fixture's.
+    // The stubs are walked as module endpoints (conformance PENDING #17): this
+    // crate's, plus the fixture's two (the model and the pull-request facades).
     assert_eq!(
         report.endpoints,
-        ENDPOINTS.len() + 1,
+        ENDPOINTS.len() + 2,
         "the catalog changed; add the id to ENDPOINTS: {report}"
     );
     assert_eq!(
@@ -541,10 +621,11 @@ fn conforms() {
         0,
         "every check runs: {report}"
     );
-    assert_eq!(
-        report.declared.opted_out.len(),
-        PR_FACADES.len(),
-        "only the pull-request family is opted out: {report}"
+    // ★ Nothing is opted out whole (ledger #189): the pull-request family is
+    // walked against the stub facades like every other endpoint.
+    assert!(
+        report.declared.opted_out.is_empty(),
+        "an endpoint is opted out of the walk: {report}"
     );
     // ★ The waiver is EXACTLY one rule on exactly one endpoint — the only thing
     // standing between this report and a whole-suite pass. A second entry appearing
@@ -615,6 +696,14 @@ fn conforms() {
             "browse-judge-finding source application/json",
             "browse-judge-tag source application/json",
             "browse-layout source text/css",
+            // ★ The pull-request family, walked (ledger #189).
+            "browse-pr source text/plain",
+            "browse-pr-explain source text/plain",
+            "browse-pr-explain source text/turtle",
+            "browse-pr-review source text/plain",
+            "browse-pr-review source text/turtle",
+            "browse-prs source text/plain",
+            "browse-prs-scoped source text/plain",
             "browse-review source text/plain",
             "browse-review source text/turtle",
             "browse-review-options source text/plain",
@@ -627,6 +716,8 @@ fn conforms() {
             "finding source text/plain",
             "finding source text/turtle",
             "stub-llm source text/plain",
+            "stub-repo source application/json",
+            "stub-repo source text/plain",
         ]
         .into_iter()
         .map(str::to_string)
@@ -651,20 +742,21 @@ fn the_catalog_is_exactly_the_endpoints_this_crate_documents() {
                 .unwrap_or_else(|| panic!("`{}` describes itself", e.pattern))
                 .id
         })
-        .filter(|id| id != "stub-llm")
+        .filter(|id| id != "stub-llm" && id != "stub-repo")
         .collect();
     let expected: BTreeSet<String> = ENDPOINTS.iter().map(|s| s.to_string()).collect();
     assert_eq!(ids, expected);
 }
 
-/// ★ The ENFORCED half [`Suite::opt_out`] blinds (conformance PENDING #21/#46).
-///
 /// Under a capability holding no grants every pull-request facade refuses with a
-/// typed, permanent `Denied` — and it does so at the kernel's own floor, before
-/// anything is resolved through it, so this test reaches no process and no socket.
-/// That is precisely why the opt-out is safe for the OTHER checks and not for this
-/// one: the check that matters most for a network-backed action is the one the
-/// opt-out drops.
+/// typed, PERMANENT `Denied`, at the kernel's own floor, before anything is
+/// resolved through it.
+///
+/// This was the one check kept by hand while the family was opted out of the walk
+/// (conformance PENDING #21/#46), because `Suite::opt_out` drops ENFORCED. The walk
+/// now fires the family against the stub facades and ENFORCED runs on it (ledger
+/// #189); this stays for the half ENFORCED does not assert, that the refusal is not
+/// transient.
 #[test]
 fn the_pull_request_family_is_denied_under_no_grants() {
     let scratch = Scratch::new();
@@ -677,6 +769,60 @@ fn the_pull_request_family_is_denied_under_no_grants() {
         assert!(matches!(err, Error::Denied(_)), "{id}: {err:?}");
         assert!(!err.is_transient(), "{id}: {err:?}");
     }
+}
+
+/// ★ The PR page's DIFF is an annotation surface, now reachable in this fixture
+/// (ledger #189): an annotation on `urn:repo:demo:pr:1` anchors on a line of the
+/// stub diff, reads back on the PR's annotation listing, and the PR page's HTML
+/// face draws it.
+#[test]
+fn the_pull_request_diff_is_an_annotation_surface() {
+    let scratch = Scratch::new();
+    let (kernel, _watch) = kernel_over(&scratch);
+    let root = Capability::root();
+    issue(
+        &kernel,
+        request(
+            Verb::Sink,
+            "urn:iki:annotation:on-the-diff",
+            &[
+                ("target", "urn:repo:demo:pr:1"),
+                ("body", "a note on the diff"),
+                ("exact", "pub fn demo() {}"),
+            ],
+        ),
+        &root,
+    )
+    .expect("an annotation anchors on the stub diff");
+    let note: serde_json::Value = serde_json::from_slice(
+        &issue(
+            &kernel,
+            request(
+                Verb::Source,
+                "urn:iki:annotation:on-the-diff",
+                &[("as", "application/json")],
+            ),
+            &root,
+        )
+        .expect("the annotation reads back")
+        .bytes,
+    )
+    .expect("json");
+    assert_eq!(note["annotates"], "urn:repo:demo:pr:1", "{note}");
+    assert_eq!(note["pr"], 1, "{note}");
+    assert_eq!(note["orphaned"], false, "{note}");
+    let page = issue(
+        &kernel,
+        request(
+            Verb::Source,
+            "urn:repo:demo:pr:1",
+            &[("as", "text/html"), ("annotations", "include")],
+        ),
+        &root,
+    )
+    .expect("the PR page");
+    let page = String::from_utf8(page.bytes).expect("UTF-8");
+    assert!(page.contains("a note on the diff"), "{page}");
 }
 
 /// ★ **`urn:repo:style` is the one representation here that carries a thread, and
@@ -762,13 +908,14 @@ fn the_style_sheet_is_the_only_threaded_representation_and_the_watch_names_its_t
 /// Read by hand for every face the module announces: each `as=` value serves a
 /// media type the description declares, and — the converse direction, which no
 /// check does — every declared output is served by some call. The pull-request
-/// facades are excluded for the same reason they are opted out of the walk.
+/// family is included since ledger #189: its faces are served from the stub
+/// facades, so its JSON and HTML faces are checked here as well as walked.
 #[test]
 fn declared_outputs_are_the_media_types_served() {
     let scratch = Scratch::new();
     let (kernel, _watch) = seeded(&scratch);
     let root = Capability::root();
-    let calls: [(&str, &[(&str, &str)]); 33] = [
+    let calls: [(&str, &[(&str, &str)]); 50] = [
         ("urn:repo:demo:tree", &[]),
         ("urn:repo:demo:tree", &[("as", "text/html")]),
         ("urn:repo:demo:tree", &[("as", "text/turtle")]),
@@ -823,6 +970,25 @@ fn declared_outputs_are_the_media_types_served() {
             "urn:repo:demo:review-status:src/lib.rs",
             &[("as", "text/html")],
         ),
+        // ★ The pull-request family, against the stub facades (ledger #189):
+        // every face each one declares, the JSON and HTML ones included.
+        ("urn:repo:demo:prs", &[]),
+        ("urn:repo:demo:prs", &[("as", "application/json")]),
+        ("urn:repo:demo:prs", &[("as", "text/html")]),
+        ("urn:repo:demo:prs:src", &[]),
+        ("urn:repo:demo:prs:src", &[("as", "application/json")]),
+        ("urn:repo:demo:prs:src", &[("as", "text/html")]),
+        ("urn:repo:demo:pr:1", &[]),
+        ("urn:repo:demo:pr:1", &[("as", "application/json")]),
+        ("urn:repo:demo:pr:1", &[("as", "text/html")]),
+        ("urn:repo:demo:pr:1:explain", &[]),
+        ("urn:repo:demo:pr:1:explain", &[("as", "application/json")]),
+        ("urn:repo:demo:pr:1:explain", &[("as", "text/html")]),
+        ("urn:repo:demo:pr:1:explain", &[("as", "text/turtle")]),
+        ("urn:repo:demo:pr:1:review", &[]),
+        ("urn:repo:demo:pr:1:review", &[("as", "application/json")]),
+        ("urn:repo:demo:pr:1:review", &[("as", "text/html")]),
+        ("urn:repo:demo:pr:1:review", &[("as", "text/turtle")]),
     ];
     let mut served: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
     for (target, args) in calls {
