@@ -339,6 +339,9 @@ padding:.3rem}\n\
 .browse-findings-empty{opacity:.7;font-style:italic}\n\
 .browse-findings-states{display:flex;flex-wrap:wrap;gap:.4rem;margin:.5rem 0}\n\
 .browse-findings-state-current{font-weight:600;text-decoration:underline}\n\
+/* A page of the findings listing (ledger #1663): where it sits, and the way on. */\n\
+.browse-findings-page{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem;font-size:.85em;margin:.75rem 0}\n\
+.browse-findings-next{font:inherit}\n\
 .browse-findings-link{font:inherit}\n\
 /* Finding groups (ledger #506): proposals a human decides once — a group is a
    bordered section so its members read as one batch, and the twin or the kept

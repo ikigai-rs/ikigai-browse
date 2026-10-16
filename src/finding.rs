@@ -244,6 +244,9 @@ use crate::{
     XSD_STRING,
 };
 
+/// An `xsd:integer` input's class.
+const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
+
 /// **The severity set** — the closed list, in triage order (most urgent
 /// first). It is the `one_of` on the decision Sink, the words the review
 /// prompt hands the model, and what every menu renders from.
@@ -674,6 +677,128 @@ pub(crate) const STATES: [&str; 5] = ["pending", "superseded", "published", "dec
 /// What `summary=` may ask for — each widens the json face to an object that
 /// carries the rows plus its own key, and names a different grain.
 pub(crate) const SUMMARIES: [&str; 3] = ["declined", "states", "unconfirmed"];
+
+/// The rows one PAGE of the findings listing holds when `after=` arrives
+/// without `limit=` (ledger #1663). About 1.1 MB at the ~2.2 KB a live row
+/// measures.
+pub(crate) const PAGE_DEFAULT: usize = 500;
+
+/// The most rows one page may ask for.
+pub(crate) const PAGE_MAX: usize = 2000;
+
+/// The most bytes ONE findings answer carries, in any face, paged or not:
+/// half the 64 MiB frame the IPC and QUIC transports refuse past, so an
+/// answer that fits here crosses either with room for its envelope.
+///
+/// ★ An unpaged answer past it is REFUSED, never cut: the bare rows array has
+/// nowhere to say "there is more", and a listing that silently drops rows is
+/// the failure a bound exists to prevent. A page is cut to it instead,
+/// because a page's `next` does say so.
+pub(crate) const ANSWER_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+/// One page of the findings listing, asked for with `limit=` and/or `after=`.
+///
+/// ★ Pages are in finding-ID order, not triage order. An id never changes
+/// (it is derived from the pass, the anchor and the quote), so the cursor —
+/// the last id a page held — survives every insert, removal, decision and
+/// re-anchor between two reads: every finding present for the whole walk is
+/// served exactly once. Triage order moves a row when a human re-rates it or
+/// its file moves, which a cursor over it would skip or repeat.
+struct Page {
+    limit: usize,
+    after: Option<String>,
+}
+
+impl Page {
+    /// `None` when neither argument was given: the unpaged listing, byte for
+    /// byte the answer it always was (up to [`ANSWER_MAX_BYTES`]).
+    fn of(inv: &Invocation<'_>) -> Result<Option<Page>> {
+        let limit = match inv.inline_str("limit") {
+            Ok(value) => Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| (1..=PAGE_MAX).contains(n))
+                    .ok_or_else(|| Error::InvalidArgument {
+                        name: "limit".to_string(),
+                        detail: format!("`{value}` is not a whole number from 1 to {PAGE_MAX}"),
+                    })?,
+            ),
+            Err(_) => None,
+        };
+        let after = match inv.inline_str("after") {
+            Ok(value) if value.is_empty() || value.contains(':') => {
+                return Err(Error::InvalidArgument {
+                    name: "after".to_string(),
+                    detail: format!(
+                        "`{value}` is not a finding id — pass the previous page's `next` (the \
+                         id, not the urn:iki:finding: IRI); omit `after` for the first page"
+                    ),
+                })
+            }
+            Ok(value) => Some(value.to_string()),
+            Err(_) => None,
+        };
+        Ok((limit.is_some() || after.is_some()).then(|| Page {
+            limit: limit.unwrap_or(PAGE_DEFAULT),
+            after,
+        }))
+    }
+
+    /// This page's slice of `findings` (already filtered), in id order, and
+    /// whether any finding remains after it.
+    fn slice(&self, mut findings: Vec<Annotation>) -> (Vec<Annotation>, bool) {
+        findings.sort_by(|a, b| a.id.cmp(&b.id));
+        let start = self.after.as_deref().map_or(0, |after| {
+            findings.partition_point(|f| f.id.as_str() <= after)
+        });
+        let rest = findings.len() - start;
+        let take = rest.min(self.limit);
+        let page = findings.into_iter().skip(start).take(take).collect();
+        (page, rest > take)
+    }
+
+    /// The line a plain or html page says where it is in the listing.
+    fn words(&self, shown: usize, total: usize, next: Option<&str>) -> String {
+        let after = match &self.after {
+            Some(after) => format!(" after {after}"),
+            None => String::new(),
+        };
+        let then = match next {
+            Some(next) => format!("next page: after={next}"),
+            None => "the last page".to_string(),
+        };
+        format!("page: {shown} of {total} findings by id{after}; {then}")
+    }
+}
+
+/// [`ANSWER_MAX_BYTES`], applied to a finished answer: refused, never cut.
+fn within_ceiling(
+    answer: Representation,
+    repo: &str,
+    rel: &str,
+    rows: usize,
+    paged: bool,
+) -> Result<Representation> {
+    if answer.bytes.len() <= ANSWER_MAX_BYTES {
+        return Ok(answer);
+    }
+    let advice = match paged {
+        true => "ask for a smaller page with a lower `limit`".to_string(),
+        false => format!(
+            "page it: `limit=` (1 to {PAGE_MAX} rows) and then `after=` the previous page's \
+             `next`, or narrow it with `state=`, `verdict=` or a path"
+        ),
+    };
+    Err(Error::Conflict(format!(
+        "`{}` is {} bytes in {rows} rows, past the {} MiB one findings answer carries (the \
+         transports refuse a frame past 64 MiB); {advice}",
+        findings_iri(repo, rel),
+        answer.bytes.len(),
+        ANSWER_MAX_BYTES / (1024 * 1024),
+    )))
+}
 
 // --- binding ----------------------------------------------------------------
 
@@ -1369,11 +1494,38 @@ impl Endpoint for FindingsEndpoint {
             Ok(word) => Some(crate::group::kind_arg(word)?),
             Err(_) => None,
         };
+        // `limit=` / `after=` (ledger #1663) page the rows. The turtle face is
+        // refused a page: a graph has nowhere to say there is more, and a
+        // partial graph that looks whole is the silent truncation paging
+        // exists to replace.
+        let page = Page::of(inv)?;
+        if page.is_some()
+            && inv
+                .inline_str("as")
+                .is_ok_and(|t| t.starts_with("text/turtle"))
+        {
+            return Err(Error::InvalidArgument {
+                name: "as".to_string(),
+                detail: "the turtle face is not paged — it has nowhere to say there is more; \
+                         page the json face (`next`), or narrow the turtle with `state=` or a \
+                         path"
+                    .to_string(),
+            });
+        }
         if let Some(kind) = group {
             let conflict = |name: &str, detail: String| Error::InvalidArgument {
                 name: name.to_string(),
                 detail,
             };
+            if page.is_some() {
+                return Err(conflict(
+                    "limit",
+                    format!(
+                        "`group={kind}` proposes over EVERY pending finding, so it is not \
+                         paged — drop `limit` and `after`, or drop `group`"
+                    ),
+                ));
+            }
             if state != "pending" {
                 return Err(conflict(
                     "state",
@@ -1474,14 +1626,25 @@ impl Endpoint for FindingsEndpoint {
                     .is_none_or(|word| f.judges.last().map(|v| v.verdict.as_str()) == Some(word))
             })
             .collect();
+        // A page is cut BEFORE the drift pass, so a page reconciles (and may
+        // re-anchor) only its own rows. Nothing in the drift pass changes an
+        // id, so the cut stands.
+        let total = findings.len();
+        let (findings, mut more) = match &page {
+            Some(page) => page.slice(findings),
+            None => (findings, false),
+        };
         let mut rows =
             annotate::reconcile_findings(inv, &self.archive, &self.roots, repo, findings, contents)
                 .await?;
-        annotate::sort_finding_rows(&mut rows);
+        match &page {
+            Some(_) => rows.sort_by(|(a, _), (b, _)| a.id.cmp(&b.id)),
+            None => annotate::sort_finding_rows(&mut rows),
+        }
         if let Some(kind) = group {
             let groups = crate::group::groups(kind, &rows, &declined_records);
             let counts = crate::group::counts(&rows, &declined_records);
-            return Ok(match inv.inline_str("as").unwrap_or("application/json") {
+            let answer = match inv.inline_str("as").unwrap_or("application/json") {
                 t if t.starts_with("text/html") => repr_utf8(
                     "text/html",
                     crate::group::html(repo, &rel, kind, &groups, &counts),
@@ -1493,7 +1656,8 @@ impl Endpoint for FindingsEndpoint {
                     "application/json",
                     crate::group::json(repo, filter, kind, &groups, &counts).to_string(),
                 ),
-            });
+            };
+            return within_ceiling(answer, repo, &rel, rows.len(), false);
         }
         // The one line a PENDING listing owes its reader: how many findings
         // are not in it because they were superseded. A suppression nobody
@@ -1503,25 +1667,46 @@ impl Endpoint for FindingsEndpoint {
             _ => None,
         };
 
-        match inv.inline_str("as").unwrap_or("application/json") {
-            t if t.starts_with("text/html") => Ok(repr_utf8(
-                "text/html",
-                listing_html(
-                    repo,
-                    &rel,
-                    &state,
-                    &rows,
-                    &declined,
-                    hidden.as_deref(),
-                    walk.as_ref().and_then(Walk::text),
-                ),
-            )),
+        let shown = rows.len();
+        let paged = page.is_some();
+        let answer = match inv.inline_str("as").unwrap_or("application/json") {
+            t if t.starts_with("text/html") => {
+                let paging = page.as_ref().map(|page| {
+                    let next = more
+                        .then(|| rows.last().map(|(f, _)| f.id.clone()))
+                        .flatten();
+                    // The next page asks for the same listing: every narrowing
+                    // argument rides along with the cursor.
+                    let mut carry = format!("state={state}");
+                    for (name, value) in [("verdict", &verdict), ("summary", &summary)] {
+                        if let Some(value) = value {
+                            carry.push_str(&format!(" {name}={value}"));
+                        }
+                    }
+                    page_html(repo, &rel, &carry, page, shown, total, next.as_deref())
+                });
+                repr_utf8(
+                    "text/html",
+                    listing_html(
+                        repo,
+                        &rel,
+                        &state,
+                        &rows,
+                        &declined,
+                        Lines {
+                            hidden: hidden.as_deref(),
+                            walk: walk.as_ref().and_then(Walk::text),
+                            paging: paging.as_deref(),
+                        },
+                    ),
+                )
+            }
             t if t.starts_with("text/turtle") => {
                 let findings: Vec<Annotation> = rows.into_iter().map(|(f, _)| f).collect();
-                Ok(repr(
+                repr(
                     "text/turtle",
                     annotate::annotation_turtle_document(&findings),
-                ))
+                )
             }
             t if t.starts_with("text/plain") => {
                 let mut out = plain(&rows, &declined, hidden.as_deref());
@@ -1529,43 +1714,95 @@ impl Endpoint for FindingsEndpoint {
                     out.push('\n');
                     out.push_str(text);
                 }
-                Ok(repr_utf8("text/plain", out))
+                if let Some(page) = &page {
+                    let next = more
+                        .then(|| rows.last().map(|(f, _)| f.id.clone()))
+                        .flatten();
+                    out.push('\n');
+                    out.push_str(&page.words(shown, total, next.as_deref()));
+                }
+                repr_utf8("text/plain", out)
             }
             _ => {
-                let rows: Vec<serde_json::Value> = rows
+                let values: Vec<serde_json::Value> = rows
                     .iter()
                     .map(|(f, line)| annotate::annotation_json(f, *line))
                     .collect();
-                let json = match (summary.as_deref(), &states) {
-                    (Some("declined"), _) => serde_json::json!({
-                        "repo": repo,
-                        "path": filter,
-                        "state": state,
-                        "rows": rows,
-                        "declined": declined.json(),
-                    }),
-                    (Some("states"), Some(counts)) => serde_json::json!({
-                        "repo": repo,
-                        "path": filter,
-                        "state": state,
-                        "rows": rows,
-                        "states": counts.json(),
-                    }),
-                    (Some("unconfirmed"), _) => serde_json::json!({
-                        "repo": repo,
-                        "path": filter,
-                        "state": state,
-                        "rows": rows,
-                        "unconfirmed": match walk {
+                // What a summary adds beside the rows, under its own key.
+                let extra = match (summary.as_deref(), &states) {
+                    (Some("declined"), _) => Some(("declined", declined.json())),
+                    (Some("states"), Some(counts)) => Some(("states", counts.json())),
+                    (Some("unconfirmed"), _) => Some((
+                        "unconfirmed",
+                        match walk {
                             Some(Walk::Json(v)) => v,
                             _ => serde_json::Value::Null,
                         },
-                    }),
-                    _ => serde_json::Value::Array(rows),
+                    )),
+                    _ => None,
                 };
-                Ok(repr("application/json", json.to_string()))
+                let mut body = serde_json::Map::new();
+                body.insert("repo".to_string(), serde_json::json!(repo));
+                body.insert("path".to_string(), serde_json::json!(filter));
+                body.insert("state".to_string(), serde_json::json!(state));
+                // ★ Rows go in BEFORE the summary's key, as they always did: a
+                // consumer that turns on serde_json's `preserve_order` reads the
+                // keys in insertion order.
+                let json = match &page {
+                    None => match extra {
+                        Some((key, value)) => {
+                            body.insert("rows".to_string(), serde_json::Value::Array(values));
+                            body.insert(key.to_string(), value);
+                            serde_json::Value::Object(body)
+                        }
+                        None => serde_json::Value::Array(values),
+                    },
+                    Some(page) => {
+                        body.insert("total".to_string(), serde_json::json!(total));
+                        body.insert("limit".to_string(), serde_json::json!(page.limit));
+                        body.insert("after".to_string(), serde_json::json!(page.after));
+                        // The page is cut to the byte ceiling too, so a page
+                        // never fails on size: `next` names where it stopped.
+                        // 64 bytes covers the `rows` and `next` keys and a
+                        // 24-character id.
+                        let envelope = serde_json::Value::Object(body.clone()).to_string().len()
+                            + extra
+                                .as_ref()
+                                .map_or(0, |(key, value)| key.len() + value.to_string().len() + 4);
+                        let budget = ANSWER_MAX_BYTES.saturating_sub(envelope + 64);
+                        let mut used = 0;
+                        let mut kept = Vec::with_capacity(values.len());
+                        for value in values {
+                            let size = value.to_string().len() + 1;
+                            if used + size > budget {
+                                break;
+                            }
+                            used += size;
+                            kept.push(value);
+                        }
+                        if kept.is_empty() && shown > 0 {
+                            return Err(Error::Conflict(format!(
+                                "finding {} alone is past the {} MiB one findings answer \
+                                 carries; read it as urn:iki:finding:{}",
+                                rows[0].0.id,
+                                ANSWER_MAX_BYTES / (1024 * 1024),
+                                rows[0].0.id,
+                            )));
+                        }
+                        more |= kept.len() < shown;
+                        let next = more.then(|| rows[kept.len() - 1].0.id.clone());
+                        body.insert("rows".to_string(), serde_json::Value::Array(kept));
+                        body.insert("next".to_string(), serde_json::json!(next));
+                        if let Some((key, value)) = extra {
+                            body.insert(key.to_string(), value);
+                        }
+                        serde_json::Value::Object(body)
+                    }
+                };
+                repr("application/json", json.to_string())
             }
-        }
+        };
+        within_ceiling(answer, repo, &rel, shown, paged)
     }
 
     fn name(&self) -> &str {
@@ -1932,14 +2169,25 @@ fn one_html(finding: &Annotation, line: Option<u64>) -> String {
     )
 }
 
+/// What an html listing says besides its cards, each when there is something
+/// to say: the superseded count, the unconfirmed walk, and where a page sits.
+struct Lines<'a> {
+    hidden: Option<&'a str>,
+    walk: Option<&'a str>,
+    paging: Option<&'a str>,
+}
+
 fn listing_html(
     repo: &str,
     rel: &str,
     state: &str,
     rows: &[(Annotation, Option<u64>)],
     declined: &DeclinedSummary,
-    hidden: Option<&str>,
-    walk: Option<&str>,
+    Lines {
+        hidden,
+        walk,
+        paging,
+    }: Lines<'_>,
 ) -> String {
     let mut out = String::from("<div class=\"browse\">");
     out.push_str(&crumbs_html(repo, rel));
@@ -1993,7 +2241,41 @@ fn listing_html(
             rel.is_empty(),
         ));
     }
-    out.push_str("</div></div>");
+    out.push_str("</div>");
+    if let Some(paging) = paging {
+        out.push_str(paging);
+    }
+    out.push_str("</div>");
+    out
+}
+
+/// Where an html page sits in the listing, and the button to the next one —
+/// the same `/k/source` request the state nav makes, carrying the cursor.
+fn page_html(
+    repo: &str,
+    rel: &str,
+    carry: &str,
+    page: &Page,
+    shown: usize,
+    total: usize,
+    next: Option<&str>,
+) -> String {
+    let mut out = format!(
+        "<nav class=\"browse-findings-page\"><p>{}</p>",
+        esc(&page.words(shown, total, next))
+    );
+    if let Some(next) = next {
+        out.push_str(&format!(
+            "<button class=\"browse-findings-next\" hx-get=\"/k/source {iri} as=text/html \
+             {carry} limit={limit} after={next}\" hx-target=\"#browse\" \
+             hx-swap=\"innerHTML\">next page</button>",
+            iri = esc(&findings_iri(repo, rel)),
+            carry = esc(carry),
+            limit = page.limit,
+            next = esc(next),
+        ));
+    }
+    out.push_str("</nav>");
     out
 }
 
@@ -2230,7 +2512,19 @@ pub(crate) fn findings_description() -> Description {
              verdict), judges, and judge_cannot (the judges that found it unjudgeable, by \
              tag; urn:repo:{repo}:judge-tag names the current one); \
              as=text/html the queue page with each card's decision form; as=text/plain a \
-             triage digest; as=text/turtle the findings and their decision graphs.",
+             triage digest; as=text/turtle the findings and their decision graphs. ★ PAGING \
+             (limit= and/or after=): a page holds at most limit rows (default 500, at most \
+             2000) in finding-ID order — an id never changes, so the cursor survives every \
+             insert, decision and re-anchor between reads — after the id after= names; the \
+             json face becomes {repo, path, state, total, limit, after, rows, next} (plus the \
+             summary's own key), where total counts every row the state and verdict narrow \
+             to and next is the id to pass as after= for the following page, null on the \
+             last; the plain and html faces end with a page line (html with a next-page \
+             button); the turtle face and group= are not paged. ⚠ No answer of this resource \
+             exceeds 32 MiB, half the transports' 64 MiB frame: a page is cut short there \
+             (next says where), and an UNPAGED answer past it is refused with a conflict \
+             that says to page — never truncated, since a bare array cannot say there is \
+             more.",
         )
         .verb(Verb::Source)
         .verb(Verb::Meta)
@@ -2268,9 +2562,31 @@ pub(crate) fn findings_description() -> Description {
                      superseded them). unconfirmed: {repo, path, state, rows, \
                      unconfirmed} — the unconfirmed declines that still steer a pending \
                      finding, grouped by the burst or batch they were made in, oldest first. \
-                     Without it the json face is the bare rows array it always was.",
+                     Without it (and unpaged) the json face is the bare rows array it always \
+                     was.",
                 )
                 .one_of(SUMMARIES),
+        )
+        .input(
+            ArgSpec::new("limit")
+                .optional()
+                .class(XSD_INTEGER)
+                .summary(
+                    "page the rows: at most this many (1 to 2000) in finding-ID order, and \
+                     the json face becomes an object carrying total and next. Omitted with \
+                     after= given = 500; omitted with no after= = the unpaged listing in \
+                     triage order.",
+                ),
+        )
+        .input(
+            ArgSpec::new("after")
+                .optional()
+                .class(XSD_STRING)
+                .summary(
+                    "the cursor: a finding id (the previous page's next, not an IRI); the \
+                     page starts with the first finding whose id sorts after it. Omitted = \
+                     the first page.",
+                ),
         )
         .input(
             ArgSpec::new("group")
@@ -4806,6 +5122,419 @@ mod tests {
                 again[0]
             );
             std::fs::remove_dir_all(&root).ok();
+        }
+    }
+}
+
+#[cfg(test)]
+mod paging_tests {
+    use crate::annotate::{content_hash, mint_pending_finding, Mint, Surface};
+    use crate::archive::Archive;
+    use crate::ExplainConfig;
+    use futures::executor::block_on;
+    use ikigai_core::{ArgRef, Capability, Iri, Kernel, Representation, Request, Result, Verb};
+    use oxigraph::model::GraphName;
+    use oxigraph::store::Store;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    const FILES: usize = 40;
+
+    struct Synthetic {
+        root: PathBuf,
+        store: Arc<Store>,
+        kernel: Kernel,
+    }
+
+    impl Drop for Synthetic {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.root).ok();
+        }
+    }
+
+    /// A store holding `n` pending findings on one repo, spread over [`FILES`]
+    /// files, each with a `note_len`-character note — minted through the real
+    /// mint path, the files on disk so the drift pass reads them.
+    fn synthetic(n: usize, note_len: usize) -> Synthetic {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "ikigai-browse-paging-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let mut texts = vec![String::new(); FILES];
+        for i in 0..n {
+            texts[i % FILES].push_str(&format!("fn f{i}() {{}}\n"));
+        }
+        for (f, text) in texts.iter().enumerate() {
+            std::fs::write(root.join(format!("src/f{f}.rs")), text).unwrap();
+        }
+        let store = Arc::new(Store::new().unwrap());
+        let archive = Archive::new(Arc::clone(&store), GraphName::DefaultGraph);
+        let note: String = "x".repeat(note_len);
+        for i in 0..n {
+            mint(&archive, &texts, i, &note);
+        }
+        let cfg = ExplainConfig::new(Arc::clone(&store))
+            .review_model_label("r1")
+            .no_judge();
+        let browse = crate::space_with_explain(vec![("demo".to_string(), root.clone())], cfg);
+        let kernel = Kernel::new(Arc::new(browse));
+        Synthetic {
+            root,
+            store,
+            kernel,
+        }
+    }
+
+    fn mint(archive: &Archive, texts: &[String], i: usize, note: &str) -> String {
+        let rel = format!("src/f{}.rs", i % FILES);
+        let text = &texts[i % FILES];
+        let pass = crate::review::pass_iri("demo", &rel, "sha256:fixture", "tag");
+        let severity = super::SEVERITIES[i % super::SEVERITIES.len()];
+        match mint_pending_finding(
+            archive,
+            &format!("urn:repo:demo:file:{rel}"),
+            "demo",
+            &rel,
+            text,
+            &content_hash(text.as_bytes()),
+            &format!("fn f{i}() {{}}"),
+            &format!("{i}: {note}"),
+            Some(severity),
+            "fixture-model",
+            &pass,
+            None,
+            Surface::File,
+        )
+        .unwrap()
+        {
+            Mint::Minted(iri) => iri,
+            _ => panic!("finding {i} did not mint"),
+        }
+    }
+
+    fn cap() -> Capability {
+        Capability::scoped(["urn:cap:browse:read:demo"])
+    }
+
+    fn read(k: &Kernel, args: &[(&str, &str)]) -> Result<Representation> {
+        let mut request = Request::new(
+            Verb::Source,
+            Iri::parse("urn:repo:demo:findings".to_string()).unwrap(),
+        )
+        .with_arg("as", ArgRef::Inline(b"application/json".to_vec()));
+        for (name, value) in args {
+            request = request.with_arg(*name, ArgRef::Inline(value.as_bytes().to_vec()));
+        }
+        block_on(k.issue(request, &cap()))
+    }
+
+    fn json(answer: &Representation) -> serde_json::Value {
+        serde_json::from_slice(&answer.bytes).unwrap()
+    }
+
+    fn ids(rows: &serde_json::Value) -> Vec<String> {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Walk every page from the first, `limit` rows at a time, and return
+    /// each page's object.
+    fn walk(k: &Kernel, limit: &str, extra: &[(&str, &str)]) -> Vec<serde_json::Value> {
+        let mut pages = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let mut args = vec![("limit", limit)];
+            args.extend_from_slice(extra);
+            if let Some(after) = &after {
+                args.push(("after", after.as_str()));
+            }
+            let page = json(&read(k, &args).unwrap());
+            after = page["next"].as_str().map(str::to_string);
+            pages.push(page);
+            if after.is_none() {
+                return pages;
+            }
+            assert!(pages.len() < 10_000, "the walk does not end");
+        }
+    }
+
+    /// ★ Ledger #1663: the pages, joined, are EXACTLY the unpaged listing's
+    /// rows — every finding once, none twice — in id order, each page within
+    /// its limit and each carrying the same total.
+    #[test]
+    fn pages_join_into_the_whole_listing_in_id_order() {
+        let s = synthetic(1234, 40);
+        let whole = json(&read(&s.kernel, &[("state", "all")]).unwrap());
+        let mut expected = ids(&whole);
+        assert_eq!(expected.len(), 1234);
+        expected.sort();
+
+        let pages = walk(&s.kernel, "100", &[("state", "all")]);
+        assert_eq!(pages.len(), 13, "1234 rows at 100 a page");
+        let mut joined = Vec::new();
+        for page in &pages {
+            assert_eq!(page["total"], 1234, "{}", page["next"]);
+            assert_eq!(page["limit"], 100);
+            assert!(page["rows"].as_array().unwrap().len() <= 100);
+            joined.extend(ids(&page["rows"]));
+        }
+        assert_eq!(joined, expected, "every finding once, in id order");
+        assert!(pages.last().unwrap()["next"].is_null());
+        assert_eq!(pages[0]["after"], serde_json::Value::Null);
+        assert_eq!(pages[1]["after"], pages[0]["next"]);
+
+        // `after=` alone pages at the stated default.
+        let rest = json(&read(&s.kernel, &[("state", "all"), ("after", &expected[0])]).unwrap());
+        assert_eq!(rest["limit"], super::PAGE_DEFAULT);
+        assert_eq!(rest["rows"].as_array().unwrap().len(), super::PAGE_DEFAULT);
+        assert_eq!(ids(&rest["rows"])[0], expected[1]);
+    }
+
+    /// ★ The cursor survives an insert: findings minted between two page
+    /// reads shift nothing, so every finding present for the whole walk is
+    /// served exactly once, and a new one whose id sorts after the cursor
+    /// is served too. An offset would repeat or skip rows here.
+    #[test]
+    fn the_cursor_survives_an_insert() {
+        let s = synthetic(300, 40);
+        let before = {
+            let mut ids = ids(&json(&read(&s.kernel, &[("state", "all")]).unwrap()));
+            ids.sort();
+            ids
+        };
+        let first = json(&read(&s.kernel, &[("state", "all"), ("limit", "100")]).unwrap());
+        let cursor = first["next"].as_str().unwrap().to_string();
+
+        // Fifty new findings on a new file: their ids land on both sides of
+        // the cursor.
+        let text: String = (0..50).map(|i| format!("fn g{i}() {{}}\n")).collect();
+        std::fs::write(s.root.join("src/g.rs"), &text).unwrap();
+        let archive = Archive::new(Arc::clone(&s.store), GraphName::DefaultGraph);
+        let pass = crate::review::pass_iri("demo", "src/g.rs", "sha256:fixture", "tag");
+        let mut added = Vec::new();
+        for i in 0..50 {
+            let Mint::Minted(iri) = mint_pending_finding(
+                &archive,
+                "urn:repo:demo:file:src/g.rs",
+                "demo",
+                "src/g.rs",
+                &text,
+                &content_hash(text.as_bytes()),
+                &format!("fn g{i}() {{}}"),
+                "inserted mid-walk",
+                Some("minor"),
+                "fixture-model",
+                &pass,
+                None,
+                Surface::File,
+            )
+            .unwrap() else {
+                panic!("insert {i} did not mint");
+            };
+            added.push(iri.rsplit(':').next().unwrap().to_string());
+        }
+        let early = added.iter().filter(|id| **id <= cursor).count();
+        assert!(early > 0 && early < 50, "inserts on both sides: {early}");
+
+        let mut seen = ids(&first["rows"]);
+        let mut after = Some(cursor.clone());
+        while let Some(cursor) = after {
+            let page = json(
+                &read(
+                    &s.kernel,
+                    &[("state", "all"), ("limit", "100"), ("after", &cursor)],
+                )
+                .unwrap(),
+            );
+            assert_eq!(page["total"], 350, "the total counts the inserts");
+            seen.extend(ids(&page["rows"]));
+            after = page["next"].as_str().map(str::to_string);
+        }
+        let mut unique = seen.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), seen.len(), "no finding served twice");
+        for id in &before {
+            assert!(
+                seen.contains(id),
+                "{id} was present throughout and was skipped"
+            );
+        }
+        for id in added.iter().filter(|id| **id > cursor) {
+            assert!(
+                seen.contains(id),
+                "{id} sorts after the cursor and was not served"
+            );
+        }
+        assert_eq!(seen.len(), 300 + 50 - early);
+    }
+
+    /// ★ The default answer fits the frame: an UNPAGED listing past
+    /// [`super::ANSWER_MAX_BYTES`] is refused with a conflict that says how to
+    /// page — never cut, since a bare array cannot say there is more — and a
+    /// page of the same listing is cut to the ceiling with `next` naming
+    /// where, so walking the pages still serves every row.
+    #[test]
+    fn the_default_answer_fits_the_frame() {
+        // ~100 KB a row, 400 rows: about 40 MB, past the 32 MiB ceiling.
+        let s = synthetic(400, 100_000);
+        // `.err()`, not `unwrap_err`: a failure must not print 40 MB of rows.
+        let Err(refused) = read(&s.kernel, &[]) else {
+            panic!("an unpaged answer past the ceiling must be refused");
+        };
+        assert!(
+            matches!(&refused, ikigai_core::Error::Conflict(m) if m.contains("limit=")
+                && m.contains("400 rows")),
+            "{refused}"
+        );
+
+        let page = read(&s.kernel, &[("limit", "2000")]).unwrap();
+        assert!(
+            page.bytes.len() <= super::ANSWER_MAX_BYTES,
+            "{}",
+            page.bytes.len()
+        );
+        let page = json(&page);
+        let held = page["rows"].as_array().unwrap().len();
+        assert!(held > 0 && held < 400, "cut to the ceiling: {held}");
+        assert_eq!(page["total"], 400);
+        assert!(page["next"].is_string(), "a cut page says there is more");
+
+        let served: usize = walk(&s.kernel, "2000", &[])
+            .iter()
+            .map(|p| p["rows"].as_array().unwrap().len())
+            .sum();
+        assert_eq!(served, 400, "every row, across the cut pages");
+    }
+
+    /// The paging arguments refuse what they cannot honor, by name.
+    #[test]
+    fn paging_refuses_what_it_cannot_honor() {
+        let s = synthetic(3, 10);
+        for (args, name) in [
+            (vec![("limit", "0")], "limit"),
+            (vec![("limit", "2001")], "limit"),
+            (vec![("limit", "ten")], "limit"),
+            (vec![("after", "urn:iki:finding:abc")], "after"),
+            (vec![("after", "")], "after"),
+            (vec![("limit", "5"), ("as", "text/turtle")], "as"),
+            (vec![("limit", "5"), ("group", "file")], "limit"),
+        ] {
+            match read(&s.kernel, &args) {
+                Err(ikigai_core::Error::InvalidArgument { name: got, .. }) => {
+                    assert_eq!(got, name, "{args:?}")
+                }
+                other => panic!(
+                    "{args:?} was not refused: {:?}",
+                    other.map(|r| r.bytes.len())
+                ),
+            }
+        }
+    }
+
+    /// The unpaged listing is the bare array it always was; the plain and
+    /// html faces of a page say where they are and how to go on.
+    #[test]
+    fn the_text_faces_say_where_a_page_is() {
+        let s = synthetic(7, 10);
+        assert!(json(&read(&s.kernel, &[]).unwrap()).is_array());
+        let first = json(&read(&s.kernel, &[("limit", "5")]).unwrap());
+        let next = first["next"].as_str().unwrap();
+
+        let plain = read(&s.kernel, &[("limit", "5"), ("as", "text/plain")]).unwrap();
+        let plain = String::from_utf8(plain.bytes).unwrap();
+        assert!(
+            plain.ends_with(&format!(
+                "page: 5 of 7 findings by id; next page: after={next}"
+            )),
+            "{plain}"
+        );
+        let last = read(
+            &s.kernel,
+            &[("limit", "5"), ("after", next), ("as", "text/plain")],
+        )
+        .unwrap();
+        let last = String::from_utf8(last.bytes).unwrap();
+        assert!(last.ends_with("; the last page"), "{last}");
+
+        let html = read(
+            &s.kernel,
+            &[
+                ("limit", "5"),
+                ("verdict", "confirmed"),
+                ("as", "text/html"),
+            ],
+        )
+        .unwrap();
+        let html = String::from_utf8(html.bytes).unwrap();
+        assert!(html.contains("class=\"browse-findings-page\""), "{html}");
+        // No finding is judged here, so `verdict=confirmed` narrows to none: one page.
+        assert!(
+            html.contains("page: 0 of 0 findings by id; the last page"),
+            "{html}"
+        );
+        let html = read(&s.kernel, &[("limit", "5"), ("as", "text/html")]).unwrap();
+        let html = String::from_utf8(html.bytes).unwrap();
+        assert!(
+            html.contains(&format!("state=pending limit=5 after={next}")),
+            "the next-page button carries the listing and the cursor: {html}"
+        );
+    }
+
+    /// The claim behind ledger #1663, measured: the findings answer grows
+    /// linearly in the rows (~2.2 KB a row at a 1,400-character note), so
+    /// 31,000 rows are ~68 MB, past the transports' 64 MiB frame. Before the
+    /// paging arc that answer was served whole; now it is refused at
+    /// [`super::ANSWER_MAX_BYTES`], and a page of 500 stays ~1 MB.
+    /// `cargo test --lib size_slope -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement, not a check: prints the answer's size slope"]
+    fn size_slope() {
+        for (n, note) in [
+            (500usize, 400usize),
+            (1000, 400),
+            (2000, 400),
+            (4000, 400),
+            (2000, 1400),
+            (31_000, 1400),
+        ] {
+            let s = synthetic(n, note);
+            let started = std::time::Instant::now();
+            let answer = match read(&s.kernel, &[("state", "all")]) {
+                Ok(answer) => answer,
+                Err(refused) => {
+                    println!(
+                        "rows={n} note={note} refused in {} ms: {refused}",
+                        started.elapsed().as_millis()
+                    );
+                    continue;
+                }
+            };
+            let rows = serde_json::from_slice::<serde_json::Value>(&answer.bytes)
+                .unwrap()
+                .as_array()
+                .map_or(0, Vec::len);
+            println!(
+                "rows={rows} note={note} bytes={} over_64MiB_frame={} per_row={} read_ms={}",
+                answer.bytes.len(),
+                answer.bytes.len() > 64 * 1024 * 1024,
+                answer.bytes.len() / rows.max(1),
+                started.elapsed().as_millis()
+            );
+            let started = std::time::Instant::now();
+            let page = read(&s.kernel, &[("state", "all"), ("limit", "500")]).unwrap();
+            println!(
+                "  page of 500: bytes={} read_ms={}",
+                page.bytes.len(),
+                started.elapsed().as_millis()
+            );
         }
     }
 }
