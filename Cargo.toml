@@ -528,7 +528,12 @@ ikigai-core = "0.1.80"
 # theme's own default foreground. `features = ["themes"]` is the syntect/two-face
 # bridge (name → embedded theme); the crate's default build is wasm-clean
 # without it.
-ikigai-a11y = { version = "0.2.1", features = ["themes"] }
+# "0.3.0" since the naming wave (ledger #11): 0.3.0 renamed a11y's endpoint ids
+# (`a11yConfig` -> `a11y-config`, and likewise contrast and presentation) and kept
+# every IRI and every library item this crate calls, so nothing here changes; the
+# floor moves because `"0.2.1"` was a 0.x CEILING (`<0.3.0`) that would hold this
+# crate, and every host linking it, on the old ids. Still a ceiling: `<0.4.0`.
+ikigai-a11y = { version = "0.3.0", features = ["themes"] }
 # Syntax highlighting for the file HTML face. The pure-Rust regex engine
 # (default-fancy) so CI never needs a C toolchain for oniguruma; yaml-load
 # compiles the embedded Turtle .sublime-syntax (assets/) at first use.
@@ -639,5 +644,12 @@ oxttl = "0.2"
 # main carries 0.14.0 (typed failures, `as=` by essence), unpublished as of
 # 2026-10-13. Re-read this pin when it ships.
 ikigai-llm = "0.13.1"
+# Only for `ikigai_http::HttpTransport`, the trait `ikigai_llm::space` takes: the
+# examples and the real-llm tests implement it to fake the network hop. So this pin
+# must name the SAME ikigai-http line ikigai-llm does, or the impls are for a different
+# trait (E0277/E0308, two copies of the crate in the graph). ⚠ It deliberately stays
+# on 0.1 through the naming wave (ledger #11): ikigai-http 0.2.0 renamed its ids and
+# IRIs, but every published ikigai-llm (0.13.1, 0.14.0) still requires `^0.1.7`.
+# Move it in the same edit that moves ikigai-llm onto a release built on 0.2.
 ikigai-http = "0.1.7"
 ureq = "2"

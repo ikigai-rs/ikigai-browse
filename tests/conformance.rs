@@ -1024,7 +1024,7 @@ fn declared_outputs_are_the_media_types_served() {
 ///
 /// With no `as=`, the endpoint serves the file's EXTENSION-MAPPED media type: a
 /// `.md` is `text/markdown`, a `.png` is `image/png`. That set is closed and
-/// enumerable (unlike `urn:httpGet`'s, conformance PENDING #48, which is the other
+/// enumerable (unlike `urn:http:get`'s, conformance PENDING #48, which is the other
 /// module to hit this), so declaring it is mechanically possible — and it would be
 /// WRONG under this suite, because three of those types are RDF faces
 /// (`text/turtle`, `application/n-triples`, `application/ld+json`) and declaring
