@@ -441,7 +441,14 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # every consumer pinning `"0.18.x"` takes it with a lock update. ⚠ A consumer that already
 # resolves store 0.2.18+ under browse 0.18.8 and builds `ExplainConfig` on a handle it opened
 # itself with a named graph has every browse write refused today: this release is its fix.
-version = "0.18.9"
+# 0.18.10 (the naming wave, ledger #11): `ikigai-a11y` "0.2.1" -> "0.3.0", whose endpoint ids
+# moved to kebab-case (`a11y-config`, `a11y-contrast`, `a11y-presentation`) with every IRI and
+# library item kept, so a host linking browse and a11y builds ONE a11y on the new ids instead of
+# being held below 0.3.0 by browse's ceiling. `ikigai-core` "0.1.80" -> "0.1.100", the floor
+# a11y 0.3.0 already imposes, so the stated floor is a build that exists. `ikigai-http` (a
+# dev-dependency) stays on 0.1 until ikigai-llm moves. ★ Why a patch: no a11y type appears in
+# browse's public API, and no Rust API, resource name, capability or stored term moves.
+version = "0.18.10"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -521,7 +528,11 @@ required-features = ["migrate"]
 # `Error::Conflict` — well-formed, authorized, the finding exists, and the
 # host's STATE (no judge configured) refuses it — and that variant is new in
 # 0.1.80.
-ikigai-core = "0.1.80"
+#
+# 0.1.100 since the naming wave (ledger #11): `ikigai-a11y` 0.3.0 requires it, so
+# "0.1.80" named a build this crate's graph can no longer have (the 0.1.56 rule above).
+# Nothing in `src/` needs more than 0.1.80 by itself.
+ikigai-core = "0.1.100"
 # The accessibility config and the contrast-floor pass: `urn:repo:style`'s
 # themes and its contrast floor are read from the layered `a11y.toml` rather
 # than hard-coded, and each theme's own sub-floor colours are lifted to that
