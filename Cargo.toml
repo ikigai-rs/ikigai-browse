@@ -448,7 +448,13 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # a11y 0.3.0 already imposes, so the stated floor is a build that exists. `ikigai-http` (a
 # dev-dependency) stays on 0.1 until ikigai-llm moves. ★ Why a patch: no a11y type appears in
 # browse's public API, and no Rust API, resource name, capability or stored term moves.
-version = "0.18.10"
+# 0.18.11 (the naming wave, ledger #11): the dev-dependencies `ikigai-llm` "0.13.1" ->
+# "0.15.0" and `ikigai-http` "0.1.7" -> "0.2.0", moved together because they share
+# `HttpTransport`. ★ Why a patch: both are dev-dependencies, so nothing reaches a consumer's
+# graph; `[dependencies]`, the Rust API, every resource name, capability, face and stored term
+# are unchanged. Browse reaches an llm only through the kernel, so its runtime behavior is
+# whatever ikigai-llm the HOST mounts, never this pin.
+version = "0.18.11"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
