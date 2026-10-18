@@ -651,16 +651,28 @@ oxttl = "0.2"
 # non-finite temperature and a non-positive max_tokens that 0.12 dropped); and the
 # inventory is now UNCACHEABLE whenever building it asked a server (a pinned
 # `vendor: "ollama"` provider probes on every resolve), which costs a menu its
-# cache but not its single sub-request. ⚠ Also a ceiling, `<0.14.0`: ikigai-llm's
-# main carries 0.14.0 (typed failures, `as=` by essence), unpublished as of
-# 2026-10-13. Re-read this pin when it ships.
-ikigai-llm = "0.13.1"
+# cache but not its single sub-request.
+#
+# **"0.15.0" now** (the naming wave, ledger #11), moved TOGETHER with `ikigai-http`
+# below, because 0.15.0 is the first ikigai-llm built on ikigai-http 0.2 and the
+# transport trait has to be the same crate on both sides. Checked against what the
+# two releases since 0.13.1 changed for these tests and examples: 0.14.0 types its
+# failures (`Unavailable`/`Timeout`/`Endpoint`) and matches `as=` against its
+# declared faces by essence. Browse asks `urn:llm:{provider}:ask` for
+# `as=application/json`, which is declared (`text/plain` or `application/json`), and
+# nothing here matches on an llm error variant. 0.15.0 changes no behavior: it moves
+# ikigai-http to 0.2.0 and its own core floor to 0.1.86, below this crate's. ⚠ Also a
+# ceiling, `<0.16.0`. Re-read this pin when ikigai-llm's next minor ships.
+ikigai-llm = "0.15.0"
 # Only for `ikigai_http::HttpTransport`, the trait `ikigai_llm::space` takes: the
 # examples and the real-llm tests implement it to fake the network hop. So this pin
 # must name the SAME ikigai-http line ikigai-llm does, or the impls are for a different
-# trait (E0277/E0308, two copies of the crate in the graph). ⚠ It deliberately stays
-# on 0.1 through the naming wave (ledger #11): ikigai-http 0.2.0 renamed its ids and
-# IRIs, but every published ikigai-llm (0.13.1, 0.14.0) still requires `^0.1.7`.
-# Move it in the same edit that moves ikigai-llm onto a release built on 0.2.
-ikigai-http = "0.1.7"
+# trait (E0277/E0308, two copies of the crate in the graph). ikigai-llm 0.15.0 requires
+# `^0.2.0`, so this is "0.2.0" (the naming wave, ledger #11). 0.2.0 renamed its six
+# endpoints (`urn:httpGet` -> `urn:http:get`, id `httpGet` -> `http-get`, and so on)
+# and made `space()` return an `Alias`; neither touches this crate, which mounts no
+# http endpoint and names none. `HttpTransport`, `HttpRequest`, `HttpResponse` and
+# `Method` did not change. ⚠ Under 0.x caret rules this is a ceiling too (`<0.3.0`):
+# move it only with an ikigai-llm built on the next line.
+ikigai-http = "0.2.0"
 ureq = "2"
