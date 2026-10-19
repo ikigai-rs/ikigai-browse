@@ -52,8 +52,8 @@ use ikigai_core::{
 use crate::annotate::{self, Included};
 use crate::archive::Archive;
 use crate::explain::{
-    entry_iri, explain_turtle, iso8601, load_entry, parse_iri, provider_label, resolve_model,
-    store_entry, truncate, truncated_len, ArchiveEntry, CAP_NET, SYSTEM_PROMPT,
+    asks_a_model, entry_iri, explain_turtle, iso8601, load_entry, parse_iri, provider_label,
+    resolve_model, store_entry, truncate, truncated_len, ArchiveEntry, CAP_NET, SYSTEM_PROMPT,
 };
 use crate::review::{
     answer_excerpt, body_ends, load_pass, parse_findings, pass_iri, pass_turtle, store_pass,
@@ -513,9 +513,11 @@ impl Endpoint for PrsEndpoint {
         }
         let (repo, root) = repo_root(inv, &self.roots)?;
         granted(inv, repo)?;
-        // The 0.1.4 facade args, forwarded ONLY when the caller supplied them
-        // — an older mounted facade never sees an argument it cannot answer,
-        // and the defaults stay the facade's own (state=open, no limit).
+        // The 0.1.4 facade args, forwarded when the invocation carries them. Since
+        // core 0.1.105 the kernel injects a DECLARED default into the invocation,
+        // so `state` always arrives (`open` when the caller named none, the same
+        // default the facade declares for itself) and is always forwarded; `limit`
+        // declares no default and still reaches the facade only when supplied.
         let mut args = vec![dir_arg(root)];
         for name in ["state", "limit"] {
             if let Ok(value) = inv.inline_str(name) {
@@ -1448,7 +1450,7 @@ fn pr_explain_face(
 
 /// `repo` is not an ArgSpec — see [`prs_description`]'s note.
 fn pr_explain_description() -> Description {
-    Description::new("browse-pr-explain")
+    asks_a_model(Description::new("browse-pr-explain"))
         .title("Pull-request explanation (archived derivation)")
         .summary(
             "An LLM-derived, review-shaped explanation of a pull request's diff — \
@@ -1778,7 +1780,7 @@ fn pr_review_face(
 
 /// `repo` is not an ArgSpec — see [`prs_description`]'s note.
 fn pr_review_description() -> Description {
-    Description::new("browse-pr-review")
+    asks_a_model(Description::new("browse-pr-review"))
         .title("Machine review pass over a pull request's diff")
         .summary(
             "A region-grain machine review of one pull request — \
@@ -2155,11 +2157,17 @@ mod tests {
         assert!(html.contains("#7 Fix &lt;gamma&gt;"), "{html}");
         assert!(html.contains("feature/beta"), "{html}");
 
-        // The 0.1.4 facade args are forwarded ONLY when supplied: the calls
-        // above carried neither, this one carries both — and the third
-        // (state) column, discriminated by gh's uppercase keyword, renders
-        // as a badge.
-        assert!(!calls[0].contains_key("state"), "{:?}", calls[0]);
+        // The 0.1.4 facade args: the calls above named neither, so the facade
+        // saw the DECLARED default for `state` (the kernel injects it since core
+        // 0.1.105; it is the facade's own default too) and no `limit`, which
+        // declares none. This one carries both — and the third (state) column,
+        // discriminated by gh's uppercase keyword, renders as a badge.
+        assert_eq!(
+            calls[0].get("state"),
+            Some(&"open".to_string()),
+            "{:?}",
+            calls[0]
+        );
         assert!(!calls[0].contains_key("limit"), "{:?}", calls[0]);
         *state.list.lock().unwrap() =
             "3\tAdd beta\tMERGED\tfeature/beta\t2026-08-09T12:00:00Z\n".to_string();

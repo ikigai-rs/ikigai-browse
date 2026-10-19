@@ -98,7 +98,9 @@ use oxigraph::model::{Literal, NamedNode, Quad, Term};
 
 use crate::annotate::{self, PROV};
 use crate::archive::Archive;
-use crate::explain::{ik, iso8601, parse_iri, provider_label, resolve_model, CAP_NET};
+use crate::explain::{
+    asks_a_model, ik, iso8601, parse_iri, provider_label, resolve_model, CAP_NET,
+};
 use crate::finding::SEVERITIES;
 use crate::{
     file_iri, granted, iri_encode, path_binding, repo_root, repr_utf8, resolve, ExplainConfig,
@@ -2154,7 +2156,7 @@ impl Endpoint for JudgeEndpoint {
 }
 
 fn judge_description(config: &ExplainConfig) -> Description {
-    Description::new("browse-judge")
+    asks_a_model(Description::new("browse-judge"))
         .title("Judge a review claim against a file")
         .summary(
             "Confirm or refute ONE review claim (a quote and a claim body) against a file's \
@@ -2826,7 +2828,7 @@ impl Endpoint for JudgeFindingEndpoint {
 }
 
 fn judge_finding_description(config: &ExplainConfig) -> Description {
-    Description::new("browse-judge-finding")
+    asks_a_model(Description::new("browse-judge-finding"))
         .title("Judge one queued finding, archived")
         .summary(
             "Run the judge on ONE finding already in the review queue (urn:iki:finding:{id}) and \

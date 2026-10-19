@@ -247,8 +247,8 @@ use oxigraph::model::{Literal, NamedNode, Quad, Term};
 use crate::annotate::{self, Included, PROV};
 use crate::archive::Archive;
 use crate::explain::{
-    command_safe, ik, iso8601, menu_options, parse_iri, provider_label, resolve_model, MenuTier,
-    ModelOption, CAP_NET, IK,
+    asks_a_model, command_safe, ik, iso8601, menu_options, parse_iri, provider_label,
+    resolve_model, MenuTier, ModelOption, CAP_NET, IK,
 };
 // ★ `truncate`/`truncated_len` are deliberately NOT imported here any more. The
 // review pass no longer truncates anything: it chunks. The explain family still
@@ -2671,7 +2671,7 @@ pub(crate) fn pass_turtle(entry: &PassEntry) -> String {
 /// `urn:kernel:validate` can reject a bad one before dispatch and a UI can
 /// build its "review with" menu from the description alone.
 fn review_description(config: &ExplainConfig) -> Description {
-    Description::new("browse-review")
+    asks_a_model(Description::new("browse-review"))
         .title("Machine review pass (annotations minted by a model)")
         .summary(
             "A region-grain machine review of one file — urn:repo:{repo}:review:{path}. \
