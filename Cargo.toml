@@ -454,7 +454,27 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # graph; `[dependencies]`, the Rust API, every resource name, capability, face and stored term
 # are unchanged. Browse reaches an llm only through the kernel, so its runtime behavior is
 # whatever ikigai-llm the HOST mounts, never this pin.
-version = "0.18.11"
+# 0.19.0 (the failure classes, ledger #1546, #1923): browse on core 0.1.108. The six actions
+# that ask a model (browse-explain, browse-review, browse-pr-explain, browse-pr-review,
+# browse-judge, browse-judge-finding) DECLARE the classes they can fail with
+# (`Description::fails`: transient, retry-after, over-budget, refused, unknown, the classes
+# ikigai-llm 0.16's `urn:llm:{provider}:ask` declares, passed through with their types kept),
+# so a caller or an agent plans its retries from the manifold; the conformance walk holds
+# them to it (FAILURES, conformance 0.10.0). Behavior changes a consumer can see, each with
+# its before: (1) the review pass and the judge loop stop at the first `Refused` or
+# `RetryAfter` as they stop at a `Denied`, returning the error WITH ITS TYPE (a `RetryAfter`
+# keeps its delay, so an HTTP edge answers 429 + Retry-After) and archiving nothing; before,
+# under ikigai-llm 0.16 a backend's 401 (`Refused`, where 0.15 said `Denied`) was collapsed
+# region by region and a 429 was spent on every remaining region with its delay lost. A 500
+# (`Endpoint` since 0.16, no longer transient, so no overlay retries it) is still the region's
+# own. (2) The pull-request listing forwards `state=open` to the facade when the caller names
+# none: since core 0.1.105 the kernel injects a declared default, and the facade's own
+# default is `open`, so the listing is byte-identical. ★ Why a minor: the six contracts gain
+# stated failure classes, which moves their contract digests (core's v2 form), and the public
+# floor moves to core 0.1.108; a host pinning `"0.18.x"` (`<0.19.0`; gonk pins "0.18.9") must
+# move its pin to see either, and should, since the llm 0.16 it mounts already answers in the
+# new types. No Rust API, resource name, capability or stored term moves.
+version = "0.19.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
