@@ -100,8 +100,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ikigai_core::{
-    ArgRef, ArgSpec, Description, Endpoint, EndpointSpace, Error, Invocation, Iri, Representation,
-    Request, Result, Verb,
+    ArgRef, ArgSpec, Description, Endpoint, EndpointSpace, Error, FailureClass, Invocation, Iri,
+    Representation, Request, Result, Verb,
 };
 use oxigraph::model::{GraphName, Literal, NamedNode, Quad, Term};
 use oxigraph::store::Store;
@@ -120,6 +120,43 @@ use crate::{
 /// localhost. Enforced by the kernel's baseline (declared = enforced) — a
 /// capability with no `urn:cap:net:…` grant is denied before dispatch.
 pub const CAP_NET: &str = "urn:cap:net:*";
+
+/// The failure classes an action that ASKS A MODEL can produce, declared on its
+/// contract (core 0.1.108's `Description::fails`, ledger #1546) so a caller or an
+/// agent plans its retries from the manifold rather than from prose.
+///
+/// Browse reaches a model only through the kernel, so these are the classes
+/// `urn:llm:{provider}:ask` declares (ikigai-llm 0.16's origin failures), passed
+/// through WITH THEIR TYPES KEPT: nothing here rewraps a model's error as
+/// `Endpoint`. Beside the implied ones, `permanent` (a bad argument, a path that
+/// is not there, the judge's no-judge `Conflict`) and `denied` (beside the declared
+/// `urn:cap:net:*` and the per-root read grant):
+///
+/// - `transient`: no answer from the backend (a refused connection, a timeout);
+/// - `retry-after`: the backend is rate-limited (a 429, a 503 with `Retry-After`);
+/// - `over-budget`: the prompt was too large for the backend;
+/// - `refused`: the backend refused the module's configured credential (401/403);
+/// - `unknown`: a 500, an answer that is not the shape browse reads, an archive
+///   read or write that failed, and browse's own `Endpoint` refusals.
+///
+/// Held to by `tests/conformance.rs` (`FAILURES`, under `Suite::check_failures`).
+pub(crate) const MODEL_FAILURES: [FailureClass; 5] = [
+    FailureClass::Transient,
+    FailureClass::RetryAfter,
+    FailureClass::OverBudget,
+    FailureClass::Refused,
+    FailureClass::Unknown,
+];
+
+/// `description` declaring [`MODEL_FAILURES`]: the six actions that ask a model
+/// (explain, review, pr-explain, pr-review, judge, judge-finding) start their
+/// builder chain here. `tests/conformance.rs` pins that each of the six reaches
+/// the walk declaring exactly this set, and holds every failure the walk sees to it.
+pub(crate) fn asks_a_model(description: Description) -> Description {
+    MODEL_FAILURES
+        .into_iter()
+        .fold(description, Description::fails)
+}
 
 // --- prompts (each constant is versioned; edit ⇒ bump its version) ----------
 
@@ -1468,7 +1505,7 @@ pub(crate) fn explain_turtle(entry: &ArchiveEntry) -> String {
 /// `urn:kernel:validate` can reject a bad one before dispatch and a UI can
 /// build its menu from the description alone.
 fn explain_description(config: &ExplainConfig) -> Description {
-    Description::new("browse-explain")
+    asks_a_model(Description::new("browse-explain"))
         .title("Repository explanation (archived derivation)")
         .summary(
             "An LLM-derived orientation explanation of a file or directory — \

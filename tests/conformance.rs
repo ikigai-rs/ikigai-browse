@@ -75,6 +75,13 @@
 //!   day one of them is marked cacheable without a thread a host cuts, this test
 //!   goes red. Nothing is declared `pure`: no endpoint here is a function of its
 //!   inputs alone.
+//! * `check_failures()` — `FAILURES` (conformance 0.10.0, ledger #1546), opt-in until
+//!   0.11 makes it the default. The six actions that ask a model declare the classes
+//!   they can fail with ([`MODEL_FAILURES`]: the classes ikigai-llm 0.16's
+//!   `urn:llm:{provider}:ask` declares, passed through with their types kept), and
+//!   every failure the walk observes from them must be one the declaration admits.
+//!   [`conforms`] reads `failures_seen()` back so that a declaration the walk never
+//!   reached cannot read as clean.
 //!
 //! ## Seeded, so the RDF checks are not vacuous
 //!
@@ -93,8 +100,8 @@ use std::sync::Arc;
 use ikigai_browse::{ExplainConfig, Mount, StyleWatch, CAP_ANNOTATE, CAP_WILDCARD, LAYOUT_IRI};
 use ikigai_conformance::{Check, Fixture, SpaceNaming, Suite};
 use ikigai_core::{
-    ArgRef, Capability, Description, EndpointSpace, Error, Exact, Expiry, Fallback, FnEndpoint,
-    Iri, Kernel, ReprType, Representation, Request, Verb,
+    ArgRef, Capability, Description, EndpointSpace, Error, Exact, Expiry, FailureClass, Fallback,
+    FnEndpoint, Iri, Kernel, ReprType, Representation, Request, Verb,
 };
 use oxigraph::store::Store;
 
@@ -531,9 +538,36 @@ fn suite(findings: &[String]) -> Suite {
         // here and this crate already knows why: it cost `browse-review` ENFORCED,
         // CACHEABLE and SKOLEM-RDF for a release cycle over a single legitimately
         // red VOCABULARY. `browse-file` keeps every other check.
-        .opt_out_check("browse-file", Check::Outputs, RAW_FACE_IS_A_PASS_THROUGH);
+        .opt_out_check("browse-file", Check::Outputs, RAW_FACE_IS_A_PASS_THROUGH)
+        // ★ FAILURES (conformance 0.10.0, opt-in until 0.11; ledger #1546): the six
+        // actions that ask a model declare the classes they can fail with
+        // (`explain::MODEL_FAILURES`), and every failure the walk observes from them
+        // must be one the declaration admits. `conforms` reads the evidence back:
+        // a declaration that reached nothing would read as clean too.
+        .check_failures();
     suite
 }
+
+/// The actions that ask a model, each declaring [`MODEL_FAILURES`] (ikigai-llm 0.16's
+/// origin failures, passed through with their types kept).
+const ASKS_A_MODEL: [&str; 6] = [
+    "browse-explain",
+    "browse-judge",
+    "browse-judge-finding",
+    "browse-pr-explain",
+    "browse-pr-review",
+    "browse-review",
+];
+
+/// What each of [`ASKS_A_MODEL`] declares: the five classes beside the implied
+/// `permanent` and `denied`.
+const MODEL_FAILURES: [FailureClass; 5] = [
+    FailureClass::Transient,
+    FailureClass::RetryAfter,
+    FailureClass::OverBudget,
+    FailureClass::Refused,
+    FailureClass::Unknown,
+];
 
 /// The labels the five space constructors are declared under, in declaration order.
 const SPACES: [&str; 5] = [
@@ -640,6 +674,42 @@ fn conforms() {
         vec![("browse-file", Check::Outputs)],
         "the per-check waiver list changed: {report}"
     );
+    // ★ FAILURES compared something: each model-asking action reached the walk
+    // declaring exactly `MODEL_FAILURES`, was resolved at least once, and nothing else
+    // in the catalog states classes yet (a seventh declarer gets a line here). The
+    // check's own judgment (every observed failure admitted) is in `is_clean` above.
+    let declared: BTreeSet<(String, Option<Vec<FailureClass>>)> = report
+        .failures_seen()
+        .iter()
+        .filter(|seen| seen.verb == Verb::Source)
+        .map(|seen| (seen.endpoint.clone(), seen.declared.clone()))
+        .collect();
+    let expected: BTreeSet<(String, Option<Vec<FailureClass>>)> = report
+        .failures_seen()
+        .iter()
+        .filter(|seen| seen.verb == Verb::Source)
+        .map(|seen| {
+            let declared = ASKS_A_MODEL
+                .contains(&seen.endpoint.as_str())
+                .then(|| MODEL_FAILURES.to_vec());
+            (seen.endpoint.clone(), declared)
+        })
+        .collect();
+    assert_eq!(
+        declared, expected,
+        "the declared failure classes changed: {report}"
+    );
+    for id in ASKS_A_MODEL {
+        let seen = report
+            .failures_seen()
+            .iter()
+            .find(|seen| seen.endpoint == id && seen.verb == Verb::Source)
+            .unwrap_or_else(|| panic!("`{id}` was not walked under FAILURES: {report}"));
+        assert!(
+            seen.resolutions > 0,
+            "`{id}` declared its classes and was never resolved: {report}"
+        );
+    }
     // ★ Every exported constructor reached SPACE-NAME, each as host-named. A new
     // constructor without a line in `SPACES` is a space nothing holds to its name.
     assert_eq!(

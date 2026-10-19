@@ -537,8 +537,11 @@ required-features = ["migrate"]
 #
 # 0.1.100 since the naming wave (ledger #11): `ikigai-a11y` 0.3.0 requires it, so
 # "0.1.80" named a build this crate's graph can no longer have (the 0.1.56 rule above).
-# Nothing in `src/` needs more than 0.1.80 by itself.
-ikigai-core = "0.1.100"
+#
+# 0.1.108 since the failure classes (ledger #1546): the six actions that ask a model
+# declare the classes they can fail with (`Description::fails`, `FailureClass`), both
+# new in 0.1.108, so this is the true floor of `src/` for the first time since 0.1.80.
+ikigai-core = "0.1.108"
 # The accessibility config and the contrast-floor pass: `urn:repo:style`'s
 # themes and its contrast floor are read from the layered `a11y.toml` rather
 # than hard-coded, and each theme's own sub-floor colours are lifted to that
@@ -613,12 +616,16 @@ notify = "6.1"
 # new conformance minor ships. (`Suite::host_named_space`, 0.6.0's, and
 # `Suite::opt_out_check`, 0.2.0's, ride along.)
 #
-# ⚠ `[dependencies] ikigai-core` above is deliberately NOT raised to match: it
-# states the LIBRARY's true minimum (rule 5), and nothing in `src/` needs more.
-# This suite requires `ikigai-core ^0.1.100` itself, so every test build already
-# unifies to a core new enough for it (and for `Arc<S>: Space`, which the
-# host-named declarations lean on).
-ikigai-conformance = "0.8.0"
+# ⚠ `[dependencies] ikigai-core` above states the LIBRARY's true minimum (rule 5);
+# since 0.1.108 the two agree, because `src/` declares failure classes itself.
+#
+# **"0.10.0" now** (ledger #1546): `FAILURES` holds the six model-asking actions to the
+# classes they declare, under `Suite::check_failures()` (opt-in in 0.10, the default from
+# 0.11.0). The move also brings 0.9.0's checks, which `"0.8.0"` (`<0.9.0`) had ceilinged
+# this crate out of: `RECOMPUTE` (24 recomputations of each cached answer after a cut),
+# `REQUIRED` over input groups, and `VALIDATE` refusing a defaulted binding. ⚠ Still a
+# ceiling: `<0.11.0`. Re-read it as a range whenever a new conformance minor ships.
+ikigai-conformance = "0.10.0"
 # A FLOOR DECLARATION, not a code dependency: no line in this crate calls it.
 # The suite's `VOCABULARY` check reads `ikigai_vocab::VOCABULARY` as its oracle,
 # and the suite's own pin is the floor for the SUITE's API, not for this module's
@@ -631,7 +638,10 @@ ikigai-conformance = "0.8.0"
 # really "the registry index is stale". Cargo unifies to the greater of the two
 # requirements, so saying it here raises the floor without touching the suite.
 # Dev-dependencies do not propagate, so no consumer of this crate pays for it.
-ikigai-vocab = "0.1.71"
+# "0.1.108" since the failure classes (ledger #1546): `ik:mayFail` and the seven
+# `ik:FailureClass` individuals the declared classes render as landed there, and
+# conformance 0.10.0 pins the same floor, so the two lines agree.
+ikigai-vocab = "0.1.108"
 futures = "0.3"
 # Validates the Turtle face in tests — the graph must actually parse.
 oxttl = "0.2"
@@ -667,9 +677,18 @@ oxttl = "0.2"
 # declared faces by essence. Browse asks `urn:llm:{provider}:ask` for
 # `as=application/json`, which is declared (`text/plain` or `application/json`), and
 # nothing here matches on an llm error variant. 0.15.0 changes no behavior: it moves
-# ikigai-http to 0.2.0 and its own core floor to 0.1.86, below this crate's. ⚠ Also a
-# ceiling, `<0.16.0`. Re-read this pin when ikigai-llm's next minor ships.
-ikigai-llm = "0.15.0"
+# ikigai-http to 0.2.0 and its own core floor to 0.1.86, below this crate's.
+#
+# **"0.16.0" now** (the failure classes, ledger #1546), moved TOGETHER with `ikigai-http`
+# "0.3.0" below for the same `HttpTransport` reason. 0.16.0 types a backend's answers by
+# ikigai-http's one status table: an origin 401/403 is `Refused` (was `Denied`), a 429 or
+# a 503 with `Retry-After` is `RetryAfter` with the delay (was `Unavailable`), a 500 is
+# `Endpoint` (was `Unavailable`, so a Retry overlay in front of the module no longer
+# repeats it), and every action declares `.fails(...)`. The review and judge loops read
+# the first two (a refused credential or a rate limit is the same for every region, so
+# they stop at the first, as they stop at a `Denied`). ⚠ Also a ceiling, `<0.17.0`.
+# Re-read this pin when ikigai-llm's next minor ships.
+ikigai-llm = "0.16.0"
 # Only for `ikigai_http::HttpTransport`, the trait `ikigai_llm::space` takes: the
 # examples and the real-llm tests implement it to fake the network hop. So this pin
 # must name the SAME ikigai-http line ikigai-llm does, or the impls are for a different
@@ -678,7 +697,10 @@ ikigai-llm = "0.15.0"
 # endpoints (`urn:httpGet` -> `urn:http:get`, id `httpGet` -> `http-get`, and so on)
 # and made `space()` return an `Alias`; neither touches this crate, which mounts no
 # http endpoint and names none. `HttpTransport`, `HttpRequest`, `HttpResponse` and
-# `Method` did not change. ⚠ Under 0.x caret rules this is a ceiling too (`<0.3.0`):
-# move it only with an ikigai-llm built on the next line.
-ikigai-http = "0.2.0"
+# `Method` did not change. "0.3.0" (ledger #1546) because ikigai-llm 0.16.0 requires
+# `^0.3.0`: it adds the public status table (`ikigai_http::status`) ikigai-llm now calls
+# and changes none of the four transport items this crate's fakes implement. ⚠ Under 0.x
+# caret rules this is a ceiling too (`<0.4.0`): move it only with an ikigai-llm built on
+# the next line.
+ikigai-http = "0.3.0"
 ureq = "2"
