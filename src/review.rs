@@ -2149,13 +2149,29 @@ impl Endpoint for ReviewEndpoint {
             // `reviewed_bytes`/`total_bytes` now carry. Discarding would also
             // re-spend all seven calls on the next ask.
             //
-            // ⚠ A DENIAL is the one error that short-circuits. It is a property
-            // of the caller's capability, identical for every region, so
-            // grinding through sixteen of them would turn one refusal into
-            // sixteen and bury the reason.
+            // ⚠ THREE errors short-circuit, each a property of something other
+            // than the region and so identical for every region, where grinding
+            // through sixteen of them would turn one refusal into sixteen and
+            // bury the reason: a DENIAL (the caller's capability); a REFUSAL
+            // (the backend refused the module's credential — ikigai-llm 0.16
+            // types an origin 401/403 as `Refused`, where 0.15 said `Denied`,
+            // ledger #1546); and a RATE LIMIT (`RetryAfter`: the backend asked
+            // for a wait, and every remaining region IS a repeat against it).
+            // Each is returned WITH ITS TYPE, so the delay a `RetryAfter`
+            // carries reaches the caller (an HTTP edge answers 429 with
+            // `Retry-After`) instead of being spent on fifteen more refusals.
+            // What the pass has already derived this time is given up, exactly
+            // as it is for a denial: the alternative archives a pass whose
+            // uncovered regions were never asked, under a key that would serve
+            // it as the answer until the bytes change. Anything else (a 500,
+            // `Endpoint` since 0.16 and no longer retried by an overlay; no
+            // answer, `Unavailable` or `Timeout`) is the region's own, and the
+            // pass goes on to the next region.
             let answer = match inv.issue(request).await {
                 Ok(answer) => Answer::of(&answer),
-                Err(e @ Error::Denied(_)) => return Err(e),
+                Err(e @ (Error::Denied(_) | Error::Refused(_) | Error::RetryAfter { .. })) => {
+                    return Err(e)
+                }
                 Err(e) => {
                     collapsed.push(format!("region {}: {e}", index + 1));
                     first_error.get_or_insert(e);
@@ -3395,7 +3411,9 @@ mod tests {
     /// A fake review model whose answers are SCRIPTED, one per call in order —
     /// the shape every region test needs (a clean region beside a region with
     /// a finding beside a region whose answer collapses). A reply of `ERROR`
-    /// fails that call instead of answering it; `DENIED` refuses it.
+    /// fails that call instead of answering it; `DENIED` refuses it; `REFUSED`
+    /// and `RATE-LIMITED` fail it the way ikigai-llm 0.16 types a backend's
+    /// 401 and 429.
     fn scripted_llm_space(log: &Arc<Log>, replies: &[&str]) -> EndpointSpace {
         let log = Arc::clone(log);
         let replies: Vec<String> = replies.iter().map(|r| (*r).to_string()).collect();
@@ -3415,6 +3433,12 @@ mod tests {
                 match reply.as_str() {
                     "ERROR" => Err(Error::Endpoint("the backend dropped the call".to_string())),
                     "DENIED" => Err(Error::Denied("no net grant".to_string())),
+                    // ikigai-llm 0.16's typing of an origin 401/403 and 429.
+                    "REFUSED" => Err(Error::Refused("llm backend returned 401".to_string())),
+                    "RATE-LIMITED" => Err(Error::RetryAfter {
+                        delay: Some(std::time::Duration::from_secs(30)),
+                        detail: "rate-limited: llm backend returned 429".to_string(),
+                    }),
                     // `JSON:` + a body answers in ikigai-llm's envelope face.
                     _ => match reply.strip_prefix("JSON:") {
                         Some(body) => Ok(repr_utf8("application/json", body.to_string())),
@@ -4476,6 +4500,74 @@ mod tests {
 
         assert!(issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).is_err());
         assert_eq!(log.count(), 1, "one refusal, not one per region");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★ A backend that REFUSED the module's credential (ikigai-llm 0.16 types an
+    /// origin 401/403 as `Refused`, where 0.15 said `Denied`; ledger #1546) is the
+    /// same story as a denial: the answer is the same for every region, so the
+    /// pass stops at the first and returns the error WITH ITS TYPE, never as a
+    /// collapsed region beside fifteen more refusals.
+    #[test]
+    fn a_refused_credential_stops_at_the_first_region_and_keeps_its_type() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &["REFUSED", "REFUSED", "REFUSED"],
+        );
+
+        let err = issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).unwrap_err();
+        assert!(matches!(err, Error::Refused(_)), "{err:?}");
+        assert_eq!(err.class(), ikigai_core::FailureClass::Refused);
+        assert_eq!(log.count(), 1, "one refusal, not one per region");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ★ A RATE LIMIT stops the pass too: every remaining region is a repeat
+    /// against the backend that just asked for a wait. The `RetryAfter` leaves
+    /// with its delay, so the caller (an HTTP edge: 429 + `Retry-After`) owns the
+    /// wait, instead of the delay being spent on two more refusals and lost in a
+    /// pass whose coverage line says only "incomplete".
+    #[test]
+    fn a_rate_limit_stops_at_the_first_region_and_keeps_its_delay() {
+        let root = six_line_root();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &log,
+            REGION_BYTES,
+            16,
+            &[&finding_on("fn one__() {}"), "RATE-LIMITED", CLEAN],
+        );
+
+        let err = issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[], &cap()).unwrap_err();
+        assert!(matches!(err, Error::RetryAfter { .. }), "{err:?}");
+        assert_eq!(err.retry_after_millis(), Some(30_000));
+        assert_eq!(log.count(), 2, "the region after the limit was never asked");
+        // Nothing was archived: the next ask re-derives (all three regions, over
+        // the same store), rather than serving a pass whose last region was never
+        // asked until the bytes change.
+        let later = Arc::new(Log::default());
+        let k = scripted_kernel(
+            &root,
+            &store,
+            &later,
+            REGION_BYTES,
+            16,
+            &[&finding_on("fn one__() {}"), CLEAN, CLEAN],
+        );
+        let pass = json(&k, "urn:repo:demo:review:a.rs", &[]);
+        assert_eq!(pass["derived"], true, "{pass}");
+        assert_eq!(later.count(), 3, "every region was asked again");
+        assert_eq!(pass["reviewed_bytes"], SIX_LINES.len());
         std::fs::remove_dir_all(&root).ok();
     }
 

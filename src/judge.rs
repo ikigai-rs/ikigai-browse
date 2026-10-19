@@ -1859,9 +1859,14 @@ pub(crate) async fn judge_findings(
         };
         let (raw, parsed) = match ask(inv, config, &provider, &prepared).await {
             Ok(answer) => answer,
-            // A denial is the caller's authority, identical for every finding:
-            // stop asking, but the pass it rides on stands.
-            Err(Error::Denied(_)) => return Ok((judged, failed + 1)),
+            // A denial is the caller's authority, a refusal the backend's answer
+            // to the module's credential, a rate limit the backend's ask for a
+            // wait: each is identical for every finding, so stop asking (the
+            // review loop stops at the same three), but the pass it rides on
+            // stands and the unjudged findings wait for the next one.
+            Err(Error::Denied(_) | Error::Refused(_) | Error::RetryAfter { .. }) => {
+                return Ok((judged, failed + 1))
+            }
             Err(_) => {
                 failed += 1;
                 continue;
@@ -3314,6 +3319,90 @@ mod finding_tests {
             Arc::new(browse),
             Arc::new(llm),
         ])))
+    }
+
+    /// A review that mints TWO serious findings on [`V1`], so a judge loop that
+    /// stops at the first can be told from one that asked about both.
+    const REVIEW_TWO: &str = "QUOTE: let x = 1;\nSEVERITY: critical\nNOTE: This overflows.\n\
+                              QUOTE: pub fn alpha() {\nSEVERITY: major\nNOTE: Unused.\n";
+
+    /// A kernel whose model answers a review prompt with [`REVIEW_TWO`] and FAILS
+    /// every judge prompt with `failure()`: the loop's answer to a failure that is
+    /// the same for every finding.
+    fn kernel_whose_judge_fails(
+        root: &Path,
+        store: &Arc<Store>,
+        log: &Arc<Log>,
+        failure: fn() -> Error,
+    ) -> Kernel {
+        let log = Arc::clone(log);
+        let llm = EndpointSpace::new().bind(
+            Exact::new(PROVIDER),
+            FnEndpoint::new("fake-llm", move |inv: &Invocation<'_>| {
+                let system = inv.inline_str("system").unwrap_or("").to_string();
+                let prompt = inv.inline_str("prompt").unwrap_or("").to_string();
+                log.0.lock().unwrap().push((prompt, system.clone()));
+                if system.starts_with("You check one claim") {
+                    return Err(failure());
+                }
+                Ok(repr_utf8("text/plain", REVIEW_TWO.to_string()))
+            })
+            .with_description(
+                Description::new("fake-llm")
+                    .verb(Verb::Source)
+                    .requires(CAP_NET),
+            ),
+        );
+        let cfg = ExplainConfig::new(Arc::clone(store)).review_model_label("r1");
+        let browse = crate::space_with_explain(vec![("demo".to_string(), root.to_path_buf())], cfg);
+        Kernel::new(Arc::new(Fallback::new(vec![
+            Arc::new(browse),
+            Arc::new(llm),
+        ])))
+    }
+
+    /// ★ The judge stops at the first REFUSED credential or RATE LIMIT as it stops
+    /// at a denial (ikigai-llm 0.16 types an origin 401/403 as `Refused` and a 429
+    /// as `RetryAfter`, where 0.15 said `Denied` and `Unavailable`; ledger #1546):
+    /// each is the same for every finding, so one call, not one per finding. The
+    /// pass it rides on stands, with both findings minted and unjudged, and a
+    /// transport failure (`Endpoint`, a 500 since 0.16) still asks about each.
+    #[test]
+    fn a_refused_or_rate_limited_judge_stops_at_the_first_finding() {
+        let cases: [(fn() -> Error, usize); 3] = [
+            (|| Error::Refused("llm backend returned 401".into()), 1),
+            (
+                || Error::RetryAfter {
+                    delay: Some(std::time::Duration::from_secs(30)),
+                    detail: "rate-limited: llm backend returned 429".into(),
+                },
+                1,
+            ),
+            (|| Error::Endpoint("llm backend returned 500".into()), 2),
+        ];
+        for (failure, judge_calls) in cases {
+            let root = temp_dir();
+            git(&root, &["init", "-q"]);
+            commit(&root, V1, "one");
+            let store = Arc::new(Store::new().unwrap());
+            let log = Arc::new(Log::default());
+            let k = kernel_whose_judge_fails(&root, &store, &log, failure);
+
+            let pass = json(&k, "urn:repo:demo:review:a.rs");
+            let minted = pass["minted"].as_array().unwrap();
+            assert_eq!(minted.len(), 2, "{pass}");
+            assert_eq!(
+                log.judge_calls().len(),
+                judge_calls,
+                "{:?}",
+                failure().to_string()
+            );
+            for iri in minted {
+                let row = json(&k, iri.as_str().unwrap());
+                assert!(row["judge"].is_null(), "{row}");
+            }
+            std::fs::remove_dir_all(&root).ok();
+        }
     }
 
     fn cap() -> Capability {
