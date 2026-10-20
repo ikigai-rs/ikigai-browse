@@ -574,6 +574,13 @@ ikigai-core = "0.1.108"
 # floor moves because `"0.2.1"` was a 0.x CEILING (`<0.3.0`) that would hold this
 # crate, and every host linking it, on the old ids. Still a ceiling: `<0.4.0`.
 ikigai-a11y = { version = "0.3.0", features = ["themes"] }
+# The ecosystem's ONE escaping module (FND-H, ledger #1813): every value an HTML face
+# interpolates goes out through `ikigai_fn::html::html_text` (element text) or `attr` (a
+# quoted attribute), pinned by that crate's shared vectors, so browse's pages escape exactly
+# as every other door does. browse reached ikigai-fn through nothing before this: the pin is
+# direct. "0.5.0" is the true floor (`ikigai_fn::html` is new in 0.5.0), and under 0.x a
+# CEILING too: `<0.6.0`.
+ikigai-fn = "0.5.0"
 # Syntax highlighting for the file HTML face. The pure-Rust regex engine
 # (default-fancy) so CI never needs a C toolchain for oniguruma; yaml-load
 # compiles the embedded Turtle .sublime-syntax (assets/) at first use.

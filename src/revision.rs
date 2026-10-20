@@ -55,6 +55,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ikigai_core::Result;
+use ikigai_fn::html::html_text;
 use oxigraph::model::{NamedNode, Term};
 
 use crate::annotate::{
@@ -62,7 +63,6 @@ use crate::annotate::{
     DCTERMS_PROVENANCE, DCTERMS_TYPE,
 };
 use crate::archive::Archive;
-use crate::esc;
 
 /// How many declines inside [`BURST_WINDOW_MS`] make a burst — see the
 /// module doc for why three.
@@ -439,13 +439,13 @@ impl<'a> Unconfirmed<'a> {
     pub(crate) fn html(&self) -> String {
         let mut out = format!(
             "<div class=\"browse-findings-unconfirmed\"><p>{}</p>",
-            esc(&self.words())
+            html_text(&self.words())
         );
         for group in &self.groups {
             out.push_str(&format!(
                 "<h3 class=\"browse-findings-unconfirmed-group\">{}</h3>\
                  <div class=\"browse-annotations\">",
-                esc(&Self::group_words(group))
+                html_text(&Self::group_words(group))
             ));
             for (f, _) in &group.declines {
                 out.push_str(&annotate::annotation_card_html(f, None, true));

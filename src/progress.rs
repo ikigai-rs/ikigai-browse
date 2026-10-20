@@ -47,7 +47,7 @@
 //! .browse-busy-note`, in [`crate::layout`], which every door serving these faces
 //! already links.
 
-use crate::esc;
+use ikigai_fn::html::{attr, html_text};
 
 /// The id of a family's progress region on a page — one per page and family,
 /// because a page carries one header control per family.
@@ -77,7 +77,7 @@ pub(crate) fn control_attrs(kind: &str) -> String {
 /// flashes and is announced for an instant answer is noise).
 pub(crate) fn busy_region(id: &str, note: Option<&str>) -> String {
     let note = note
-        .map(|n| format!("<span class=\"browse-busy-note\">{}</span>", esc(n)))
+        .map(|n| format!("<span class=\"browse-busy-note\">{}</span>", html_text(n)))
         .unwrap_or_default();
     format!("<p class=\"browse-busy\" id=\"{id}\" role=\"status\" aria-live=\"polite\">{note}</p>")
 }
@@ -92,7 +92,7 @@ pub(crate) fn status_slot(kind: &str, status_iri: &str, generic_note: &str) -> S
         "<div class=\"browse-status\" hx-get=\"/k/source {iri} as=text/html\" \
          hx-trigger=\"load\" hx-swap=\"outerHTML\">\
          <p class=\"browse-cost\" id=\"{cost}\"></p>{busy}</div>",
-        iri = esc(status_iri),
+        iri = attr(status_iri),
         cost = cost_id(kind),
         busy = busy_region(&busy_id(kind), Some(generic_note)),
     )
@@ -105,7 +105,7 @@ pub(crate) fn status_html(kind: &str, cost: &str, note: Option<&str>) -> String 
     format!(
         "<div class=\"browse-status\"><p class=\"browse-cost\" id=\"{id}\">{cost}</p>{busy}</div>",
         id = cost_id(kind),
-        cost = esc(cost),
+        cost = html_text(cost),
         busy = busy_region(&busy_id(kind), note),
     )
 }

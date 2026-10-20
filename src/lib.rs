@@ -197,6 +197,7 @@ use ikigai_core::{
     ArgSpec, Bindings, Description, Endpoint, EndpointSpace, Error, FnEndpoint, Grammar,
     Invocation, Iri, ReprType, Representation, Result, UriTemplate, Verb,
 };
+use ikigai_fn::html::{attr, html_text};
 use ikigai_store::SharedWriter;
 use oxigraph::model::{GraphName, NamedNode};
 use oxigraph::store::Store;
@@ -1152,14 +1153,6 @@ pub(crate) fn proposal_severities(inv: &Invocation<'_>) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// Minimal HTML escaping for names and paths embedded in attributes and text.
-pub(crate) fn esc(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
 /// Percent-encode a root-relative path for embedding in a `urn:repo:…` IRI.
 /// `/` and the URN-safe punctuation stay literal; everything else (spaces,
 /// `%`, non-ASCII) is encoded so the emitted IRI is RFC 3987-valid and the
@@ -1169,6 +1162,14 @@ pub(crate) fn esc(s: &str) -> String {
 /// mirroring the encoder (ledger #252): a host that names a golden thread per
 /// file, or posts to `urn:repo:{repo}:review:{path}`, needs these exact bytes.
 ///
+/// ★ **This is the shared home of this rule; there is no other copy to call.**
+/// The rule is RFC 3986's `pchar` plus `/`, over UTF-8 bytes: a whole relative
+/// PATH, kept readable. Neither shared encoder implements it (checked for
+/// ledger #1813): `ikigai_fn::html::url_segment` encodes ONE segment, so `/`
+/// and the sub-delims become escapes, and `ikigai_core::encode_name` spells a
+/// NAME, so it keeps non-ASCII raw. Both differences are pinned below. A host
+/// that needs a browse path in an IRI calls this; it does not copy it.
+///
 /// ```
 /// use ikigai_browse::{iri_decode, iri_encode};
 ///
@@ -1176,6 +1177,12 @@ pub(crate) fn esc(s: &str) -> String {
 /// assert_eq!(iri_encode("docs/a b%.md"), "docs/a%20b%25.md");
 /// assert_eq!(iri_encode("ü.txt"), "%C3%BC.txt");
 /// assert_eq!(iri_decode(&iri_encode("docs/a b%ü.md")).unwrap(), "docs/a b%ü.md");
+///
+/// // Not `url_segment`: a path keeps its `/` and its sub-delims literal.
+/// assert_eq!(iri_encode("a/b+c.rs"), "a/b+c.rs");
+/// assert_eq!(ikigai_fn::html::url_segment("a/b+c.rs"), "a%2Fb%2Bc.rs");
+/// // Not `encode_name`: non-ASCII is encoded, so the IRI is plain ASCII.
+/// assert_eq!(ikigai_core::encode_name("ü.txt"), "ü.txt");
 /// ```
 pub fn iri_encode(path: &str) -> String {
     const SAFE: &[u8] = b"-._~/!$&'()*+,;=:@";
@@ -1493,12 +1500,12 @@ pub(crate) fn crumb_trail(items: &[(String, Option<String>)]) -> String {
                 "<button class=\"browse-crumb\" hx-get=\"/k/source {} as=text/html\" \
                  hx-target=\"#browse\" hx-swap=\"innerHTML\">{}</button>\
                  <span class=\"browse-sep\">/</span>",
-                esc(iri),
-                esc(label)
+                attr(iri),
+                html_text(label)
             )),
             None => out.push_str(&format!(
                 "<span class=\"browse-here\">{}</span>",
-                esc(label)
+                html_text(label)
             )),
         }
     }
@@ -1545,12 +1552,12 @@ fn explain_button(
     progress: &str,
 ) -> String {
     let title = title
-        .map(|t| format!(" title=\"{}\"", esc(t)))
+        .map(|t| format!(" title=\"{}\"", attr(t)))
         .unwrap_or_default();
     format!(
         "<button class=\"browse-explain-link\"{title} hx-get=\"/k/source {iri} \
          as=text/html\" hx-target=\"#browse\" hx-swap=\"innerHTML\"{progress}>{label}</button>",
-        iri = esc(&explain::explain_iri(repo, rel)),
+        iri = attr(&explain::explain_iri(repo, rel)),
     )
 }
 
@@ -1631,7 +1638,7 @@ fn tree_html(repo: &str, rel: &str, entries: &[Entry], explain: bool) -> String 
         actions.push_str(&format!(
             "<button class=\"browse-prs-link\" hx-get=\"/k/source {} as=text/html\" \
              hx-target=\"#browse\" hx-swap=\"innerHTML\">pull requests</button>",
-            esc(&pr::prs_iri(repo)),
+            attr(&pr::prs_iri(repo)),
         ));
     }
     if !actions.is_empty() {
@@ -1656,14 +1663,14 @@ fn tree_html(repo: &str, rel: &str, entries: &[Entry], explain: bool) -> String 
             format!("{rel}/{}", e.name)
         };
         let (iri, label) = match e.kind {
-            Kind::Dir => (tree_iri(repo, &child), format!("{}/", esc(&e.name))),
-            Kind::Link if e.to_dir => (tree_iri(repo, &child), format!("{}/", esc(&e.name))),
-            _ => (file_iri(repo, &child), esc(&e.name)),
+            Kind::Dir => (tree_iri(repo, &child), format!("{}/", html_text(&e.name))),
+            Kind::Link if e.to_dir => (tree_iri(repo, &child), format!("{}/", html_text(&e.name))),
+            _ => (file_iri(repo, &child), html_text(&e.name)),
         };
         // Escaped like every attribute value: `iri_encode` keeps `&` (it is
         // IRI-legal), and the browser entity-decodes the attribute before htmx
         // reads it, so a raw `a&lt;b.rs` would request `a<b.rs` (ledger #736).
-        let iri = esc(&iri);
+        let iri = attr(&iri);
         let size = e
             .size
             .map(|s| format!(" <span class=\"browse-size\">{}</span>", human_size(s)))
@@ -1720,7 +1727,7 @@ fn tree_html(repo: &str, rel: &str, entries: &[Entry], explain: bool) -> String 
          <div hx-get=\"/k/source {iri_with_args} chrome=embed as=text/html\" \
          hx-trigger=\"load\" hx-swap=\"innerHTML\">\
          <p class=\"browse-recent-prs-loading\">loading&#8230;</p></div></section>",
-        iri_with_args = esc(&iri_with_args),
+        iri_with_args = attr(&iri_with_args),
     ));
     out.push_str("</div>");
     out
@@ -2245,7 +2252,7 @@ fn file_html(
         Err(_) => out.push_str(&format!(
             "<p class=\"browse-binary\">binary file — {} ({})</p>",
             human_size(bytes.len() as u64),
-            esc(&media_type_for(Path::new(rel), bytes).media_type),
+            html_text(&media_type_for(Path::new(rel), bytes).media_type),
         )),
         Ok(text) => {
             // The S2 overlay, when the annotation store is mounted: which
@@ -2345,7 +2352,7 @@ fn highlight_html(
                         html
                     })
             })
-            .unwrap_or_else(|| esc(line));
+            .unwrap_or_else(|| html_text(line));
         let markers = annotated.get(&(n as u64));
         // A line is `annotated` when a published annotation anchors on it
         // and `proposed` when a pending finding does; both when both. The
@@ -2380,21 +2387,21 @@ fn highlight_html(
                         MarkerKind::Human => format!(
                             "<a class=\"browse-annotation-marker\" href=\"#annotation-{}\" \
                              title=\"{}\">●</a>",
-                            esc(&m.id),
-                            esc(&m.note)
+                            attr(&m.id),
+                            attr(&m.note)
                         ),
                         MarkerKind::Machine => format!(
                             "<a class=\"browse-annotation-marker browse-annotation-marker-machine\" \
                              href=\"#annotation-{}\" title=\"{}\">○</a>",
-                            esc(&m.id),
-                            esc(&m.note)
+                            attr(&m.id),
+                            attr(&m.note)
                         ),
                         MarkerKind::Proposal(severity) => format!(
                             "<a class=\"browse-proposal-marker browse-proposal-marker-{severity}\" \
                              href=\"#proposal-{}\" title=\"proposal ({severity}): {}\">◇</a>",
-                            esc(&m.id),
-                            esc(&m.note),
-                            severity = esc(severity),
+                            attr(&m.id),
+                            attr(&m.note),
+                            severity = attr(severity),
                         ),
                     }
                 })
@@ -2865,6 +2872,29 @@ mod tests {
         let crumbs = hx_gets(&pages[1].1);
         let wanted = format!("/k/source {} as=text/html", tree_iri("demo", dir));
         assert!(crumbs.contains(&wanted), "the directory crumb: {crumbs:?}");
+    }
+
+    /// Ledger #1813: browse escapes through `ikigai_fn::html`, so `'` is
+    /// escaped too (a value is safe inside a single-quoted attribute) and a C0
+    /// control is U+FFFD in text. `iri_encode` keeps `'` literal (a sub-delim),
+    /// so the row's `hx-get` carries it escaped and still decodes to the IRI.
+    #[test]
+    fn a_name_with_an_apostrophe_or_a_control_is_escaped_by_the_shared_rule() {
+        let entries = vec![Entry {
+            name: "it's\u{1}.rs".to_string(),
+            kind: Kind::File,
+            size: None,
+            to_dir: false,
+        }];
+        let html = tree_html("demo", "", &entries, false);
+        assert!(html.contains(">it&#39;s\u{FFFD}.rs</button>"), "{html}");
+        assert!(!html.contains("it's"), "{html}");
+        let iri = file_iri("demo", "it's\u{1}.rs");
+        assert_eq!(iri, "urn:repo:demo:file:it's%01.rs");
+        assert!(
+            html.contains("hx-get=\"/k/source urn:repo:demo:file:it&#39;s%01.rs as=text/html\""),
+            "{html}"
+        );
     }
 
     #[test]
