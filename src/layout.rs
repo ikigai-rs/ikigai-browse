@@ -285,6 +285,9 @@ color:var(--browse-flag)}\n\
 .browse-annotated-back{color:var(--browse-link)}\n\
 .browse-annotation-new{border-left-color:var(--browse-link);background:var(--browse-mark)}\n\
 .browse-annotation-new:focus{outline:2px solid var(--browse-link);outline-offset:2px}\n\
+/* One annotation opened on its own (ledger #1948): its card and the way to its target. */\n\
+.browse-annotation-view-open{font-size:.85em}\n\
+.browse-annotation-view-open a{color:var(--browse-link)}\n\
 \
 /* The pending review queue (ledger #444). A finding is a MACHINE CLAIM
    AWAITING A HUMAN, and it must never read as a published note: the dashed

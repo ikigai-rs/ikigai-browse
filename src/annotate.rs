@@ -2619,6 +2619,11 @@ impl AnnotationEndpoint {
             t if t.starts_with("text/turtle") => {
                 Ok(repr("text/turtle", annotation_turtle_document(&[ann])))
             }
+            // The face a link swaps into `#browse` (ledger #1948): HTML browse
+            // built, so the annotation's text arrives escaped.
+            t if t.starts_with("text/html") => {
+                Ok(repr_utf8("text/html", annotation_view_html(&ann, line)))
+            }
             _ => Ok(repr_utf8("text/plain", ann.body.clone())),
         }
     }
@@ -2807,12 +2812,13 @@ fn annotation_description() -> Description {
                         .optional()
                         .class(XSD_STRING)
                         .summary("the face to render")
-                        .one_of(["text/plain", "application/json", "text/turtle"])
+                        .one_of(["text/plain", "application/json", "text/turtle", "text/html"])
                         .default_value("text/plain"),
                 )
                 .output("text/plain;charset=utf-8")
                 .output("application/json")
-                .output("text/turtle"),
+                .output("text/turtle")
+                .output("text/html;charset=utf-8"),
         )
         .action(
             ActionSpec::new(Verb::Sink)
@@ -3416,6 +3422,29 @@ fn annotated_html(ann: &Annotation) -> String {
          hx-swap=\"innerHTML\">{back}</a></p></div>",
         view = attr(&view),
         iri = html_text(&ann.iri()),
+    )
+}
+
+/// The Source's `as=text/html` face (ledger #1948): the annotation's own
+/// card, escaped like every card, with a link to its target's view. It is what
+/// a link that opens ONE annotation swaps into `#browse` (the finding page's
+/// link to the annotation a publication minted), so the annotation's text (a
+/// model's words, a quoted source line) reaches the page only as text. ⚠ Never
+/// point such a link at the JSON face: `#browse` parses what it is given as
+/// HTML. Not the Sink's [`annotated_html`] either, whose target view marks the
+/// card "just added".
+fn annotation_view_html(ann: &Annotation, line: Option<u64>) -> String {
+    let open = match ann.target_ref() {
+        TargetRef::Pr(_) => "open the pull request",
+        TargetRef::File(_) => "open the file",
+    };
+    format!(
+        "<div class=\"browse-annotation-view\">{card}\
+         <p class=\"browse-annotation-view-open\"><a href=\"#\" \
+         hx-get=\"/k/source {target} as=text/html\" hx-target=\"#browse\" \
+         hx-swap=\"innerHTML\">{open}</a></p></div>",
+        card = annotation_card_html(ann, line, true),
+        target = attr(&ann.target_iri),
     )
 }
 
