@@ -242,6 +242,7 @@ use ikigai_core::{
     ArgRef, ArgSpec, Description, Endpoint, EndpointSpace, Error, Invocation, Representation,
     Request, Result, Verb,
 };
+use ikigai_fn::html::{attr, html_text};
 use oxigraph::model::{Literal, NamedNode, Quad, Term};
 
 use crate::annotate::{self, Included, PROV};
@@ -259,8 +260,8 @@ use crate::finding::{
 };
 use crate::hash::hash_iri;
 use crate::{
-    crumbs_html, esc, file_iri, granted, iri_encode, path_binding, repo_root, repr, repr_utf8,
-    resolve, ttl_str, ExplainConfig, Roots, CAP_WILDCARD,
+    crumbs_html, file_iri, granted, iri_encode, path_binding, repo_root, repr, repr_utf8, resolve,
+    ttl_str, ExplainConfig, Roots, CAP_WILDCARD,
 };
 
 // --- the prompt (versioned; edit ⇒ bump) -------------------------------------
@@ -1873,7 +1874,7 @@ pub(crate) fn review_button_html(repo: &str, rel: &str) -> String {
         "<button class=\"browse-review-link\" title=\"review this file — one model call, \
          findings minted as annotations\" hx-get=\"/k/source {iri} as=text/html\" \
          hx-target=\"#browse\" hx-swap=\"innerHTML\"{progress}>review</button>",
-        iri = esc(&review_iri(repo, rel)),
+        iri = attr(&review_iri(repo, rel)),
         progress = crate::progress::control_attrs("review"),
     )
 }
@@ -1893,7 +1894,7 @@ pub(crate) fn menu_html(repo: &str, rel: &str) -> String {
          <div class=\"browse-review-menu-body\" hx-get=\"/k/source {iri} as=text/html\" \
          hx-trigger=\"toggle once from:closest details\" hx-target=\"this\" \
          hx-swap=\"innerHTML\"><p>loading options…</p></div></details>",
-        iri = esc(&options_iri(repo, rel)),
+        iri = attr(&options_iri(repo, rel)),
     )
 }
 
@@ -2589,7 +2590,7 @@ fn review_html(
         "<nav class=\"browse-actions\"><button class=\"browse-view-link\" \
          hx-get=\"/k/source {} as=text/html\" hx-target=\"#browse\" \
          hx-swap=\"innerHTML\">view file</button></nav>",
-        esc(&entry.target_iri),
+        attr(&entry.target_iri),
     ));
     // ⚠ A clean pass renders an EMPTY annotation panel, and an empty panel is
     // the shape of every other way this page can fail. The statement goes
@@ -2598,22 +2599,22 @@ fn review_html(
     if entry.findings().is_empty() {
         out.push_str(&format!(
             "<p class=\"browse-review-clean\">This file was reviewed: {}.</p>",
-            esc(&entry.statement()),
+            html_text(&entry.statement()),
         ));
     }
     out.push_str(&included.panel_html(None));
     let hash_short: String = entry.hash.chars().take(19).collect(); // "sha256:" + 12 hex
     let mut provenance = format!(
         "reviewed by {} · {} · {}… · {} · {}",
-        esc(&entry.model),
-        esc(&entry.tag),
-        esc(&hash_short),
+        html_text(&entry.model),
+        html_text(&entry.tag),
+        html_text(&hash_short),
         if derived {
             "derived now"
         } else {
             "from the archive"
         },
-        esc(&entry.statement()),
+        html_text(&entry.statement()),
     );
     if entry.orphaned_items > 0 {
         provenance.push_str(&format!(
@@ -2966,7 +2967,7 @@ const MENU_BUSY: &str = "Reviewing with the model you chose… each region it ha
 /// second review it cannot produce, and its no-op would read as a bug.
 fn options_panel_html(repo: &str, rel: &str, options: &[ModelOption]) -> String {
     // Attribute-escaped once: every row interpolates it into an `hx-get`.
-    let review = esc(&review_iri(repo, rel));
+    let review = attr(&review_iri(repo, rel));
     let mut out = String::from("<div class=\"browse-review-menu-panel\">");
     out.push_str(
         "<p class=\"browse-review-menu-heading\">review with \
@@ -3006,7 +3007,7 @@ fn options_panel_html(repo: &str, rel: &str, options: &[ModelOption]) -> String 
         } else {
             format!(
                 " <span class=\"browse-size\">{}</span>",
-                esc(&notes.join(" · "))
+                html_text(&notes.join(" · "))
             )
         };
         let label = option.label();
@@ -3016,13 +3017,13 @@ fn options_panel_html(repo: &str, rel: &str, options: &[ModelOption]) -> String 
                  as=text/html provider={provider}\" hx-target=\"#browse\" \
                  hx-swap=\"innerHTML\" hx-indicator=\"#{MENU_BUSY_ID}\">{label}</button>\
                  {detail}</li>",
-                provider = esc(option.provider()),
-                label = esc(&label),
+                provider = attr(option.provider()),
+                label = html_text(&label),
             ));
         } else {
             out.push_str(&format!(
                 "<li><span class=\"browse-review-inert\">{}</span>{detail}</li>",
-                esc(&label),
+                html_text(&label),
             ));
         }
     }

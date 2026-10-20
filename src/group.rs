@@ -54,10 +54,11 @@
 use std::collections::BTreeMap;
 
 use ikigai_core::{Error, Result};
+use ikigai_fn::html::{attr, html_text};
 
 use crate::annotate::{self, Annotation, TargetRef};
+use crate::crumbs_html;
 use crate::finding::{plain_row, DECLINE_REASONS, NOT_A_GATE};
-use crate::{crumbs_html, esc};
 
 /// **The group kinds**, in the order a picker shows them — the `one_of` on the
 /// findings face's `group` argument, and the order of the `kinds` counts.
@@ -559,17 +560,17 @@ pub(crate) fn html(
              as=text/html group={option}\" hx-target=\"#browse\" hx-swap=\"innerHTML\">\
              {option} <span class=\"browse-findings-group-count\">{groups} / {findings}</span>\
              </button>",
-            iri = esc(&iri),
+            iri = attr(&iri),
         ));
     }
     out.push_str("</nav>");
     if groups.is_empty() {
         out.push_str(&format!(
             "<p class=\"browse-findings-empty\">No {} groups{}.</p>",
-            esc(kind),
+            html_text(kind),
             match rel.is_empty() {
                 true => String::new(),
-                false => format!(" for {}", esc(rel)),
+                false => format!(" for {}", html_text(rel)),
             }
         ));
     }
@@ -577,14 +578,14 @@ pub(crate) fn html(
         out.push_str(&format!(
             "<section class=\"browse-findings-group\" data-key=\"{key}\">\
              <h3 class=\"browse-findings-group-label\">{label}</h3>",
-            key = esc(&group.key),
-            label = esc(&group.label),
+            key = attr(&group.key),
+            label = html_text(&group.label),
         ));
         if let Some(word) = group.reason {
             out.push_str(&format!(
                 "<p class=\"browse-findings-group-reason\">suggested reason: \
                  <code>{}</code></p>",
-                esc(word)
+                html_text(word)
             ));
         }
         let show_path = rel.is_empty();

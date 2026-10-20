@@ -48,6 +48,7 @@ use ikigai_core::{
     ArgRef, ArgSpec, Bindings, Description, Endpoint, EndpointSpace, Error, Grammar, Invocation,
     Iri, Representation, Request, Result, UriTemplate, Verb,
 };
+use ikigai_fn::html::{attr, html_text};
 
 use crate::annotate::{self, Included};
 use crate::archive::Archive;
@@ -60,7 +61,7 @@ use crate::review::{
     Answer, Ending, PassEntry,
 };
 use crate::{
-    bind_family, esc, granted, highlight_html, repo_root, repr, repr_utf8, ExplainConfig, Roots,
+    bind_family, granted, highlight_html, repo_root, repr, repr_utf8, ExplainConfig, Roots,
     CAP_WILDCARD,
 };
 
@@ -622,17 +623,20 @@ fn pr_row_li(repo: &str, n: u64, title: &str, state: &str, branch: &str, updated
     let state_span = if state.is_empty() {
         String::new()
     } else {
-        format!(" <span class=\"browse-pr-state\">{}</span>", esc(state))
+        format!(
+            " <span class=\"browse-pr-state\">{}</span>",
+            html_text(state)
+        )
     };
     format!(
         "<li><button class=\"browse-pr\" hx-get=\"/k/source {iri} as=text/html\" \
          hx-target=\"#browse\" hx-swap=\"innerHTML\">#{n} {title}</button>{state_span} \
          <span class=\"browse-pr-branch\">{branch}</span> \
          <span class=\"browse-pr-updated\">{updated}</span></li>",
-        iri = esc(&pr_iri(repo, n)),
-        title = esc(title),
-        branch = esc(branch),
-        updated = esc(updated),
+        iri = attr(&pr_iri(repo, n)),
+        title = html_text(title),
+        branch = html_text(branch),
+        updated = html_text(updated),
     )
 }
 
@@ -899,7 +903,7 @@ impl Endpoint for PrsScopedEndpoint {
                 ]));
                 out.push_str(&format!(
                     "<p class=\"browse-prs-scope\">pull requests touching {}/&#8230;</p>",
-                    esc(&scope)
+                    html_text(&scope)
                 ));
                 out.push_str(&body);
                 out.push_str("</div>");
@@ -1263,13 +1267,13 @@ fn pr_html(
     let mut actions = format!(
         "<button class=\"browse-view-link\" hx-get=\"/k/source {} as=text/html\" \
          hx-target=\"#browse\" hx-swap=\"innerHTML\">pull requests</button>",
-        esc(&prs_iri(repo)),
+        attr(&prs_iri(repo)),
     );
     if explain_status.is_some() {
         actions.push_str(&format!(
             "<button class=\"browse-explain-link\" hx-get=\"/k/source {} as=text/html\" \
              hx-target=\"#browse\" hx-swap=\"innerHTML\"{}>explain</button>",
-            esc(&pr_explain_iri(repo, n)),
+            attr(&pr_explain_iri(repo, n)),
             crate::progress::control_attrs(PR_EXPLAIN_KIND),
         ));
     }
@@ -1280,9 +1284,9 @@ fn pr_html(
          <p class=\"browse-pr-line\">{}</p>\
          <p class=\"browse-pr-head\">head {}</p></div>",
         view.number,
-        esc(&view.title),
-        esc(&view.summary_line()),
-        esc(&view.head_oid),
+        html_text(&view.title),
+        html_text(&view.summary_line()),
+        html_text(&view.head_oid),
     ));
     // The diff through the same highlighted, line-anchored view files get —
     // the `.diff` name selects the diff syntax; markers land like a file's.
@@ -1422,19 +1426,19 @@ fn pr_explain_face(
                 "<nav class=\"browse-actions\"><button class=\"browse-view-link\" \
                  hx-get=\"/k/source {} as=text/html\" hx-target=\"#browse\" \
                  hx-swap=\"innerHTML\">view pull request</button></nav>",
-                esc(&entry.target_iri),
+                attr(&entry.target_iri),
             ));
             out.push_str("<div class=\"browse-explain\">");
             for paragraph in entry.text.split("\n\n").filter(|p| !p.trim().is_empty()) {
-                out.push_str(&format!("<p>{}</p>", esc(paragraph.trim())));
+                out.push_str(&format!("<p>{}</p>", html_text(paragraph.trim())));
             }
             out.push_str("</div>");
             let oid_short: String = entry.hash.chars().take(12).collect();
             out.push_str(&format!(
                 "<p class=\"browse-provenance\">explained by {} · {} · head {}… · {}</p></div>",
-                esc(&entry.model),
-                esc(&entry.tag),
-                esc(&oid_short),
+                html_text(&entry.model),
+                html_text(&entry.tag),
+                html_text(&oid_short),
                 if derived {
                     "derived now"
                 } else {
@@ -1725,15 +1729,15 @@ fn pr_review_face(
                 "<nav class=\"browse-actions\"><button class=\"browse-view-link\" \
                  hx-get=\"/k/source {} as=text/html\" hx-target=\"#browse\" \
                  hx-swap=\"innerHTML\">view pull request</button></nav>",
-                esc(&entry.target_iri),
+                attr(&entry.target_iri),
             ));
             out.push_str(&included.panel_html(None));
             let oid_short: String = entry.hash.chars().take(12).collect();
             let mut provenance = format!(
                 "reviewed by {} · {} · head {}… · {}",
-                esc(&entry.model),
-                esc(&entry.tag),
-                esc(&oid_short),
+                html_text(&entry.model),
+                html_text(&entry.tag),
+                html_text(&oid_short),
                 if derived {
                     "derived now"
                 } else {
@@ -1747,7 +1751,7 @@ fn pr_review_face(
                 ));
             }
             if let Some(note) = entry.coverage_note() {
-                provenance.push_str(&esc(&note));
+                provenance.push_str(&html_text(&note));
             }
             out.push_str(&format!(
                 "<p class=\"browse-provenance\">{provenance}</p></div>"

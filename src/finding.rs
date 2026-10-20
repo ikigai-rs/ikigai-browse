@@ -232,6 +232,7 @@ use ikigai_core::{
     ActionSpec, ArgSpec, Bindings, Description, Endpoint, EndpointSpace, Error, Grammar,
     Invocation, Iri, Representation, Result, UriTemplate, Verb,
 };
+use ikigai_fn::html::{attr, html_text};
 
 use crate::annotate::{
     self, Annotation, Decision, Family, Made, Outcome, CAP_ANNOTATE, DECLINE, MADE_WORDS, PUBLISH,
@@ -240,8 +241,7 @@ use crate::annotate::{
 use crate::archive::Archive;
 use crate::explain::iso8601;
 use crate::{
-    crumbs_html, esc, granted, path_binding, repo_root, repr, repr_utf8, Roots, CAP_WILDCARD,
-    XSD_STRING,
+    crumbs_html, granted, path_binding, repo_root, repr, repr_utf8, Roots, CAP_WILDCARD, XSD_STRING,
 };
 
 /// An `xsd:integer` input's class.
@@ -405,7 +405,7 @@ pub(crate) fn findings_link_html(repo: &str, rel: &str) -> String {
         "<button class=\"browse-findings-link\" title=\"review findings awaiting a human — \
          publishing is never automatic\" hx-get=\"/k/source {iri} as=text/html state=all\" \
          hx-target=\"#browse\" hx-swap=\"innerHTML\">findings</button>",
-        iri = esc(&findings_iri(repo, rel)),
+        iri = attr(&findings_iri(repo, rel)),
     )
 }
 
@@ -421,15 +421,17 @@ pub(crate) fn findings_link_html(repo: &str, rel: &str) -> String {
 pub(crate) fn severity_badge_html(proposed: Option<&str>, decision: Option<&Decision>) -> String {
     let proposed = proposed.unwrap_or("unrated");
     let mut out = format!(
-        "<span class=\"browse-finding-severity browse-finding-severity-{p}\">{p}</span>\
+        "<span class=\"browse-finding-severity browse-finding-severity-{p}\">{p_text}</span>\
          <span class=\"browse-finding-rater\">proposed by the model</span>",
-        p = esc(proposed),
+        p = attr(proposed),
+        p_text = html_text(proposed),
     );
     if let Some(decision) = decision {
         out.push_str(&format!(
-            "<span class=\"browse-finding-severity browse-finding-severity-{s}\">{s}</span>\
+            "<span class=\"browse-finding-severity browse-finding-severity-{s}\">{s_text}</span>\
              <span class=\"browse-finding-rater\">{outcome} by a human</span>",
-            s = esc(decision.severity.as_deref().unwrap_or("unrated")),
+            s = attr(decision.severity.as_deref().unwrap_or("unrated")),
+            s_text = html_text(decision.severity.as_deref().unwrap_or("unrated")),
             outcome = decision.outcome.label(),
         ));
     }
@@ -458,12 +460,12 @@ pub(crate) fn decision_html(
     if let Some(decision) = decision {
         let mut out = format!(
             "<p class=\"browse-finding-decision\">{} by a human",
-            esc(decision.outcome.label())
+            html_text(decision.outcome.label())
         );
         if let Some(reason) = &decision.reason {
             out.push_str(&format!(
                 " <span class=\"browse-finding-decline-reason\">({})</span>",
-                esc(reason)
+                html_text(reason)
             ));
         }
         if decision.reproduced {
@@ -477,30 +479,31 @@ pub(crate) fn decision_html(
                 " <span class=\"browse-finding-unconfirmed\">unconfirmed — no word, made in {}\
                  </span>",
                 match &decision.made {
-                    Some(Made::Batch(key)) => format!("batch {}", esc(key)),
+                    Some(Made::Batch(key)) => format!("batch {}", html_text(key)),
                     _ => format!(
                         "a burst at {}",
-                        esc(decision.burst.as_deref().unwrap_or("an unknown time"))
+                        html_text(decision.burst.as_deref().unwrap_or("an unknown time"))
                     ),
                 }
             ));
         }
         if let Some(at) = &decision.at {
-            out.push_str(&format!(" · {}", esc(at)));
+            out.push_str(&format!(" · {}", html_text(at)));
         }
         if let Some(minted) = &decision.minted {
             out.push_str(&format!(
                 " · <a class=\"browse-finding-minted\" href=\"#\" \
                  hx-get=\"/k/source {iri} as=application/json\" hx-target=\"#browse\" \
-                 hx-swap=\"innerHTML\">{iri}</a>",
-                iri = esc(minted)
+                 hx-swap=\"innerHTML\">{iri_text}</a>",
+                iri = attr(minted),
+                iri_text = html_text(minted),
             ));
         }
         out.push_str("</p>");
         if let Some(note) = &decision.note {
             out.push_str(&format!(
                 "<p class=\"browse-finding-reason\">{}</p>",
-                esc(note)
+                html_text(note)
             ));
         }
         if decision.outcome == Outcome::Declined {
@@ -520,7 +523,7 @@ pub(crate) fn decision_html(
             retraction
                 .at
                 .as_deref()
-                .map(|at| format!(" · {}", esc(at)))
+                .map(|at| format!(" · {}", html_text(at)))
                 .unwrap_or_default()
         ));
     }
@@ -547,7 +550,7 @@ pub(crate) fn decision_html(
          <button type=\"submit\" name=\"decision\" value=\"{PUBLISH}\">publish</button>\
          <button type=\"submit\" name=\"decision\" value=\"{DECLINE}\">decline</button>\
          </form>",
-        iri = esc(&finding_iri(id)),
+        iri = attr(&finding_iri(id)),
         reasons = reason_options(None),
         yes = REPRODUCED_WORDS[0],
     ));
@@ -569,8 +572,8 @@ fn reproduce_html(id: &str, decision: &Decision) -> String {
          <textarea name=\"content\" placeholder=\"how it was reproduced\"></textarea>\
          <button type=\"submit\" name=\"decision\" value=\"{PUBLISH}\">reproduced</button>\
          </form></details>",
-        iri = esc(&finding_iri(id)),
-        revises = esc(&decision.iri),
+        iri = attr(&finding_iri(id)),
+        revises = attr(&decision.iri),
         yes = REPRODUCED_WORDS[0],
     )
 }
@@ -588,7 +591,7 @@ fn reason_options(current: Option<&str>) -> String {
     for (word, meaning) in DECLINE_REASONS.iter().zip(DECLINE_REASON_MEANINGS) {
         reasons.push_str(&format!(
             "<option value=\"{word}\" title=\"{}\"{}>{word}</option>",
-            esc(meaning),
+            attr(meaning),
             if current == Some(*word) {
                 " selected"
             } else {
@@ -617,8 +620,8 @@ fn reason_options(current: Option<&str>) -> String {
 /// stamps no `made=`: how a decision was made is the host's to say at its
 /// door, and a form cannot know whether it is being fanned out.
 fn revise_html(id: &str, decision: &Decision) -> String {
-    let iri = esc(&finding_iri(id));
-    let revises = esc(&decision.iri);
+    let iri = attr(&finding_iri(id));
+    let revises = attr(&decision.iri);
     let mut options = String::new();
     for severity in SEVERITIES {
         let selected = match decision.severity.as_deref() == Some(severity) {
@@ -2058,17 +2061,17 @@ impl DeclinedSummary {
         };
         let mut out = format!(
             "<div class=\"browse-findings-declined\"><p>{}</p><ul>",
-            esc(&words)
+            html_text(&words)
         );
         for quote in &self.quotes {
             out.push_str(&format!(
                 "<li>{}× <code>{}</code>{}</li>",
                 quote.count,
-                esc(&quote.exact),
+                html_text(&quote.exact),
                 quote
                     .latest
                     .as_deref()
-                    .map(|at| format!(" · last {}", esc(at.get(..10).unwrap_or(at))))
+                    .map(|at| format!(" · last {}", html_text(at.get(..10).unwrap_or(at))))
                     .unwrap_or_default(),
             ));
         }
@@ -2204,14 +2207,14 @@ fn listing_html(
             "<button class=\"browse-findings-state{current}\" hx-get=\"/k/source {iri} \
              as=text/html state={option}\" hx-target=\"#browse\" \
              hx-swap=\"innerHTML\">{option}</button>",
-            iri = esc(&findings_iri(repo, rel)),
+            iri = attr(&findings_iri(repo, rel)),
         ));
     }
     out.push_str("</nav>");
     if let Some(line) = hidden {
         out.push_str(&format!(
             "<p class=\"browse-findings-superseded\">{}</p>",
-            esc(line)
+            html_text(line)
         ));
     }
     // The file grain, on a FILE's listing only: a repo-wide page would be
@@ -2226,10 +2229,10 @@ fn listing_html(
     if rows.is_empty() {
         out.push_str(&format!(
             "<p class=\"browse-findings-empty\">No {} findings{}.</p>",
-            esc(state),
+            html_text(state),
             match rel.is_empty() {
                 true => String::new(),
-                false => format!(" for {}", esc(rel)),
+                false => format!(" for {}", html_text(rel)),
             }
         ));
     }
@@ -2262,17 +2265,17 @@ fn page_html(
 ) -> String {
     let mut out = format!(
         "<nav class=\"browse-findings-page\"><p>{}</p>",
-        esc(&page.words(shown, total, next))
+        html_text(&page.words(shown, total, next))
     );
     if let Some(next) = next {
         out.push_str(&format!(
             "<button class=\"browse-findings-next\" hx-get=\"/k/source {iri} as=text/html \
              {carry} limit={limit} after={next}\" hx-target=\"#browse\" \
              hx-swap=\"innerHTML\">next page</button>",
-            iri = esc(&findings_iri(repo, rel)),
-            carry = esc(carry),
+            iri = attr(&findings_iri(repo, rel)),
+            carry = attr(carry),
             limit = page.limit,
-            next = esc(next),
+            next = attr(next),
         ));
     }
     out.push_str("</nav>");

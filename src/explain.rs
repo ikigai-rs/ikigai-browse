@@ -103,6 +103,7 @@ use ikigai_core::{
     ArgRef, ArgSpec, Description, Endpoint, EndpointSpace, Error, FailureClass, Invocation, Iri,
     Representation, Request, Result, Verb,
 };
+use ikigai_fn::html::{attr, html_text};
 use oxigraph::model::{GraphName, Literal, NamedNode, Quad, Term};
 use oxigraph::store::Store;
 
@@ -110,9 +111,8 @@ use crate::annotate::{self, Included, TargetFilter};
 use crate::archive::Archive;
 use crate::hash::hash_iri;
 use crate::{
-    crumbs_html, esc, file_iri, granted, human_size, include_annotations, iri_encode,
-    media_type_for, path_binding, repo_root, repr, repr_utf8, resolve, tree_iri, ttl_str, Roots,
-    CAP_WILDCARD,
+    crumbs_html, file_iri, granted, human_size, include_annotations, iri_encode, media_type_for,
+    path_binding, repo_root, repr, repr_utf8, resolve, tree_iri, ttl_str, Roots, CAP_WILDCARD,
 };
 
 /// The network capability the explain action declares (wildcard offering
@@ -1436,7 +1436,7 @@ fn explain_html(
         "<nav class=\"browse-actions\"><button class=\"browse-view-link\" \
          hx-get=\"/k/source {} as=text/html\" hx-target=\"#browse\" \
          hx-swap=\"innerHTML\">{}</button></nav>",
-        esc(&entry.target_iri),
+        attr(&entry.target_iri),
         if is_dir {
             "view directory"
         } else {
@@ -1449,15 +1449,15 @@ fn explain_html(
     out.push_str(&menu_html(repo, rel));
     out.push_str("<div class=\"browse-explain\">");
     for paragraph in entry.text.split("\n\n").filter(|p| !p.trim().is_empty()) {
-        out.push_str(&format!("<p>{}</p>", esc(paragraph.trim())));
+        out.push_str(&format!("<p>{}</p>", html_text(paragraph.trim())));
     }
     out.push_str("</div>");
     let hash_short: String = entry.hash.chars().take(19).collect(); // "sha256:" + 12 hex
     out.push_str(&format!(
         "<p class=\"browse-provenance\">explained by {} · {} · {}… · {}</p>",
-        esc(&entry.model),
-        esc(&entry.tag),
-        esc(&hash_short),
+        html_text(&entry.model),
+        html_text(&entry.tag),
+        html_text(&hash_short),
         if derived {
             "derived now"
         } else {
@@ -1844,7 +1844,7 @@ pub(crate) fn menu_html(repo: &str, rel: &str) -> String {
          <div class=\"browse-explain-menu-body\" hx-get=\"/k/source {iri} as=text/html\" \
          hx-trigger=\"toggle once from:closest details\" hx-target=\"this\" \
          hx-swap=\"innerHTML\"><p>loading options…</p></div></details>",
-        iri = esc(&versions_iri(repo, rel)),
+        iri = attr(&versions_iri(repo, rel)),
     )
 }
 
@@ -1878,7 +1878,7 @@ fn menu_panel_html(
     current_hash: Option<&str>,
 ) -> String {
     // Attribute-escaped once: every row interpolates it into an `hx-get`.
-    let explain = esc(&explain_iri(repo, rel));
+    let explain = attr(&explain_iri(repo, rel));
     let mut out = String::from("<div class=\"browse-explain-menu-panel\">");
 
     // --- already explained, at the CURRENT content ---------------------------
@@ -1909,7 +1909,7 @@ fn menu_panel_html(
         };
         out.push_str(&format!(
             "<p class=\"browse-explain-menu-empty\">{}</p>",
-            esc(&note)
+            html_text(&note)
         ));
     } else {
         out.push_str("<ul class=\"browse-entries browse-explain-archived\">");
@@ -1930,16 +1930,16 @@ fn menu_panel_html(
                      as=text/html version={tag}\" hx-target=\"#browse\" hx-swap=\"innerHTML\" \
                      title=\"reopen this archived explanation — no model call\">{label}</button> \
                      <span class=\"browse-size\">{detail}</span></li>",
-                    tag = esc(&entry.tag),
-                    label = esc(&label),
-                    detail = esc(&detail),
+                    tag = attr(&entry.tag),
+                    label = html_text(&label),
+                    detail = html_text(&detail),
                 ));
             } else {
                 out.push_str(&format!(
                     "<li><span class=\"browse-explain-inert\">{}</span> \
                      <span class=\"browse-size\">{} · not addressable from here</span></li>",
-                    esc(&label),
-                    esc(&detail),
+                    html_text(&label),
+                    html_text(&detail),
                 ));
             }
         }
@@ -1984,7 +1984,7 @@ fn menu_panel_html(
         } else {
             format!(
                 " <span class=\"browse-size\">{}</span>",
-                esc(&notes.join(" · "))
+                html_text(&notes.join(" · "))
             )
         };
         let label = option.label();
@@ -1994,13 +1994,13 @@ fn menu_panel_html(
                  as=text/html provider={provider}\" hx-target=\"#browse\" \
                  hx-swap=\"innerHTML\" hx-indicator=\"#{MENU_BUSY_ID}\">{label}</button>\
                  {detail}</li>",
-                provider = esc(option.provider()),
-                label = esc(&label),
+                provider = attr(option.provider()),
+                label = html_text(&label),
             ));
         } else {
             out.push_str(&format!(
                 "<li><span class=\"browse-explain-inert\">{}</span>{detail}</li>",
-                esc(&label),
+                html_text(&label),
             ));
         }
     }
@@ -4040,8 +4040,9 @@ mod tests {
             )
             .unwrap(),
         );
+        // `'` is escaped since browse adopted ikigai_fn::html (ledger #1813).
         assert!(
-            html.contains("d1 will write it from its entries' explanations"),
+            html.contains("d1 will write it from its entries&#39; explanations"),
             "{html}"
         );
         assert!(html.contains("Explaining with d1…"), "{html}");

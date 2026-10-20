@@ -116,14 +116,15 @@ use ikigai_core::{
     ActionSpec, ArgSpec, Bindings, Description, Endpoint, EndpointSpace, Error, Grammar,
     Invocation, Iri, Representation, Result, UriTemplate, Verb,
 };
+use ikigai_fn::html::{attr, html_text};
 use oxigraph::model::{Literal, NamedNode, Quad, Term};
 use sha2::{Digest, Sha256};
 
 use crate::archive::Archive;
 use crate::explain::{ik, iso8601, parse_iri, IK};
 use crate::{
-    crumbs_html, esc, file_iri, granted, iri_decode, path_binding, repo_root, repr, repr_utf8,
-    ttl_str, Roots, CAP_WILDCARD,
+    crumbs_html, file_iri, granted, iri_decode, path_binding, repo_root, repr, repr_utf8, ttl_str,
+    Roots, CAP_WILDCARD,
 };
 
 /// The capability Sink and Delete require: authority to create, update, and
@@ -3279,14 +3280,14 @@ fn card_html(ann: &Annotation, line: Option<u64>, show_path: bool, just_written:
         .map(|creator| {
             format!(
                 "<span class=\"browse-annotation-model\">review by {}</span> ",
-                esc(creator)
+                html_text(creator)
             )
         })
         .unwrap_or_default();
     let path = if show_path {
         format!(
             "<span class=\"browse-annotation-path\">{}</span> ",
-            esc(&ann.place())
+            html_text(&ann.place())
         )
     } else {
         String::new()
@@ -3323,9 +3324,10 @@ fn card_html(ann: &Annotation, line: Option<u64>, show_path: bool, just_written:
         flags.push_str(&format!(
             "<p class=\"browse-finding-prior\">{} · <a class=\"browse-finding-prior-link\" \
              href=\"#\" hx-get=\"/k/source {twin} as=text/html\" hx-target=\"#browse\" \
-             hx-swap=\"innerHTML\">{twin}</a></p>",
-            esc(&prior.words()),
-            twin = esc(&prior.finding),
+             hx-swap=\"innerHTML\">{twin_text}</a></p>",
+            html_text(&prior.words()),
+            twin = attr(&prior.finding),
+            twin_text = html_text(&prior.finding),
         ));
     }
     // The finding family's extra furniture: the model's proposed severity, the
@@ -3358,9 +3360,9 @@ fn card_html(ann: &Annotation, line: Option<u64>, show_path: bool, just_written:
          id=\"annotation-{id}\"{focus}>{path}{anchor}{model}{severity_html}\
          <blockquote class=\"browse-annotation-quote\">{exact}</blockquote>\
          <p class=\"browse-annotation-body\">{body}</p>{flags}{decision_html}</div>",
-        id = esc(&ann.id),
-        exact = esc(&ann.exact),
-        body = esc(&ann.body),
+        id = attr(&ann.id),
+        exact = html_text(&ann.exact),
+        body = html_text(&ann.body),
     )
 }
 
@@ -3390,7 +3392,7 @@ fn annotation_form_html(target_iri: &str) -> String {
          <input name=\"exact\" placeholder=\"quote to anchor\" required>\
          <textarea name=\"body\" placeholder=\"note\" required></textarea>\
          <button type=\"submit\">annotate</button></form>",
-        target = esc(target_iri)
+        target = attr(target_iri)
     )
 }
 
@@ -3412,8 +3414,8 @@ fn annotated_html(ann: &Annotation) -> String {
          <p class=\"browse-annotated-note\" role=\"status\">annotated: {iri} · \
          <a class=\"browse-annotated-back\" href=\"#\" hx-get=\"{view}\" hx-target=\"#browse\" \
          hx-swap=\"innerHTML\">{back}</a></p></div>",
-        view = esc(&view),
-        iri = esc(&ann.iri()),
+        view = attr(&view),
+        iri = html_text(&ann.iri()),
     )
 }
 
@@ -3623,8 +3625,8 @@ impl Proposals {
              {header} — pending review findings rated {words}, drawn here as proposals. \
              Nothing in this section is published; a human decides at each finding's \
              own page.</p>",
-            header = esc(&self.header()),
-            words = esc(&self.requested.join(", ")),
+            header = html_text(&self.header()),
+            words = html_text(&self.requested.join(", ")),
         );
         for (finding, line) in &self.rows {
             out.push_str(&proposal_card_html(finding, *line));
@@ -3691,7 +3693,7 @@ fn proposal_card_html(finding: &Annotation, line: Option<u64>) -> String {
         .map(|m| {
             format!(
                 "<span class=\"browse-proposal-model\">by {}</span> ",
-                esc(m)
+                html_text(m)
             )
         })
         .unwrap_or_default();
@@ -3709,16 +3711,18 @@ fn proposal_card_html(finding: &Annotation, line: Option<u64>) -> String {
         "<div class=\"browse-proposal browse-proposal-{severity}{orphan_class}\" \
          id=\"proposal-{id}\">{anchor}\
          <span class=\"browse-proposal-severity browse-proposal-severity-{severity}\">\
-         {severity}</span> <span class=\"browse-proposal-label\">proposal</span> {model}\
+         {severity_text}</span> <span class=\"browse-proposal-label\">proposal</span> {model}\
          <blockquote class=\"browse-proposal-quote\">{exact}</blockquote>\
          <p class=\"browse-proposal-body\">{body}</p>{flags}\
          <a class=\"browse-proposal-link\" href=\"#\" hx-get=\"/k/source {iri} as=text/html\" \
-         hx-target=\"#browse\" hx-swap=\"innerHTML\">{iri}</a></div>",
-        severity = esc(severity),
-        id = esc(&finding.id),
-        exact = esc(&finding.exact),
-        body = esc(&finding.body),
-        iri = esc(&iri),
+         hx-target=\"#browse\" hx-swap=\"innerHTML\">{iri_text}</a></div>",
+        severity = attr(severity),
+        severity_text = html_text(severity),
+        id = attr(&finding.id),
+        exact = html_text(&finding.exact),
+        body = html_text(&finding.body),
+        iri = attr(&iri),
+        iri_text = html_text(&iri),
     )
 }
 
