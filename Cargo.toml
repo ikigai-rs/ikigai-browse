@@ -482,7 +482,13 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # no Rust API, resource name, capability, contract or stored term moves; `esc` was
 # `pub(crate)`. `iri_encode` is unchanged and now documents that it is the shared home of its
 # rule.
-version = "0.19.1"
+# 0.19.2 (ledger #1948): `urn:iki:annotation:{id}` gains an `as=text/html` Source face (the
+# annotation's own card, escaped like every card, and a link to its target's view), and a
+# published finding's link to the annotation it minted reads that face instead of
+# `as=application/json`. Why a patch: the change is additive (one more `as` value and output);
+# no Rust API, resource name, capability or stored term moves, and every face it had answers
+# as before.
+version = "0.19.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
