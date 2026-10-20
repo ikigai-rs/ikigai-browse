@@ -490,10 +490,12 @@ pub(crate) fn decision_html(
         if let Some(at) = &decision.at {
             out.push_str(&format!(" · {}", html_text(at)));
         }
+        // The annotation's HTML face, which browse builds and escapes: what
+        // the link reads is swapped into `#browse` as HTML (ledger #1948).
         if let Some(minted) = &decision.minted {
             out.push_str(&format!(
                 " · <a class=\"browse-finding-minted\" href=\"#\" \
-                 hx-get=\"/k/source {iri} as=application/json\" hx-target=\"#browse\" \
+                 hx-get=\"/k/source {iri} as=text/html\" hx-target=\"#browse\" \
                  hx-swap=\"innerHTML\">{iri_text}</a>",
                 iri = attr(minted),
                 iri_text = html_text(minted),
@@ -4883,6 +4885,111 @@ mod tests {
         }
         assert_eq!(of(&k, &alpha)["decision"]["reproduced"], false);
         assert_eq!(of(&k, &beta)["decision"]["reproduced"], false);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Every `hx-get` value in `html`, entity-decoded the way a browser
+    /// decodes an attribute before htmx reads it, each with the tag it sits
+    /// in (so a caller can pick one out by its class or trigger).
+    fn hx_gets(html: &str) -> Vec<(String, String)> {
+        html.split('<')
+            .filter_map(|tag| {
+                let tag = &tag[..tag.find('>')?];
+                let at = tag.find("hx-get=\"")? + "hx-get=\"".len();
+                let value = tag[at..at + tag[at..].find('"')?]
+                    .replace("&lt;", "<")
+                    .replace("&gt;", ">")
+                    .replace("&quot;", "\"")
+                    .replace("&#39;", "'")
+                    .replace("&amp;", "&");
+                Some((tag.to_string(), value))
+            })
+            .collect()
+    }
+
+    /// Issue the read an `hx-get` of `/k/source <iri> k=v…` names, the way
+    /// the host's `/k/` adapter does.
+    fn follow(k: &Kernel, get: &str) -> ikigai_core::Representation {
+        let mut words = get.split_whitespace();
+        assert_eq!(words.next(), Some("/k/source"), "{get}");
+        let iri = words.next().unwrap_or_else(|| panic!("no IRI in {get}"));
+        let args: Vec<(&str, &str)> = words
+            .map(|w| w.split_once('=').unwrap_or_else(|| panic!("{w} in {get}")))
+            .collect();
+        issue(k, Verb::Source, iri, &args).unwrap()
+    }
+
+    /// Markup from the fixture's body or quote, parsed as ELEMENTS: raw, or
+    /// raw with JSON's backslash before each quote (an HTML parser still
+    /// makes a `span` of that).
+    fn live_markup(bytes: &str) -> bool {
+        bytes.contains("<b>")
+            || bytes.contains("<span class=\"planted")
+            || bytes.contains("<span class=\\\"planted")
+    }
+
+    /// ★ Ledger #1948: the link from a publication to the annotation it
+    /// minted swaps what it reads into `#browse` as HTML, so it must read a
+    /// face browse BUILT and escaped, never one that carries the annotation's
+    /// text raw. The fixture's body and quote both hold markup. The test
+    /// clicks the link the way the page does (the same `/k/source … as=…`
+    /// read the link names), then every link in what it swapped, and each
+    /// swap must carry that markup as TEXT. Red on 0.19.1, whose link read
+    /// `as=application/json`.
+    #[test]
+    fn the_minted_link_swaps_a_face_browse_escaped() {
+        const MARKED: &str = "fn alpha() { \"<b>\" }\n";
+        const REPLY: &str = "QUOTE: fn alpha() { \"<b>\" }\nSEVERITY: major\n\
+             NOTE: see <span class=\"planted\" hx-get=\"/k/source urn:x\">this</span>.\n";
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), MARKED).unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel_replying(&root, &store, REPLY);
+        let finding = finding_on(&k, &pass(&k), "fn alpha() { \"<b>\" }");
+        let minted = sink(&k, &finding, &[("decision", "publish")]).unwrap();
+        assert!(minted.starts_with("urn:iki:annotation:"), "{minted}");
+
+        // The page the link is on: the finding's own HTML face.
+        let page = body(&issue(&k, Verb::Source, &finding, &[("as", "text/html")]).unwrap());
+        let (_, link) = hx_gets(&page)
+            .into_iter()
+            .find(|(tag, _)| tag.contains("browse-finding-minted"))
+            .unwrap_or_else(|| panic!("no minted link on {page}"));
+
+        // The click: what lands in `#browse`.
+        let swapped = follow(&k, &link);
+        let text = body(&swapped);
+        assert!(
+            swapped.repr_type.media_type.starts_with("text/html"),
+            "the link swaps {} into an HTML target: {text}",
+            swapped.repr_type.media_type
+        );
+        assert!(!live_markup(&text), "markup went live: {text}");
+        assert!(
+            text.contains("&lt;span class=&quot;planted&quot;"),
+            "the card's body, escaped: {text}"
+        );
+        assert!(
+            text.contains("&lt;b&gt;"),
+            "the card's quote, escaped: {text}"
+        );
+
+        // And every link in the fragment (to the target's own view) swaps a
+        // face browse built too.
+        let onward = hx_gets(&text);
+        assert!(!onward.is_empty(), "a way on from {text}");
+        for (_, get) in onward {
+            let next = follow(&k, &get);
+            let next_text = body(&next);
+            assert!(
+                next.repr_type.media_type.starts_with("text/html"),
+                "{get}: {next_text}"
+            );
+            assert!(
+                !live_markup(&next_text),
+                "{get}: markup went live: {next_text}"
+            );
+        }
         std::fs::remove_dir_all(&root).ok();
     }
 

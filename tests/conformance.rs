@@ -985,7 +985,7 @@ fn declared_outputs_are_the_media_types_served() {
     let scratch = Scratch::new();
     let (kernel, _watch) = seeded(&scratch);
     let root = Capability::root();
-    let calls: [(&str, &[(&str, &str)]); 50] = [
+    let calls: [(&str, &[(&str, &str)]); 51] = [
         ("urn:repo:demo:tree", &[]),
         ("urn:repo:demo:tree", &[("as", "text/html")]),
         ("urn:repo:demo:tree", &[("as", "text/turtle")]),
@@ -1009,6 +1009,7 @@ fn declared_outputs_are_the_media_types_served() {
         ("urn:iki:annotation:seed", &[]),
         ("urn:iki:annotation:seed", &[("as", "application/json")]),
         ("urn:iki:annotation:seed", &[("as", "text/turtle")]),
+        ("urn:iki:annotation:seed", &[("as", "text/html")]),
         ("urn:repo:demo:explain-versions", &[]),
         (
             "urn:repo:demo:explain-versions",
