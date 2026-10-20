@@ -474,7 +474,15 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # floor moves to core 0.1.108; a host pinning `"0.18.x"` (`<0.19.0`; gonk pins "0.18.9") must
 # move its pin to see either, and should, since the llm 0.16 it mounts already answers in the
 # new types. No Rust API, resource name, capability or stored term moves.
-version = "0.19.0"
+# 0.19.1 (FND-H, ledger #1813): every HTML face escapes through `ikigai_fn::html` (ikigai-fn
+# 0.5.0, a new direct dependency) instead of browse's private `esc`. Output a consumer can
+# see, with its before: `'` is now `&#39;` (before, it passed through, so a value inside a
+# single-quoted attribute was not safe), and a C0 control other than tab, LF and CR becomes
+# U+FFFD in text (before, it passed through and broke an XHTML or XSLT reader). Why a patch:
+# no Rust API, resource name, capability, contract or stored term moves; `esc` was
+# `pub(crate)`. `iri_encode` is unchanged and now documents that it is the shared home of its
+# rule.
+version = "0.19.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
