@@ -1638,7 +1638,7 @@ fn tree_html(repo: &str, rel: &str, entries: &[Entry], explain: bool) -> String 
         actions.push_str(&format!(
             "<button class=\"browse-prs-link\" hx-get=\"/k/source {} as=text/html\" \
              hx-target=\"#browse\" hx-swap=\"innerHTML\">pull requests</button>",
-            attr(&pr::prs_iri(repo)),
+            attr(&pr::prs_listing_target(repo)),
         ));
     }
     if !actions.is_empty() {
