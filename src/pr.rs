@@ -1304,7 +1304,7 @@ fn pr_html(
     let mut actions = format!(
         "<button class=\"browse-view-link\" hx-get=\"/k/source {} as=text/html\" \
          hx-target=\"#browse\" hx-swap=\"innerHTML\">pull requests</button>",
-        attr(&prs_iri(repo)),
+        attr(&prs_listing_target(repo)),
     );
     if explain_status.is_some() {
         actions.push_str(&format!(
@@ -2583,6 +2583,13 @@ mod tests {
         assert!(
             html.contains("hx-get=\"/k/source urn:repo:demo:prs state=all as=text/html\""),
             "{html}"
+        );
+        // EVERY way back to the listing asks for every state (ledger #2188): the crumb and the
+        // action bar's "pull requests" button alike. The bare IRI is the open-only default, which
+        // on a repository with no open PRs reads as a list that lost all its rows.
+        assert!(
+            !html.contains("hx-get=\"/k/source urn:repo:demo:prs as=text/html\""),
+            "a link to the open-only listing: {html}"
         );
         // View passed pr= and dir=; both facades were asked.
         assert_eq!(
