@@ -160,6 +160,15 @@ pub(crate) fn prs_iri(repo: &str) -> String {
     format!("urn:repo:{repo}:prs")
 }
 
+/// The request every way to "the pull requests" makes (the `prs` crumb, the root tree's
+/// "pull requests" button): every state, most recently updated first. That is the listing the
+/// root tree's recent-PRs block shows the top ten of, so following the crumb back from a PR
+/// reached there lands on the same list. The bare IRI answers its declared default,
+/// `state=open`, which is one or two rows on a quiet repo and reads as a lost list.
+pub(crate) fn prs_listing_target(repo: &str) -> String {
+    format!("{} state=all", prs_iri(repo))
+}
+
 /// The path-scoped listing's IRI for a root-relative path.
 pub(crate) fn prs_scoped_iri(repo: &str, rel: &str) -> String {
     format!("urn:repo:{repo}:prs:{}", crate::iri_encode(rel))
@@ -187,7 +196,7 @@ fn pr_rel(n: u64) -> String {
 fn pr_crumbs(repo: &str, n: Option<u64>, layer: Option<&str>) -> String {
     let mut items = vec![
         (repo.to_string(), Some(crate::tree_iri(repo, ""))),
-        ("prs".to_string(), Some(prs_iri(repo))),
+        ("prs".to_string(), Some(prs_listing_target(repo))),
     ];
     if let Some(n) = n {
         items.push((format!("#{n}"), layer.is_some().then(|| pr_iri(repo, n))));
@@ -540,7 +549,8 @@ impl Endpoint for PrsEndpoint {
                 // (the root tree's lazy recent-PRs block) — no crumbs, no
                 // wrapper, the embedding page already carries both.
                 let embed = inv.inline_str("chrome").is_ok_and(|c| c == "embed");
-                Ok(repr_utf8("text/html", prs_html(repo, &text, embed)))
+                let state = inv.inline_str("state").unwrap_or("open");
+                Ok(repr_utf8("text/html", prs_html(repo, &text, state, embed)))
             }
             // The default face is the facade's text contract, untouched:
             // number⇥title⇥branch⇥updated[⇥state] per line, empty = no PRs.
@@ -649,7 +659,33 @@ fn prs_list_body(rows: String) -> String {
     }
 }
 
-fn prs_html(repo: &str, listing: &str, embed: bool) -> String {
+/// The listing page's scope line: which states it shows, in words, and a button to each other
+/// state. Without it the open-only default looks like a list that lost most of its rows.
+/// `state` is the invocation's, the facade's `open` when the caller named none.
+fn prs_state_line(repo: &str, state: &str) -> String {
+    const STATES: [(&str, &str); 4] = [
+        ("all", "all pull requests, most recently updated first"),
+        ("open", "open pull requests"),
+        ("merged", "merged pull requests"),
+        ("closed", "closed pull requests"),
+    ];
+    let shown = STATES
+        .iter()
+        .find(|(s, _)| *s == state)
+        .map_or("pull requests", |(_, words)| words);
+    let mut out = format!("<p class=\"browse-prs-scope\">{shown}");
+    for (other, _) in STATES.iter().filter(|(s, _)| *s != state) {
+        out.push_str(&format!(
+            " &#183; <button class=\"browse-crumb\" hx-get=\"/k/source {} as=text/html\" \
+             hx-target=\"#browse\" hx-swap=\"innerHTML\">{other}</button>",
+            attr(&format!("{} state={other}", prs_iri(repo))),
+        ));
+    }
+    out.push_str("</p>");
+    out
+}
+
+fn prs_html(repo: &str, listing: &str, state: &str, embed: bool) -> String {
     let mut rows = String::new();
     for line in listing.lines() {
         let mut cols = line.split('\t');
@@ -678,6 +714,7 @@ fn prs_html(repo: &str, listing: &str, embed: bool) -> String {
     }
     let mut out = String::from("<div class=\"browse\">");
     out.push_str(&pr_crumbs(repo, None, None));
+    out.push_str(&prs_state_line(repo, state));
     out.push_str(&body);
     out.push_str("</div>");
     out
@@ -898,7 +935,7 @@ impl Endpoint for PrsScopedEndpoint {
                 let mut out = String::from("<div class=\"browse\">");
                 out.push_str(&crate::crumb_trail(&[
                     (repo.to_string(), Some(crate::tree_iri(repo, ""))),
-                    ("prs".to_string(), Some(prs_iri(repo))),
+                    ("prs".to_string(), Some(prs_listing_target(repo))),
                     (scope.clone(), None),
                 ]));
                 out.push_str(&format!(
@@ -2187,6 +2224,16 @@ mod tests {
             html.contains("<span class=\"browse-pr-state\">MERGED</span>"),
             "{html}"
         );
+        // The page says which states it shows, and offers each other state.
+        assert!(
+            html.contains(
+                "<p class=\"browse-prs-scope\">all pull requests, most recently updated first \
+                 &#183; <button class=\"browse-crumb\" \
+                 hx-get=\"/k/source urn:repo:demo:prs state=open as=text/html\""
+            ),
+            "{html}"
+        );
+        assert!(!html.contains("\">all</button>"), "{html}");
         let forwarded = state.calls_to(FACADE_LIST).pop().unwrap();
         assert_eq!(forwarded.get("state"), Some(&"all".to_string()));
         assert_eq!(forwarded.get("limit"), Some(&"10".to_string()));
@@ -2211,13 +2258,23 @@ mod tests {
         assert_eq!(body(&source(&k, "urn:repo:demo:prs", &[]).unwrap()), "");
         let html = body(&source(&k, "urn:repo:demo:prs", &[("as", "text/html")]).unwrap());
         assert!(html.contains("no pull requests"), "{html}");
+        // The declared default is open, and the page says so: an open-only list of none is
+        // not mistaken for a repository with no pull requests.
+        assert!(
+            html.contains("<p class=\"browse-prs-scope\">open pull requests &#183; "),
+            "{html}"
+        );
+        assert!(
+            html.contains("hx-get=\"/k/source urn:repo:demo:prs state=all as=text/html\""),
+            "{html}"
+        );
 
         // The root tree's html face links the listing AND lazy-loads the
         // recent-PRs block (hx-trigger=load, embed chrome, the 0.1.4 args) —
         // the tree itself renders without ever consulting the facades.
         let html = body(&source(&k, "urn:repo:demo:tree", &[("as", "text/html")]).unwrap());
         assert!(
-            html.contains("hx-get=\"/k/source urn:repo:demo:prs as=text/html\""),
+            html.contains("hx-get=\"/k/source urn:repo:demo:prs state=all as=text/html\""),
             "{html}"
         );
         assert!(
@@ -2524,7 +2581,7 @@ mod tests {
             "{html}"
         );
         assert!(
-            html.contains("hx-get=\"/k/source urn:repo:demo:prs as=text/html\""),
+            html.contains("hx-get=\"/k/source urn:repo:demo:prs state=all as=text/html\""),
             "{html}"
         );
         // View passed pr= and dir=; both facades were asked.
