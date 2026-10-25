@@ -1301,11 +1301,9 @@ fn pr_html(
 ) -> String {
     let mut out = String::from("<div class=\"browse\">");
     out.push_str(&pr_crumbs(repo, Some(n), None));
-    let mut actions = format!(
-        "<button class=\"browse-view-link\" hx-get=\"/k/source {} as=text/html\" \
-         hx-target=\"#browse\" hx-swap=\"innerHTML\">pull requests</button>",
-        attr(&prs_listing_target(repo)),
-    );
+    // No "pull requests" button: the `prs` crumb above is the way back to the listing, and a
+    // second link to the same place beside it read as two different places (Brian, 2026-10-24).
+    let mut actions = String::new();
     if explain_status.is_some() {
         actions.push_str(&format!(
             "<button class=\"browse-explain-link\" hx-get=\"/k/source {} as=text/html\" \
@@ -1314,7 +1312,9 @@ fn pr_html(
             crate::progress::control_attrs(PR_EXPLAIN_KIND),
         ));
     }
-    out.push_str(&format!("<nav class=\"browse-actions\">{actions}</nav>"));
+    if !actions.is_empty() {
+        out.push_str(&format!("<nav class=\"browse-actions\">{actions}</nav>"));
+    }
     out.push_str(explain_status.unwrap_or_default());
     out.push_str(&format!(
         "<div class=\"browse-pr-meta\"><h3>#{} {}</h3>\
@@ -2584,13 +2584,21 @@ mod tests {
             html.contains("hx-get=\"/k/source urn:repo:demo:prs state=all as=text/html\""),
             "{html}"
         );
-        // EVERY way back to the listing asks for every state (ledger #2188): the crumb and the
-        // action bar's "pull requests" button alike. The bare IRI is the open-only default, which
-        // on a repository with no open PRs reads as a list that lost all its rows.
+        // ONE way back to the listing, the `prs` crumb, and it asks for every state (ledger
+        // #2188). The bare IRI is the open-only default, which on a repository with no open PRs
+        // reads as a list that lost all its rows; and a second link to the same place beside the
+        // crumb read as two different places.
         assert!(
             !html.contains("hx-get=\"/k/source urn:repo:demo:prs as=text/html\""),
             "a link to the open-only listing: {html}"
         );
+        assert_eq!(
+            html.matches("urn:repo:demo:prs state=all as=text/html")
+                .count(),
+            1,
+            "one link back to the listing: {html}"
+        );
+        assert!(!html.contains(">pull requests</button>"), "{html}");
         // View passed pr= and dir=; both facades were asked.
         assert_eq!(
             state.calls_to(FACADE_VIEW)[0].get("pr"),
