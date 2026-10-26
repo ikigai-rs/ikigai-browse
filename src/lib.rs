@@ -212,11 +212,13 @@ mod archive;
 /// the `git-dir-doctor` example can run them over any store.
 pub mod doctor;
 mod explain;
+mod file_read;
 mod finding;
 /// Finding GROUPS — `group=` on the findings face: the machine proposes a set
 /// of pending findings, a human decides it once. Proposals only; no Sink.
 mod group;
 mod hash;
+pub use file_read::MAX_FILE_BYTES;
 /// The JUDGE — a second call per serious review finding that confirms or
 /// refutes it with the context the reviewer lacked, attached to the finding.
 mod judge;
@@ -1822,8 +1824,7 @@ fn file_endpoint(roots: &Roots, archive: Option<&Arc<Archive>>, explain: bool) -
                 tree_iri(repo, &rel)
             )));
         }
-        let bytes = std::fs::read(&target)
-            .map_err(|e| Error::Endpoint(format!("browse: read `{rel}`: {e}")))?;
+        let bytes = file_read::read_file(&target)?;
         let include = include_annotations(inv)?;
         let proposals = proposal_severities(inv)?;
         // Both folds need a mounted store. Checked before the face is chosen
@@ -1922,6 +1923,7 @@ fn file_description(has_store: bool, explain: bool) -> Description {
          severities as proposal marks — labelled proposals, never annotations, nothing \
          published, each linking its urn:iki:finding:{id} — with a proposals panel on the \
          html face and a proposals section on the text face; the default draws nothing. \
+         Files over 16 MiB (16,777,216 bytes) fail with OverBudget, never truncating. \
          Live and uncacheable.",
     );
     if explain {

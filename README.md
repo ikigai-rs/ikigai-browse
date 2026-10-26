@@ -5,6 +5,12 @@ foundation of the repository-browsing family. A host mounts
 [`space`](src/lib.rs) over a set of named **roots** (`(name, directory)`
 pairs), and each root answers these resource families:
 
+File content and content hashing have a **16 MiB (16,777,216-byte) per-file input
+limit** (`MAX_FILE_BYTES`). Larger files return `OverBudget`; no truncated content
+or partial hash is served, on any face. Directory hashing refuses if any included
+file exceeds this limit; the limit is per file, not an aggregate tree budget.
+Hashing reads fixed-size chunks rather than holding a whole file in memory.
+
 | resource | what it is |
 |----------|------------|
 | `urn:repo:{repo}:tree` / `urn:repo:{repo}:tree:{path}` | a directory listing — `text/plain` (default; `name`⇥`kind`⇥`size` per line), `as=text/html` (htmx-navigable; with the explanation family mounted, an explain link for the directory and one per entry), `as=text/turtle` (the skolemized graph) |
