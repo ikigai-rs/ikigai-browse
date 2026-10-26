@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
-use ikigai_core::{ArgSpec, Description, Error, FnEndpoint, Invocation, Result, Verb};
+use ikigai_core::{ArgSpec, Description, FnEndpoint, Invocation, Result, Verb};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -52,9 +52,9 @@ pub(crate) fn hash_iri(repo: &str, rel: &str) -> String {
 
 /// Hash a file's bytes — `sha256:{hex}`.
 fn hash_file(path: &Path) -> Result<String> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| Error::Endpoint(format!("browse: read {}: {e}", path.display())))?;
-    Ok(format!("sha256:{:x}", Sha256::digest(&bytes)))
+    let mut hasher = Sha256::new();
+    crate::file_read::visit_file(path, |chunk| hasher.update(chunk))?;
+    Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
 /// Hash a directory: one row per kept entry — `name NUL kind NUL child-hash LF`
@@ -136,6 +136,8 @@ fn hash_description() -> Description {
              edit re-keys exactly the path to the root. The ignore policy (.git, target, \
              node_modules, …), symlinks, and non-UTF-8 names are excluded. text/plain \
              (default) is `sha256:{hex}`; as=application/json adds algorithm and target. \
+             Each file is limited to 16 MiB (16,777,216 bytes); larger files fail with \
+             OverBudget, including within directories, without returning a partial hash. \
              Live and uncacheable: this is the cheap probe the explanation archive keys on.",
         )
         .verb(Verb::Source)
