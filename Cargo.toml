@@ -488,7 +488,19 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # `as=application/json`. Why a patch: the change is additive (one more `as` value and output);
 # no Rust API, resource name, capability or stored term moves, and every face it had answers
 # as before.
-version = "0.19.5"
+# 0.20.0 (the core 0.2.0 sweep, wave 3, ledger #2346): browse on ikigai-core 0.2.0, the streams
+# release (ledger #2261), with every ikigai crate it links on the same core: `ikigai-a11y`
+# "0.4.0", `ikigai-fn` "0.7.0", `ikigai-store` "0.3.0", and in the test graph
+# `ikigai-conformance` "0.11.0", `ikigai-vocab` "0.2.0", `ikigai-llm` "0.17.0" and `ikigai-http`
+# "0.4.0". No source change in `src/` outside a test: the library builds unchanged on core
+# 0.2.0, and conformance 0.11's default DATATYPES and FAILURES checks pass as they are (every
+# narrower-ranged `ik:` count is already written typed). The tests' and examples' fake
+# `HttpTransport`s wrap their canned bytes with `.into()`, because ikigai-http 0.4's
+# `HttpResponse::body` is an `HttpBody` (a stream) rather than a `Vec<u8>`. ★ Why a minor:
+# core's types (`Endpoint`, `Kernel`, `Representation`) are in browse's public API, so a host on
+# core 0.1 cannot link 0.20.0, and a host pinning `"0.19.x"` (`<0.20.0`) moves its pin in its
+# own core 0.2.0 wave. No resource name, capability, face or stored term moves.
+version = "0.20.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -575,7 +587,12 @@ required-features = ["migrate"]
 # 0.1.108 since the failure classes (ledger #1546): the six actions that ask a model
 # declare the classes they can fail with (`Description::fails`, `FailureClass`), both
 # new in 0.1.108, so this is the true floor of `src/` for the first time since 0.1.80.
-ikigai-core = "0.1.108"
+#
+# **"0.2.0" now** (the core 0.2.0 sweep, ledger #2346): 0.2.0 is the streams release (ledger
+# #2261). The old `"0.1.108"` pin meant `<0.2.0` under 0.x rules, so it could never reach 0.2
+# on its own. Every floor named above is still met, and `src/` builds on it unchanged. Every
+# ikigai crate below moves with it, so the graph links ONE core. ⚠ A ceiling in turn: `<0.3.0`.
+ikigai-core = "0.2.0"
 # The accessibility config and the contrast-floor pass: `urn:repo:style`'s
 # themes and its contrast floor are read from the layered `a11y.toml` rather
 # than hard-coded, and each theme's own sub-floor colours are lifted to that
@@ -586,15 +603,21 @@ ikigai-core = "0.1.108"
 # (`a11yConfig` -> `a11y-config`, and likewise contrast and presentation) and kept
 # every IRI and every library item this crate calls, so nothing here changes; the
 # floor moves because `"0.2.1"` was a 0.x CEILING (`<0.3.0`) that would hold this
-# crate, and every host linking it, on the old ids. Still a ceiling: `<0.4.0`.
-ikigai-a11y = { version = "0.3.0", features = ["themes"] }
+# crate, and every host linking it, on the old ids.
+# "0.4.0" since the core 0.2.0 sweep (ledger #2346): a11y on ikigai-core 0.2.0, the streams
+# release (ledger #2261), and no other change, so the graph links one core. Still a ceiling:
+# `<0.5.0`.
+ikigai-a11y = { version = "0.4.0", features = ["themes"] }
 # The ecosystem's ONE escaping module (FND-H, ledger #1813): every value an HTML face
 # interpolates goes out through `ikigai_fn::html::html_text` (element text) or `attr` (a
 # quoted attribute), pinned by that crate's shared vectors, so browse's pages escape exactly
 # as every other door does. browse reached ikigai-fn through nothing before this: the pin is
-# direct. "0.5.0" is the true floor (`ikigai_fn::html` is new in 0.5.0), and under 0.x a
-# CEILING too: `<0.6.0`.
-ikigai-fn = "0.5.0"
+# direct. "0.5.0" was the true floor (`ikigai_fn::html` is new in 0.5.0).
+# "0.7.0" since the core 0.2.0 sweep (ledger #2346): 0.7.0 is ikigai-fn on ikigai-core 0.2.0
+# (ledger #2261), so the graph links one core. 0.6.0 between them added `each` and
+# `html::url_reserved`; `html_text`, `attr` and `url_segment`, the items this crate calls, are
+# unchanged. ⚠ Under 0.x a CEILING too: `<0.8.0`.
+ikigai-fn = "0.7.0"
 # Syntax highlighting for the file HTML face. The pure-Rust regex engine
 # (default-fancy) so CI never needs a C toolchain for oniguruma; yaml-load
 # compiles the embedded Turtle .sublime-syntax (assets/) at first use.
@@ -628,10 +651,13 @@ oxigraph = { version = "0.5", default-features = false }
 # the first (0.2.17), the two unpublished releases 0.2.18 carries. `Mount::annotations_through`
 # narrows the host's writer with an `over` on its handle, which below 0.2.18 would be a SECOND
 # writer thread beside the host's: the RocksDB lost update it exists to prevent. (`over` and
-# `write_declared` themselves arrived in 0.2.15.) ⚠ And a CEILING: `^0.2.18` is `<0.3.0`.
+# `write_declared` themselves arrived in 0.2.15.)
+# "0.3.0" since the core 0.2.0 sweep (ledger #2346): store on ikigai-core 0.2.0 (ledger #2261)
+# with no source change, so every floor above still holds and the graph links one core.
+# ⚠ And a CEILING: `^0.3.0` is `<0.4.0`.
 # default-features = false keeps RocksDB out (the crate's default is already empty; stated so a
 # future default cannot pull it in), as above.
-ikigai-store = { version = "0.2.18", default-features = false }
+ikigai-store = { version = "0.3.0", default-features = false }
 # async trait objects for the explain endpoint (it must await sub-requests —
 # FnEndpoint is sync-only), matching ikigai-core's own endpoint plumbing.
 async-trait = "0.1"
@@ -664,9 +690,16 @@ notify = "6.1"
 # classes they declare, under `Suite::check_failures()` (opt-in in 0.10, the default from
 # 0.11.0). The move also brings 0.9.0's checks, which `"0.8.0"` (`<0.9.0`) had ceilinged
 # this crate out of: `RECOMPUTE` (24 recomputations of each cached answer after a cut),
-# `REQUIRED` over input groups, and `VALIDATE` refusing a defaulted binding. ⚠ Still a
-# ceiling: `<0.11.0`. Re-read it as a range whenever a new conformance minor ships.
-ikigai-conformance = "0.10.0"
+# `REQUIRED` over input groups, and `VALIDATE` refusing a defaulted binding.
+#
+# **"0.11.0" now** (the core 0.2.0 sweep, ledger #2346): conformance on ikigai-core 0.2.0
+# (ledger #2261), and it turns on two checks by default: `DATATYPES` (a literal for an `ik:`
+# property must carry its `rdfs:range` datatype; the review face already writes its counts as
+# `^^xsd:nonNegativeInteger`, and `ik:byteSize`'s range is `xsd:integer`, which a bare Turtle
+# integer is) and `FAILURES`, which this crate had already opted into. Both pass with no
+# waiver. ⚠ Still a ceiling: `<0.12.0`. Re-read it as a range whenever a new conformance minor
+# ships.
+ikigai-conformance = "0.11.0"
 # A FLOOR DECLARATION, not a code dependency: no line in this crate calls it.
 # The suite's `VOCABULARY` check reads `ikigai_vocab::VOCABULARY` as its oracle,
 # and the suite's own pin is the floor for the SUITE's API, not for this module's
@@ -682,7 +715,10 @@ ikigai-conformance = "0.10.0"
 # "0.1.108" since the failure classes (ledger #1546): `ik:mayFail` and the seven
 # `ik:FailureClass` individuals the declared classes render as landed there, and
 # conformance 0.10.0 pins the same floor, so the two lines agree.
-ikigai-vocab = "0.1.108"
+# "0.2.0" since the core 0.2.0 sweep (ledger #2346): vocab on ikigai-core 0.2.0, the streams
+# release (ledger #2261). The old `"0.1.108"` meant `<0.2.0` under 0.x rules, and conformance
+# 0.11.0 pins `^0.2.0`, so the two lines agree again.
+ikigai-vocab = "0.2.0"
 futures = "0.3"
 # Validates the Turtle face in tests — the graph must actually parse.
 oxttl = "0.2"
@@ -727,9 +763,13 @@ oxttl = "0.2"
 # `Endpoint` (was `Unavailable`, so a Retry overlay in front of the module no longer
 # repeats it), and every action declares `.fails(...)`. The review and judge loops read
 # the first two (a refused credential or a rate limit is the same for every region, so
-# they stop at the first, as they stop at a `Denied`). ⚠ Also a ceiling, `<0.17.0`.
-# Re-read this pin when ikigai-llm's next minor ships.
-ikigai-llm = "0.16.0"
+# they stop at the first, as they stop at a `Denied`).
+#
+# **"0.17.0" now** (the core 0.2.0 sweep, ledger #2346), moved TOGETHER with `ikigai-http`
+# "0.4.0" below for the same `HttpTransport` reason: 0.17.0 is ikigai-llm on ikigai-core 0.2.0
+# (ledger #2261) and ikigai-http 0.4.0. ⚠ Also a ceiling, `<0.18.0`. Re-read this pin when
+# ikigai-llm's next minor ships.
+ikigai-llm = "0.17.0"
 # Only for `ikigai_http::HttpTransport`, the trait `ikigai_llm::space` takes: the
 # examples and the real-llm tests implement it to fake the network hop. So this pin
 # must name the SAME ikigai-http line ikigai-llm does, or the impls are for a different
@@ -740,8 +780,11 @@ ikigai-llm = "0.16.0"
 # http endpoint and names none. `HttpTransport`, `HttpRequest`, `HttpResponse` and
 # `Method` did not change. "0.3.0" (ledger #1546) because ikigai-llm 0.16.0 requires
 # `^0.3.0`: it adds the public status table (`ikigai_http::status`) ikigai-llm now calls
-# and changes none of the four transport items this crate's fakes implement. ⚠ Under 0.x
-# caret rules this is a ceiling too (`<0.4.0`): move it only with an ikigai-llm built on
-# the next line.
-ikigai-http = "0.3.0"
+# and changes none of the four transport items this crate's fakes implement.
+# "0.4.0" (the core 0.2.0 sweep, ledger #2346) because ikigai-llm 0.17.0 requires `^0.4.0`:
+# http on ikigai-core 0.2.0 (ledger #2261). One of the four items moved: `HttpResponse::body`
+# is now an `HttpBody` (a bounded stream) rather than a `Vec<u8>`, so each fake wraps its canned
+# bytes with `.into()` (`From<Vec<u8>>`). ⚠ Under 0.x caret rules this is a ceiling too
+# (`<0.5.0`): move it only with an ikigai-llm built on the next line.
+ikigai-http = "0.4.0"
 ureq = "2"

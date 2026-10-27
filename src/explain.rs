@@ -2946,7 +2946,7 @@ mod tests {
             Ok(ikigai_http::HttpResponse {
                 status: 200,
                 headers: vec![],
-                body: br#"{"model":"m","choices":[{"message":{"role":"assistant","content":"An explanation."},"finish_reason":"stop"}]}"#.to_vec(),
+                body: br#"{"model":"m","choices":[{"message":{"role":"assistant","content":"An explanation."},"finish_reason":"stop"}]}"#.to_vec().into(),
             })
         }
     }

@@ -84,7 +84,7 @@ impl ikigai_http::HttpTransport for CountingTransport {
         Ok(ikigai_http::HttpResponse {
             status,
             headers,
-            body,
+            body: body.into(),
         })
     }
 }
