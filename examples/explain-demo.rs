@@ -61,7 +61,7 @@ impl ikigai_http::HttpTransport for UreqTransport {
         Ok(ikigai_http::HttpResponse {
             status,
             headers,
-            body,
+            body: body.into(),
         })
     }
 }

@@ -75,8 +75,9 @@
 //!   day one of them is marked cacheable without a thread a host cuts, this test
 //!   goes red. Nothing is declared `pure`: no endpoint here is a function of its
 //!   inputs alone.
-//! * `check_failures()` — `FAILURES` (conformance 0.10.0, ledger #1546), opt-in until
-//!   0.11 makes it the default. The six actions that ask a model declare the classes
+//! * `check_failures()` — `FAILURES` (conformance 0.10.0, ledger #1546), the default
+//!   since 0.11.0, where this call only records the request (DECLARATIONS reports it if
+//!   FAILURES is ever subtracted). The six actions that ask a model declare the classes
 //!   they can fail with ([`MODEL_FAILURES`]: the classes ikigai-llm 0.16's
 //!   `urn:llm:{provider}:ask` declares, passed through with their types kept), and
 //!   every failure the walk observes from them must be one the declaration admits.
@@ -539,7 +540,7 @@ fn suite(findings: &[String]) -> Suite {
         // CACHEABLE and SKOLEM-RDF for a release cycle over a single legitimately
         // red VOCABULARY. `browse-file` keeps every other check.
         .opt_out_check("browse-file", Check::Outputs, RAW_FACE_IS_A_PASS_THROUGH)
-        // ★ FAILURES (conformance 0.10.0, opt-in until 0.11; ledger #1546): the six
+        // ★ FAILURES (conformance 0.10.0, the default since 0.11; ledger #1546): the six
         // actions that ask a model declare the classes they can fail with
         // (`explain::MODEL_FAILURES`), and every failure the walk observes from them
         // must be one the declaration admits. `conforms` reads the evidence back:
