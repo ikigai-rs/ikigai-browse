@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use futures::executor::block_on;
 use futures::StreamExt;
 use ikigai_core::{
-    ArgRef, Body, BodyIssue, ByteStream, Capability, ContentId, Endpoint, Error, Exact, FnEndpoint,
-    Invocation, Iri, Kernel, Replay, ReprType, Representation, Request, Result, Verb,
+    ArgRef, ArgSpec, Body, BodyIssue, ByteStream, Capability, ContentId, Description, Endpoint,
+    Error, Exact, Invocation, Iri, Kernel, Replay, ReprType, Representation, Request, Result, Verb,
 };
 
 /// A large input: 8 MiB that is no repeat of one chunk, so a slice from the
@@ -214,26 +214,44 @@ fn past_the_byte_budget_the_collected_answer_is_over_budget() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// `urn:length`: a cacheable stage that reads `content` AS A BODY (declared
+/// `reads_body`), so the kernel keys the request by the attached body's id: its
+/// validator when it states one, else a nonce that never repeats.
+struct Length(Arc<AtomicUsize>);
+
+#[async_trait]
+impl Endpoint for Length {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        let len = inv
+            .content_body("content")
+            .await?
+            .collect(1024)
+            .await?
+            .len();
+        Ok(
+            Representation::new(ReprType::new("text/plain"), len.to_string().into_bytes())
+                .cacheable(),
+        )
+    }
+    fn describe(&self) -> Description {
+        Description::new("length")
+            .verb(Verb::Source)
+            .input(ArgSpec::new("content").reads_body())
+    }
+}
+
 /// Handed to a cacheable stage, the body is keyed by its validator: an
-/// unchanged file is a cache hit, a changed one is not.
+/// unchanged file is a cache hit, a changed one is not. (A body with no
+/// validator, a buffer, is attached under a nonce and is never a hit.)
 #[test]
 fn an_unchanged_validator_is_a_cache_hit() {
     let root = root("cache");
     std::fs::write(root.join("doc.txt"), b"version one\n").unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
-    let counted = Arc::clone(&calls);
     let kernel = Kernel::new(Arc::new(
-        ikigai_browse::space(vec![("demo".into(), root.clone())]).bind(
-            Exact::new("urn:length"),
-            FnEndpoint::new("length", move |inv: &Invocation<'_>| {
-                counted.fetch_add(1, Ordering::SeqCst);
-                let len = inv.inline_arg("content")?.len();
-                Ok(
-                    Representation::new(ReprType::new("text/plain"), len.to_string().into_bytes())
-                        .cacheable(),
-                )
-            }),
-        ),
+        ikigai_browse::space(vec![("demo".into(), root.clone())])
+            .bind(Exact::new("urn:length"), Length(Arc::clone(&calls))),
     ));
     let length = |kernel: &Kernel| {
         let body = block_on(kernel.issue_body(read("doc.txt"), &Capability::root())).unwrap();
