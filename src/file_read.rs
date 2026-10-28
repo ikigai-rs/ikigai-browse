@@ -9,7 +9,7 @@ use ikigai_core::{Error, Result};
 /// Directory hashing applies this limit to each file, not the aggregate tree.
 pub const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
-fn over_budget(path: &Path) -> Error {
+pub(crate) fn over_budget(path: &Path) -> Error {
     Error::OverBudget {
         detail: format!(
             "browse: file {} exceeds the {MAX_FILE_BYTES}-byte per-file limit",

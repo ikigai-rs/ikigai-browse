@@ -80,7 +80,8 @@
 //!   FAILURES is ever subtracted). The six actions that ask a model declare the classes
 //!   they can fail with ([`MODEL_FAILURES`]: the classes ikigai-llm 0.16's
 //!   `urn:llm:{provider}:ask` declares, passed through with their types kept), and
-//!   every failure the walk observes from them must be one the declaration admits.
+//!   every failure the walk observes from them must be one the declaration admits; the
+//!   file action declares [`FILE_FAILURES`] (ledger #2281).
 //!   [`conforms`] reads `failures_seen()` back so that a declaration the walk never
 //!   reached cannot read as clean.
 //!
@@ -570,6 +571,12 @@ const MODEL_FAILURES: [FailureClass; 5] = [
     FailureClass::Unknown,
 ];
 
+/// What the file action declares (ledger #2281, when its raw face became a file-backed
+/// body): over-budget past the per-file bound or the run's byte budget, unknown for an I/O
+/// error, beside the implied `permanent` (a file changed while read is a `Conflict`) and
+/// `denied`.
+const FILE_FAILURES: [FailureClass; 2] = [FailureClass::OverBudget, FailureClass::Unknown];
+
 /// The labels the five space constructors are declared under, in declaration order.
 const SPACES: [&str; 5] = [
     "Mount::new(roots).explain(config).space_watched()",
@@ -676,9 +683,10 @@ fn conforms() {
         "the per-check waiver list changed: {report}"
     );
     // ★ FAILURES compared something: each model-asking action reached the walk
-    // declaring exactly `MODEL_FAILURES`, was resolved at least once, and nothing else
-    // in the catalog states classes yet (a seventh declarer gets a line here). The
-    // check's own judgment (every observed failure admitted) is in `is_clean` above.
+    // declaring exactly `MODEL_FAILURES`, was resolved at least once, the file action
+    // declares `FILE_FAILURES`, and nothing else in the catalog states classes yet (an
+    // eighth declarer gets a line here). The check's own judgment (every observed
+    // failure admitted) is in `is_clean` above.
     let declared: BTreeSet<(String, Option<Vec<FailureClass>>)> = report
         .failures_seen()
         .iter()
@@ -690,9 +698,13 @@ fn conforms() {
         .iter()
         .filter(|seen| seen.verb == Verb::Source)
         .map(|seen| {
-            let declared = ASKS_A_MODEL
-                .contains(&seen.endpoint.as_str())
-                .then(|| MODEL_FAILURES.to_vec());
+            let declared = if seen.endpoint == "browse-file" {
+                Some(FILE_FAILURES.to_vec())
+            } else {
+                ASKS_A_MODEL
+                    .contains(&seen.endpoint.as_str())
+                    .then(|| MODEL_FAILURES.to_vec())
+            };
             (seen.endpoint.clone(), declared)
         })
         .collect();

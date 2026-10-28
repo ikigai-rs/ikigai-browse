@@ -194,8 +194,8 @@ use std::process::Command;
 use std::sync::{Arc, OnceLock};
 
 use ikigai_core::{
-    ArgSpec, Bindings, Description, Endpoint, EndpointSpace, Error, FnEndpoint, Grammar,
-    Invocation, Iri, ReprType, Representation, Result, UriTemplate, Verb,
+    ArgSpec, Bindings, Body, Description, Endpoint, EndpointSpace, Error, FailureClass, FnEndpoint,
+    Grammar, Invocation, Iri, ReprType, Representation, Result, UriTemplate, Verb,
 };
 use ikigai_fn::html::{attr, html_text};
 use ikigai_store::SharedWriter;
@@ -212,6 +212,7 @@ mod archive;
 /// the `git-dir-doctor` example can run them over any store.
 pub mod doctor;
 mod explain;
+mod file_body;
 mod file_read;
 mod finding;
 /// Finding GROUPS — `group=` on the findings face: the machine proposes a set
@@ -1806,12 +1807,35 @@ fn tree_turtle(repo: &str, rel: &str, entries: &[Entry]) -> String {
 
 // --- file endpoint ----------------------------------------------------------
 
-fn file_endpoint(roots: &Roots, archive: Option<&Arc<Archive>>, explain: bool) -> FnEndpoint {
-    let held = Arc::clone(roots);
-    let archive = archive.map(Arc::clone);
+fn file_endpoint(roots: &Roots, archive: Option<&Arc<Archive>>, explain: bool) -> FileEndpoint {
     let has_store = archive.is_some();
-    FnEndpoint::new("browse-file", move |inv: &Invocation<'_>| {
-        let (repo, root) = repo_root(inv, &held)?;
+    FileEndpoint {
+        roots: Arc::clone(roots),
+        archive: archive.map(Arc::clone),
+        explain,
+        description: file_description(has_store, explain),
+    }
+}
+
+/// `urn:repo:{repo}:file:{path}`. Two paths beside each other (ledger #2281):
+/// [`invoke`](Endpoint::invoke) reads the file into a buffer under
+/// [`MAX_FILE_BYTES`] and renders whichever face is asked, as it always has;
+/// [`invoke_body`](Endpoint::invoke_body), what the kernel calls, answers the
+/// RAW face as a seekable file-backed body with its length and validator
+/// ([`file_body`]), and every other face (html, annotations, proposals) by the
+/// bytes path, collected under the run's byte budget.
+struct FileEndpoint {
+    roots: Roots,
+    archive: Option<Arc<Archive>>,
+    explain: bool,
+    description: Description,
+}
+
+impl FileEndpoint {
+    /// The judged target: its repo, its root-relative path and its resolved
+    /// path, a file inside the root the caller is granted.
+    fn target<'a>(&'a self, inv: &'a Invocation<'_>) -> Result<(&'a str, String, PathBuf)> {
+        let (repo, root) = repo_root(inv, &self.roots)?;
         granted(inv, repo)?;
         let rel = path_binding(inv)?;
         if rel.is_empty() {
@@ -1824,6 +1848,23 @@ fn file_endpoint(roots: &Roots, archive: Option<&Arc<Archive>>, explain: bool) -
                 tree_iri(repo, &rel)
             )));
         }
+        Ok((repo, rel, target))
+    }
+
+    /// Whether the request asks for the raw face: no `as=text/html`, and no
+    /// annotations or proposals folded in. A malformed one is an error, which
+    /// the caller leaves to the bytes path to report.
+    fn is_raw(inv: &Invocation<'_>) -> Result<bool> {
+        let include = include_annotations(inv)?;
+        let proposals = proposal_severities(inv)?;
+        let html = inv.inline_str("as").unwrap_or("").starts_with("text/html");
+        Ok(!html && !include && proposals.is_empty())
+    }
+
+    fn invoke_bytes(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let archive = &self.archive;
+        let explain = self.explain;
+        let (repo, rel, target) = self.target(inv)?;
         let bytes = file_read::read_file(&target)?;
         let include = include_annotations(inv)?;
         let proposals = proposal_severities(inv)?;
@@ -1903,8 +1944,32 @@ fn file_endpoint(roots: &Roots, archive: Option<&Arc<Archive>>, explain: bool) -
             }
             _ => Ok(Representation::new(media_type_for(&target, &bytes), bytes)),
         }
-    })
-    .with_description(file_description(has_store, explain))
+    }
+}
+
+#[async_trait::async_trait]
+impl Endpoint for FileEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        self.invoke_bytes(inv)
+    }
+
+    async fn invoke_body(&self, inv: &Invocation<'_>) -> Result<Representation<Body>> {
+        // Anything but a well-formed raw request takes the bytes path, refusals
+        // included, so both paths refuse a request alike and in the same order.
+        if !matches!(Self::is_raw(inv), Ok(true)) {
+            return self.invoke_bytes(inv).map(Representation::into_body);
+        }
+        let (_, rel, target) = self.target(inv)?;
+        file_body::raw_face(&target, &rel, media_type)
+    }
+
+    fn name(&self) -> &str {
+        "browse-file"
+    }
+
+    fn describe(&self) -> Description {
+        self.description.clone()
+    }
 }
 
 /// `repo` is not an ArgSpec — see [`tree_description`]'s note.
@@ -1924,7 +1989,10 @@ fn file_description(has_store: bool, explain: bool) -> Description {
          published, each linking its urn:iki:finding:{id} — with a proposals panel on the \
          html face and a proposals section on the text face; the default draws nothing. \
          Files over 16 MiB (16,777,216 bytes) fail with OverBudget, never truncating. \
-         Live and uncacheable.",
+         The raw face is a file-backed body: seekable, its length known, and its validator \
+         the content id of the bytes, so a byte range reads only the range and a stage \
+         handed the body caches on the validator; a file changed while read fails with \
+         Conflict, never torn bytes. Live and uncacheable.",
     );
     if explain {
         summary.push_str(
@@ -1999,6 +2067,11 @@ fn file_description(has_store: bool, explain: bool) -> Description {
         .output("application/octet-stream")
         .output("text/html;charset=utf-8")
         .output("text/plain;charset=utf-8")
+        // OverBudget past MAX_FILE_BYTES or the run's byte budget; Unknown for an
+        // I/O error. Permanent (a bad argument, a missing path, a file changed
+        // while read as a body: Conflict) is implied, and Denied rides `requires`.
+        .fails(FailureClass::OverBudget)
+        .fails(FailureClass::Unknown)
 }
 
 /// The `focus` arg of the file and pull-request html faces (ledger #658): the
@@ -2020,6 +2093,16 @@ pub(crate) fn focus_input() -> ArgSpec {
 /// The extension→media-type map for the raw face; unknown extensions fall back
 /// to a UTF-8 sniff (`text/plain`) and finally `application/octet-stream`.
 pub(crate) fn media_type_for(path: &Path, bytes: &[u8]) -> ReprType {
+    media_type_with(path, || std::str::from_utf8(bytes).is_ok())
+}
+
+/// [`media_type_for`] with the UTF-8 verdict already known (the file body sniffs
+/// it while it hashes, so the bytes are never held whole).
+fn media_type(path: &Path, utf8: bool) -> ReprType {
+    media_type_with(path, || utf8)
+}
+
+fn media_type_with(path: &Path, utf8: impl FnOnce() -> bool) -> ReprType {
     let media = match path.extension().and_then(|e| e.to_str()) {
         Some("txt") => "text/plain",
         Some("md") => "text/markdown",
@@ -2045,7 +2128,7 @@ pub(crate) fn media_type_for(path: &Path, bytes: &[u8]) -> ReprType {
         Some("rs") => "text/x-rust",
         Some("py") => "text/x-python",
         Some("sh") | Some("fish") => "text/x-shellscript",
-        _ if std::str::from_utf8(bytes).is_ok() => "text/plain",
+        _ if utf8() => "text/plain",
         _ => "application/octet-stream",
     };
     if media.starts_with("text/") {
@@ -4181,16 +4264,102 @@ mod tests {
         std::fs::remove_dir_all(&b).ok();
     }
 
+    /// Ledger #2281: the body path (what the kernel calls) answers the raw face
+    /// as a file-backed body and every other face by the bytes path; collected,
+    /// each answer equals what the bytes path (`invoke`) alone answers, its type
+    /// and its refusals included.
+    #[test]
+    fn the_collected_body_equals_the_bytes_answer_on_every_face() {
+        struct BytesOnly(FileEndpoint);
+        #[async_trait::async_trait]
+        impl Endpoint for BytesOnly {
+            async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+                self.0.invoke(inv).await
+            }
+        }
+        let root = demo_root();
+        std::fs::write(root.join("NOTES"), "no extension, but UTF-8 — ✓\n").unwrap();
+        std::fs::write(root.join("blob"), [0x00, 0xC3, 0x28, 0xFF]).unwrap();
+        std::fs::write(root.join("empty.txt"), "").unwrap();
+        let roots: Roots = Arc::new(BTreeMap::from([("demo".to_string(), root.clone())]));
+        let store = Arc::new(oxigraph::store::Store::new().unwrap());
+        let archive = Arc::new(Archive::new(store, GraphName::DefaultGraph));
+        let mount = |endpoint: Arc<dyn Endpoint>| {
+            Kernel::new(Arc::new(bind_family(
+                EndpointSpace::new(),
+                &roots,
+                endpoint,
+                None,
+                Some("file:{path}"),
+            )))
+        };
+        let body = mount(Arc::new(file_endpoint(&roots, Some(&archive), false)));
+        let bytes = mount(Arc::new(BytesOnly(file_endpoint(
+            &roots,
+            Some(&archive),
+            false,
+        ))));
+        let faces: [&[(&str, &str)]; 5] = [
+            &[],
+            &[("as", "text/html")],
+            &[("annotations", "include")],
+            &[("proposals", "minor")],
+            &[("annotations", "sometimes")],
+        ];
+        let paths = [
+            "src/lib.rs",
+            "README.md",
+            "img.png",
+            "hello%20world.txt",
+            "NOTES",
+            "blob",
+            "empty.txt",
+            "src",
+            "missing",
+        ];
+        let mut raw_bodies = 0;
+        for path in paths {
+            for args in faces {
+                let iri = format!("urn:repo:demo:file:{path}");
+                let mut request = Request::new(Verb::Source, Iri::parse(&iri).unwrap());
+                for (k, v) in args {
+                    request = request.with_arg(*k, ArgRef::Inline(v.as_bytes().to_vec()));
+                }
+                if let Ok(answer) = block_on(body.issue_body(request.clone(), &demo_cap())) {
+                    if matches!(answer.bytes, Body::Replay(_)) {
+                        raw_bodies += 1;
+                    }
+                }
+                let streamed = block_on(body.issue(request.clone(), &demo_cap()));
+                let buffered = block_on(bytes.issue(request, &demo_cap()));
+                match (streamed, buffered) {
+                    (Ok(s), Ok(b)) => {
+                        assert_eq!(s.repr_type, b.repr_type, "{iri} {args:?}");
+                        assert_eq!(s.bytes, b.bytes, "{iri} {args:?}");
+                    }
+                    (Err(s), Err(b)) => assert_eq!(s.to_string(), b.to_string(), "{iri} {args:?}"),
+                    (s, b) => panic!("{iri} {args:?}: body {s:?}, bytes {b:?}"),
+                }
+            }
+        }
+        // Every file's raw face (the seven files, not the directory or the
+        // missing path) was a file-backed body, not a buffer.
+        assert_eq!(raw_bodies, 7);
+        std::fs::remove_dir_all(root).ok();
+    }
+
     #[test]
     fn describe_declares_argspecs_and_the_wildcard_capability() {
         let root = demo_root();
         let roots: Roots = Arc::new(BTreeMap::from([("demo".to_string(), root.clone())]));
         for (endpoint, wants_path) in [
-            (tree_endpoint(&roots, false), true),
-            (file_endpoint(&roots, None, false), true),
-            (state_endpoint(&roots), false),
+            (
+                Arc::new(tree_endpoint(&roots, false)) as Arc<dyn Endpoint>,
+                true,
+            ),
+            (Arc::new(file_endpoint(&roots, None, false)), true),
+            (Arc::new(state_endpoint(&roots)), false),
         ] {
-            use ikigai_core::Endpoint;
             let description = endpoint.describe();
             assert!(
                 description.requires.contains(&CAP_WILDCARD.to_string()),

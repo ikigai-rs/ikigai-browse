@@ -500,7 +500,18 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # core's types (`Endpoint`, `Kernel`, `Representation`) are in browse's public API, so a host on
 # core 0.1 cannot link 0.20.0, and a host pinning `"0.19.x"` (`<0.20.0`) moves its pin in its
 # own core 0.2.0 wave. No resource name, capability, face or stored term moves.
-version = "0.20.0"
+# 0.20.1 (ledger #2281): the raw face of `urn:repo:{repo}:file:{path}` is answered on the body
+# path (`Endpoint::invoke_body`, what the kernel calls) as a file-backed `Body::Replay`:
+# seekable (`open_at`, so `urn:stream:range` and a door's `206` read only the range), its length
+# known, and its validator the content id of the bytes, so a stage it is handed to caches on
+# it. Under the same 16 MiB per-file bound; a file changed while read ends the stream with
+# `Conflict`, never torn bytes. The html, annotations and proposals faces, and `invoke` (the
+# bytes path), answer as before. The file action now declares its failure classes
+# (over-budget and unknown; permanent and denied are implied). The core floor rises within its caret to "0.2.1"
+# (`ContentHasher`), and `futures-core` (already in the graph) is a direct dependency. ★ Why a
+# patch: additive; no Rust API, resource name, capability, face or stored term moves, and the
+# collected body equals the bytes answer.
+version = "0.20.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -592,7 +603,11 @@ required-features = ["migrate"]
 # #2261). The old `"0.1.108"` pin meant `<0.2.0` under 0.x rules, so it could never reach 0.2
 # on its own. Every floor named above is still met, and `src/` builds on it unchanged. Every
 # ikigai crate below moves with it, so the graph links ONE core. ⚠ A ceiling in turn: `<0.3.0`.
-ikigai-core = "0.2.0"
+#
+# "0.2.1" since the raw file face became a file-backed body (ledger #2281): its validator is
+# built with `ContentHasher`, new in 0.2.1, so that is the true floor of `src/` again. Within
+# the caret, so no consumer's pin moves.
+ikigai-core = "0.2.1"
 # The accessibility config and the contrast-floor pass: `urn:repo:style`'s
 # themes and its contrast floor are read from the layered `a11y.toml` rather
 # than hard-coded, and each theme's own sub-floor colours are lifted to that
@@ -661,6 +676,9 @@ ikigai-store = { version = "0.3.0", default-features = false }
 # async trait objects for the explain endpoint (it must await sub-requests —
 # FnEndpoint is sync-only), matching ikigai-core's own endpoint plumbing.
 async-trait = "0.1"
+# `Stream` for the raw file face's reader (ledger #2281, `src/file_body.rs`): the trait core's
+# `ByteStream` boxes, already in the graph through ikigai-core.
+futures-core = "0.3"
 # Minted annotation ids (S2): a Sink of the bare urn:iki:annotation creates the
 # annotation under a fresh v4 uuid.
 uuid = { version = "1", features = ["v4"] }
@@ -719,6 +737,11 @@ ikigai-conformance = "0.11.0"
 # release (ledger #2261). The old `"0.1.108"` meant `<0.2.0` under 0.x rules, and conformance
 # 0.11.0 pins `^0.2.0`, so the two lines agree again.
 ikigai-vocab = "0.2.0"
+# A FLOOR for the tests only (ledger #2281): `tests/file_body.rs` hands the raw file body to a
+# cacheable stage with `BodyIssue::attach`, new in core 0.2.3. `[dependencies]` above keeps the
+# library's true minimum ("0.2.1"); Cargo unifies to the greater of the two, and
+# dev-dependencies do not propagate, so no consumer pays for it.
+ikigai-core = "0.2.3"
 futures = "0.3"
 # Validates the Turtle face in tests — the graph must actually parse.
 oxttl = "0.2"
