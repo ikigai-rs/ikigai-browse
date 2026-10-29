@@ -789,10 +789,10 @@ oxttl = "0.2"
 # they stop at the first, as they stop at a `Denied`).
 #
 # **"0.17.0" now** (the core 0.2.0 sweep, ledger #2346), moved TOGETHER with `ikigai-http`
-# "0.4.0" below for the same `HttpTransport` reason: 0.17.0 is ikigai-llm on ikigai-core 0.2.0
-# (ledger #2261) and ikigai-http 0.4.0. ⚠ Also a ceiling, `<0.18.0`. Re-read this pin when
+# "0.5.0" below for the same `HttpTransport` reason: 0.18.0 is ikigai-llm on ikigai-http 0.5.0
+# (conditional revalidation, ledger #2535). ⚠ Also a ceiling, `<0.19.0`. Re-read this pin when
 # ikigai-llm's next minor ships.
-ikigai-llm = "0.17.0"
+ikigai-llm = "0.18.0"
 # Only for `ikigai_http::HttpTransport`, the trait `ikigai_llm::space` takes: the
 # examples and the real-llm tests implement it to fake the network hop. So this pin
 # must name the SAME ikigai-http line ikigai-llm does, or the impls are for a different
@@ -807,7 +807,8 @@ ikigai-llm = "0.17.0"
 # "0.4.0" (the core 0.2.0 sweep, ledger #2346) because ikigai-llm 0.17.0 requires `^0.4.0`:
 # http on ikigai-core 0.2.0 (ledger #2261). One of the four items moved: `HttpResponse::body`
 # is now an `HttpBody` (a bounded stream) rather than a `Vec<u8>`, so each fake wraps its canned
-# bytes with `.into()` (`From<Vec<u8>>`). ⚠ Under 0.x caret rules this is a ceiling too
-# (`<0.5.0`): move it only with an ikigai-llm built on the next line.
-ikigai-http = "0.4.0"
+# bytes with `.into()` (`From<Vec<u8>>`). "0.5.0" because ikigai-llm 0.18.0 requires `^0.5.0`
+# (conditional revalidation, ledger #2535); the four transport items did not change. ⚠ Under 0.x
+# caret rules this is a ceiling too (`<0.6.0`): move it only with an ikigai-llm built on the next line.
+ikigai-http = "0.5.0"
 ureq = "2"
