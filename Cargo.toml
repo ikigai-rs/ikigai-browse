@@ -511,7 +511,8 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # (`ContentHasher`), and `futures-core` (already in the graph) is a direct dependency. ★ Why a
 # patch: additive; no Rust API, resource name, capability, face or stored term moves, and the
 # collected body equals the bytes answer.
-version = "0.20.1"
+# 0.20.2 (ledger #2615) — PATCH: adopt ikigai-fn 0.8.0; browse uses unchanged HTML helpers and ships no compose markers.
+version = "0.20.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -607,7 +608,8 @@ required-features = ["migrate"]
 # "0.2.1" since the raw file face became a file-backed body (ledger #2281): its validator is
 # built with `ContentHasher`, new in 0.2.1, so that is the true floor of `src/` again. Within
 # the caret, so no consumer's pin moves.
-ikigai-core = "0.2.1"
+# "0.2.8" (ledger #2615): match ikigai-fn 0.8.0's minimum core for reference arguments.
+ikigai-core = "0.2.8"
 # The accessibility config and the contrast-floor pass: `urn:repo:style`'s
 # themes and its contrast floor are read from the layered `a11y.toml` rather
 # than hard-coded, and each theme's own sub-floor colours are lifted to that
@@ -632,7 +634,8 @@ ikigai-a11y = { version = "0.4.0", features = ["themes"] }
 # (ledger #2261), so the graph links one core. 0.6.0 between them added `each` and
 # `html::url_reserved`; `html_text`, `attr` and `url_segment`, the items this crate calls, are
 # unchanged. ⚠ Under 0.x a CEILING too: `<0.8.0`.
-ikigai-fn = "0.7.0"
+# "0.8.0" (ledger #2615): compose accepts <iri> references; no literal compose arguments here need quoting.
+ikigai-fn = "0.8.0"
 # Syntax highlighting for the file HTML face. The pure-Rust regex engine
 # (default-fancy) so CI never needs a C toolchain for oniguruma; yaml-load
 # compiles the embedded Turtle .sublime-syntax (assets/) at first use.
