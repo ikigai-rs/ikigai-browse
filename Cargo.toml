@@ -717,7 +717,11 @@ notify = "6.1"
 # integer is) and `FAILURES`, which this crate had already opted into. Both pass with no
 # waiver. ⚠ Still a ceiling: `<0.12.0`. Re-read it as a range whenever a new conformance minor
 # ships.
-ikigai-conformance = "0.11.0"
+# "0.12.0" (ledger #2562): BODIES and BODY-INPUTS run by default. The suite supplies
+# the kernel's shared module space for direct body comparisons. No browse input
+# declares reads_body, so BODY-INPUTS currently has no transports to compare.
+# The library's core minimum stays unchanged; conformance supplies its own test floor.
+ikigai-conformance = "0.12.0"
 # A FLOOR DECLARATION, not a code dependency: no line in this crate calls it.
 # The suite's `VOCABULARY` check reads `ikigai_vocab::VOCABULARY` as its oracle,
 # and the suite's own pin is the floor for the SUITE's API, not for this module's

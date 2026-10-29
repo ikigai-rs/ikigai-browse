@@ -75,6 +75,12 @@
 //!   day one of them is marked cacheable without a thread a host cuts, this test
 //!   goes red. Nothing is declared `pure`: no endpoint here is a function of its
 //!   inputs alone.
+//! * `body_space(..)` — the same module `Arc` the kernel holds, so `BODIES`
+//!   compares `invoke` with collected `invoke_body` and checks the smaller budget
+//!   on deterministic Sources (style and layout). Volatile Sources remain explicitly
+//!   unprobed with the suite's reason. No module argument declares `reads_body`, so
+//!   `BODY-INPUTS` has no transports to compare and needs no content store yet.
+//!   [`conforms`] rejects unexpected unprobed checks, including missing body setup.
 //! * `check_failures()` — `FAILURES` (conformance 0.10.0, ledger #1546), the default
 //!   since 0.11.0, where this call only records the request (DECLARATIONS reports it if
 //!   FAILURES is ever subtracted). The six actions that ask a model declare the classes
@@ -598,6 +604,7 @@ fn declare_spaces(suite: Suite, scratch: &Scratch, walked: Arc<EndpointSpace>) -
     let store = || Arc::new(Store::new().expect("in-memory store"));
     let home = Some(scratch.home.clone());
     suite
+        .body_space(walked.clone())
         .host_named_space(SPACES[0], walked)
         .host_named_space(SPACES[1], ikigai_browse::space(roots()))
         .host_named_space(
@@ -650,6 +657,22 @@ fn conforms() {
     // Printed even when clean (`--nocapture`): the report is the record.
     eprintln!("{report}");
     assert!(report.is_clean(), "{report}");
+    // Live working-tree/store reads cannot be compared across independent calls.
+    // Everything else must be probed, including both deterministic body readers;
+    // losing body_space must fail even when the report has no findings.
+    for unprobed in report.unprobed.iter() {
+        let volatile_body = unprobed.check == Check::Bodies
+            && !["browse-style", "browse-layout"].contains(&unprobed.endpoint.as_str())
+            && unprobed.reason == "uncacheable, time-varying, or volatile answer: independent calls cannot establish method agreement (Suite::live, expiry or CACHEABLE's byte comparison)";
+        let unfired_delete = unprobed.endpoint == "annotation"
+            && unprobed.verb == Verb::Delete
+            && unprobed.check == Check::Outputs
+            && unprobed.reason == "never fired under root: a mutating action is fired only by the pipeline probe (PIPELINE, on an action declaring `content`), so what it serves was not observed";
+        assert!(
+            volatile_body || unfired_delete,
+            "unexpected unprobed check: {unprobed:?}\n{report}"
+        );
+    }
 
     // The stubs are walked as module endpoints (conformance PENDING #17): this
     // crate's, plus the fixture's two (the model and the pull-request facades).
