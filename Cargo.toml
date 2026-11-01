@@ -512,7 +512,13 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # patch: additive; no Rust API, resource name, capability, face or stored term moves, and the
 # collected body equals the bytes answer.
 # 0.20.2 (ledger #2615) — PATCH: adopt ikigai-fn 0.8.0; browse uses unchanged HTML helpers and ships no compose markers.
-version = "0.20.2"
+# 0.20.3 (ledger #2781) — PATCH: a finding's answer is decided inside the write. A publish and a
+# decline at once both read an undecided finding and both wrote node 1 (one `:decision` node with
+# two outcomes, and a minted annotation beside the decline); now the node and the annotation a
+# publish mints commit in one transaction that first checks the node carries no outcome, and the
+# answer that loses decides again from what is on file. No Rust API, resource name, capability,
+# face or stored term moves.
+version = "0.20.3"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]

@@ -925,7 +925,23 @@ impl FindingEndpoint {
     /// records that a person looked and said no; `decision=retract`
     /// withdraws the current answer. A second answer on a decided finding is
     /// a REVISION and must name the decision it revises (`revises=`).
+    ///
+    /// ★ The answer on file is decided INSIDE THE WRITE (ledger #2781): [`Self::decide_once`]
+    /// branches on the history it read, and its write lands only if that history is still the
+    /// one on file. When another answer landed in between, it is decided again from what is on
+    /// file now — so of two answers at once, one is recorded and the other is the double click
+    /// or the refusal a sequential second answer is, never a second outcome on the same node.
     async fn decide(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        loop {
+            if let Some(answer) = self.decide_once(inv)? {
+                return Ok(answer);
+            }
+        }
+    }
+
+    /// One attempt at [`Self::decide`]: `Ok(None)` when the chain moved between its read and
+    /// its write, and nothing was written.
+    fn decide_once(&self, inv: &Invocation<'_>) -> Result<Option<Representation>> {
         let id = Self::id_binding(inv)?;
         let mut finding = self.load_required(&id)?;
         granted(inv, &finding.repo)?;
@@ -1097,7 +1113,7 @@ impl FindingEndpoint {
                 // The second submit of a revision that already landed is the
                 // double click of THIS path: a no-op, not an error.
                 if head.revises.as_deref() == Some(named.as_str()) && same_answer(head) {
-                    return self.answer(inv, finding);
+                    return self.answer(inv, finding).map(Some);
                 }
                 return Err(Error::InvalidArgument {
                     name: "revises".to_string(),
@@ -1127,7 +1143,7 @@ impl FindingEndpoint {
                 // contradict one on file; a repeat that states a DIFFERENT
                 // one (including a reason where none was recorded) does.
                 if same_answer(head) {
-                    return self.answer(inv, finding);
+                    return self.answer(inv, finding).map(Some);
                 }
                 let same_rating = head.outcome == outcome && head.severity == severity;
                 // Only the mark differs: say how to add it, and that the
@@ -1168,7 +1184,7 @@ impl FindingEndpoint {
                 // the chain stays one chain by linking the retraction. A
                 // second retraction is the double click of the first.
                 if outcome == Outcome::Retracted {
-                    return self.answer(inv, finding);
+                    return self.answer(inv, finding).map(Some);
                 }
                 Some(head.iri.clone())
             }
@@ -1189,11 +1205,16 @@ impl FindingEndpoint {
         // Pipeline citizenship: a piped value is the human's reason.
         let note = stated("content");
         let at = inv.now().map(|t| iso8601(t.as_millis()));
+        // The annotation a publish mints is written in the decision's own transaction, so it
+        // lands exactly when the decision does.
+        let mut beside = Vec::new();
         let minted = match (outcome, &severity, keeps) {
             // A mark-only revision: the publication stands, unchanged.
             (_, _, Some(kept)) => Some(kept),
             (Outcome::Published, Some(severity), None) => {
-                Some(promote(&self.archive, &finding, severity)?)
+                let annotation = promoted(&finding, severity);
+                beside = annotate::record_quads(&self.archive, &annotation)?;
+                Some(annotation.iri())
             }
             _ => None,
         };
@@ -1212,10 +1233,12 @@ impl FindingEndpoint {
             minted,
             reproduced,
         };
-        annotate::append_decision(&self.archive, &finding.iri(), &decision)?;
+        if !annotate::append_decision(&self.archive, &finding.iri(), &decision, beside)? {
+            return Ok(None);
+        }
         finding.history.push(decision);
         finding.settle();
-        self.answer(inv, finding)
+        self.answer(inv, finding).map(Some)
     }
 
     /// Whether the CURRENT decision may be revised to `outcome` — refused,
@@ -1399,7 +1422,9 @@ fn ack(inv: &Invocation<'_>, finding: &Annotation) -> Result<Representation> {
 }
 
 /// Promote one finding into the annotation family — the ONE path in, and the
-/// one place `urn:cap:annotate` buys anything.
+/// one place `urn:cap:annotate` buys anything. The annotation is returned, not
+/// stored: `decide` stores it in the decision's own transaction (ledger #2781),
+/// so a publish that loses a race to another answer mints nothing.
 ///
 /// The minted annotation KEEPS the finding's id, so `urn:iki:finding:{id}` and
 /// `urn:iki:annotation:{id}` are the same claim before and after a human said
@@ -1412,7 +1437,7 @@ fn ack(inv: &Invocation<'_>, finding: &Annotation) -> Result<Representation> {
 /// `dcterms:creator` (the model) and `oa:motivatedBy oa:assessing`: a published
 /// finding is still a machine claim — a human vouched for it, they did not
 /// write it.
-fn promote(archive: &Archive, finding: &Annotation, severity: &str) -> Result<String> {
+fn promoted(finding: &Annotation, severity: &str) -> Annotation {
     let mut annotation = finding.clone();
     annotation.family = Family::Annotation;
     // The finding carried no `oa:motivatedBy` (its domain would have typed it
@@ -1422,8 +1447,7 @@ fn promote(archive: &Archive, finding: &Annotation, severity: &str) -> Result<St
     annotation.derived_from = Some(finding.iri());
     annotation.decision = None;
     annotation.history = Vec::new();
-    annotate::store_annotation(archive, &annotation)?;
-    Ok(annotation.iri())
+    annotation
 }
 
 // --- the queue listing ------------------------------------------------------
@@ -3874,6 +3898,67 @@ mod tests {
             .collect();
         out.sort();
         out
+    }
+
+    /// ★★ **Two answers at once are one answer** (ledger #2781). A publish and a
+    /// decline of one pending finding, released together, used to BOTH pass the
+    /// "undecided" branch on the history each had read, and both write node 1:
+    /// one `:decision` node carrying `outcome:published` AND `outcome:declined`,
+    /// plus a minted annotation, permanently. The answer on file is decided inside
+    /// the write now, so exactly one lands and the other is refused naming it, as
+    /// a sequential second answer is.
+    #[test]
+    fn a_publish_and_a_decline_at_once_record_one_answer() {
+        use std::sync::Barrier;
+        const ROUNDS: usize = 30;
+        let mut violations = Vec::new();
+        for round in 0..ROUNDS {
+            let root = demo_root();
+            let store = Arc::new(Store::new().unwrap());
+            let k = kernel(&root, &store);
+            let findings = pass(&k);
+            let alpha = finding_on(&k, &findings, "fn alpha() {}");
+            let gate = Barrier::new(2);
+            let (published, declined) = std::thread::scope(|s| {
+                let fire = |word: &'static str| {
+                    let (k, alpha, gate) = (&k, &alpha, &gate);
+                    s.spawn(move || {
+                        gate.wait();
+                        sink(k, alpha, &[("decision", word)])
+                    })
+                };
+                let (p, d) = (fire("publish"), fire("decline"));
+                (p.join().unwrap(), d.join().unwrap())
+            });
+            let on_file = nodes(&store, &alpha);
+            let annotation = alpha.replace("urn:iki:finding:", "urn:iki:annotation:");
+            let minted = issue(&k, Verb::Source, &annotation, &[]).is_ok();
+            let one_answer = on_file.len() == 1 && !on_file[0].1.contains(',');
+            let one_accepted = published.is_ok() != declined.is_ok();
+            let mint_agrees = minted == published.is_ok();
+            if !(one_answer && one_accepted && mint_agrees) {
+                violations.push(format!(
+                    "round {round}: nodes {on_file:?}, minted {minted}, publish {published:?}, \
+                     decline {declined:?}"
+                ));
+            }
+            for loser in [&published, &declined] {
+                if let Err(e) = loser {
+                    assert!(
+                        matches!(e, Error::InvalidArgument { name, detail }
+                            if name == "decision" && detail.contains("was already")),
+                        "round {round}: the second answer is refused as a sequential one is: {e:?}"
+                    );
+                }
+            }
+            std::fs::remove_dir_all(&root).ok();
+        }
+        assert!(
+            violations.is_empty(),
+            "{}/{ROUNDS} rounds recorded more than one answer:\n{}",
+            violations.len(),
+            violations.join("\n")
+        );
     }
 
     /// ★★ **Confirm**: a wordless decline gains a word — but only by NAMING the

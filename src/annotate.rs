@@ -863,7 +863,7 @@ pub(crate) fn store_annotation(archive: &Archive, ann: &Annotation) -> Result<()
 
 /// The quads [`store_annotation`] stores: the annotation node plus both
 /// selector nodes, in the archive's graph.
-fn record_quads(archive: &Archive, ann: &Annotation) -> Result<Vec<Quad>> {
+pub(crate) fn record_quads(archive: &Archive, ann: &Annotation) -> Result<Vec<Quad>> {
     use oxigraph::model::vocab::{rdf, xsd};
     let subject = NamedNode::new(ann.iri()).map_err(store_err)?;
     let quote = NamedNode::new(quote_iri(ann.family, &ann.id)).map_err(store_err)?;
@@ -1052,11 +1052,43 @@ fn record_quads(archive: &Archive, ann: &Annotation) -> Result<Vec<Quad>> {
 /// of its current one (ledger #653). The node is written once and never
 /// touched again: no path in this crate re-stores or removes it, so the chain
 /// of answers is append-only by construction rather than by care.
+///
+/// ★ DECIDED INSIDE THE WRITE (ledger #2781): `decision` is written, with `beside` (the
+/// annotation a publish mints) in the same transaction, only if its node carries no outcome
+/// yet — that is, only if the chain is still the one the caller read and branched on, since
+/// [`revision_iri`] numbers each node from the chain's length. `false` when another answer
+/// took the node in between: nothing is written, and the caller decides again from what is on
+/// file now (which then holds that answer, so deciding again always gets further). The check
+/// is a compare-and-set because every write on a store handle commits on one writer thread
+/// under one lock (see [`Archive`]): no other commit falls between this transaction's read and
+/// its insert. Without it, two answers that both read an undecided finding both wrote node 1
+/// — one node carrying two outcomes, and a minted annotation beside a decline.
 pub(crate) fn append_decision(
     archive: &Archive,
     finding_iri: &str,
     decision: &Decision,
-) -> Result<()> {
+    beside: Vec<Quad>,
+) -> Result<bool> {
+    let mut quads = beside;
+    quads.extend(decision_quads(archive, finding_iri, decision)?);
+    let node = NamedNode::new(&decision.iri).map_err(store_err)?;
+    let outcome = NamedNode::new(DCTERMS_TYPE).map_err(store_err)?;
+    archive
+        .write(move |record| {
+            let taken = !record
+                .quads_for_pattern(Some(node.as_ref().into()), Some(outcome.as_ref()), None)?
+                .is_empty();
+            if taken {
+                return Ok(false);
+            }
+            quads.iter().try_for_each(|quad| record.insert(quad))?;
+            Ok(true)
+        })
+        .map_err(store_err)
+}
+
+/// The quads of ONE decision node, in the archive's graph.
+fn decision_quads(archive: &Archive, finding_iri: &str, decision: &Decision) -> Result<Vec<Quad>> {
     use oxigraph::model::vocab::{rdf, xsd};
     let g = archive.graph().clone();
     let node = NamedNode::new(&decision.iri).map_err(store_err)?;
@@ -1145,7 +1177,7 @@ pub(crate) fn append_decision(
     if let Some(minted) = &decision.minted {
         quads.push(Quad::new(node, named(PROV_GENERATED)?, named(minted)?, g));
     }
-    archive.insert_all(quads).map_err(store_err)
+    Ok(quads)
 }
 
 /// The IRI of a severity value. ⚠ An OBJECT, not a vocabulary term: the
