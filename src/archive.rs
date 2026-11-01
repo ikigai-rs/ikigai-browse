@@ -666,7 +666,7 @@ mod tests {
         });
         count("append a decision", &mut || {
             let decision = records::decision("f1", &published.iri());
-            append_decision(&archive, &finding_iri, &decision).unwrap()
+            assert!(append_decision(&archive, &finding_iri, &decision, Vec::new()).unwrap())
         });
         count("remove an annotation", &mut || {
             remove_annotation(&archive, Family::Annotation, "f1").unwrap()
