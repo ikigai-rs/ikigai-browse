@@ -3440,6 +3440,12 @@ fn annotation_form_html(target_iri: &str) -> String {
 /// lands on the SAME file (or pull request) with the new card marked and
 /// focused, instead of a bare IRI with no way back. The IRI is still said,
 /// and a link repeats the GET for a host whose `load` trigger did not fire.
+///
+/// The note takes focus after the swap (`tabindex="-1" autofocus`, which htmx
+/// honors), because the button the reader pressed is gone with the form it sat
+/// in, until the target's view replaces it and focuses the new card. It is not
+/// a live region (ledger #2876): announcing is the host's one status region's
+/// job (CONVENTIONS D13), as in the finding acknowledgement (ledger #1988).
 fn annotated_html(ann: &Annotation) -> String {
     let view = format!("/k/source {} as=text/html focus={}", ann.target_iri, ann.id);
     let back = match ann.target_ref() {
@@ -3449,7 +3455,7 @@ fn annotated_html(ann: &Annotation) -> String {
     format!(
         "<div class=\"browse-annotated\" hx-get=\"{view}\" hx-trigger=\"load\" \
          hx-target=\"#browse\" hx-swap=\"innerHTML\">\
-         <p class=\"browse-annotated-note\" role=\"status\">annotated: {iri} · \
+         <p class=\"browse-annotated-note\" tabindex=\"-1\" autofocus>annotated: {iri} · \
          <a class=\"browse-annotated-back\" href=\"#\" hx-get=\"{view}\" hx-target=\"#browse\" \
          hx-swap=\"innerHTML\">{back}</a></p></div>",
         view = attr(&view),
@@ -5261,6 +5267,16 @@ mod tests {
         );
         assert!(ack.contains(&format!("urn:iki:annotation:{id}")), "{ack}");
         assert!(ack.contains("back to the file"), "{ack}");
+        // Ledger #2876: the fragment is no live region (the host's `#status`
+        // is the only one that announces, CONVENTIONS D13); its note takes
+        // focus instead, since the pressed button went with its form.
+        assert!(
+            ack.contains("<p class=\"browse-annotated-note\" tabindex=\"-1\" autofocus>"),
+            "the acknowledgement line is focused: {ack}"
+        );
+        for live in ["role=\"status\"", "role=\"alert\"", "aria-live"] {
+            assert!(!ack.contains(live), "a second live region ({live}): {ack}");
+        }
 
         // What that GET answers: the file view, the new card marked and
         // focused, and the line it anchors on marked in the code.
