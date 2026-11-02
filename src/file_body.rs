@@ -26,7 +26,7 @@
 
 use std::fs::{File, Metadata};
 use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -35,6 +35,7 @@ use ikigai_core::{
     Body, ByteStream, Bytes, ContentHasher, ContentId, Error, ReprType, Representation, Result,
 };
 
+use crate::checkout::Jailed;
 use crate::file_read::{over_budget, MAX_FILE_BYTES};
 
 /// The largest chunk a [`FileReplay`] reader yields.
@@ -105,13 +106,13 @@ fn io_error(what: &str, shown: &str, e: std::io::Error) -> Error {
 /// answer is never cached as such (the file can change), but its validator lets
 /// whatever the body is handed to cache on it.
 pub(crate) fn raw_face(
-    path: &Path,
+    path: &Jailed,
     shown: &str,
     media_type: impl FnOnce(&Path, bool) -> ReprType,
 ) -> Result<Representation<Body>> {
     let (replay, utf8) = FileReplay::open(path, shown)?;
     Ok(Representation::from_body(
-        media_type(path, utf8),
+        media_type(path.path(), utf8),
         Body::replay(replay),
     ))
 }
@@ -119,7 +120,7 @@ pub(crate) fn raw_face(
 /// A file as a [`Replay`]: its path, the version recorded at open, and the
 /// content id and UTF-8 verdict of the bytes of that version.
 pub(crate) struct FileReplay {
-    path: PathBuf,
+    path: Jailed,
     shown: String,
     at_open: Version,
     validator: ContentId,
@@ -128,13 +129,13 @@ pub(crate) struct FileReplay {
 impl FileReplay {
     /// Open the file, refuse it past [`MAX_FILE_BYTES`], and hash it (and sniff
     /// UTF-8) in one bounded-chunk pass that holds no more than a chunk.
-    pub(crate) fn open(path: &Path, shown: &str) -> Result<(Self, bool)> {
-        let file = File::open(path).map_err(|e| io_error("open", shown, e))?;
+    pub(crate) fn open(path: &Jailed, shown: &str) -> Result<(Self, bool)> {
+        let file = path.open().map_err(|e| io_error("open", shown, e))?;
         let meta = file
             .metadata()
             .map_err(|e| io_error("metadata", shown, e))?;
         if meta.len() > MAX_FILE_BYTES {
-            return Err(over_budget(path));
+            return Err(over_budget(path.path()));
         }
         let at_open = Version::of(&meta);
         let mut hasher = ContentHasher::new();
@@ -146,7 +147,7 @@ impl FileReplay {
             utf8.feed(&chunk);
         }
         let replay = FileReplay {
-            path: path.to_path_buf(),
+            path: path.clone(),
             shown: shown.to_string(),
             at_open,
             validator: hasher.finish(),
@@ -157,7 +158,9 @@ impl FileReplay {
     /// A reader from `offset`: the path opened afresh, refused unless it is the
     /// version recorded at open.
     fn reader(&self, offset: u64) -> FileReader {
-        let fresh = File::open(&self.path)
+        let fresh = self
+            .path
+            .open()
             .map_err(|_| changed_while_read(&self.shown))
             .and_then(|file| {
                 let now = file

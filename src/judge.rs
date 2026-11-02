@@ -785,10 +785,13 @@ pub(crate) struct RepoFile {
 /// directories, links and anything larger than [`MAX_INDEX_FILE_BYTES`].
 pub(crate) fn test_files(root: &Path, ignore: &BTreeSet<String>) -> Vec<RepoFile> {
     let mut out = Vec::new();
-    let mut stack = vec![(root.to_path_buf(), String::new())];
+    let Ok(top) = crate::checkout::Jailed::root(root) else {
+        return Vec::new();
+    };
+    let mut stack = vec![(top, String::new())];
     let mut seen = 0usize;
     while let Some((dir, prefix)) = stack.pop() {
-        let Ok(entries) = crate::list_entries(&dir) else {
+        let Ok(entries) = dir.list() else {
             continue;
         };
         for entry in entries.into_iter().rev() {
@@ -801,7 +804,11 @@ pub(crate) fn test_files(root: &Path, ignore: &BTreeSet<String>) -> Vec<RepoFile
                 false => format!("{prefix}/{name}"),
             };
             match entry.kind {
-                crate::Kind::Dir => stack.push((dir.join(&name), rel)),
+                crate::Kind::Dir => {
+                    if let Ok(child) = dir.child(&name) {
+                        stack.push((child, rel));
+                    }
+                }
                 crate::Kind::File => {
                     seen += 1;
                     if seen > MAX_INDEX_FILES {
@@ -810,7 +817,11 @@ pub(crate) fn test_files(root: &Path, ignore: &BTreeSet<String>) -> Vec<RepoFile
                     if entry.size.unwrap_or(0) > MAX_INDEX_FILE_BYTES {
                         continue;
                     }
-                    let Ok(text) = std::fs::read_to_string(dir.join(&name)) else {
+                    let Ok(text) = dir
+                        .child(&name)
+                        .map_err(drop)
+                        .and_then(|file| file.read_to_string().map_err(drop))
+                    else {
                         continue;
                     };
                     if is_test_path(&rel)
@@ -2364,39 +2375,16 @@ fn recover_version(
     rel: &str,
     hash: &str,
 ) -> std::result::Result<Option<(String, String)>, Unjudgeable> {
-    use std::io::{BufRead, Read, Write};
-    use std::process::{Command, Stdio};
+    use std::io::{BufRead, Read};
 
     let commits = history(root, rel).map_err(Unjudgeable::transient)?;
     let commits: Vec<String> = commits.split_whitespace().map(str::to_string).collect();
     if commits.is_empty() {
         return Ok(None);
     }
-    let batch = |args: &[&str], input: String| -> std::result::Result<Vec<u8>, String> {
-        let mut child = Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("could not run git: {e}"))?;
-        let mut stdin = child.stdin.take().expect("stdin is piped");
-        // Written from its own thread: git answers as it reads, and a full
-        // stdout pipe would otherwise stall both sides.
-        let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
-        let mut out = Vec::new();
-        child
-            .stdout
-            .take()
-            .expect("stdout is piped")
-            .read_to_end(&mut out)
-            .map_err(|e| format!("git output: {e}"))?;
-        let _ = writer.join();
-        child.wait().map_err(|e| format!("git: {e}"))?;
-        Ok(out)
-    };
+    let root =
+        crate::checkout::Jailed::root(root).map_err(|e| Unjudgeable::transient(e.to_string()))?;
+    let batch = |args: &[&str], input: String| root.git_batch(args, input);
     // `rev:./path` is relative to the root, which may sit below the work
     // tree's top; a plain `rev:path` would be read from the top.
     let specs: String = commits.iter().map(|c| format!("{c}:./{rel}\n")).collect();
@@ -2452,7 +2440,9 @@ fn recover_version(
 /// Every commit, on any ref, that touches `rel` — `git rev-list --all`, one
 /// per line. `Err(why)` when the history cannot be read at all.
 fn history(root: &Path, rel: &str) -> std::result::Result<String, String> {
-    let commits = crate::git(root, &["rev-list", "--all", "--", rel])
+    let root = crate::checkout::Jailed::root(root).map_err(|e| e.to_string())?;
+    let commits = root
+        .git(&["rev-list", "--all", "--", rel])
         .map_err(|e| format!("could not run git: {e}"))?;
     if !commits.status.success() {
         return Err(format!(
