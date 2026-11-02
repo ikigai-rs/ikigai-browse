@@ -520,7 +520,10 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # face or stored term moves.
 # 0.20.4 (ledger #2848) — PATCH: adopt ikigai-fn 0.9.0 so hosts on that line link one copy.
 # Reference arguments remain supported; browse uses unchanged HTML helpers.
-version = "0.20.4"
+# 0.20.5 (ledger #1988) — PATCH: every finding decision form sends as=text/html, and the Sink's
+# HTML acknowledgement is the answer in words, a way back to the pending findings and the decided
+# card, so htmx no longer swaps a bare IRI into #browse. The plain and JSON faces are unchanged.
+version = "0.20.5"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]

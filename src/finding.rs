@@ -450,7 +450,9 @@ pub(crate) fn severity_badge_html(proposed: Option<&str>, decision: Option<&Deci
 ///
 /// Markup only: the host's `/k/` adapter turns the form into a Sink, the same
 /// assumption every other S0 face documents. The activating button's
-/// `name`/`value` is what carries `decision=`.
+/// `name`/`value` is what carries `decision=`, and every form here carries
+/// [`ASK_HTML`], so the answer swapped into `#browse` is [`decided_html`],
+/// never the bare IRI (ledger #1988).
 pub(crate) fn decision_html(
     id: &str,
     proposed: Option<&str>,
@@ -541,7 +543,7 @@ pub(crate) fn decision_html(
     }
     out.push_str(&format!(
         "<form class=\"browse-finding-decide\" hx-post=\"/k/sink {iri}\" hx-target=\"#browse\" \
-         hx-swap=\"innerHTML\">\
+         hx-swap=\"innerHTML\">{ASK_HTML}\
          <label class=\"browse-finding-label\">severity \
          <select name=\"severity\">{options}</select></label>\
          <label class=\"browse-finding-label\">reason (decline only) \
@@ -568,7 +570,7 @@ fn reproduce_html(id: &str, decision: &Decision) -> String {
     format!(
         "<details class=\"browse-finding-reproduce\"><summary>record a reproduction</summary>\
          <form class=\"browse-finding-decide\" hx-post=\"/k/sink {iri}\" hx-target=\"#browse\" \
-         hx-swap=\"innerHTML\">\
+         hx-swap=\"innerHTML\">{ASK_HTML}\
          <input type=\"hidden\" name=\"revises\" value=\"{revises}\">\
          <input type=\"hidden\" name=\"reproduced\" value=\"{yes}\">\
          <textarea name=\"content\" placeholder=\"how it was reproduced\"></textarea>\
@@ -635,7 +637,7 @@ fn revise_html(id: &str, decision: &Decision) -> String {
         ));
     }
     let open = format!(
-        "hx-post=\"/k/sink {iri}\" hx-target=\"#browse\" hx-swap=\"innerHTML\">\
+        "hx-post=\"/k/sink {iri}\" hx-target=\"#browse\" hx-swap=\"innerHTML\">{ASK_HTML}\
          <input type=\"hidden\" name=\"revises\" value=\"{revises}\">"
     );
     format!(
@@ -1401,14 +1403,15 @@ fn made_arg(inv: &Invocation<'_>) -> Result<Option<Made>> {
 
 /// The decision's acknowledgement, in the caller's face. The plain form is the
 /// IRI the decision produced — the minted annotation on a publish, the finding
-/// itself on a decline — so either pipes straight into a Source.
+/// itself on a decline — so either pipes straight into a Source. The HTML
+/// form is [`decided_html`], what browse's own decision forms ask for.
 fn ack(inv: &Invocation<'_>, finding: &Annotation) -> Result<Representation> {
     match inv.inline_str("as").unwrap_or("text/plain") {
         t if t.starts_with("application/json") => Ok(repr(
             "application/json",
             annotate::annotation_json(finding, None).to_string(),
         )),
-        t if t.starts_with("text/html") => Ok(repr_utf8("text/html", one_html(finding, None))),
+        t if t.starts_with("text/html") => Ok(repr_utf8("text/html", decided_html(finding))),
         _ => Ok(repr_utf8(
             "text/plain",
             match &finding.decision {
@@ -2189,6 +2192,45 @@ impl StateCounts {
     }
 }
 
+/// The hidden field every decision form carries (ledger #1988): it asks the
+/// Sink for [`decided_html`]. Without it the Sink answers its plain face, the
+/// IRI the decision produced, and htmx swapped that one line into `#browse`
+/// in place of the page; a host's `/k/` adapter adds no `as` of its own.
+const ASK_HTML: &str = "<input type=\"hidden\" name=\"as\" value=\"text/html\">";
+
+/// The decision Sink's `as=text/html` acknowledgement (ledger #1988), what
+/// htmx swaps into `#browse` when a card's form is submitted: the answer in
+/// words, a button back to this file's pending findings (the next one to
+/// decide), and the finding's card as it now stands, with its record and the
+/// revise or reproduce affordance that follows it.
+///
+/// The answer line takes focus after the swap (`tabindex="-1" autofocus`,
+/// which htmx honors), because the button the reader pressed is gone with the
+/// form it sat in. It is not a live region: announcing is the host's one
+/// status region's job. Everything repeated from the record (a model's note,
+/// a quoted line, a human's reason) is escaped by the card, as on every face.
+/// A refusal never reaches here: it stays a typed error, the host answers it
+/// as a 4xx, and htmx leaves the form and what was typed in it as they were.
+fn decided_html(finding: &Annotation) -> String {
+    let answer = finding
+        .history
+        .last()
+        .map(|d| d.outcome.label())
+        .unwrap_or("recorded");
+    format!(
+        "<div class=\"browse\">{crumbs}<p class=\"browse-findings-note\">{NOT_A_GATE}</p>\
+         <p class=\"browse-finding-decided\" tabindex=\"-1\" autofocus>Your answer is \
+         recorded: {answer}. <button class=\"browse-findings-link\" \
+         hx-get=\"/k/source {queue} as=text/html\" hx-target=\"#browse\" \
+         hx-swap=\"innerHTML\">back to the pending findings</button></p>\
+         <div class=\"browse-annotations\">{card}</div></div>",
+        crumbs = crumbs_html(&finding.repo, &finding.rel),
+        answer = html_text(answer),
+        queue = attr(&findings_iri(&finding.repo, &finding.rel)),
+        card = annotate::annotation_card_html(finding, None, false),
+    )
+}
+
 fn one_html(finding: &Annotation, line: Option<u64>) -> String {
     format!(
         "<div class=\"browse\">{}<p class=\"browse-findings-note\">{NOT_A_GATE}</p>\
@@ -2472,7 +2514,12 @@ fn finding_description() -> Description {
                     ArgSpec::new("as")
                         .optional()
                         .class(XSD_STRING)
-                        .summary("the acknowledgement face")
+                        .summary(
+                            "the acknowledgement face: text/plain the IRI the decision \
+                             produced; application/json the finding's row; text/html the \
+                             answer in words, a way back to the queue and the decided card \
+                             (what browse's own decision forms ask for)",
+                        )
                         .one_of(["text/plain", "application/json", "text/html"])
                         .default_value("text/plain"),
                 )
@@ -3355,6 +3402,10 @@ mod tests {
         let mut fields = Vec::new();
         for tag in form.split('<').skip(1) {
             if tag.starts_with("input") || tag.starts_with("textarea") {
+                // A browser submits a checkbox only when it is checked.
+                if tag.contains("type=\"checkbox\"") && !tag.contains(" checked") {
+                    continue;
+                }
                 let value = attr(tag, "value").unwrap_or_default();
                 fields.push((attr(tag, "name").expect("a named field"), value));
             } else if let Some(rest) = tag.strip_prefix("select") {
@@ -3425,6 +3476,141 @@ mod tests {
             assert_eq!(chain[1]["outcome"], outcome, "{button}: {row}");
             std::fs::remove_dir_all(&root).ok();
         }
+    }
+
+    /// ★★ Ledger #1988: every decision form a finding's card carries asks the
+    /// Sink for its HTML acknowledgement, so what htmx swaps into `#browse` is
+    /// a page (the answer, the way back to the queue, the decided card), never
+    /// the bare IRI the plain face answers. Walked the way a browser and the
+    /// host walk it: the card's own form fields, posted to the Sink as they
+    /// stand (gonk's `/k/` adds no `as`).
+    #[test]
+    fn every_decision_form_answers_a_page_not_an_iri() {
+        // (the answer on file before the form is used, the button, the
+        // outcome it records): the pending card's two buttons, the three
+        // revisions under a decline, and the reproduced mark under a publish.
+        type Case<'a> = (&'a [(&'a str, &'a str)], &'a str, &'a str);
+        let cases: [Case; 6] = [
+            (&[], "publish", "published"),
+            (&[], "decline", "declined"),
+            (
+                &[("decision", "decline"), ("reason", "restates")],
+                "publish",
+                "published",
+            ),
+            (
+                &[("decision", "decline"), ("reason", "restates")],
+                "decline",
+                "declined",
+            ),
+            (&[("decision", "decline")], "retract", "retracted"),
+            (&[("decision", "publish")], "publish", "published"),
+        ];
+        for (before, button, outcome) in cases {
+            let root = demo_root();
+            let store = Arc::new(Store::new().unwrap());
+            let k = kernel(&root, &store);
+            let findings = pass(&k);
+            let alpha = finding_on(&k, &findings, "fn alpha() {}");
+            if !before.is_empty() {
+                issue(&k, Verb::Sink, &alpha, before).expect("the answer on file");
+            }
+            let html = body(&issue(&k, Verb::Source, &alpha, &[("as", "text/html")]).unwrap());
+            let fields = submitted(&html, button);
+            let args: Vec<(&str, &str)> = fields
+                .iter()
+                .map(|(n, v)| (n.as_str(), v.as_str()))
+                .collect();
+            let ack = issue(&k, Verb::Sink, &alpha, &args).unwrap_or_else(|e| {
+                panic!("`{button}` after {before:?} was refused: {e} (submitted {fields:?})")
+            });
+            let case = format!("{button} after {before:?}");
+            assert!(
+                ack.repr_type.media_type.starts_with("text/html"),
+                "{case}: {:?} {}",
+                ack.repr_type,
+                body(&ack)
+            );
+            assert!(
+                fields.contains(&("as".to_string(), "text/html".to_string())),
+                "{case}: the form asks for no HTML answer: {fields:?}"
+            );
+            let page = body(&ack);
+            assert!(
+                page.contains(&format!(
+                    "<p class=\"browse-finding-decided\" tabindex=\"-1\" autofocus>Your \
+                     answer is recorded: {outcome}."
+                )),
+                "{case}: {page}"
+            );
+            assert!(
+                page.contains(
+                    "hx-get=\"/k/source urn:repo:demo:findings:a.rs as=text/html\" \
+                     hx-target=\"#browse\""
+                ),
+                "{case}: the way back to the queue: {page}"
+            );
+            assert!(page.contains("fn alpha() {}"), "{case}: the card: {page}");
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// ★ The HTML acknowledgement escapes what it repeats (a model's note, a
+    /// quoted line, a human's reason), and the plain face is unchanged: a
+    /// caller that does not ask for HTML still gets the IRI the decision
+    /// produced, ready to pipe into a Source.
+    #[test]
+    fn the_html_acknowledgement_escapes_and_the_plain_one_is_the_iri() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "fn alpha() {}\nfn beta() {}\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let hostile = "QUOTE: fn alpha() {}\nSEVERITY: major\n\
+                       NOTE: <script>alert(\"x\")</script> & <b>bold</b>\n\
+                       QUOTE: fn beta() {}\nSEVERITY: minor\nNOTE: plain.\n";
+        let k = kernel_replying(&root, &store, hostile);
+        let findings = pass(&k);
+        let alpha = finding_on(&k, &findings, "fn alpha() {}");
+        let beta = finding_on(&k, &findings, "fn beta() {}");
+
+        let ack = issue(
+            &k,
+            Verb::Sink,
+            &alpha,
+            &[
+                ("decision", "decline"),
+                ("as", "text/html"),
+                ("content", "<img src=x onerror=alert(1)>"),
+            ],
+        )
+        .unwrap();
+        assert!(ack.repr_type.media_type.starts_with("text/html"));
+        let page = body(&ack);
+        assert!(
+            page.contains("Your answer is recorded: declined."),
+            "{page}"
+        );
+        for raw in ["<script", "<b>", "<img"] {
+            assert!(!page.contains(raw), "`{raw}` reached the page raw: {page}");
+        }
+        assert!(
+            page.contains("&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt; &amp; &lt;b&gt;")
+                || page.contains("&lt;script&gt;alert(\"x\")&lt;/script&gt; &amp; &lt;b&gt;"),
+            "the model's note, as text: {page}"
+        );
+        assert!(
+            page.contains("&lt;img src=x onerror=alert(1)&gt;"),
+            "{page}"
+        );
+
+        // No `as`: the plain acknowledgement, the IRI it produced.
+        let plain = issue(&k, Verb::Sink, &beta, &[("decision", "decline")]).unwrap();
+        assert!(
+            plain.repr_type.media_type.starts_with("text/plain"),
+            "{:?}",
+            plain.repr_type
+        );
+        assert_eq!(body(&plain), beta);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// ★ The reason words are the CONTRACT's, read exactly the way gonk reads
