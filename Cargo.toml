@@ -523,6 +523,8 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # 0.20.5 (ledger #1988) — PATCH: every finding decision form sends as=text/html, and the Sink's
 # HTML acknowledgement is the answer in words, a way back to the pending findings and the decided
 # card, so htmx no longer swaps a bare IRI into #browse. The plain and JSON faces are unchanged.
+# Also (ledger #2876): annotate's HTML acknowledgement drops its role="status" and focuses its note,
+# leaving the host's #status the only announcing region (CONVENTIONS D13).
 version = "0.20.5"
 edition = "2021"
 license = "MIT OR Apache-2.0"

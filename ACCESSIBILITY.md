@@ -34,7 +34,8 @@ the [ACCESSIBILITY.md template](https://github.com/mgifford/ACCESSIBILITY.md) (M
 - A control whose click may call a model names its cost line with `aria-describedby`; the
   progress note shows inside a polite live region (`role="status"`) that is in the markup before
   the note appears, and never carries `aria-busy`. A new annotation card takes focus after it is
-  created (`tabindex="-1"`).
+  created (`tabindex="-1"`). Until the file's view replaces it, the short "annotated" note in its
+  place takes focus the same way and carries no live role either.
 - A finding decision (publish, decline, a revision, a retraction, the reproduced mark) answers a
   page, not a bare IRI: every decision form asks for `as=text/html`, and the answer is the
   outcome in words ("Your answer is recorded: declined."), a button back to the file's pending
@@ -52,7 +53,8 @@ the [ACCESSIBILITY.md template](https://github.com/mgifford/ACCESSIBILITY.md) (M
   edited `a11y.toml` reaching the next read. `src/layout.rs`: every emitted `browse-*` class has a
   rule, and the palette's four foreground colors per scheme clear 4.5:1 on an assumed white and
   `#0d1117` ground. `src/progress.rs`: the live regions and `aria-describedby`; `src/annotate.rs`
-  and `src/pr.rs`: the new card focused; `src/finding.rs`: every decision form's answer is HTML
+  and `src/pr.rs`: the new card focused, and the annotate acknowledgement focused with no live
+  role; `src/finding.rs`: every decision form's answer is HTML
   with the answer line focused, and hostile text in it is escaped. All ran on main at `528192f` on 2026-10-15 and passed,
   with and without feature `migrate`; CI runs them on every pull request.
 - Once, by hand, on 2026-10-15 (not a gate): axe-core 4.10.3 in Chrome 153.0.8010.54 over
