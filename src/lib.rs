@@ -190,7 +190,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, OnceLock};
 
 use ikigai_core::{
@@ -207,6 +206,9 @@ use syntect::util::LinesWithEndings;
 
 mod annotate;
 mod archive;
+/// The checkout a root serves, read from disk: every filesystem read and every
+/// `git` run goes through its jailed paths (Hypothesis H).
+mod checkout;
 /// Store checks that list and never write — today, the records minted against
 /// a `.git` path before 0.18.2 refused it (ledger #1130). Public so a host or
 /// the `git-dir-doctor` example can run them over any store.
@@ -1028,34 +1030,10 @@ pub(crate) fn lexical_jail(rel: &str) -> Result<()> {
 }
 
 /// Resolve a root-relative path to a canonical path within the root — **the
-/// jail**. `..` and absolute segments are rejected lexically; the target is
-/// then canonicalized (it must exist — browsing is a read) and required to sit
-/// within the canonical root, so a symlink component cannot escape.
-pub(crate) fn resolve(root: &Path, rel: &str) -> Result<PathBuf> {
-    lexical_jail(rel)?;
-    // Judged on the path AS WRITTEN first, before the filesystem is touched, so
-    // a `.git` path that exists and one that does not answer alike.
-    if names_git_dir(Path::new(rel)) {
-        return Err(git_dir_refusal(rel));
-    }
-    let canonical_root = root
-        .canonicalize()
-        .map_err(|e| Error::Endpoint(format!("browse: root `{}`: {e}", root.display())))?;
-    let target = canonical_root.join(rel);
-    let canonical = target
-        .canonicalize()
-        .map_err(|_| Error::NotFound(format!("browse: no such path `{rel}`")))?;
-    let Ok(inside) = canonical.strip_prefix(&canonical_root) else {
-        return Err(Error::Endpoint(format!(
-            "browse: `{rel}` resolves outside its root"
-        )));
-    };
-    // And on the CANONICAL path: a symlink inside the tree (`cfg -> .git/config`,
-    // `gitdir -> .git`) passes the lexical check and lands here.
-    if names_git_dir(inside) {
-        return Err(git_dir_refusal(rel));
-    }
-    Ok(canonical)
+/// jail** ([`checkout::Jailed::resolve`], where it lives beside every read it
+/// guards).
+pub(crate) fn resolve(root: &Path, rel: &str) -> Result<checkout::Jailed> {
+    checkout::Jailed::resolve(root, rel)
 }
 
 /// The name of git's own directory (or, in a submodule or linked worktree, the
@@ -1315,55 +1293,6 @@ pub(crate) struct Entry {
     to_dir: bool,
 }
 
-/// List a directory: directories first, then files and links, each
-/// alphabetical. Non-UTF-8 names are skipped rather than mangled, and a `.git`
-/// entry (directory or file) is never listed: [`resolve`] refuses it, and this
-/// listing is what the tree, the hash's merkle walk and the explain rollup all
-/// enumerate, so none of them can offer or fold in what the resolver will not
-/// serve. Whether a symlink is served needs the root to judge, so the tree face
-/// resolves each one itself ([`tree_endpoint`]); every other enumerator skips
-/// links outright.
-pub(crate) fn list_entries(dir: &Path) -> Result<Vec<Entry>> {
-    let read = std::fs::read_dir(dir)
-        .map_err(|e| Error::Endpoint(format!("browse: read {}: {e}", dir.display())))?;
-    let mut entries = Vec::new();
-    for entry in read.flatten() {
-        if is_git_dir_name(&entry.file_name()) {
-            continue;
-        }
-        let Ok(name) = entry.file_name().into_string() else {
-            continue;
-        };
-        // `file_type`/`metadata` on a DirEntry do NOT follow symlinks — a link
-        // is reported as a link, and an escaping one is only ever denied later,
-        // at resolution.
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        let kind = if file_type.is_dir() {
-            Kind::Dir
-        } else if file_type.is_symlink() {
-            Kind::Link
-        } else {
-            Kind::File
-        };
-        let size = (kind == Kind::File)
-            .then(|| entry.metadata().ok().map(|m| m.len()))
-            .flatten();
-        entries.push(Entry {
-            name,
-            kind,
-            size,
-            to_dir: false,
-        });
-    }
-    entries.sort_by(|a, b| {
-        let rank = |e: &Entry| (e.kind != Kind::Dir) as u8;
-        (rank(a), a.name.as_str()).cmp(&(rank(b), b.name.as_str()))
-    });
-    Ok(entries)
-}
-
 // --- tree endpoint ----------------------------------------------------------
 
 fn tree_endpoint(roots: &Roots, explain: bool) -> FnEndpoint {
@@ -1379,7 +1308,7 @@ fn tree_endpoint(roots: &Roots, explain: bool) -> FnEndpoint {
                 file_iri(repo, &rel)
             )));
         }
-        let mut entries = list_entries(&dir)?;
+        let mut entries = dir.list()?;
         // The enumerator never outruns the resolver: a link is listed iff
         // [`resolve`] serves its path, judged by resolve itself so the two
         // cannot drift. That drops a link into `.git` (ledger #1126) and an
@@ -1834,7 +1763,10 @@ struct FileEndpoint {
 impl FileEndpoint {
     /// The judged target: its repo, its root-relative path and its resolved
     /// path, a file inside the root the caller is granted.
-    fn target<'a>(&'a self, inv: &'a Invocation<'_>) -> Result<(&'a str, String, PathBuf)> {
+    fn target<'a>(
+        &'a self,
+        inv: &'a Invocation<'_>,
+    ) -> Result<(&'a str, String, checkout::Jailed)> {
         let (repo, root) = repo_root(inv, &self.roots)?;
         granted(inv, repo)?;
         let rel = path_binding(inv)?;
@@ -1942,7 +1874,10 @@ impl FileEndpoint {
                 }
                 Ok(repr_utf8("text/plain", out))
             }
-            _ => Ok(Representation::new(media_type_for(&target, &bytes), bytes)),
+            _ => Ok(Representation::new(
+                media_type_for(target.path(), &bytes),
+                bytes,
+            )),
         }
     }
 }
@@ -2614,16 +2549,13 @@ struct GitState {
     git: bool,
 }
 
-/// Run `git -C <root> <args…>` — an argument vector, never a shell string.
-pub(crate) fn git(root: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
-    Command::new("git").arg("-C").arg(root).args(args).output()
-}
-
 fn git_state(root: &Path) -> Result<GitState> {
+    let root = checkout::Jailed::root(root)?;
     // `-- .` scopes the status to the root (git runs in it, via `-C`); `-z`
     // gives NUL-terminated, UNQUOTED paths, which is what makes them
     // strippable — the quoted form would hide the prefix inside the quote.
-    let status = git(root, &["status", "--porcelain", "-z", "--", "."])
+    let status = root
+        .git(&["status", "--porcelain", "-z", "--", "."])
         .map_err(|e| Error::Endpoint(format!("browse: could not run git: {e}")))?;
     if !status.status.success() {
         let stderr = String::from_utf8_lossy(&status.stderr);
@@ -2643,7 +2575,8 @@ fn git_state(root: &Path) -> Result<GitState> {
     // Porcelain paths are relative to the WORK TREE's top, whatever `-C`
     // says; the root's own place in it is `--show-prefix` (`""` at the top,
     // else `sub/dir/`).
-    let prefix = git(root, &["rev-parse", "--show-prefix"])
+    let prefix = root
+        .git(&["rev-parse", "--show-prefix"])
         .map_err(|e| Error::Endpoint(format!("browse: could not run git: {e}")))?;
     if !prefix.status.success() {
         return Err(Error::Endpoint(format!(
@@ -2657,7 +2590,8 @@ fn git_state(root: &Path) -> Result<GitState> {
     let dirty = porcelain_z_paths(&String::from_utf8_lossy(&status.stdout), prefix);
     // An unborn branch (init, no commits) has no HEAD — that is `head: None`
     // with `git: true`, distinct from a non-repo.
-    let head = git(root, &["rev-parse", "HEAD"])
+    let head = root
+        .git(&["rev-parse", "HEAD"])
         .ok()
         .filter(|out| out.status.success())
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
@@ -2761,6 +2695,7 @@ mod tests {
     use super::*;
     use futures::executor::block_on;
     use ikigai_core::{ArgRef, Capability, Kernel, Request};
+    use std::process::Command;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     fn temp_dir() -> PathBuf {

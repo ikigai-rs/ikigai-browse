@@ -4,6 +4,8 @@ use std::path::Path;
 
 use ikigai_core::{Error, Result};
 
+use crate::checkout::Jailed;
+
 /// Maximum file input for browse content and hashing: 16 MiB (16,777,216 bytes).
 /// Larger files fail with `Error::OverBudget`; content and hashes are never truncated.
 /// Directory hashing applies this limit to each file, not the aggregate tree.
@@ -18,8 +20,10 @@ pub(crate) fn over_budget(path: &Path) -> Error {
     }
 }
 
-pub(crate) fn visit_file(path: &Path, visit: impl FnMut(&[u8])) -> Result<()> {
-    let file = std::fs::File::open(path)
+pub(crate) fn visit_file(file: &Jailed, visit: impl FnMut(&[u8])) -> Result<()> {
+    let path = file.path();
+    let file = file
+        .open()
         .map_err(|e| Error::Endpoint(format!("browse: open {}: {e}", path.display())))?;
     let size = file
         .metadata()
@@ -54,9 +58,9 @@ fn visit_reader(reader: impl Read, path: &Path, mut visit: impl FnMut(&[u8])) ->
     }
 }
 
-pub(crate) fn read_file(path: &Path) -> Result<Vec<u8>> {
+pub(crate) fn read_file(file: &Jailed) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    visit_file(path, |chunk| bytes.extend_from_slice(chunk))?;
+    visit_file(file, |chunk| bytes.extend_from_slice(chunk))?;
     Ok(bytes)
 }
 

@@ -17,6 +17,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ikigai_core::{ArgSpec, Description, FnEndpoint, Invocation, Result, Verb};
+
+use crate::checkout::Jailed;
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -51,7 +53,7 @@ pub(crate) fn hash_iri(repo: &str, rel: &str) -> String {
 }
 
 /// Hash a file's bytes — `sha256:{hex}`.
-fn hash_file(path: &Path) -> Result<String> {
+fn hash_file(path: &Jailed) -> Result<String> {
     let mut hasher = Sha256::new();
     crate::file_read::visit_file(path, |chunk| hasher.update(chunk))?;
     Ok(format!("sha256:{:x}", hasher.finalize()))
@@ -61,13 +63,13 @@ fn hash_file(path: &Path) -> Result<String> {
 /// in name order — hashed together. Ignored names, symlinks (never followed,
 /// so no cycles), and non-UTF-8 names are excluded. An empty directory is the
 /// hash of the empty input: stable, and distinct from any file.
-fn hash_dir(dir: &Path, ignore: &BTreeSet<String>) -> Result<String> {
-    let mut entries = crate::list_entries(dir)?;
+fn hash_dir(dir: &Jailed, ignore: &BTreeSet<String>) -> Result<String> {
+    let mut entries = dir.list()?;
     entries.retain(|e| !ignore.contains(&e.name) && e.kind != crate::Kind::Link);
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     let mut hasher = Sha256::new();
     for entry in entries {
-        let child = dir.join(&entry.name);
+        let child = dir.child(&entry.name)?;
         let child_hash = match entry.kind {
             crate::Kind::Dir => hash_dir(&child, ignore)?,
             _ => hash_file(&child)?,
