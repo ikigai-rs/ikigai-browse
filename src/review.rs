@@ -2587,7 +2587,7 @@ fn review_html(
     let mut out = String::from("<div class=\"browse\">");
     out.push_str(&crumbs_html(repo, rel));
     out.push_str(&format!(
-        "<nav class=\"browse-actions\"><button class=\"browse-view-link\" \
+        "<nav class=\"browse-actions\" aria-label=\"Actions\"><button class=\"browse-view-link\" \
          hx-get=\"/k/source {} as=text/html\" hx-target=\"#browse\" \
          hx-swap=\"innerHTML\">view file</button></nav>",
         attr(&entry.target_iri),

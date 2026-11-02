@@ -329,12 +329,15 @@ Turtle/TriG definition ([assets/](assets/)) so the graph faces highlight too;
 unknown formats degrade to escaped plain text, and extensionless well-known
 names (`Dockerfile`) match by file name. File views wrap each
 line in `<span id="L{n}">` with a self-linking gutter number, so `#L42`
-deep-links a line — the anchor surface annotations target. With the
+deep-links a line — the anchor surface annotations target. The gutter links
+are out of the tab order and the `<pre>` takes focus instead, so a file is one
+tab stop rather than one per line. With the
 annotation store mounted, the file view marks annotated lines
 (`browse-line-annotated`), renders an inline marker per anchored annotation
 between the gutter number and the code (`browse-annotation-marker` — an
-anchor down to the annotation's card whose native `title` tooltip reveals
-the note; hosts may style it as a margin dot), and appends an annotations
+anchor down to the annotation's card, named in words by its kind and note,
+whose native `title` tooltip also shows the note; hosts may style it as a
+margin dot), and appends an annotations
 panel: one card per annotation at its `#L{n}` anchor (orphans visually
 flagged, listed without a marker) plus a create form that `hx-post`s a Sink
 of `urn:iki:annotation` through the host's `/k/` adapter (form fields become
@@ -1036,8 +1039,8 @@ Three things a reader of that test should know:
 ## Accessibility
 
 [ACCESSIBILITY.md](ACCESSIBILITY.md) says which parts of a browse page this crate writes and which
-the host does, the rules that output follows, how it is tested, what is known to fail today (text
-dimmed by opacity, among other things), and how to report a barrier.
+the host does, the rules that output follows, how it is tested, what is known to fail today, and
+how to report a barrier.
 
 ## License
 

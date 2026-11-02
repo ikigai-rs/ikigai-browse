@@ -1313,7 +1313,9 @@ fn pr_html(
         ));
     }
     if !actions.is_empty() {
-        out.push_str(&format!("<nav class=\"browse-actions\">{actions}</nav>"));
+        out.push_str(&format!(
+            "<nav class=\"browse-actions\" aria-label=\"Actions\">{actions}</nav>"
+        ));
     }
     out.push_str(explain_status.unwrap_or_default());
     out.push_str(&format!(
@@ -1460,7 +1462,7 @@ fn pr_explain_face(
             let mut out = String::from("<div class=\"browse\">");
             out.push_str(&pr_crumbs(repo, Some(n), Some("explain")));
             out.push_str(&format!(
-                "<nav class=\"browse-actions\"><button class=\"browse-view-link\" \
+                "<nav class=\"browse-actions\" aria-label=\"Actions\"><button class=\"browse-view-link\" \
                  hx-get=\"/k/source {} as=text/html\" hx-target=\"#browse\" \
                  hx-swap=\"innerHTML\">view pull request</button></nav>",
                 attr(&entry.target_iri),
@@ -1763,7 +1765,7 @@ fn pr_review_face(
             let mut out = String::from("<div class=\"browse\">");
             out.push_str(&pr_crumbs(repo, Some(n), Some("review")));
             out.push_str(&format!(
-                "<nav class=\"browse-actions\"><button class=\"browse-view-link\" \
+                "<nav class=\"browse-actions\" aria-label=\"Actions\"><button class=\"browse-view-link\" \
                  hx-get=\"/k/source {} as=text/html\" hx-target=\"#browse\" \
                  hx-swap=\"innerHTML\">view pull request</button></nav>",
                 attr(&entry.target_iri),

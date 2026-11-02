@@ -1433,7 +1433,7 @@ fn explain_html(
     // navigably — a directory's target is its tree face, a file's its view.
     let is_dir = entry.target_iri == tree_iri(repo, rel);
     out.push_str(&format!(
-        "<nav class=\"browse-actions\"><button class=\"browse-view-link\" \
+        "<nav class=\"browse-actions\" aria-label=\"Actions\"><button class=\"browse-view-link\" \
          hx-get=\"/k/source {} as=text/html\" hx-target=\"#browse\" \
          hx-swap=\"innerHTML\">{}</button></nav>",
         attr(&entry.target_iri),

@@ -550,7 +550,7 @@ pub(crate) fn decision_html(
          <select name=\"reason\">{reasons}</select></label>\
          <label class=\"browse-finding-label\"><input type=\"checkbox\" name=\"reproduced\" \
          value=\"{yes}\"> reproduced (publish only — say how below)</label>\
-         <textarea name=\"content\" placeholder=\"why (optional; kept either way)\"></textarea>\
+         <label class=\"browse-field\">why (optional; kept either way) <textarea name=\"content\"></textarea></label>\
          <button type=\"submit\" name=\"decision\" value=\"{PUBLISH}\">publish</button>\
          <button type=\"submit\" name=\"decision\" value=\"{DECLINE}\">decline</button>\
          </form>",
@@ -573,7 +573,7 @@ fn reproduce_html(id: &str, decision: &Decision) -> String {
          hx-swap=\"innerHTML\">{ASK_HTML}\
          <input type=\"hidden\" name=\"revises\" value=\"{revises}\">\
          <input type=\"hidden\" name=\"reproduced\" value=\"{yes}\">\
-         <textarea name=\"content\" placeholder=\"how it was reproduced\"></textarea>\
+         <label class=\"browse-field\">how it was reproduced <textarea name=\"content\"></textarea></label>\
          <button type=\"submit\" name=\"decision\" value=\"{PUBLISH}\">reproduced</button>\
          </form></details>",
         iri = attr(&finding_iri(id)),
@@ -647,17 +647,17 @@ fn revise_html(id: &str, decision: &Decision) -> String {
          <select name=\"severity\">{options}</select></label>\
          <label class=\"browse-finding-label\">reason \
          <select name=\"reason\">{reasons}</select></label>\
-         <textarea name=\"content\" placeholder=\"why (optional; kept either way)\"></textarea>\
+         <label class=\"browse-field\">why (optional; kept either way) <textarea name=\"content\"></textarea></label>\
          <button type=\"submit\" name=\"decision\" value=\"{DECLINE}\">decline (confirm)</button>\
          </form>\
          <form class=\"browse-finding-decide\" {open}\
          <label class=\"browse-finding-label\">severity \
          <select name=\"severity\">{options}</select></label>\
-         <textarea name=\"content\" placeholder=\"why publish it after all (optional)\"></textarea>\
+         <label class=\"browse-field\">why publish it after all (optional) <textarea name=\"content\"></textarea></label>\
          <button type=\"submit\" name=\"decision\" value=\"{PUBLISH}\">publish instead</button>\
          </form>\
          <form class=\"browse-finding-retract\" {open}\
-         <textarea name=\"content\" placeholder=\"why withdraw it (optional)\"></textarea>\
+         <label class=\"browse-field\">why withdraw it (optional) <textarea name=\"content\"></textarea></label>\
          <button type=\"submit\" name=\"decision\" value=\"{RETRACT}\">retract</button>\
          </form></details>",
         reasons = reason_options(decision.reason.as_deref()),
@@ -2264,7 +2264,7 @@ fn listing_html(
     out.push_str(&crumbs_html(repo, rel));
     out.push_str(&format!(
         "<p class=\"browse-findings-note\">{NOT_A_GATE}</p>\
-         <nav class=\"browse-findings-states\">"
+         <nav class=\"browse-findings-states\" aria-label=\"Finding states\">"
     ));
     for option in STATES {
         let current = match option == state {
@@ -2332,7 +2332,7 @@ fn page_html(
     next: Option<&str>,
 ) -> String {
     let mut out = format!(
-        "<nav class=\"browse-findings-page\"><p>{}</p>",
+        "<nav class=\"browse-findings-page\" aria-label=\"Pages\"><p>{}</p>",
         html_text(&page.words(shown, total, next))
     );
     if let Some(next) = next {

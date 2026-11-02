@@ -102,15 +102,20 @@ pub const LAYOUT_IRI: &str = "urn:repo:style:layout";
 /// as a blob.
 pub(crate) const LAYOUT_CSS: &str = "\
 /* ikigai-browse layout — the browse-* classes the HTML faces emit.\n\
-   Palette only; a door may override any of these. Nothing here paints. */\n\
+   Palette only; a door may override any of these. Nothing here paints.\n\
+   Secondary text is --browse-muted, never opacity: a color the contrast test\n\
+   can measure (ledger #1653). It is the host's ikigai-ui --muted token when\n\
+   the host defines one, so it follows the host's theme, else the same value.\n\
+   The two tints are #rrggbbaa so urn:repo:style can read them. */\n\
 :root{\
 --browse-link:#0b57d0;\
 --browse-rule:#d0d7de;\
 --browse-flag:#8a6100;\
 --browse-machine:#6639ba;\
 --browse-praise:#1a7f37;\
---browse-mark:rgba(255,212,0,.22);\
---browse-propose:rgba(102,57,186,.10)\
+--browse-muted:var(--muted,#545d68);\
+--browse-mark:#ffd40038;\
+--browse-propose:#6639ba1a\
 }\n\
 @media (prefers-color-scheme:dark){:root{\
 --browse-link:#8ab4f8;\
@@ -118,8 +123,9 @@ pub(crate) const LAYOUT_CSS: &str = "\
 --browse-flag:#d4a72c;\
 --browse-machine:#b78af8;\
 --browse-praise:#57ab5a;\
---browse-mark:rgba(255,212,0,.14);\
---browse-propose:rgba(183,138,248,.12)\
+--browse-muted:var(--muted,#9ea8b3);\
+--browse-mark:#ffd40024;\
+--browse-propose:#b78af81f\
 }}\n\
 \
 /* Navigation is buttons (every move is an hx-get), so the buttons must read as\n\
@@ -160,7 +166,7 @@ text-decoration:none\
 .browse-crumbs{display:flex;flex-wrap:wrap;align-items:baseline;gap:.1rem;\
 margin-bottom:.75rem}\n\
 .browse-here{font-weight:600}\n\
-.browse-sep{opacity:.5;margin:0 .15rem}\n\
+.browse-sep{color:var(--browse-muted);margin:0 .15rem}\n\
 \
 /* The header action strip, and the disclosure menus under it. */\n\
 .browse-actions{display:flex;flex-wrap:wrap;gap:.9rem;margin-bottom:.75rem}\n\
@@ -172,11 +178,11 @@ border:1px solid var(--browse-rule);border-radius:6px;padding:.5rem .75rem;\
 margin-top:.4rem}\n\
 .browse-explain-menu-heading,.browse-review-menu-heading{\
 margin:0 0 .4rem;font-weight:600}\n\
-.browse-explain-menu-empty,.browse-review-menu-empty{margin:.2rem 0;opacity:.7}\n\
+.browse-explain-menu-empty,.browse-review-menu-empty{margin:.2rem 0;color:var(--browse-muted)}\n\
 .browse-explain-menu-note,.browse-review-menu-note{margin:.5rem 0 0}\n\
 .browse-explain-menu-body,.browse-review-menu-body{display:block}\n\
 .browse-explain-choices,.browse-review-choices,.browse-explain-archived{margin:0}\n\
-.browse-explain-inert,.browse-review-inert{opacity:.6;cursor:not-allowed}\n\
+.browse-explain-inert,.browse-review-inert{color:var(--browse-muted);cursor:not-allowed}\n\
 \
 /* What a model-backed click will cost, and its wait (crate::progress). The\n\
    cost line keeps the door's own text color at full opacity, so its contrast\n\
@@ -200,11 +206,11 @@ padding:.35rem .6rem;border-left:3px solid var(--browse-link);max-width:46rem}\n
 .browse-dir{font-weight:600}\n\
 /* browse-size is the generic muted detail, not only a byte count: a menu
    heading nests one, so it states its weight rather than inheriting 600. */\n\
-.browse-size{opacity:.6;font-size:.85em;font-weight:400;margin-left:.5rem}\n\
+.browse-size{color:var(--browse-muted);font-size:.85em;font-weight:400;margin-left:.5rem}\n\
 \
 /* The explanation face: prose, then its provenance line. */\n\
 .browse-explain p{margin:.6rem 0;max-width:46rem}\n\
-.browse-provenance{margin-top:1.25rem;opacity:.6;font-size:.85em}\n\
+.browse-provenance{margin-top:1.25rem;color:var(--browse-muted);font-size:.85em}\n\
 \
 /* The file face. `.browse-line` stays INLINE: LinesWithEndings keeps each\n\
    line's own newline inside the span, so a block would double-space the file. */\n\
@@ -212,12 +218,15 @@ padding:.35rem .6rem;border-left:3px solid var(--browse-link);max-width:46rem}\n
 font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}\n\
 .browse-code code{font:inherit}\n\
 .browse-ln{display:inline-block;width:4ch;margin-right:1ch;text-align:right;\
-color:inherit;opacity:.4;text-decoration:none;user-select:none;\
+color:inherit;text-decoration:none;user-select:none;\
 -webkit-user-select:none}\n\
-.browse-ln:hover{opacity:.8}\n\
+.browse-ln:hover{text-decoration:underline}\n\
 .browse-line-annotated,.browse-line:target{background:var(--browse-mark)}\n\
-.browse-annotation-marker{margin-right:.35ch;opacity:.8;color:inherit;\
-text-decoration:none}\n\
+/* The line marks and the L{n} links in a card sit inside running text, so\n\
+   they are underlined, not told apart by color alone (SC 1.4.1, ledger #1653). */\n\
+.browse-annotation-marker{margin-right:.35ch;color:inherit;\
+text-decoration:underline;text-underline-offset:.2em}\n\
+.browse-annotation-line{text-decoration:underline}\n\
 .browse-annotation-marker-machine{color:var(--browse-machine)}\n\
 /* Proposals (ledger #496): a PENDING finding drawn beside its line under\n\
    `proposals=`. A different tint than an annotated line and a different glyph\n\
@@ -226,7 +235,8 @@ text-decoration:none}\n\
    the badge; every colour is a palette property above and sits over the\n\
    contrast floor (`the_palette_clears_the_contrast_floor`). */\n\
 .browse-line-proposed{background:var(--browse-propose)}\n\
-.browse-proposal-marker{margin-right:.35ch;color:inherit;text-decoration:none}\n\
+.browse-proposal-marker{margin-right:.35ch;color:inherit;text-decoration:underline;\
+text-underline-offset:.2em}\n\
 .browse-proposal-marker-critical,.browse-proposal-marker-major,\
 .browse-proposal-severity-critical,.browse-proposal-severity-major{\
 color:var(--browse-flag)}\n\
@@ -236,22 +246,21 @@ color:var(--browse-machine)}\n\
 .browse-proposal-marker-praise,.browse-proposal-severity-praise{\
 color:var(--browse-praise)}\n\
 .browse-proposals{display:grid;gap:.75rem;margin-top:1.25rem}\n\
-.browse-proposals-note{font-size:.85em;opacity:.7;margin:0}\n\
+.browse-proposals-note{font-size:.85em;color:var(--browse-muted);margin:0}\n\
 .browse-proposal{border-left:3px dotted var(--browse-machine);padding-left:.6rem}\n\
 .browse-proposal-critical,.browse-proposal-major{border-left-color:var(--browse-flag)}\n\
 .browse-proposal-minor,.browse-proposal-info{border-left-color:var(--browse-machine)}\n\
 .browse-proposal-praise{border-left-color:var(--browse-praise)}\n\
-.browse-proposal-orphaned{opacity:.75}\n\
+.browse-proposal-orphaned{color:var(--browse-muted)}\n\
 .browse-proposal-line{background:none;border:0;padding:0;margin:0;font:inherit;\
-color:var(--browse-link);text-decoration:none}\n\
-.browse-proposal-line:hover{text-decoration:underline}\n\
+color:var(--browse-link);text-decoration:underline}\n\
 .browse-proposal-severity{font-size:.72em;white-space:nowrap;margin-right:.35rem;\
 padding:.05em .5em;border:1px solid currentColor;border-radius:999px}\n\
 .browse-proposal-label{font-size:.72em;text-transform:uppercase;letter-spacing:.06em;\
-opacity:.7;margin-right:.35rem}\n\
-.browse-proposal-model{opacity:.65;font-size:.85em}\n\
+color:var(--browse-muted);margin-right:.35rem}\n\
+.browse-proposal-model{color:var(--browse-muted);font-size:.85em}\n\
 .browse-proposal-quote{margin:.15rem 0;padding-left:.5rem;\
-border-left:2px solid var(--browse-rule);font-style:italic;opacity:.85}\n\
+border-left:2px solid var(--browse-rule);font-style:italic;color:var(--browse-muted)}\n\
 .browse-proposal-body{margin:.25rem 0}\n\
 .browse-proposal-flag{font-size:.72em;white-space:nowrap;margin-left:.35rem;\
 padding:.05em .5em;border:1px solid var(--browse-flag);border-radius:999px;\
@@ -259,7 +268,7 @@ color:var(--browse-flag)}\n\
 .browse-proposal-link{font-size:.85em;color:var(--browse-link);text-decoration:none;\
 word-break:break-all}\n\
 .browse-proposal-link:hover{text-decoration:underline}\n\
-.browse-binary{opacity:.7;font-style:italic}\n\
+.browse-binary{color:var(--browse-muted);font-style:italic}\n\
 \
 /* A review pass that found nothing: the statement IS the page body, so it\n\
    carries the page's weight rather than the provenance line's whisper — an\n\
@@ -271,17 +280,17 @@ padding-left:.6rem;margin-top:1.25rem}\n\
 .browse-annotations{display:grid;gap:.75rem;margin-top:1.25rem}\n\
 .browse-annotation{border-left:3px solid var(--browse-rule);padding-left:.6rem}\n\
 .browse-annotation-machine{border-left-color:var(--browse-machine)}\n\
-.browse-annotation-orphaned{opacity:.75}\n\
-.browse-annotation-model,.browse-annotation-path{opacity:.65;font-size:.85em}\n\
+.browse-annotation-orphaned{color:var(--browse-muted)}\n\
+.browse-annotation-model,.browse-annotation-path{color:var(--browse-muted);font-size:.85em}\n\
 .browse-annotation-quote{margin:.15rem 0;padding-left:.5rem;\
-border-left:2px solid var(--browse-rule);font-style:italic;opacity:.85}\n\
+border-left:2px solid var(--browse-rule);font-style:italic;color:var(--browse-muted)}\n\
 .browse-annotation-body{margin:.25rem 0}\n\
 .browse-annotation-flag{font-size:.72em;white-space:nowrap;margin-left:.35rem;\
 padding:.05em .5em;border:1px solid var(--browse-flag);border-radius:999px;\
 color:var(--browse-flag)}\n\
 /* A successful annotate (ledger #658): the note shown while the target's view\n\
    loads back, and the new card in that view, marked and focused. */\n\
-.browse-annotated-note{font-size:.85em;opacity:.8}\n\
+.browse-annotated-note{font-size:.85em;color:var(--browse-muted)}\n\
 .browse-annotated-back{color:var(--browse-link)}\n\
 .browse-annotation-new{border-left-color:var(--browse-link);background:var(--browse-mark)}\n\
 .browse-annotation-new:focus{outline:2px solid var(--browse-link);outline-offset:2px}\n\
@@ -295,31 +304,31 @@ color:var(--browse-flag)}\n\
 .browse-finding{border-left-style:dashed}\n\
 .browse-finding-pending{border-left-color:var(--browse-flag)}\n\
 .browse-finding-published{border-left-style:solid}\n\
-.browse-finding-declined{opacity:.6}\n\
+.browse-finding-declined{color:var(--browse-muted)}\n\
 /* Superseded (ledger #504): undecided, but the file's current review does not
    carry it — still answerable, so dimmed rather than hidden, and the note says
    why before anyone spends a decision on it. */\n\
-.browse-finding-superseded{opacity:.75}\n\
+.browse-finding-superseded{color:var(--browse-muted)}\n\
 .browse-finding-superseded-note{font-style:italic}\n\
-.browse-findings-superseded{font-size:.85em;opacity:.8;margin:.5rem 0}\n\
+.browse-findings-superseded{font-size:.85em;color:var(--browse-muted);margin:.5rem 0}\n\
 .browse-finding-severity{font-size:.72em;white-space:nowrap;margin-right:.35rem;\
 padding:.05em .5em;border:1px solid currentColor;border-radius:999px}\n\
 .browse-finding-severity-critical,.browse-finding-severity-major{\
 color:var(--browse-flag)}\n\
 .browse-finding-severity-minor,.browse-finding-severity-info,\
-.browse-finding-severity-praise,.browse-finding-severity-unrated{opacity:.7}\n\
-.browse-finding-rater{font-size:.72em;opacity:.6;margin-right:.75rem}\n\
-.browse-finding-decision,.browse-finding-reason{font-size:.85em;opacity:.75;\
+.browse-finding-severity-praise,.browse-finding-severity-unrated{color:var(--browse-muted)}\n\
+.browse-finding-rater{font-size:.72em;color:var(--browse-muted);margin-right:.75rem}\n\
+.browse-finding-decision,.browse-finding-reason{font-size:.85em;color:var(--browse-muted);\
 margin:.25rem 0}\n\
 .browse-finding-minted{color:inherit}\n\
 /* The decision Sink's HTML answer (ledger #1988): the answer in words, full
    strength (no opacity), above the decided card. */\n\
 .browse-finding-decided{font-weight:600;margin:.5rem 0}\n\
 .browse-finding-decline-reason{font-weight:600}\n\
-.browse-finding-prior{font-size:.85em;opacity:.85;margin:.25rem 0;\
+.browse-finding-prior{font-size:.85em;color:var(--browse-muted);margin:.25rem 0;\
 border-left:3px solid var(--browse-flag);padding-left:.5rem}\n\
 .browse-finding-prior-link{color:inherit}\n\
-.browse-findings-declined{font-size:.85em;opacity:.8;margin:.5rem 0}\n\
+.browse-findings-declined{font-size:.85em;color:var(--browse-muted);margin:.5rem 0}\n\
 .browse-findings-declined ul{margin:.25rem 0 0 1rem;padding:0}\n\
 .browse-finding-decide{display:grid;gap:.4rem;max-width:32rem;margin:.5rem 0}\n\
 .browse-finding-decide textarea,.browse-finding-decide select{font:inherit;\
@@ -340,9 +349,9 @@ padding:.3rem}\n\
 .browse-finding-reproduce{font-size:.85em;margin:.25rem 0}\n\
 .browse-findings-unconfirmed{margin:.5rem 0}\n\
 .browse-findings-unconfirmed-group{font-size:.95em;margin:.75rem 0 .25rem}\n\
-.browse-finding-label{font-size:.85em;opacity:.8}\n\
-.browse-findings-note{font-size:.85em;opacity:.7;margin:.5rem 0}\n\
-.browse-findings-empty{opacity:.7;font-style:italic}\n\
+.browse-finding-label{font-size:.85em;color:var(--browse-muted)}\n\
+.browse-findings-note{font-size:.85em;color:var(--browse-muted);margin:.5rem 0}\n\
+.browse-findings-empty{color:var(--browse-muted);font-style:italic}\n\
 .browse-findings-states{display:flex;flex-wrap:wrap;gap:.4rem;margin:.5rem 0}\n\
 .browse-findings-state-current{font-weight:600;text-decoration:underline}\n\
 /* A page of the findings listing (ledger #1663): where it sits, and the way on. */\n\
@@ -352,19 +361,23 @@ padding:.3rem}\n\
 /* Finding groups (ledger #506): proposals a human decides once — a group is a
    bordered section so its members read as one batch, and the twin or the kept
    finding sits above them, set apart, because it is context, not a member. */\n\
-.browse-findings-groups-note{font-size:.85em;opacity:.7;margin:.5rem 0}\n\
+.browse-findings-groups-note{font-size:.85em;color:var(--browse-muted);margin:.5rem 0}\n\
 .browse-findings-group-kinds{display:flex;flex-wrap:wrap;gap:.4rem;margin:.5rem 0}\n\
 .browse-findings-group-kind{font:inherit}\n\
 .browse-findings-group-kind-current{font-weight:600;text-decoration:underline}\n\
-.browse-findings-group-count{font-size:.8em;opacity:.7}\n\
+.browse-findings-group-count{font-size:.8em;color:var(--browse-muted)}\n\
 .browse-findings-group{border:1px solid var(--browse-rule);border-radius:4px;\
 padding:.5rem .75rem;margin:.75rem 0}\n\
 .browse-findings-group-label{font-size:1em;margin:.25rem 0}\n\
-.browse-findings-group-reason{font-size:.85em;opacity:.8;margin:.25rem 0}\n\
-.browse-findings-group-twin,.browse-findings-group-kept{font-size:.9em;opacity:.85;\
+.browse-findings-group-reason{font-size:.85em;color:var(--browse-muted);margin:.25rem 0}\n\
+.browse-findings-group-twin,.browse-findings-group-kept{font-size:.9em;color:var(--browse-muted);\
 margin:.25rem 0 .5rem 0}\n\
 \
 .browse-annotate{display:grid;gap:.4rem;max-width:32rem;margin:1rem 0}\n\
+/* A text field and its visible label (ledger #1653): the words above the\n\
+   field, not a placeholder that goes when typing starts (SC 3.3.2). */\n\
+.browse-field{display:grid;gap:.2rem}\n\
+.browse-field input,.browse-field textarea{font:inherit;padding:.3rem}\n\
 .browse-annotate input,.browse-annotate textarea{font:inherit;padding:.3rem}\n\
 /* The submit is a real button and reads as one — only its placement is ours, so\n\
    a door that styles buttons keeps its own. */\n\
@@ -378,15 +391,33 @@ margin:.25rem 0 .5rem 0}\n\
 .browse-prs{list-style:none;padding-left:0;margin:0}\n\
 .browse-prs li{padding:.15rem 0}\n\
 .browse-pr-state{font-size:.72em;white-space:nowrap;padding:.05em .5em;\
-border:1px solid currentColor;border-radius:999px;opacity:.7}\n\
-.browse-pr-branch,.browse-pr-updated{opacity:.6;font-size:.85em}\n\
-.browse-prs-empty,.browse-prs-scope{opacity:.7}\n\
+border:1px solid currentColor;border-radius:999px;color:var(--browse-muted)}\n\
+.browse-pr-branch,.browse-pr-updated{color:var(--browse-muted);font-size:.85em}\n\
+.browse-prs-empty,.browse-prs-scope{color:var(--browse-muted)}\n\
 .browse-pr-meta h3{margin:.25rem 0}\n\
-.browse-pr-line,.browse-pr-head{margin:.1rem 0;opacity:.7;font-size:.9em}\n\
+.browse-pr-line,.browse-pr-head{margin:.1rem 0;color:var(--browse-muted);font-size:.9em}\n\
 .browse-recent-prs{margin-top:1.5rem}\n\
 .browse-recent-prs h4{margin:0 0 .35rem}\n\
-.browse-recent-prs-loading{opacity:.6}\n\
+.browse-recent-prs-loading{color:var(--browse-muted)}\n\
 ";
+
+/// One palette property's value as [`LAYOUT_CSS`] writes it, in the light
+/// (`dark == false`) or the dark block: the first `:root{…}` is light, the one
+/// inside the media query is dark. `urn:repo:style` reads the line tints through
+/// this, so the tint the floor pass measures against is the tint this sheet
+/// paints, with no second copy to drift (ledger #1653).
+pub(crate) fn palette_value(dark: bool, name: &str) -> Option<&'static str> {
+    LAYOUT_CSS
+        .split(":root{")
+        .nth(if dark { 2 } else { 1 })?
+        .split('}')
+        .next()?
+        .split(';')
+        .find_map(|declaration| {
+            let (property, value) = declaration.split_once(':')?;
+            (property.trim() == name).then_some(value.trim())
+        })
+}
 
 /// The layout sheet's one concrete grammar row: the bare [`LAYOUT_IRI`], no
 /// bindings — it is the same sheet whatever the roots are.
@@ -532,6 +563,8 @@ mod tests {
     /// a severity colour added for `proposals=` does not slip under the floor
     /// a door cannot see past. The `--browse-mark` / `--browse-propose` tints
     /// are backgrounds behind inherited text and are not foregrounds.
+    /// `--browse-muted` is checked at its fallback, the value a door without
+    /// ikigai-ui's `--muted` token gets.
     #[test]
     fn the_palette_clears_the_contrast_floor() {
         use ikigai_a11y::{ratio, Rgba};
@@ -554,9 +587,19 @@ mod tests {
                 let Some((name, value)) = declaration.split_once(':') else {
                     continue;
                 };
+                // A host token with a fallback: the fallback is ours.
+                let value = value
+                    .strip_prefix("var(")
+                    .and_then(|v| v.split_once(','))
+                    .map_or(value, |(_, fallback)| fallback.trim_end_matches(')'));
                 // `--browse-rule` is a hairline border, never text — a rule
-                // held to a text floor would have to be near-black.
-                if !value.starts_with('#') || name == "--browse-rule" {
+                // held to a text floor would have to be near-black. The two
+                // tints are grounds (`#rrggbbaa`), checked in `urn:repo:style`.
+                if !value.starts_with('#')
+                    || name == "--browse-rule"
+                    || name == "--browse-mark"
+                    || name == "--browse-propose"
+                {
                     continue;
                 }
                 let colour = Rgba::parse(value.trim()).unwrap();
@@ -569,8 +612,53 @@ mod tests {
                 checked += 1;
             }
         }
-        // Four foreground properties per scheme: link, flag, machine, praise.
-        assert_eq!(checked, 8, "the palette scan stopped seeing the properties");
+        // Five foreground properties per scheme: link, flag, machine, praise, muted.
+        assert_eq!(
+            checked, 10,
+            "the palette scan stopped seeing the properties"
+        );
+    }
+
+    /// ★ No text is dimmed by `opacity` (ledger #1653). Opacity blends a
+    /// color toward whatever is behind it, so a palette color that clears the
+    /// floor can render under it, and no test that reads colors sees it: axe
+    /// measured line numbers at 2.24:1 and the finding labels at 2.2 to 4.2:1
+    /// while the palette test above was green. Secondary text says
+    /// `color:var(--browse-muted)` instead, which that test measures.
+    #[test]
+    fn no_rule_dims_text_with_opacity() {
+        let mut sheet = String::new();
+        let mut rest = LAYOUT_CSS;
+        while let Some(open) = rest.find("/*") {
+            sheet.push_str(&rest[..open]);
+            rest = rest[open..]
+                .find("*/")
+                .map_or("", |close| &rest[open + close + 2..]);
+        }
+        sheet.push_str(rest);
+        let dimmed: Vec<&str> = sheet
+            .split('}')
+            .filter(|block| block.contains("opacity"))
+            .collect();
+        assert!(
+            dimmed.is_empty(),
+            "these rules dim with opacity, which no contrast test measures: {dimmed:?}"
+        );
+    }
+
+    /// The tints `urn:repo:style` measures against are read from this sheet,
+    /// so they must stay in a form it can parse: `#rrggbbaa`.
+    #[test]
+    fn the_line_tints_are_readable_colors_in_both_schemes() {
+        for dark in [false, true] {
+            for name in ["--browse-mark", "--browse-propose"] {
+                let value = palette_value(dark, name)
+                    .unwrap_or_else(|| panic!("{name} is missing (dark: {dark})"));
+                let tint = ikigai_a11y::Rgba::parse(value)
+                    .unwrap_or_else(|e| panic!("{name}:{value} is not #rrggbbaa: {e}"));
+                assert!(!tint.is_opaque(), "{name} is a tint, so it is translucent");
+            }
+        }
     }
 
     /// Every `browse-*` class the faces emit has a rule in [`LAYOUT_CSS`].
