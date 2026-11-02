@@ -548,7 +548,7 @@ pub(crate) fn html(
     out.push_str(&format!(
         "<p class=\"browse-findings-note\">{NOT_A_GATE}</p>\
          <p class=\"browse-findings-groups-note\">{A_PROPOSAL}</p>\
-         <nav class=\"browse-findings-group-kinds\">"
+         <nav class=\"browse-findings-group-kinds\" aria-label=\"Group kinds\">"
     ));
     for (option, groups, findings) in counts {
         let current = match *option == kind {

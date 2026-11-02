@@ -1424,7 +1424,7 @@ fn home_link_html() -> &'static str {
 /// item. `Some(iri)` crumbs `hx-get` that resource's html face into
 /// `#browse`; `None` is the inert current segment. Labels are escaped here.
 pub(crate) fn crumb_trail(items: &[(String, Option<String>)]) -> String {
-    let mut out = String::from("<nav class=\"browse-crumbs\">");
+    let mut out = String::from("<nav class=\"browse-crumbs\" aria-label=\"Breadcrumb\">");
     out.push_str(home_link_html());
     for (label, target) in items {
         match target {
@@ -1527,7 +1527,7 @@ fn actions_html(repo: &str, rel: &str, explain: bool) -> String {
         return String::new();
     }
     format!(
-        "<nav class=\"browse-actions\">{}{}{}</nav>{}{}{}{}",
+        "<nav class=\"browse-actions\" aria-label=\"Actions\">{}{}{}</nav>{}{}{}{}",
         explain_button(
             repo,
             rel,
@@ -1574,7 +1574,9 @@ fn tree_html(repo: &str, rel: &str, entries: &[Entry], explain: bool) -> String 
         ));
     }
     if !actions.is_empty() {
-        out.push_str(&format!("<nav class=\"browse-actions\">{actions}</nav>"));
+        out.push_str(&format!(
+            "<nav class=\"browse-actions\" aria-label=\"Actions\">{actions}</nav>"
+        ));
     }
     // The directory's own option menu, once — NOT one per row. The rows keep
     // their compact `?`; a listing of a thousand entries must not carry a
@@ -2174,10 +2176,103 @@ fn style_css(config: &ikigai_a11y::Presentation) -> Result<String> {
     );
     Ok(format!(
         "{floor}\n\
-         @media (prefers-color-scheme: light) {{\n{}}}\n\
-         @media (prefers-color-scheme: dark) {{\n{}}}\n",
-        light.css, dark.css
+         @media (prefers-color-scheme: light) {{\n{}{}}}\n\
+         @media (prefers-color-scheme: dark) {{\n{}{}}}\n",
+        light.css,
+        painted_grounds_css(&light, false, config.contrast.min),
+        dark.css,
+        painted_grounds_css(&dark, true, config.contrast.min),
     ))
+}
+
+/// The rules for what sits on a ground THIS crate paints over the theme's
+/// (ledger #1653): the line-number gutter, and the syntax colors on an
+/// annotated, targeted or proposed line's tint.
+///
+/// The floor pass measures every color against the theme's own ground, but a
+/// marked line is painted with `--browse-mark` or `--browse-propose` from the
+/// layout sheet, and a color that clears the floor on the ground can miss it on
+/// the tint: axe measured base16-ocean.dark's `#b48ead` and `#d08770` at 3.3 to
+/// 3.8:1 on them. So the pass runs again against each tint composited over the
+/// ground, and each color it lifts is lifted ON THAT LINE only, by a rule one
+/// class more specific (`.browse-line-annotated .hl-…`), so the theme's hues
+/// stay everywhere they are legible. The tints are read from the layout sheet
+/// ([`layout::palette_value`]); a door that overrides them is measured by
+/// nobody, which is the same assumption the layout palette test states.
+///
+/// The gutter used to be the code's own color at `opacity:.4` (2.24:1 on white,
+/// 2.5:1 on base16-ocean.dark). It is now a blend of the theme's own foreground
+/// toward its ground, the faintest blend that still clears the floor on the
+/// ground and on both tints: muted, but measured, and nothing invented.
+fn painted_grounds_css(scheme: &SchemeCss, dark: bool, min: f64) -> String {
+    use ikigai_a11y::Rgba;
+    let tint = |name: &str| {
+        layout::palette_value(dark, name)
+            .and_then(|value| Rgba::parse(value).ok())
+            .map(|tint| tint.over(scheme.ground))
+    };
+    let mark = tint("--browse-mark");
+    let propose = tint("--browse-propose");
+    let grounds: Vec<Rgba> = [Some(scheme.ground), mark, propose]
+        .into_iter()
+        .flatten()
+        .collect();
+    let mut out = format!(
+        ".hl-code .browse-ln {{\n color: {};\n}}\n",
+        gutter_color(scheme.foreground, scheme.ground, &grounds, min).to_css()
+    );
+    let tinted: [(Option<Rgba>, &[&str]); 2] = [
+        (mark, &[".browse-line-annotated", ".browse-line:target"]),
+        (propose, &[".browse-line-proposed"]),
+    ];
+    for (ground, lines) in tinted {
+        let Some(ground) = ground else { continue };
+        let pass = ikigai_a11y::apply_floor(&scheme.css, ground, scheme.foreground, min);
+        for lift in &pass.lifted {
+            let selectors: Vec<String> = lines
+                .iter()
+                .flat_map(|line| {
+                    lift.selector
+                        .split(',')
+                        .map(move |selector| format!("{line} {}", selector.trim()))
+                })
+                .collect();
+            out.push_str(&format!(
+                "{} {{\n color: {};\n}}\n",
+                selectors.join(", "),
+                lift.to.to_css()
+            ));
+        }
+    }
+    out
+}
+
+/// The faintest blend of `foreground` toward `ground` (in twentieths, from
+/// halfway) that clears `min` on every one of `grounds`; the foreground itself
+/// when none does, which is the floor pass's own repair color.
+fn gutter_color(
+    foreground: ikigai_a11y::Rgba,
+    ground: ikigai_a11y::Rgba,
+    grounds: &[ikigai_a11y::Rgba],
+    min: f64,
+) -> ikigai_a11y::Rgba {
+    let mix = |t: f64| {
+        let channel =
+            |f: u8, g: u8| (f64::from(g) + (f64::from(f) - f64::from(g)) * t).round() as u8;
+        ikigai_a11y::Rgba::rgb(
+            channel(foreground.r, ground.r),
+            channel(foreground.g, ground.g),
+            channel(foreground.b, ground.b),
+        )
+    };
+    (10..=20)
+        .map(|step| mix(f64::from(step) / 20.0))
+        .find(|candidate| {
+            grounds
+                .iter()
+                .all(|on| ikigai_a11y::ratio(*candidate, *on) >= min)
+        })
+        .unwrap_or(foreground)
 }
 
 /// two-face's embedded theme set, loaded once: it is ~2MB of data and a pure
@@ -2345,7 +2440,13 @@ fn highlight_html(
         .unwrap_or_else(|| syntaxes.find_syntax_plain_text());
     let mut parse = ParseState::new(syntax);
     let mut scopes = ScopeStack::new();
-    let mut out = format!("<pre class=\"browse-code {CLASS_PREFIX}code\"><code>");
+    // ★ One tab stop for the whole file (ledger #1653): the `<pre>` takes focus,
+    // so a keyboard can scroll a long line, and each gutter link is out of the
+    // tab order (`tabindex="-1"`), still a link to click and still in a screen
+    // reader's links list. A keyboard user used to tab once per line through the
+    // whole file to reach the annotations below it. The marks stay tab stops:
+    // there are few, and each leads to its card.
+    let mut out = format!("<pre class=\"browse-code {CLASS_PREFIX}code\" tabindex=\"0\"><code>");
     for (i, line) in LinesWithEndings::from(text).enumerate() {
         let n = i + 1;
         // Classed spans with PER-LINE balance: spans syntect leaves open
@@ -2402,25 +2503,30 @@ fn highlight_html(
                     // (review) annotation, a hollow diamond for a proposal —
                     // three kinds, distinguishable at the line, and the
                     // proposal anchored to ITS card (`#proposal-`), never an
-                    // annotation's.
+                    // annotation's. The glyph is not a name (ledger #1653): each
+                    // mark is named in words, its kind and its note, so a screen
+                    // reader does not read "black circle" and the note is not
+                    // only in a hover tooltip.
                     match &m.kind {
                         MarkerKind::Human => format!(
                             "<a class=\"browse-annotation-marker\" href=\"#annotation-{}\" \
-                             title=\"{}\">●</a>",
+                             title=\"{note}\" aria-label=\"annotation: {note}\">●</a>",
                             attr(&m.id),
-                            attr(&m.note)
+                            note = attr(&m.note)
                         ),
                         MarkerKind::Machine => format!(
                             "<a class=\"browse-annotation-marker browse-annotation-marker-machine\" \
-                             href=\"#annotation-{}\" title=\"{}\">○</a>",
+                             href=\"#annotation-{}\" title=\"{note}\" \
+                             aria-label=\"machine annotation: {note}\">○</a>",
                             attr(&m.id),
-                            attr(&m.note)
+                            note = attr(&m.note)
                         ),
                         MarkerKind::Proposal(severity) => format!(
                             "<a class=\"browse-proposal-marker browse-proposal-marker-{severity}\" \
-                             href=\"#proposal-{}\" title=\"proposal ({severity}): {}\">◇</a>",
+                             href=\"#proposal-{}\" title=\"proposal ({severity}): {note}\" \
+                             aria-label=\"proposal ({severity}): {note}\">◇</a>",
                             attr(&m.id),
-                            attr(&m.note),
+                            note = attr(&m.note),
                             severity = attr(severity),
                         ),
                     }
@@ -2429,7 +2535,7 @@ fn highlight_html(
         });
         out.push_str(&format!(
             "<span class=\"{class}\" id=\"L{n}\"><a class=\"browse-ln\" \
-             href=\"#L{n}\">{n}</a>{marks}{html}</span>"
+             href=\"#L{n}\" tabindex=\"-1\">{n}</a>{marks}{html}</span>"
         ));
     }
     out.push_str("</code></pre>");
@@ -3116,10 +3222,20 @@ mod tests {
         assert!(html.contains("id=\"L1\""), "{html}");
         assert!(html.contains("id=\"L3\""), "{html}");
         assert!(html.contains("href=\"#L2\""), "{html}");
+        // One tab stop for the file, not one per line (ledger #1653): the gutter
+        // links are out of the tab order and the pre takes focus to scroll.
+        assert!(
+            html.contains("href=\"#L2\" tabindex=\"-1\">2</a>"),
+            "{html}"
+        );
+        assert!(
+            !html.contains("class=\"browse-ln\" href=\"#L3\">"),
+            "every gutter link leaves the tab order: {html}"
+        );
         // Highlighted via CLASSES (the rules live in urn:repo:style), never
         // inline styles — the host's color scheme decides, not the markup.
         assert!(
-            html.contains("<pre class=\"browse-code hl-code\">"),
+            html.contains("<pre class=\"browse-code hl-code\" tabindex=\"0\">"),
             "{html}"
         );
         assert!(html.contains("class=\"hl-"), "{html}");
@@ -3820,15 +3936,22 @@ mod tests {
     /// nothing more. What it leaves in `unrepaired` is not a bug — those are
     /// rules that repaint their own background, where the theme's foreground
     /// would not clear the floor either and inventing a colour is not the pass's
-    /// business. On base16-ocean.dark the leftovers are the two git-gutter
-    /// markers, which are chrome rather than prose.
+    /// business. On base16-ocean.dark the leftovers are `.hl-meta.hl-separator`
+    /// and `.hl-invalid.hl-illegal` (ledger #1653: this comment used to name the
+    /// two git-gutter markers, and a probe found these two), so the test names
+    /// them rather than describing them.
     #[test]
     fn the_floor_pass_is_complete_on_both_blocks() {
         let css = default_css();
         let (light, dark) = scheme_blocks(&css);
-        for (block, ground, foreground) in [
-            (&light, "#ffffff", "#323232"),
-            (&dark, "#2b303b", "#c0c5ce"),
+        for (block, ground, foreground, leftovers) in [
+            (&light, "#ffffff", "#323232", &[][..]),
+            (
+                &dark,
+                "#2b303b",
+                "#c0c5ce",
+                &[".hl-meta.hl-separator", ".hl-invalid.hl-illegal"][..],
+            ),
         ] {
             let again = ikigai_a11y::apply_floor(
                 block,
@@ -3842,7 +3965,79 @@ mod tests {
                 again.lifted
             );
             assert!(again.repairable(4.5), "the theme can repair itself at all");
+            let unrepaired: Vec<&str> = again
+                .unrepaired
+                .iter()
+                .map(|finding| finding.selector.as_str())
+                .collect();
+            assert_eq!(unrepaired, leftovers, "what the pass cannot repair");
         }
+    }
+
+    /// ★ Every syntax color clears the floor on the grounds THIS crate paints
+    /// under it, not only on the theme's (ledger #1653): an annotated or
+    /// targeted line's `--browse-mark` and a proposed line's `--browse-propose`,
+    /// each composited over the theme's ground. A rule the floor pass would
+    /// lift on a tint has an override scoped to that line, and the gutter's
+    /// color clears the floor on the ground and on both tints.
+    #[test]
+    fn every_syntax_color_clears_the_floor_on_the_line_tints() {
+        use ikigai_a11y::{ratio, Rgba};
+        let css = default_css();
+        let (light, dark) = scheme_blocks(&css);
+        let mut overrides = 0;
+        for (block, is_dark) in [(&light, false), (&dark, true)] {
+            let (ground, foreground) = base_colours(block);
+            let gutter = block
+                .split_once(".hl-code .browse-ln {\n color: ")
+                .and_then(|(_, rest)| rest.split_once(';'))
+                .map(|(value, _)| Rgba::parse(value).expect("a hex gutter color"))
+                .expect("the block colors the gutter");
+            assert_ne!(
+                gutter, foreground,
+                "the gutter is muted, not the text color"
+            );
+            assert!(ratio(gutter, ground) >= 4.5, "gutter {gutter} on {ground}");
+            for (tint, line) in [
+                ("--browse-mark", ".browse-line-annotated"),
+                ("--browse-mark", ".browse-line:target"),
+                ("--browse-propose", ".browse-line-proposed"),
+            ] {
+                let tinted = Rgba::parse(layout::palette_value(is_dark, tint).unwrap())
+                    .unwrap()
+                    .over(ground);
+                assert!(
+                    ratio(gutter, tinted) >= 4.5,
+                    "gutter {gutter} on {tint} {tinted}"
+                );
+                assert!(
+                    ratio(foreground, tinted) >= 4.5,
+                    "the theme's own text color {foreground} on {tint} {tinted}"
+                );
+                // What the pass would lift on this tint, each with its scoped rule.
+                for lift in ikigai_a11y::apply_floor(block, tinted, foreground, 4.5).lifted {
+                    // A rule that is already a scoped override is the fix itself.
+                    if lift.selector.starts_with(".browse-line") {
+                        continue;
+                    }
+                    for selector in lift.selector.split(',') {
+                        let scoped = format!("{line} {}", selector.trim());
+                        assert!(
+                            block.contains(&scoped),
+                            "{} at {:.2}:1 on {tint} has no override `{scoped}`",
+                            lift.from,
+                            lift.ratio
+                        );
+                        overrides += 1;
+                    }
+                }
+            }
+        }
+        // The default dark theme is the case axe found; the scan must see it.
+        assert!(
+            overrides > 0,
+            "no color needed an override, so this test checks nothing"
+        );
     }
 
     /// The themes are configuration now, not constants — asserted on a config

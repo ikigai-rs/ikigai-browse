@@ -205,7 +205,7 @@ fn main() {
          body{{margin:0 auto;max-width:60rem;padding:1rem;\
          font:15px/1.5 -apple-system,system-ui,sans-serif}}\
          .preview-label{{margin:2rem 0 .5rem;font-size:.85rem;font-weight:600;\
-         text-transform:uppercase;letter-spacing:.04em;opacity:.55}}\
+         text-transform:uppercase;letter-spacing:.04em}}\
          .preview-frame{{border:1px dashed rgba(128,128,128,.4);border-radius:8px;\
          padding:1rem}}</style></head><body>\
          <h1>ikigai-browse faces</h1>\

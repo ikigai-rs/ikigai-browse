@@ -3427,8 +3427,8 @@ fn annotation_form_html(target_iri: &str) -> String {
          <input type=\"hidden\" name=\"as\" value=\"text/html\">\
          <input type=\"hidden\" name=\"prefix\" value=\"\">\
          <input type=\"hidden\" name=\"suffix\" value=\"\">\
-         <input name=\"exact\" placeholder=\"quote to anchor\" required>\
-         <textarea name=\"body\" placeholder=\"note\" required></textarea>\
+         <label class=\"browse-field\">quote to anchor <input name=\"exact\" required></label>\
+         <label class=\"browse-field\">note <textarea name=\"body\" required></textarea></label>\
          <button type=\"submit\">annotate</button></form>",
         target = attr(target_iri)
     )
@@ -4853,6 +4853,17 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("title=\"the middle function\""), "{html}");
+        // Named in words, not by its glyph (ledger #1653).
+        assert!(
+            html.contains("aria-label=\"annotation: the middle function\">●</a>"),
+            "{html}"
+        );
+        // Labeled by visible words, not a placeholder (SC 3.3.2).
+        assert!(
+            html.contains("<label class=\"browse-field\">note <textarea name=\"body\""),
+            "{html}"
+        );
+        assert!(!html.contains("placeholder="), "{html}");
         // The bottom panel still lists the card.
         assert!(html.contains("id=\"annotation-mid\""), "{html}");
 
