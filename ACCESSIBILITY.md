@@ -35,6 +35,13 @@ the [ACCESSIBILITY.md template](https://github.com/mgifford/ACCESSIBILITY.md) (M
   progress note shows inside a polite live region (`role="status"`) that is in the markup before
   the note appears, and never carries `aria-busy`. A new annotation card takes focus after it is
   created (`tabindex="-1"`).
+- A finding decision (publish, decline, a revision, a retraction, the reproduced mark) answers a
+  page, not a bare IRI: every decision form asks for `as=text/html`, and the answer is the
+  outcome in words ("Your answer is recorded: declined."), a button back to the file's pending
+  findings, and the decided card. The answer line takes focus after the swap (`tabindex="-1"`,
+  `autofocus`), since the pressed button went with its form; it carries no live role, leaving
+  announcement to the host's one status region. Text from the record is escaped. A refusal stays
+  a 4xx, so the form and what was typed stay put and the host shows why.
 - Both color schemes, through `@media (prefers-color-scheme: …)`, never `light-dark()`. Syntax
   colors below the configured floor (default 4.5:1) are lifted to the theme's own foreground.
 
@@ -45,7 +52,8 @@ the [ACCESSIBILITY.md template](https://github.com/mgifford/ACCESSIBILITY.md) (M
   edited `a11y.toml` reaching the next read. `src/layout.rs`: every emitted `browse-*` class has a
   rule, and the palette's four foreground colors per scheme clear 4.5:1 on an assumed white and
   `#0d1117` ground. `src/progress.rs`: the live regions and `aria-describedby`; `src/annotate.rs`
-  and `src/pr.rs`: the new card focused. All ran on main at `528192f` on 2026-10-15 and passed,
+  and `src/pr.rs`: the new card focused; `src/finding.rs`: every decision form's answer is HTML
+  with the answer line focused, and hostile text in it is escaped. All ran on main at `528192f` on 2026-10-15 and passed,
   with and without feature `migrate`; CI runs them on every pull request.
 - Once, by hand, on 2026-10-15 (not a gate): axe-core 4.10.3 in Chrome 153.0.8010.54 over
   `cargo run --example page-preview`, light and dark, with the page ground set to white and
@@ -83,6 +91,7 @@ From that axe run and from reading the source on 2026-10-15:
 | 2026-08-15 | Each theme in its own scheme block; the floor pass from `ikigai-a11y` ([PR 15](https://github.com/ikigai-rs/ikigai-browse/pull/15), [PR 17](https://github.com/ikigai-rs/ikigai-browse/pull/17)). |
 | 2026-10-05 | Cost lines and live progress notes ([PR 78](https://github.com/ikigai-rs/ikigai-browse/pull/78)). |
 | 2026-10-15 | This file ([PR 111](https://github.com/ikigai-rs/ikigai-browse/pull/111)). |
+| 2026-11-01 | Finding decisions answer an HTML page with the answer focused, not a bare IRI (0.20.5, ledger #1988). |
 
 ## Contributing
 
