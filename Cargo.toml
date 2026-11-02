@@ -518,7 +518,9 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # publish mints commit in one transaction that first checks the node carries no outcome, and the
 # answer that loses decides again from what is on file. No Rust API, resource name, capability,
 # face or stored term moves.
-version = "0.20.3"
+# 0.20.4 (ledger #2848) — PATCH: adopt ikigai-fn 0.9.0 so hosts on that line link one copy.
+# Reference arguments remain supported; browse uses unchanged HTML helpers.
+version = "0.20.4"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -641,7 +643,9 @@ ikigai-a11y = { version = "0.4.0", features = ["themes"] }
 # `html::url_reserved`; `html_text`, `attr` and `url_segment`, the items this crate calls, are
 # unchanged. ⚠ Under 0.x a CEILING too: `<0.8.0`.
 # "0.8.0" (ledger #2615): compose accepts <iri> references; no literal compose arguments here need quoting.
-ikigai-fn = "0.8.0"
+# "0.9.0" (ledger #2848): strict percent decoding is additive; reference arguments and
+# the HTML helpers browse calls are unchanged. This caret also sets a ceiling: <0.10.0.
+ikigai-fn = "0.9.0"
 # Syntax highlighting for the file HTML face. The pure-Rust regex engine
 # (default-fancy) so CI never needs a C toolchain for oniguruma; yaml-load
 # compiles the embedded Turtle .sublime-syntax (assets/) at first use.
