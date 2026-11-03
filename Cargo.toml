@@ -531,7 +531,9 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # gutter; gutter links leave the tab order and the <pre> takes focus; marks are named in words;
 # in-text links are underlined; text fields get visible labels; every <nav> is named. No Rust
 # API, resource name, capability or stored term moves; the markup and both sheets do.
-version = "0.20.6"
+# 0.20.7 — PATCH (ledger #2929): explain controls retain a 24px minimum target
+# after the layout reset, including the compact tree-row ?. No interface moves.
+version = "0.20.7"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]

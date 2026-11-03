@@ -162,6 +162,11 @@ text-decoration:none\
 .browse-pr:hover,\
 .browse-annotation-line:hover{text-decoration:underline}\n\
 \
+/* The compact tree-row ? is a control, too (SC 2.5.8, ledger #2929). Keep\n\
+   the link-like reset above, but give every explain button a 24px target\n\
+   independent of the host's font size or button rules. */\n\
+.browse-explain-link{min-width:24px;min-height:24px;text-align:center}\n\
+\
 /* Crumbs. */\n\
 .browse-crumbs{display:flex;flex-wrap:wrap;align-items:baseline;gap:.1rem;\
 margin-bottom:.75rem}\n\

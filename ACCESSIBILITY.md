@@ -43,6 +43,8 @@ the [ACCESSIBILITY.md template](https://github.com/mgifford/ACCESSIBILITY.md) (M
   `--browse-muted`, never `opacity`: ikigai-ui's `--muted` token when the host defines one, so it
   follows the host's theme, else the same values (`#545d68` light, `#9ea8b3` dark). A test refuses
   any `opacity` in the layout sheet, since no contrast test can measure it.
+- Explain buttons, including each tree row's compact `?`, have a minimum 24 × 24 CSS pixel
+  target after the link-like button reset (SC 2.5.8), independent of the host's button defaults.
 - A control whose click may call a model names its cost line with `aria-describedby`; the
   progress note shows inside a polite live region (`role="status"`) that is in the markup before
   the note appears, and never carries `aria-busy`. A new annotation card takes focus after it is
@@ -87,8 +89,31 @@ the [ACCESSIBILITY.md template](https://github.com/mgifford/ACCESSIBILITY.md) (M
   link-in-text-block failure in either scheme, 106 tab stops (2 in that `<pre>`), and no repeated
   landmark within one view. What remains is the preview page's own shell (no `<main>`, content
   outside landmarks, a heading level skipped by the stacked views), which a host owns.
-- **No screen reader, magnifier or other assistive technology has been used**, and gonk's real
-  pages have not been checked by any tool.
+- On 2026-11-02 (ledger #2929), axe-core 4.10.3 in Playwright 1.58.0 with Chromium
+  156.0.8078.4: the real preview tree fragment placed in the live gonk server's captured browse
+  shell with its captured stylesheet, followed by browse's layout. Before: `?` targets about
+  6.95 × 24 CSS pixels and 8 target-size violations; after: 24 × 24 and no target-size violations
+  or incomplete results. The live tree required sign-in, so this was a composed reproduction,
+  **not an authenticated live-page audit**.
+- `tests/browser/explain-targets.py` is a repeatable manual regression (not a CI gate): axe's `target-size` rule and actual bounding
+  boxes of every explain control on the real preview tree, at a 320px viewport, 12/16/20px root
+  fonts, light/dark, with gonk's relevant button defaults loaded before browse and with an
+  unstyled host. It checks header and row controls; it is not a full accessibility audit.
+  To repeat locally (Python 3.12, Playwright 1.58.0, axe-core 4.10.3):
+
+  ```sh
+  python3 -m venv target/browser-venv
+  target/browser-venv/bin/python -m pip install playwright==1.58.0
+  target/browser-venv/bin/python -m playwright install --with-deps chromium
+  cargo run --example page-preview -- target/browse-preview.html
+  curl --fail --location https://cdnjs.cloudflare.com/ajax/libs/axe-core/4.10.3/axe.min.js --output target/axe.min.js
+  target/browser-venv/bin/python tests/browser/explain-targets.py target/browse-preview.html target/axe.min.js
+  ```
+
+  Optional `--chromium PATH` uses an installed browser; `--host-css PATH` substitutes a full
+  host stylesheet for the small gonk-default fixture. All 12 combinations also passed with
+  the captured full gonk stylesheet in the manual run above.
+- **No screen reader, magnifier or other assistive technology has been used**.
 
 ## Known limitations
 
@@ -114,6 +139,7 @@ From that axe run and from reading the source on 2026-10-15:
 | 2026-10-05 | Cost lines and live progress notes ([PR 78](https://github.com/ikigai-rs/ikigai-browse/pull/78)). |
 | 2026-10-15 | This file ([PR 111](https://github.com/ikigai-rs/ikigai-browse/pull/111)). |
 | 2026-11-01 | Finding decisions answer an HTML page with the answer focused, not a bare IRI (0.20.5, ledger #1988). |
+| 2026-11-02 | Explain controls keep a 24 × 24 CSS pixel minimum after the layout reset (0.20.7, ledger #2929). |
 | 2026-11-02 | Muted text by color, not opacity; the floor kept on line tints; one tab stop per file; marks named in words; in-text links underlined; fields labeled; navs named (0.20.6, ledger #1653). |
 
 ## Contributing
