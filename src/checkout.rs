@@ -20,18 +20,28 @@
 //! hard links, mount changes, or an attacker controlling the configured root's
 //! ancestors when the root is initially opened. Git's own repository reads are
 //! outside this filesystem jail; its working directory is pinned separately.
+//! Platforms without the Unix handle-relative implementation refuse checkout
+//! access explicitly; they never fall back to pathname-based reads.
 
 use std::fs::File;
 use std::io::Read;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
+use std::path::Component;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+#[cfg(unix)]
 use std::sync::Arc;
 
 use ikigai_core::{Error, Result};
+#[cfg(unix)]
 use rustix::fs::{openat, statat, AtFlags, Dir, FileType, Mode, OFlags};
 
-use crate::{bad_path, git_dir_refusal, is_git_dir_name, lexical_jail, names_git_dir, Entry, Kind};
+use crate::Entry;
+#[cfg(unix)]
+use crate::{bad_path, is_git_dir_name, Kind};
+use crate::{git_dir_refusal, lexical_jail, names_git_dir};
 
 /// A canonical path inside a configured root, judged by the jail. Its fields
 /// are private to this module, so a `Jailed` cannot be made from an arbitrary
@@ -39,8 +49,10 @@ use crate::{bad_path, git_dir_refusal, is_git_dir_name, lexical_jail, names_git_
 #[derive(Clone, Debug)]
 pub(crate) struct Jailed {
     /// The canonical root this path was judged against.
+    #[cfg(unix)]
     root: Arc<Path>,
     /// Opened once; later pathname replacements cannot redirect this root.
+    #[cfg(unix)]
     root_handle: Arc<File>,
     /// The canonical path, within `root`.
     path: PathBuf,
@@ -61,6 +73,7 @@ impl Jailed {
     /// handle. Canonicalization alone does not authorize a read: every use
     /// walks again without following symlinks. `.git` is refused both as
     /// written and as resolved.
+    #[cfg(unix)]
     pub(crate) fn resolve(root: &Path, rel: &str) -> Result<Jailed> {
         lexical_jail(rel)?;
         // Judged on the path AS WRITTEN first, before the filesystem is touched,
@@ -81,9 +94,7 @@ impl Jailed {
             .map_err(|e| Error::Endpoint(format!("browse: open root: {e}")))?,
         ));
         let target = canonical_root.join(rel);
-        let canonical = target
-            .canonicalize()
-            .map_err(|_| Error::NotFound(format!("browse: no such path `{rel}`")))?;
+        let canonical = target.canonicalize().map_err(|e| path_error(rel, e))?;
         let Ok(inside) = canonical.strip_prefix(&canonical_root) else {
             return Err(Error::Endpoint(format!(
                 "browse: `{rel}` resolves outside its root"
@@ -99,9 +110,7 @@ impl Jailed {
             root_handle,
             path: canonical,
         };
-        jailed
-            .open()
-            .map_err(|e| Error::NotFound(format!("browse: no such path `{rel}`: {e}")))?;
+        jailed.open().map_err(|e| path_error(rel, e))?;
         Ok(jailed)
     }
 
@@ -113,6 +122,7 @@ impl Jailed {
     /// One entry below this directory, by its name as [`Jailed::list`] gave
     /// it: a single path segment, never `.git`. Links are selected by their
     /// canonical in-root name, then opened without following links.
+    #[cfg(unix)]
     pub(crate) fn child(&self, name: &str) -> Result<Jailed> {
         let mut parts = Path::new(name).components();
         let Some(Component::Normal(segment)) = parts.next() else {
@@ -125,9 +135,7 @@ impl Jailed {
             return Err(git_dir_refusal(name));
         }
         let path = self.path.join(segment);
-        let canonical = path
-            .canonicalize()
-            .map_err(|_| Error::NotFound(format!("browse: no such entry `{name}`")))?;
+        let canonical = path.canonicalize().map_err(|e| path_error(name, e))?;
         let Ok(inside) = canonical.strip_prefix(&self.root) else {
             return Err(Error::Endpoint(format!(
                 "browse: `{name}` resolves outside its root"
@@ -141,9 +149,7 @@ impl Jailed {
             root_handle: Arc::clone(&self.root_handle),
             path: canonical,
         };
-        jailed
-            .open()
-            .map_err(|e| Error::NotFound(format!("browse: no such entry `{name}`: {e}")))?;
+        jailed.open().map_err(|e| path_error(name, e))?;
         Ok(jailed)
     }
 
@@ -162,6 +168,7 @@ impl Jailed {
     /// in what the resolver will not serve. Whether a symlink is served needs
     /// the root to judge, so the tree face resolves each one itself
     /// (`tree_endpoint`); every other enumerator skips links outright.
+    #[cfg(unix)]
     pub(crate) fn list(&self) -> Result<Vec<Entry>> {
         let directory = self
             .open()
@@ -202,6 +209,7 @@ impl Jailed {
     }
 
     /// Open the file for reading.
+    #[cfg(unix)]
     pub(crate) fn open(&self) -> std::io::Result<File> {
         // Canonical names contain only normal components. Open each one
         // separately: NOFOLLOW on only the final component is insufficient.
@@ -245,6 +253,7 @@ impl Jailed {
 impl Jailed {
     /// Pin git's working directory before spawning, rather than letting git
     /// resolve a pathname that an attacker could replace after our check.
+    #[cfg(unix)]
     fn git_command(&self) -> std::io::Result<Command> {
         let directory = self.open()?;
         let mut command = Command::new("git");
@@ -298,7 +307,91 @@ impl Jailed {
     }
 }
 
-#[cfg(test)]
+/// Missing names and refused symlink loops share the missing-path response.
+/// Operational failures retain their cause instead of masquerading as absence.
+#[cfg(unix)]
+fn path_error(name: &str, error: std::io::Error) -> Error {
+    if error.kind() == std::io::ErrorKind::NotFound
+        || error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error())
+    {
+        Error::NotFound(format!("browse: no such path `{name}`: {error}"))
+    } else {
+        Error::Endpoint(format!("browse: path `{name}`: {error}"))
+    }
+}
+
+// A platform without a handle-relative jail must refuse, never fall back to
+// checking a pathname and then opening it unconfined.
+#[cfg(not(unix))]
+impl Jailed {
+    fn unsupported() -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "browse: checkout jail requires Unix handle-relative reads; refused on this platform",
+        )
+    }
+
+    pub(crate) fn resolve(_root: &Path, rel: &str) -> Result<Jailed> {
+        lexical_jail(rel)?;
+        if names_git_dir(Path::new(rel)) {
+            return Err(git_dir_refusal(rel));
+        }
+        Err(Error::Endpoint(Self::unsupported().to_string()))
+    }
+
+    pub(crate) fn child(&self, _name: &str) -> Result<Jailed> {
+        Err(Error::Endpoint(Self::unsupported().to_string()))
+    }
+
+    pub(crate) fn list(&self) -> Result<Vec<Entry>> {
+        Err(Error::Endpoint(Self::unsupported().to_string()))
+    }
+
+    pub(crate) fn open(&self) -> std::io::Result<File> {
+        Err(Self::unsupported())
+    }
+
+    fn git_command(&self) -> std::io::Result<Command> {
+        Err(Self::unsupported())
+    }
+}
+
+#[cfg(all(test, not(unix)))]
+mod unsupported_tests {
+    use super::*;
+
+    #[test]
+    fn checkout_operations_refuse_without_a_handle_relative_jail() {
+        let error = Jailed::resolve(Path::new("."), "file").unwrap_err();
+        assert!(matches!(error, Error::Endpoint(message) if message.contains("requires Unix")));
+        // Constructed only here to exercise the otherwise unreachable methods.
+        let jailed = Jailed {
+            path: PathBuf::from("."),
+        };
+        assert!(Jailed::root(jailed.path()).is_err());
+        assert!(jailed.child("file").is_err());
+        assert!(jailed.list().is_err());
+        assert!(!jailed.is_dir());
+        assert_eq!(
+            jailed.open().unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            jailed.read_to_string().unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            jailed.git(&["status"]).unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+        assert!(jailed
+            .git_batch(&["status"], String::new())
+            .unwrap_err()
+            .contains("requires Unix"));
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -311,6 +404,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn path_errors_preserve_operational_failures() {
+        for errno in [rustix::io::Errno::NOENT, rustix::io::Errno::LOOP] {
+            assert!(matches!(
+                path_error("data", errno.into()),
+                Error::NotFound(_)
+            ));
+        }
+        for errno in [rustix::io::Errno::ACCESS, rustix::io::Errno::MFILE] {
+            let cause = std::io::Error::from(errno).to_string();
+            assert!(
+                matches!(path_error("data", errno.into()), Error::Endpoint(message) if message.contains(&cause))
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permission_denied_is_not_missing() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("permission-denied");
+        std::fs::create_dir(root.join("private")).unwrap();
+        std::fs::write(root.join("private/data"), "inside").unwrap();
+        let top = Jailed::root(&root).unwrap();
+        std::fs::set_permissions(root.join("private"), std::fs::Permissions::from_mode(0o0))
+            .unwrap();
+        let resolved = Jailed::resolve(&root, "private/data");
+        let child = top.child("private");
+        std::fs::set_permissions(root.join("private"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(matches!(resolved, Err(Error::Endpoint(_))), "{resolved:?}");
+        assert!(matches!(child, Err(Error::Endpoint(_))), "{child:?}");
     }
 
     #[test]
@@ -367,6 +495,8 @@ mod tests {
         std::fs::write(outside.join("outside-only"), "secret").unwrap();
         let file = Jailed::resolve(&root, "sub/data").unwrap();
         let dir = Jailed::resolve(&root, "sub").unwrap();
+        assert_eq!(file.read_to_string().unwrap(), "inside");
+        assert_eq!(dir.list().unwrap()[0].name, "data");
         let attacker_root = root.clone();
         let attacker_outside = outside.clone();
         std::thread::spawn(move || {
@@ -375,24 +505,16 @@ mod tests {
         })
         .join()
         .unwrap();
-        if let Ok(contents) = file.read_to_string() {
-            assert_eq!(contents, "inside", "a swapped link exposed outside bytes");
-        }
-        if let Ok(mut opened) = file.open() {
-            let mut contents = String::new();
-            opened.read_to_string(&mut contents).unwrap();
-            assert_eq!(contents, "inside");
-        }
-        if let Ok(entries) = dir.list() {
-            assert!(!entries.iter().any(|e| e.name == "outside-only"));
-            for entry in entries {
-                if let Ok(child) = dir.child(&entry.name) {
-                    if let Ok(contents) = child.read_to_string() {
-                        assert_ne!(contents, "secret");
-                    }
-                }
-            }
-        }
+        assert_eq!(
+            file.read_to_string().unwrap_err().raw_os_error(),
+            Some(rustix::io::Errno::NOTDIR.raw_os_error())
+        );
+        assert_eq!(
+            file.open().unwrap_err().raw_os_error(),
+            Some(rustix::io::Errno::NOTDIR.raw_os_error())
+        );
+        assert!(matches!(dir.list(), Err(Error::Endpoint(_))));
+        assert!(matches!(dir.child("data"), Err(Error::Endpoint(_))));
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(outside).unwrap();
     }
@@ -408,6 +530,7 @@ mod tests {
         for target in [root.join(".git/config"), outside.join("secret")] {
             std::fs::write(root.join("data"), "inside").unwrap();
             let file = Jailed::resolve(&root, "data").unwrap();
+            assert_eq!(file.read_to_string().unwrap(), "inside");
             let swapped = root.join("data");
             std::thread::spawn(move || {
                 std::fs::remove_file(&swapped).unwrap();
@@ -415,9 +538,14 @@ mod tests {
             })
             .join()
             .unwrap();
-            if let Ok(contents) = file.read_to_string() {
-                assert_eq!(contents, "inside");
-            }
+            assert_eq!(
+                file.read_to_string().unwrap_err().raw_os_error(),
+                Some(rustix::io::Errno::LOOP.raw_os_error())
+            );
+            assert_eq!(
+                file.open().unwrap_err().raw_os_error(),
+                Some(rustix::io::Errno::LOOP.raw_os_error())
+            );
             std::fs::remove_file(root.join("data")).unwrap();
         }
         std::fs::remove_dir_all(root).unwrap();

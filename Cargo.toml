@@ -596,8 +596,6 @@ path = "examples/root-migration-rehearsal.rs"
 required-features = ["migrate"]
 
 [dependencies]
-# Handle-relative checkout reads; never follow a swapped symlink during use.
-rustix = { version = "1", features = ["fs", "process"] }
 # The released kernel, consumed from crates.io. 0.1.54 is the true minimum:
 # the manifold contract this crate now tests against (per-root rows surviving
 # `describe_entry`'s probe-expansion, `Kernel::select_actions` + `ActionQuery`)
@@ -844,3 +842,7 @@ ikigai-llm = "0.18.0"
 # caret rules this is a ceiling too (`<0.6.0`): move it only with an ikigai-llm built on the next line.
 ikigai-http = "0.5.0"
 ureq = "2"
+
+[target.'cfg(unix)'.dependencies]
+# Handle-relative checkout reads; other platforms explicitly refuse checkout access.
+rustix = { version = "1", features = ["fs", "process"] }
