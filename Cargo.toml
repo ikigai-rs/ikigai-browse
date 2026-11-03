@@ -596,6 +596,8 @@ path = "examples/root-migration-rehearsal.rs"
 required-features = ["migrate"]
 
 [dependencies]
+# Handle-relative checkout reads; never follow a swapped symlink during use.
+rustix = { version = "1", features = ["fs", "process"] }
 # The released kernel, consumed from crates.io. 0.1.54 is the true minimum:
 # the manifold contract this crate now tests against (per-root rows surviving
 # `describe_entry`'s probe-expansion, `Kernel::select_actions` + `ActionQuery`)

@@ -109,7 +109,13 @@
 //! grammar mentions it, so resolution falls through to whatever else is
 //! mounted rather than erroring here. Paths are **jailed** to their root:
 //! `..` and absolute segments are rejected lexically, and the canonicalized
-//! target must stay inside the canonicalized root, so a symlink cannot escape.
+//! target must stay inside the canonicalized root. Every filesystem read then
+//! walks from an open root handle with `openat(O_NOFOLLOW)` on each component,
+//! closing the former check-then-act symlink-swap window. Concurrent changes
+//! can fail a read; this is not a snapshot. Hard links, mount changes, and
+//! control of the root's ancestors at initial open are outside the guarantee.
+//! Git's working directory is pinned, but its own repository traversal is not
+//! sandboxed by this jail.
 //!
 //! **`.git` is never served** (ledger #1126). A path any of whose components is
 //! `.git` (ASCII case-insensitively: the default macOS volume is

@@ -42,7 +42,16 @@ Hashing reads fixed-size chunks rather than holding a whole file in memory.
 a clean resolution *miss* (the grammar refuses to match; other mounted spaces
 may still answer), never an error from here. Paths are **jailed** to their
 root: `..` and absolute segments are rejected lexically, and the canonicalized
-target must stay inside the canonicalized root, so a symlink cannot escape.
+target must stay inside the canonicalized root. Previously, the later read by
+pathname left a check-then-act window: swapping a symlink could escape. Reads,
+metadata and listings now walk from an open root directory handle with
+`openat(O_NOFOLLOW)` on every component. In-root symlinks still resolve, but a
+concurrent swap can cause a refusal instead of redirecting a read outside the
+root. Git starts in a handle-pinned working directory; its own repository
+traversal (including `.git` and worktree configuration) is not sandboxed by this
+jail. This is name confinement, not a snapshot: files can change during reads.
+Hard links, mount changes, and control of the configured root's ancestors when
+it is initially opened are outside the guarantee.
 **`.git` is never served**: a path with a `.git` component (ASCII
 case-insensitively, as written or once canonicalized, so a symlink into it is
 refused too) is a `NotFound` at every door that reads the filesystem, under any
