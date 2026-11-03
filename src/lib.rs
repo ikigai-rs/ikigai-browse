@@ -1273,7 +1273,10 @@ pub fn file_iri(repo: &str, rel: &str) -> String {
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Kind {
+    // Only the Unix jail constructs these entries; other platforms refuse listings.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Dir,
+    #[cfg_attr(not(unix), allow(dead_code))]
     File,
     Link,
 }
