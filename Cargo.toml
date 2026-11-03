@@ -533,7 +533,13 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # API, resource name, capability or stored term moves; the markup and both sheets do.
 # 0.20.7 — PATCH (ledger #2929): explain controls retain a 24px minimum target
 # after the layout reset, including the compact tree-row ?. No interface moves.
-version = "0.20.7"
+# 0.20.8 — PATCH, a security fix (ledger #2894, #2960): checkout reads walk from a held root
+# directory handle with a no-follow open on every component, so a component swapped for a
+# symlink between the check and the open cannot escape the jail, and git runs from a pinned
+# directory. Unix only (rustix under cfg(unix)); elsewhere checkout access is refused with a
+# typed error. A read failure other than not-found or a symlink loop now reports itself
+# rather than reading as missing. No resource name, capability or stored term moves.
+version = "0.20.8"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
