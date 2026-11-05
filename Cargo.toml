@@ -539,7 +539,12 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # directory. Unix only (rustix under cfg(unix)); elsewhere checkout access is refused with a
 # typed error. A read failure other than not-found or a symlink loop now reports itself
 # rather than reading as missing. No resource name, capability or stored term moves.
-version = "0.20.8"
+# 0.21.0 (the core 0.3.0 cascade, wave 7, ledger #3146) — MINOR: moves to ikigai-core 0.3.0, the
+# scoped content store (ledger #2965). Core's types are in browse's public API, so a host on core
+# 0.2 cannot link 0.21.0, and a host pinning `"0.20.x"` (`<0.21.0`) moves its pin in its own core
+# 0.3 wave. Browse calls neither `ContentStore::put` nor `put_replay`, so nothing moves to
+# `put_for`. No resource name, capability, face or stored term moves.
+version = "0.21.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -636,7 +641,12 @@ required-features = ["migrate"]
 # built with `ContentHasher`, new in 0.2.1, so that is the true floor of `src/` again. Within
 # the caret, so no consumer's pin moves.
 # "0.2.8" (ledger #2615): match ikigai-fn 0.8.0's minimum core for reference arguments.
-ikigai-core = "0.2.8"
+# "0.3.0" (the core 0.3.0 cascade, ledger #3146): the scoped content store (ledger #2965), where
+# held content belongs to whoever delivered it, a hold with no principal is root's, and
+# `ContentStore::put` and `put_replay` are root-only. `src/` calls neither and builds on it
+# unchanged. Every ikigai crate below moves with it, so the graph links ONE core. ⚠ A ceiling in
+# turn: `<0.4.0`.
+ikigai-core = "0.3.0"
 # The accessibility config and the contrast-floor pass: `urn:repo:style`'s
 # themes and its contrast floor are read from the layered `a11y.toml` rather
 # than hard-coded, and each theme's own sub-floor colours are lifted to that
@@ -651,7 +661,12 @@ ikigai-core = "0.2.8"
 # "0.4.0" since the core 0.2.0 sweep (ledger #2346): a11y on ikigai-core 0.2.0, the streams
 # release (ledger #2261), and no other change, so the graph links one core. Still a ceiling:
 # `<0.5.0`.
-ikigai-a11y = { version = "0.4.0", features = ["themes"] }
+# "0.6.0" (the core 0.3.0 cascade, ledger #3146): a11y on ikigai-core 0.3.0. 0.5.0 between them
+# refuses an `a11y.toml` with `contrast.min` below 4.5 or `contrast.min_large` below 3.0, so a host
+# whose file sets a lower floor gets that refusal from `urn:repo:style` until it raises it. 0.5.1's
+# floor pass reads the `background` shorthand and judges a ground with no color of its own; the
+# tests of the two default themes pass unchanged. Still a ceiling: `<0.7.0`.
+ikigai-a11y = { version = "0.6.0", features = ["themes"] }
 # The ecosystem's ONE escaping module (FND-H, ledger #1813): every value an HTML face
 # interpolates goes out through `ikigai_fn::html::html_text` (element text) or `attr` (a
 # quoted attribute), pinned by that crate's shared vectors, so browse's pages escape exactly
@@ -664,7 +679,10 @@ ikigai-a11y = { version = "0.4.0", features = ["themes"] }
 # "0.8.0" (ledger #2615): compose accepts <iri> references; no literal compose arguments here need quoting.
 # "0.9.0" (ledger #2848): strict percent decoding is additive; reference arguments and
 # the HTML helpers browse calls are unchanged. This caret also sets a ceiling: <0.10.0.
-ikigai-fn = "0.9.0"
+# "0.10.0" (the core 0.3.0 cascade, ledger #3146): ikigai-fn on ikigai-core 0.3.0, so the graph
+# links one core. `html::form_pairs` is additive; the HTML helpers browse calls are unchanged.
+# Still a ceiling: <0.11.0.
+ikigai-fn = "0.10.0"
 # Syntax highlighting for the file HTML face. The pure-Rust regex engine
 # (default-fancy) so CI never needs a C toolchain for oniguruma; yaml-load
 # compiles the embedded Turtle .sublime-syntax (assets/) at first use.
@@ -702,9 +720,11 @@ oxigraph = { version = "0.5", default-features = false }
 # "0.3.0" since the core 0.2.0 sweep (ledger #2346): store on ikigai-core 0.2.0 (ledger #2261)
 # with no source change, so every floor above still holds and the graph links one core.
 # ⚠ And a CEILING: `^0.3.0` is `<0.4.0`.
+# "0.4.0" (the core 0.3.0 cascade, ledger #3146): store on ikigai-core 0.3.0, so the graph links
+# one core; every floor above still holds. A ceiling in turn: `<0.5.0`.
 # default-features = false keeps RocksDB out (the crate's default is already empty; stated so a
 # future default cannot pull it in), as above.
-ikigai-store = { version = "0.3.0", default-features = false }
+ikigai-store = { version = "0.4.0", default-features = false }
 # async trait objects for the explain endpoint (it must await sub-requests —
 # FnEndpoint is sync-only), matching ikigai-core's own endpoint plumbing.
 async-trait = "0.1"
@@ -753,7 +773,10 @@ notify = "6.1"
 # the kernel's shared module space for direct body comparisons. No browse input
 # declares reads_body, so BODY-INPUTS currently has no transports to compare.
 # The library's core minimum stays unchanged; conformance supplies its own test floor.
-ikigai-conformance = "0.12.0"
+# "0.14.0" (the core 0.3.0 cascade, ledger #3146): conformance on ikigai-core 0.3.0, whose
+# BODY-INPUTS holds its sample with `put_for`. 0.13.0 between them adds the `race` module and
+# changes nothing in `Suite`. ⚠ Still a ceiling: `<0.15.0`.
+ikigai-conformance = "0.14.0"
 # A FLOOR DECLARATION, not a code dependency: no line in this crate calls it.
 # The suite's `VOCABULARY` check reads `ikigai_vocab::VOCABULARY` as its oracle,
 # and the suite's own pin is the floor for the SUITE's API, not for this module's
@@ -772,12 +795,16 @@ ikigai-conformance = "0.12.0"
 # "0.2.0" since the core 0.2.0 sweep (ledger #2346): vocab on ikigai-core 0.2.0, the streams
 # release (ledger #2261). The old `"0.1.108"` meant `<0.2.0` under 0.x rules, and conformance
 # 0.11.0 pins `^0.2.0`, so the two lines agree again.
-ikigai-vocab = "0.2.0"
+# "0.3.0" (the core 0.3.0 cascade, ledger #3146): vocab on ikigai-core 0.3.0, the scoped content
+# store (ledger #2965). The old `"0.2.0"` meant `<0.3.0`, and conformance 0.14.0 pins `^0.3.0`.
+ikigai-vocab = "0.3.0"
 # A FLOOR for the tests only (ledger #2281): `tests/file_body.rs` hands the raw file body to a
 # cacheable stage with `BodyIssue::attach`, new in core 0.2.3. `[dependencies]` above keeps the
 # library's true minimum ("0.2.1"); Cargo unifies to the greater of the two, and
 # dev-dependencies do not propagate, so no consumer pays for it.
-ikigai-core = "0.2.3"
+# "0.3.0" (the core 0.3.0 cascade, ledger #3146): the scoped content store (ledger #2965). The old
+# `"0.2.3"` meant `<0.3.0`, which `[dependencies]` above no longer admits; the two lines agree now.
+ikigai-core = "0.3.0"
 futures = "0.3"
 # Validates the Turtle face in tests — the graph must actually parse.
 oxttl = "0.2"
@@ -828,7 +855,17 @@ oxttl = "0.2"
 # "0.5.0" below for the same `HttpTransport` reason: 0.18.0 is ikigai-llm on ikigai-http 0.5.0
 # (conditional revalidation, ledger #2535). ⚠ Also a ceiling, `<0.19.0`. Re-read this pin when
 # ikigai-llm's next minor ships.
-ikigai-llm = "0.18.0"
+#
+# **"0.20.0" now** (the core 0.3.0 cascade, ledger #3146), moved TOGETHER with `ikigai-http`
+# "0.6.0" below for the same `HttpTransport` reason: 0.20.0 is ikigai-llm on ikigai-core 0.3.0 and
+# ikigai-http 0.6.0, and calls neither `ContentStore::put` nor `put_replay`. Checked against what
+# the two minors changed for these tests and examples, which needed no edit. 0.19.0 gives each
+# provider's endpoints their own ids (`llm-<provider>-ask` and so on, was the shared `llm-openai`,
+# `llm-up`, `llm-installed`, `llm-model`), and browse names only IRIs. It also adds
+# `api_key_secret`, a provider key named in ikigai-secret, whose actions and the `urn:llm:ask`
+# facade require `urn:cap:llm:use:*` beside the net grant. These fixtures set no key, and an inline
+# `api_key` still loads (deprecated, with a line on stderr). ⚠ Also a ceiling, `<0.21.0`.
+ikigai-llm = "0.20.0"
 # Only for `ikigai_http::HttpTransport`, the trait `ikigai_llm::space` takes: the
 # examples and the real-llm tests implement it to fake the network hop. So this pin
 # must name the SAME ikigai-http line ikigai-llm does, or the impls are for a different
@@ -846,7 +883,9 @@ ikigai-llm = "0.18.0"
 # bytes with `.into()` (`From<Vec<u8>>`). "0.5.0" because ikigai-llm 0.18.0 requires `^0.5.0`
 # (conditional revalidation, ledger #2535); the four transport items did not change. ⚠ Under 0.x
 # caret rules this is a ceiling too (`<0.6.0`): move it only with an ikigai-llm built on the next line.
-ikigai-http = "0.5.0"
+# "0.6.0" (the core 0.3.0 cascade, ledger #3146) because ikigai-llm 0.20.0 requires `^0.6.0`: http
+# on ikigai-core 0.3.0, with no other change. Now a ceiling at `<0.7.0`.
+ikigai-http = "0.6.0"
 ureq = "2"
 
 [target.'cfg(unix)'.dependencies]
