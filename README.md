@@ -88,6 +88,18 @@ roots: `urn:cap:browse:read:{repo}` grants one root; the literal
 baseline-checks the wildcard before dispatch, and the endpoint checks the
 target's root against the grant.
 
+**Pull-request sources.** Hosts can select which roots have a pull-request
+source with `Mount::new(roots).pull_request_roots(["core", "web"]).space()`.
+The names refer to the mount's root names; unknown names have no effect.
+Omitting the option keeps every root eligible, and an empty list (for example,
+`std::iter::empty::<&str>()`) disables the tree's PR sections everywhere.
+This mount-level allowlist lets hosts pass their source configuration without
+changing the existing root pairs. Both the root's recent-PR section and a
+subdirectory's scoped section (and the root's PR navigation button) appear only
+when the root is eligible and the viewer's capability allows
+`urn:cap:exec:gh`. Sections still load lazily through htmx `load`; the option
+controls presentation and does not change endpoint authorization.
+
 **The explanation archive (S1).** `space_with_explain` takes an
 `ExplainConfig` around a host-injected Oxigraph store handle (`Arc<Store>`) —
 ONE shared store; later stages (annotations) join it. Since 0.4.0 a host can

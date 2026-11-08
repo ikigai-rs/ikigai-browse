@@ -370,6 +370,7 @@ pub fn space_with_explain(
 /// ```
 pub struct Mount {
     roots: Roots,
+    pull_request_roots: Option<BTreeSet<String>>,
     app: Option<String>,
     config_home: ConfigHome,
     store: Option<Arc<Store>>,
@@ -418,6 +419,7 @@ impl Mount {
     pub fn new(roots: impl IntoIterator<Item = (String, PathBuf)>) -> Self {
         Mount {
             roots: build_roots(roots),
+            pull_request_roots: None,
             app: None,
             config_home: ConfigHome::Ambient,
             store: None,
@@ -425,6 +427,20 @@ impl Mount {
             graph: None,
             explain: None,
         }
+    }
+
+    /// Name the roots that have a pull-request source configured by the host.
+    ///
+    /// By default every root is eligible. An empty iterator disables tree-page
+    /// pull-request sections for all roots. Unknown names have no effect.
+    /// Eligible roots show their lazy section only to viewers whose capability
+    /// allows `urn:cap:exec:gh`. This controls presentation, not endpoint access.
+    pub fn pull_request_roots(
+        mut self,
+        names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.pull_request_roots = Some(names.into_iter().map(Into::into).collect());
+        self
     }
 
     /// The **process's** name — `dev-server`, `web`, `cms-web` — which selects
@@ -722,6 +738,7 @@ impl Mount {
         let graph = self.graph_name();
         let Mount {
             roots,
+            pull_request_roots,
             app,
             config_home,
             store,
@@ -738,7 +755,15 @@ impl Mount {
         let Some(mut config) = explain else {
             let ignore = Arc::new(hash::default_ignore());
             let archive = store.map(|store| Arc::new(archive_for(store, writer, graph.clone())));
-            let space = base_space(&roots, &ignore, archive.as_ref(), None, app, home);
+            let space = base_space(
+                &roots,
+                &ignore,
+                archive.as_ref(),
+                None,
+                app,
+                home,
+                pull_request_roots,
+            );
             let space = match archive {
                 Some(archive) => {
                     finding::bind(annotate::bind(space, &roots, &archive), &roots, &archive)
@@ -761,7 +786,15 @@ impl Mount {
         ));
         config.archive = Arc::clone(&archive);
         let shared = Arc::new(config.clone());
-        let space = base_space(&roots, &ignore, Some(&archive), Some(&shared), app, home);
+        let space = base_space(
+            &roots,
+            &ignore,
+            Some(&archive),
+            Some(&shared),
+            app,
+            home,
+            pull_request_roots,
+        );
         let space = explain::bind(space, &roots, config);
         // The S4 review pass (machine-minted annotations) rides with the
         // explanation family: it needs the same LLM seam and the same store.
@@ -859,9 +892,10 @@ fn base_space(
     config: Option<&Arc<ExplainConfig>>,
     app: Option<&str>,
     home: Option<&Path>,
+    pull_request_roots: Option<BTreeSet<String>>,
 ) -> EndpointSpace {
     let explain = config.is_some();
-    let tree: Arc<dyn Endpoint> = Arc::new(tree_endpoint(roots, explain));
+    let tree: Arc<dyn Endpoint> = Arc::new(tree_endpoint(roots, explain, pull_request_roots));
     let file: Arc<dyn Endpoint> = Arc::new(file_endpoint(roots, archive, explain));
     let state: Arc<dyn Endpoint> = Arc::new(state_endpoint(roots));
     let hash: Arc<dyn Endpoint> = Arc::new(hash::hash_endpoint(roots, ignore));
@@ -1304,7 +1338,11 @@ pub(crate) struct Entry {
 
 // --- tree endpoint ----------------------------------------------------------
 
-fn tree_endpoint(roots: &Roots, explain: bool) -> FnEndpoint {
+fn tree_endpoint(
+    roots: &Roots,
+    explain: bool,
+    pull_request_roots: Option<BTreeSet<String>>,
+) -> FnEndpoint {
     let held = Arc::clone(roots);
     FnEndpoint::new("browse-tree", move |inv: &Invocation<'_>| {
         let (repo, root) = repo_root(inv, &held)?;
@@ -1343,7 +1381,16 @@ fn tree_endpoint(roots: &Roots, explain: bool) -> FnEndpoint {
             }
             t if t.starts_with("text/html") => Ok(repr_utf8(
                 "text/html",
-                tree_html(repo, &rel, &entries, explain),
+                tree_html(
+                    repo,
+                    &rel,
+                    &entries,
+                    explain,
+                    inv.capability.allows("urn:cap:exec:gh")
+                        && pull_request_roots
+                            .as_ref()
+                            .is_none_or(|names| names.contains(repo)),
+                ),
             )),
             _ => Ok(repr_utf8("text/plain", tree_text(&entries))),
         }
@@ -1559,12 +1606,17 @@ fn actions_html(repo: &str, rel: &str, explain: bool) -> String {
     )
 }
 
-fn tree_html(repo: &str, rel: &str, entries: &[Entry], explain: bool) -> String {
+fn tree_html(
+    repo: &str,
+    rel: &str,
+    entries: &[Entry],
+    explain: bool,
+    pull_requests: bool,
+) -> String {
     let mut out = String::from("<div class=\"browse\">");
     out.push_str(&crumbs_html(repo, rel));
     // The header actions: the explain affordance (family mounted), and — at
-    // the top only — the repo's pull requests (a repo-grain resource, always
-    // bound; its data facades answer at resolution time).
+    // the top only — the repo's pull requests when configured and permitted.
     let mut actions = String::new();
     if explain {
         actions.push_str(&explain_button(
@@ -1575,7 +1627,7 @@ fn tree_html(repo: &str, rel: &str, entries: &[Entry], explain: bool) -> String 
             &progress::control_attrs("explain"),
         ));
     }
-    if rel.is_empty() {
+    if pull_requests && rel.is_empty() {
         actions.push_str(&format!(
             "<button class=\"browse-prs-link\" hx-get=\"/k/source {} as=text/html\" \
              hx-target=\"#browse\" hx-swap=\"innerHTML\">pull requests</button>",
@@ -1643,35 +1695,29 @@ fn tree_html(repo: &str, rel: &str, entries: &[Entry], explain: bool) -> String 
         ));
     }
     out.push_str("</ul>");
-    // Every tree page's recent-PRs section, LAZY by design: the tree renders
-    // instantly and htmx fetches the listing after insertion
-    // (hx-trigger="load", swapping into the block itself). When the pr
-    // facades are absent the fetch answers the typed 404-with-guidance and
-    // the host renders it per its error handling — the tree never blocks on
-    // it. `chrome=embed` keeps the loaded fragment crumb-free (this page
-    // already has the trail). The ROOT loads the repo-wide listing
-    // (`state=all limit=10`, ikigai-repo >= 0.1.4 facade args forwarded by
-    // the prs endpoint); a SUBDIRECTORY loads its own path-scoped listing
-    // (`urn:repo:{repo}:prs:{path}`, default state=all), so every directory
-    // page shows the PRs that touched IT.
-    let (iri_with_args, label) = if rel.is_empty() {
-        (
-            format!("{} state=all limit=10", pr::prs_iri(repo)),
-            "recent pull requests".to_string(),
-        )
-    } else {
-        (
-            format!("{} limit=10", pr::prs_scoped_iri(repo, rel)),
-            "pull requests touching this directory".to_string(),
-        )
-    };
-    out.push_str(&format!(
-        "<section class=\"browse-recent-prs\"><h4>{label}</h4>\
+    // Fetch only after insertion, and only for configured, permitted roots.
+    // The root loads recent PRs; subdirectories load the path-scoped listing.
+    // chrome=embed avoids repeating this page's breadcrumbs.
+    if pull_requests {
+        let (iri_with_args, label) = if rel.is_empty() {
+            (
+                format!("{} state=all limit=10", pr::prs_iri(repo)),
+                "recent pull requests".to_string(),
+            )
+        } else {
+            (
+                format!("{} limit=10", pr::prs_scoped_iri(repo, rel)),
+                "pull requests touching this directory".to_string(),
+            )
+        };
+        out.push_str(&format!(
+            "<section class=\"browse-recent-prs\"><h4>{label}</h4>\
          <div hx-get=\"/k/source {iri_with_args} chrome=embed as=text/html\" \
          hx-trigger=\"load\" hx-swap=\"innerHTML\">\
          <p class=\"browse-recent-prs-loading\">loading&#8230;</p></div></section>",
-        iri_with_args = attr(&iri_with_args),
-    ));
+            iri_with_args = attr(&iri_with_args),
+        ));
+    }
     out.push_str("</div>");
     out
 }
@@ -2980,7 +3026,7 @@ mod tests {
             },
         ];
         let pages = [
-            ("tree", tree_html("demo", dir, &entries, true)),
+            ("tree", tree_html("demo", dir, &entries, true, true)),
             ("crumbs", crumbs_html("demo", &format!("{rel}/x"))),
             (
                 "explain button",
@@ -3021,7 +3067,7 @@ mod tests {
             size: None,
             to_dir: false,
         }];
-        let html = tree_html("demo", "", &entries, false);
+        let html = tree_html("demo", "", &entries, false, true);
         assert!(html.contains(">it&#39;s\u{FFFD}.rs</button>"), "{html}");
         assert!(!html.contains("it's"), "{html}");
         let iri = file_iri("demo", "it's\u{1}.rs");
@@ -3030,6 +3076,67 @@ mod tests {
             html.contains("hx-get=\"/k/source urn:repo:demo:file:it&#39;s%01.rs as=text/html\""),
             "{html}"
         );
+    }
+
+    #[test]
+    fn tree_hides_pull_requests_without_gh_capability() {
+        let root = demo_root();
+        let k = kernel(vec![("demo".to_string(), root.clone())]);
+        for iri in ["urn:repo:demo:tree", "urn:repo:demo:tree:src"] {
+            let html = body(&source(&k, iri, &[("as", "text/html")], &demo_cap()).unwrap());
+            assert!(!html.contains("browse-recent-prs"), "{html}");
+            assert!(!html.contains("pull requests"), "{html}");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tree_pull_request_roots_preserve_lazy_sections_only_where_enabled() {
+        let root = demo_root();
+        let cap = Capability::scoped(["urn:cap:browse:read:demo", "urn:cap:exec:gh"]);
+        for (names, enabled) in [
+            (None, true),
+            (Some(vec!["demo"]), true),
+            (Some(vec!["other"]), false),
+            (Some(vec![]), false),
+        ] {
+            let mount = Mount::new([("demo".to_string(), root.clone())]);
+            let mount = match names {
+                Some(names) => mount.pull_request_roots(names),
+                None => mount,
+            };
+            let k = Kernel::new(Arc::new(mount.space()));
+            for (iri, target, heading) in [
+                (
+                    "urn:repo:demo:tree",
+                    "urn:repo:demo:prs state=all limit=10",
+                    "recent pull requests",
+                ),
+                (
+                    "urn:repo:demo:tree:src",
+                    "urn:repo:demo:prs:src limit=10",
+                    "pull requests touching this directory",
+                ),
+            ] {
+                let html = body(&source(&k, iri, &[("as", "text/html")], &cap).unwrap());
+                assert_eq!(html.contains("browse-recent-prs"), enabled, "{html}");
+                assert_eq!(html.contains(heading), enabled, "{html}");
+                assert_eq!(html.contains("hx-trigger=\"load\""), enabled, "{html}");
+                if enabled {
+                    assert!(
+                        html.contains(&format!(
+                            "hx-get=\"/k/source {target} chrome=embed as=text/html\""
+                        )),
+                        "{html}"
+                    );
+                } else {
+                    assert!(!html.contains("pull requests"), "{html}");
+                }
+                let html = body(&source(&k, iri, &[("as", "text/html")], &demo_cap()).unwrap());
+                assert!(!html.contains("pull requests"), "{html}");
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4493,7 +4600,7 @@ mod tests {
         let roots: Roots = Arc::new(BTreeMap::from([("demo".to_string(), root.clone())]));
         for (endpoint, wants_path) in [
             (
-                Arc::new(tree_endpoint(&roots, false)) as Arc<dyn Endpoint>,
+                Arc::new(tree_endpoint(&roots, false, None)) as Arc<dyn Endpoint>,
                 true,
             ),
             (Arc::new(file_endpoint(&roots, None, false)), true),

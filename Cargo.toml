@@ -544,7 +544,9 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # 0.2 cannot link 0.21.0, and a host pinning `"0.20.x"` (`<0.21.0`) moves its pin in its own core
 # 0.3 wave. Browse calls neither `ContentStore::put` nor `put_replay`, so nothing moves to
 # `put_for`. No resource name, capability, face or stored term moves.
-version = "0.21.0"
+# 0.21.1 (ledger #3234): additive Mount::pull_request_roots host option; tree
+# PR sections require exec:gh and an eligible root. No endpoint contract changes.
+version = "0.21.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
