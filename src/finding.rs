@@ -1152,33 +1152,25 @@ impl FindingEndpoint {
                 // annotation stays.
                 let only_the_mark =
                     same_rating && (reason.is_none() || reason == head.reason) && reproduced;
-                let name = match (only_the_mark, same_rating) {
-                    (true, _) => "reproduced",
-                    (false, true) => "reason",
-                    (false, false) => "decision",
-                };
-                return Err(Error::InvalidArgument {
-                    name: name.to_string(),
-                    detail: format!(
-                        "`{}` was already {} — a decision is the record and is not \
+                return Err(Error::Conflict(format!(
+                    "`{}` was already {} — a decision is the record and is not \
                          overwritten. To REVISE it, name it: revises={} (both answers are \
                          kept).{}",
-                        finding_iri(&id),
-                        on_file(head),
-                        head.iri,
-                        match (&head.minted, only_the_mark) {
-                            (Some(iri), true) => format!(
-                                " Adding the reproduced mark is a revision that keeps the \
+                    finding_iri(&id),
+                    on_file(head),
+                    head.iri,
+                    match (&head.minted, only_the_mark) {
+                        (Some(iri), true) => format!(
+                            " Adding the reproduced mark is a revision that keeps the \
                                  annotation it minted (`{iri}`)."
-                            ),
-                            (Some(iri), false) => format!(
-                                " A publication is revised only once the annotation it minted \
+                        ),
+                        (Some(iri), false) => format!(
+                            " A publication is revised only once the annotation it minted \
                                  (`{iri}`) is deleted."
-                            ),
-                            (None, _) => String::new(),
-                        },
-                    ),
-                });
+                        ),
+                        (None, _) => String::new(),
+                    },
+                )));
             }
             (None, Some(head)) => {
                 // The current answer was withdrawn, so the finding is
@@ -2964,7 +2956,7 @@ mod tests {
             &[("decision", "publish"), ("severity", "minor")][..],
         ] {
             let err = issue(&k, Verb::Sink, &findings[0], change).unwrap_err();
-            assert!(matches!(err, Error::InvalidArgument { .. }), "{err:?}");
+            assert!(matches!(err, Error::Conflict(_)), "{err:?}");
             assert!(err.to_string().contains("already published"), "{err}");
         }
         std::fs::remove_dir_all(&root).ok();
@@ -3821,10 +3813,7 @@ mod tests {
             &[("decision", "decline"), ("reason", "misread")],
         )
         .unwrap_err();
-        assert!(
-            matches!(&err, Error::InvalidArgument { name, .. } if name == "reason"),
-            "{err:?}"
-        );
+        assert!(matches!(&err, Error::Conflict(_)), "{err:?}");
         assert!(err.to_string().contains("(no reason stated)"), "{err}");
 
         issue(
@@ -4047,6 +4036,47 @@ mod tests {
         issue(k, Verb::Sink, iri, args).map(|r| body(&r))
     }
 
+    #[test]
+    fn changing_a_recorded_decision_is_a_conflict() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        let findings = pass(&k);
+        let alpha = finding_on(&k, &findings, "fn alpha() {}");
+        sink(&k, &alpha, &[("decision", "decline")]).unwrap();
+
+        for args in [
+            vec![("decision", "publish")],
+            vec![("decision", "decline"), ("reason", "restates")],
+        ] {
+            let err = sink(&k, &alpha, &args).unwrap_err();
+            assert!(
+                matches!(&err, Error::Conflict(detail)
+                if detail.contains("was already") && detail.contains("revises=")),
+                "{err:?}"
+            );
+        }
+        refused(
+            sink(&k, &alpha, &[("decision", "bogus")]),
+            "decision",
+            "not a decision",
+        );
+        refused(
+            sink(&k, &alpha, &[("decision", "decline"), ("reason", "bogus")]),
+            "reason",
+            "one of:",
+        );
+        assert_eq!(nodes(&store, &alpha).len(), 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    fn conflicted(result: Result<String>, says: &str) {
+        match result {
+            Err(Error::Conflict(detail)) => assert!(detail.contains(says), "{detail}"),
+            other => panic!("expected conflict saying `{says}`, got {other:?}"),
+        }
+    }
+
     fn refused(result: Result<String>, name: &str, says: &str) {
         match result {
             Err(Error::InvalidArgument { name: got, detail }) => {
@@ -4131,8 +4161,7 @@ mod tests {
             for loser in [&published, &declined] {
                 if let Err(e) = loser {
                     assert!(
-                        matches!(e, Error::InvalidArgument { name, detail }
-                            if name == "decision" && detail.contains("was already")),
+                        matches!(e, Error::Conflict(detail) if detail.contains("was already")),
                         "round {round}: the second answer is refused as a sequential one is: {e:?}"
                     );
                 }
@@ -4163,13 +4192,12 @@ mod tests {
         let first = format!("{alpha}:decision");
         assert_eq!(of(&k, &alpha)["decision"]["iri"], first.as_str());
 
-        refused(
+        conflicted(
             sink(
                 &k,
                 &alpha,
                 &[("decision", "decline"), ("reason", "restates")],
             ),
-            "reason",
             &format!("revises={first}"),
         );
 
@@ -4365,9 +4393,8 @@ mod tests {
             );
         }
         // Without `revises`, the refusal says both halves of the way.
-        refused(
+        conflicted(
             sink(&k, &alpha, &[("decision", "decline")]),
-            "decision",
             "revised only once the annotation it minted",
         );
 
@@ -4991,13 +5018,12 @@ mod tests {
                 .len()
         };
 
-        refused(
+        conflicted(
             sink(
                 &k,
                 &alpha,
                 &[("decision", "publish"), ("reproduced", "yes")],
             ),
-            "reproduced",
             &format!("revises={first}"),
         );
         refused(
