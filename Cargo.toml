@@ -546,7 +546,7 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # `put_for`. No resource name, capability, face or stored term moves.
 # 0.21.1 (ledger #3234): additive Mount::pull_request_roots host option; tree
 # PR sections require exec:gh and an eligible root. No endpoint contract changes.
-version = "0.21.1"
+version = "0.22.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -724,6 +724,9 @@ oxigraph = { version = "0.5", default-features = false }
 # ⚠ And a CEILING: `^0.3.0` is `<0.4.0`.
 # "0.4.0" (the core 0.3.0 cascade, ledger #3146): store on ikigai-core 0.3.0, so the graph links
 # one core; every floor above still holds. A ceiling in turn: `<0.5.0`.
+# "0.5.0" (ledger #3348): per-graph freshness (ledger #3322); every floor above still holds.
+# `Mount::annotations_through` takes the store's `SharedWriter`, so this move is a breaking
+# release of browse (0.22.0). A ceiling in turn: `<0.6.0`.
 # default-features = false keeps RocksDB out (the crate's default is already empty; stated so a
 # future default cannot pull it in), as above.
 ikigai-store = { version = "0.5.0", default-features = false }
