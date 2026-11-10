@@ -2637,9 +2637,8 @@ fn no_judge(target: &str) -> Error {
     ))
 }
 
-#[async_trait]
-impl Endpoint for JudgeFindingEndpoint {
-    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+impl JudgeFindingEndpoint {
+    async fn run(&self, inv: &Invocation<'_>) -> Result<Representation> {
         let verb = inv.request.verb;
         if verb != Verb::Source && verb != Verb::Exists {
             return Err(Error::Endpoint(format!(
@@ -2811,6 +2810,16 @@ impl Endpoint for JudgeFindingEndpoint {
             "application/json",
             serde_json::to_string(&answer).unwrap_or_default(),
         ))
+    }
+}
+
+#[async_trait]
+impl Endpoint for JudgeFindingEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        if inv.request.verb == Verb::Exists {
+            return self.run(inv).await;
+        }
+        self.config.archive.changing(inv, self.run(inv)).await
     }
 
     fn name(&self) -> &str {

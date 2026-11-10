@@ -860,6 +860,25 @@ badge read over seven roots went from ~120 ms to ~106 ms: fewer rows to reconcil
 and serialize, and the current content hash is the one the drift pass already
 computes.
 
+**Findings caching (ledger #528).** Findings listings, including every `group=`
+face, opt into caching under one thread per archive graph. Decisions, file and PR
+reviews, and judge verdicts announce before and after work through a notification
+Sink, including on failure after a partial pass. The graph grain is deliberate:
+legacy decline bursts and their confirmation counts span roots. Unchanged empty
+queues cache immediately. Populated queues inherit their file dependencies, so they
+cache only when the host supplies cacheable file reads and cuts their threads on
+edits; ordinary unwatched files remain live. File cuts also refresh drift and
+supersession. This does not make the shared store's scoped reads cacheable.
+
+The notification IRI is `urn:ikigai:browse:findings-written:<sha256>`, with the digest
+of Oxigraph's graph-name display (`DEFAULT` for the default graph).
+It appears in the representation's threads. Sinking it needs a browse read grant
+and changes no data. A host changing findings or
+review records through its raw store handle must notify before and after those
+writes too; writes through the kernel's store update/load/graph-update doors are
+covered by those doors' threads. As with other kernel threads, cuts do not cross a
+mount into a different kernel.
+
 **Finding groups: the machine proposes, a human decides once (0.12.0, ledger
 #506).** A decline records a HUMAN judgment and the recurrence mark reads every
 decline as a prior "no", so nothing here auto-declines. Instead

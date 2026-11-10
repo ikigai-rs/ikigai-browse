@@ -1903,9 +1903,8 @@ struct ReviewEndpoint {
     config: Arc<ExplainConfig>,
 }
 
-#[async_trait]
-impl Endpoint for ReviewEndpoint {
-    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+impl ReviewEndpoint {
+    async fn run(&self, inv: &Invocation<'_>) -> Result<Representation> {
         if inv.request.verb != Verb::Source {
             return Err(Error::Endpoint(format!(
                 "browse-review does not support the {:?} verb",
@@ -2488,6 +2487,13 @@ impl Endpoint for ReviewEndpoint {
         entry.superseded =
             crate::supersede::superseded_on(&config.archive, repo, &rel, &entry.hash)?;
         face(inv, repo, &rel, &entry, true, &included)
+    }
+}
+
+#[async_trait]
+impl Endpoint for ReviewEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        self.config.archive.changing(inv, self.run(inv)).await
     }
 
     fn name(&self) -> &str {

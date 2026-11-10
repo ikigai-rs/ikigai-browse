@@ -811,6 +811,10 @@ fn within_ceiling(
 
 pub(crate) fn bind(space: EndpointSpace, roots: &Roots, archive: &Arc<Archive>) -> EndpointSpace {
     let space = space.bind(
+        ikigai_core::Exact::new(archive.findings_thread()),
+        FindingsWritten,
+    );
+    let space = space.bind(
         FindingGrammar::new(),
         FindingEndpoint {
             roots: Arc::clone(roots),
@@ -828,6 +832,45 @@ pub(crate) fn bind(space: EndpointSpace, roots: &Roots, archive: &Arc<Archive>) 
         Some("findings"),
         Some("findings:{path}"),
     )
+}
+
+/// Notification only: writers retain their own data grants. A browse reader can
+/// invalidate this graph's cached queues without acquiring kernel-wide cut authority.
+struct FindingsWritten;
+
+#[async_trait]
+impl Endpoint for FindingsWritten {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        if inv.request.verb != Verb::Sink {
+            return Err(Error::Endpoint(
+                "findings-written supports only Sink".to_string(),
+            ));
+        }
+        // The same graph may be mounted under disjoint root sets. Its notification
+        // door must work whichever mount resolves it first. No data is exposed or
+        // changed, so a browse-family grant is sufficient (as at the kernel floor).
+        if !inv.capability.satisfies(CAP_WILDCARD) {
+            return Err(Error::Denied(
+                "invalidating findings needs a browse read grant".to_string(),
+            ));
+        }
+        Ok(repr_utf8(
+            "text/plain",
+            "findings invalidated\n".to_string(),
+        ))
+    }
+
+    fn name(&self) -> &str {
+        "browse-findings-written"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new(self.name())
+            .summary("Invalidate cached findings and groups in this archive graph. Changes no data. Browse writers announce here before and after work; a host writing the raw store handle must announce here too. Requires a browse read grant.")
+            .verb(Verb::Sink)
+            .requires(CAP_WILDCARD)
+            .output("text/plain;charset=utf-8")
+    }
 }
 
 /// `urn:iki:finding:{id}`. Unlike the annotation family there is no bare form:
@@ -873,7 +916,7 @@ impl Endpoint for FindingEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         match inv.request.verb {
             Verb::Source => self.read(inv).await,
-            Verb::Sink => self.decide(inv).await,
+            Verb::Sink => self.archive.changing(inv, self.decide(inv)).await,
             other => Err(Error::Endpoint(format!(
                 "finding does not support the {other:?} verb — a finding is never deleted: \
                  declining is how a human removes one, and the decline is the record"
@@ -1681,7 +1724,13 @@ impl Endpoint for FindingsEndpoint {
                     crate::group::json(repo, filter, kind, &groups, &counts).to_string(),
                 ),
             };
-            return within_ceiling(answer, repo, &rel, rows.len(), false);
+            return within_ceiling(
+                self.archive.cache_findings(answer),
+                repo,
+                &rel,
+                rows.len(),
+                false,
+            );
         }
         // The one line a PENDING listing owes its reader: how many findings
         // are not in it because they were superseded. A suppression nobody
@@ -1826,7 +1875,13 @@ impl Endpoint for FindingsEndpoint {
                 repr("application/json", json.to_string())
             }
         };
-        within_ceiling(answer, repo, &rel, shown, paged)
+        within_ceiling(
+            self.archive.cache_findings(answer),
+            repo,
+            &rel,
+            shown,
+            paged,
+        )
     }
 
     fn name(&self) -> &str {
@@ -2733,6 +2788,17 @@ mod tests {
     /// different notes re-raises the first pass's claims without being an
     /// exact repeat (which the mint would withhold).
     fn kernel_replying(root: &std::path::Path, store: &Arc<Store>, reply: &str) -> Kernel {
+        kernel_reading_files(root, store, reply, false)
+    }
+
+    /// A host may cache file reads only while it cuts their threads on edits.
+    /// Tests using this option explicitly cut the file target after each edit.
+    fn kernel_reading_files(
+        root: &std::path::Path,
+        store: &Arc<Store>,
+        reply: &str,
+        watched: bool,
+    ) -> Kernel {
         let reply = reply.to_string();
         let llm = EndpointSpace::new().bind(
             Exact::new(PROVIDER),
@@ -2751,7 +2817,21 @@ mod tests {
             .review_model_label("r1")
             .no_judge();
         let browse = crate::space_with_explain(vec![("demo".to_string(), root.to_path_buf())], cfg);
+        let file = root.join("a.rs");
+        let files = match watched {
+            true => EndpointSpace::new().bind(
+                Exact::new("urn:repo:demo:file:a.rs"),
+                FnEndpoint::new("watched-test-file", move |_| {
+                    Ok(
+                        repr_utf8("text/plain", std::fs::read_to_string(&file).unwrap())
+                            .cacheable(),
+                    )
+                }),
+            ),
+            false => EndpointSpace::new(),
+        };
         Kernel::new(Arc::new(Fallback::new(vec![
+            Arc::new(files),
             Arc::new(browse),
             Arc::new(llm),
         ])))
@@ -2805,6 +2885,227 @@ mod tests {
 
     fn of(k: &Kernel, iri: &str) -> serde_json::Value {
         json(k, iri, &[])
+    }
+
+    /// Ledger #528: unchanged empty queues have no live file dependency.
+    #[test]
+    fn unchanged_findings_and_groups_are_cacheable() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        for args in [vec![], vec![("group", "file")]] {
+            let answer = issue(&k, Verb::Source, "urn:repo:demo:findings", &args).unwrap();
+            assert_eq!(answer.expiry, ikigai_core::Expiry::Never);
+            let mut request =
+                Request::new(Verb::Source, Iri::parse("urn:repo:demo:findings").unwrap());
+            for (name, value) in args {
+                request =
+                    request.with_arg(name, ikigai_core::ArgRef::Inline(value.as_bytes().to_vec()));
+            }
+            assert!(k.is_cached(&request, &cap()));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn queue_request(args: &[(&str, &str)]) -> Request {
+        args.iter().fold(
+            Request::new(Verb::Source, Iri::parse("urn:repo:demo:findings").unwrap()),
+            |r, (name, value)| {
+                r.with_arg(
+                    *name,
+                    ikigai_core::ArgRef::Inline(value.as_bytes().to_vec()),
+                )
+            },
+        )
+    }
+
+    /// Empty and populated projections share the graph thread. Both a review
+    /// (a Source that writes) and a human decision must invalidate every shape.
+    #[test]
+    fn reviews_and_decisions_invalidate_cached_findings_and_groups() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel_reading_files(&root, &store, FINDINGS, true);
+        let variants = [
+            vec![],
+            vec![("group", "file")],
+            vec![("summary", "states")],
+            vec![("limit", "1")],
+        ];
+        let warm = || {
+            for args in &variants {
+                let r = block_on(k.issue(queue_request(args), &cap())).unwrap();
+                assert_eq!(r.expiry, ikigai_core::Expiry::Never, "{args:?}");
+            }
+            for args in &variants {
+                assert!(k.is_cached(&queue_request(args), &cap()), "{args:?}");
+            }
+        };
+        warm();
+        let minted = pass(&k);
+        assert_eq!(minted.len(), 2);
+        for args in &variants {
+            assert!(
+                !k.is_cached(&queue_request(args), &cap()),
+                "review: {args:?}"
+            );
+        }
+        warm();
+        assert_eq!(
+            of(&k, "urn:repo:demo:findings").as_array().unwrap().len(),
+            2
+        );
+        issue(
+            &k,
+            Verb::Sink,
+            &minted[0],
+            &[("decision", "decline"), ("severity", "minor")],
+        )
+        .unwrap();
+        for args in &variants {
+            assert!(
+                !k.is_cached(&queue_request(args), &cap()),
+                "decision: {args:?}"
+            );
+        }
+        assert_eq!(
+            of(&k, "urn:repo:demo:findings").as_array().unwrap().len(),
+            1
+        );
+        warm();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The archive's cacheability must not conceal an unwatched working tree.
+    #[test]
+    fn populated_findings_remain_live_without_a_file_watch() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        pass(&k);
+        for args in [vec![], vec![("group", "file")]] {
+            let r = block_on(k.issue(queue_request(&args), &cap())).unwrap();
+            assert_eq!(r.expiry, ikigai_core::Expiry::Always);
+            assert!(!k.is_cached(&queue_request(&args), &cap()));
+        }
+        std::fs::write(root.join("a.rs"), "// removed both functions\n").unwrap();
+        let rows = of(&k, "urn:repo:demo:findings");
+        assert!(rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["orphaned"] == true));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A watched edit invalidates a populated queue before another review:
+    /// drift and supersession still depend on current file contents.
+    #[test]
+    fn a_file_cut_refreshes_cached_findings() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel_reading_files(&root, &store, FINDINGS, true);
+        pass(&k);
+        let before = of(&k, "urn:repo:demo:findings");
+        assert!(before
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["orphaned"] == false));
+        std::fs::write(root.join("a.rs"), "// removed both functions\n").unwrap();
+        k.cut("urn:repo:demo:file:a.rs");
+        assert!(!k.is_cached(&queue_request(&[]), &cap()));
+        let after = of(&k, "urn:repo:demo:findings");
+        assert!(after
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["orphaned"] == true));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A carved-out notification door must refuse the pass before any record lands.
+    #[test]
+    fn a_review_cannot_write_without_its_notification_door() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        let listing = issue(&k, Verb::Source, "urn:repo:demo:findings", &[]).unwrap();
+        let thread = listing
+            .threads()
+            .iter()
+            .find(|t| {
+                t.as_str()
+                    .starts_with("urn:ikigai:browse:findings-written:")
+            })
+            .unwrap();
+        let refuse = EndpointSpace::new().bind(
+            Exact::new(thread.as_str()),
+            FnEndpoint::new("refuse-notification", |_| {
+                Err(Error::Denied("notification carved out".into()))
+            }),
+        );
+        let scope = ikigai_core::Scope::empty().with_named(
+            Iri::parse("urn:test:refused-notification").unwrap(),
+            Arc::new(refuse),
+        );
+        let request = Request::new(
+            Verb::Source,
+            Iri::parse("urn:repo:demo:review:a.rs").unwrap(),
+        );
+        assert!(matches!(
+            block_on(k.issue_in(request, &cap(), scope)),
+            Err(Error::Denied(_))
+        ));
+        assert!(
+            store.is_empty().unwrap(),
+            "refused before minting or archiving"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A queue can be read and cached while the reviewer waits on a model.
+    /// The final notification must invalidate that answer, including on error.
+    #[test]
+    fn reviews_invalidate_reads_cached_during_work_even_on_failure() {
+        for fails in [false, true] {
+            let root = demo_root();
+            let store = Arc::new(Store::new().unwrap());
+            let cfg = ExplainConfig::new(Arc::clone(&store))
+                .review_model_label("r1")
+                .no_judge();
+            let browse = crate::space_with_explain(vec![("demo".into(), root.clone())], cfg);
+            let llm = EndpointSpace::new().bind(
+                Exact::new(PROVIDER),
+                ikigai_core::AsyncFnEndpoint::new("reading-model", move |inv| {
+                    Box::pin(async move {
+                        let rows = inv
+                            .source(&Iri::parse("urn:repo:demo:findings").unwrap())
+                            .await?;
+                        assert_eq!(rows.expiry, ikigai_core::Expiry::Never);
+                        assert_eq!(rows.bytes, b"[]");
+                        if fails {
+                            Err(Error::Refused("model refused".into()))
+                        } else {
+                            Ok(repr_utf8("text/plain", FINDINGS.into()))
+                        }
+                    })
+                }),
+            );
+            let k = Kernel::new(Arc::new(Fallback::new(vec![
+                Arc::new(browse),
+                Arc::new(llm),
+            ])));
+            let review = issue(&k, Verb::Source, "urn:repo:demo:review:a.rs", &[]);
+            assert_eq!(review.is_err(), fails);
+            assert!(
+                !k.is_cached(&queue_request(&[]), &cap()),
+                "an intermediate empty answer survived; failed={fails}"
+            );
+            let rows = of(&k, "urn:repo:demo:findings");
+            assert_eq!(rows.as_array().unwrap().len(), if fails { 0 } else { 2 });
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     /// ★★ **Both ratings survive a re-rate — the item's headline decision.**

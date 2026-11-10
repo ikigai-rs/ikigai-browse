@@ -69,12 +69,10 @@
 //!   claiming nothing — no `id()`, an anonymous topology root. The walked one is the
 //!   very `Arc` the kernel runs over; the other four are built over the same
 //!   scratch so the declaration is about the constructor, not a stand-in.
-//! * `cacheable("browse-style")` — the one representation in the crate that is
-//!   `.cacheable()`. Everything else reads a working tree and is `Expiry::Always`,
-//!   which is the honest spelling for a read of a tree nothing here watches; the
-//!   day one of them is marked cacheable without a thread a host cuts, this test
-//!   goes red. Nothing is declared `pure`: no endpoint here is a function of its
-//!   inputs alone.
+//! * `cacheable("browse-style")` / `cacheable("browse-layout")` — the stylesheets
+//!   cache under a config watch or as a build constant. Findings also opt in, but
+//!   the populated fixture reads unwatched files and inherits `Expiry::Always`.
+//!   Their cache hits and writer cuts are pinned in `finding::tests`.
 //! * `body_space(..)` — the same module `Arc` the kernel holds, so `BODIES`
 //!   compares `invoke` with collected `invoke_body` and checks the smaller budget
 //!   on deterministic Sources (style and layout). Volatile Sources remain explicitly
@@ -150,10 +148,9 @@ const RAW_FACE_IS_A_PASS_THROUGH: &str =
      `the_raw_file_face_serves_the_extension_mapped_type`; remove this waiver when \
      `Description` grows a pass-through output marker (core PENDING §20)";
 
-/// Every description id this crate binds. A twenty-fifth endpoint bound without a
-/// line here is held to a weaker standard than the twenty-four; a listed id that
-/// binds nothing is a stale list.
-const ENDPOINTS: [&str; 24] = [
+/// Every description id this crate binds. A new endpoint without a line here
+/// is held to a weaker standard; a listed id that binds nothing is a stale list.
+const ENDPOINTS: [&str; 25] = [
     "annotation",
     "browse-annotations",
     "browse-explain",
@@ -161,6 +158,7 @@ const ENDPOINTS: [&str; 24] = [
     "browse-explain-versions",
     "browse-file",
     "browse-findings",
+    "browse-findings-written",
     "browse-hash",
     "browse-judge",
     "browse-judge-finding",
@@ -661,6 +659,38 @@ fn conforms() {
     // Everything else must be probed, including both deterministic body readers;
     // losing body_space must fail even when the report has no findings.
     for unprobed in report.unprobed.iter() {
+        // This notification Sink has no content input, so the suite cannot fire
+        // it. Probe its actual output here instead of leaving OUTPUTS unchecked.
+        if unprobed.endpoint == "browse-findings-written" {
+            assert_eq!(unprobed.verb, Verb::Sink);
+            assert_eq!(unprobed.check, Check::Outputs);
+            let listing = issue(
+                &kernel,
+                request(Verb::Source, "urn:repo:demo:findings", &[]),
+                &Capability::root(),
+            )
+            .unwrap();
+            let thread = listing
+                .threads()
+                .iter()
+                .find(|t| {
+                    t.as_str()
+                        .starts_with("urn:ikigai:browse:findings-written:")
+                })
+                .expect("the findings notification thread")
+                .as_str();
+            let ack = issue(
+                &kernel,
+                request(Verb::Sink, thread, &[]),
+                &Capability::root(),
+            )
+            .unwrap();
+            assert_eq!(
+                declared_outputs(&kernel, thread),
+                BTreeSet::from([bare(&ack.repr_type.media_type)])
+            );
+            continue;
+        }
         let volatile_body = unprobed.check == Check::Bodies
             && !["browse-style", "browse-layout"].contains(&unprobed.endpoint.as_str())
             && unprobed.reason == "uncacheable, time-varying, or volatile answer: independent calls cannot establish method agreement (Suite::live, expiry or CACHEABLE's byte comparison)";
@@ -941,7 +971,7 @@ fn the_pull_request_diff_is_an_annotation_surface() {
 /// ONE resolution of it. So the promise is checkable here, and this pins it:
 /// the declared threads and the watch's threads are the same list, by name.
 ///
-/// Everything else the family serves is `Expiry::Always`. That is a decision, not
+/// The other faces probed below are `Expiry::Always`. That is a decision, not
 /// an omission: a working-tree read could only be cached under a thread naming a
 /// file the HOST watches with a root only the host knows (core PENDING §18), so a
 /// thread minted here would be a promise no host keeps.
