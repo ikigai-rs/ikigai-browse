@@ -110,71 +110,91 @@ pub(crate) struct Standing {
     pub(crate) members: BTreeSet<String>,
 }
 
-/// Every archived FILE pass on `(repo, rel)`, found through the `ik:path`
-/// literal (one indexed pattern — the path's findings and memos come back too
-/// and are dropped by prefix), each with its content hash and derivation time.
-///
-/// ★ The prefix carries the repo AND its trailing colon, so a root named
-/// `ikigai-web` never reads the passes of `ikigai-web-demo`, and
-/// [`PASS_PREFIX`]'s own colon keeps region memos out.
-fn passes_on(archive: &Archive, repo: &str, rel: &str) -> Result<Vec<PassHead>> {
-    let prefix = format!("{PASS_PREFIX}{repo}:");
-    let path = Literal::new_simple_literal(rel);
-    let mut iris = BTreeSet::new();
-    for quad in
-        archive.quads_for_pattern(None, Some(ik("path").as_ref()), Some(path.as_ref().into()))
-    {
-        let quad = quad.map_err(store_err)?;
-        if let NamedOrBlankNode::NamedNode(subject) = &quad.subject {
-            if subject.as_str().starts_with(&prefix) {
-                iris.insert(subject.as_str().to_string());
+/// Pass headers for one repository, indexed once per listing request.
+/// The repository literal bounds the store read before paths are examined.
+pub(crate) struct Passes(BTreeMap<String, Vec<PassHead>>);
+
+impl Passes {
+    pub(crate) fn of(archive: &Archive, repo: &str) -> Result<Self> {
+        let prefix = format!("{PASS_PREFIX}{repo}:");
+        let root = Literal::new_simple_literal(repo);
+        let mut iris = BTreeSet::new();
+        for quad in
+            archive.quads_for_pattern(None, Some(ik("repo").as_ref()), Some(root.as_ref().into()))
+        {
+            let quad = quad.map_err(store_err)?;
+            if let NamedOrBlankNode::NamedNode(subject) = &quad.subject {
+                if subject.as_str().starts_with(&prefix) {
+                    iris.insert(subject.as_str().to_string());
+                }
             }
         }
-    }
-    let literal = |subject: &NamedNode, term: &str| -> Result<Option<String>> {
-        let predicate = ik(term);
-        match archive
-            .quads_for_pattern(
-                Some(subject.as_ref().into()),
-                Some(predicate.as_ref()),
-                None,
-            )
-            .next()
-        {
-            Some(quad) => Ok(match quad.map_err(store_err)?.object {
-                Term::Literal(l) => Some(l.value().to_string()),
-                _ => None,
-            }),
-            None => Ok(None),
-        }
-    };
-    let mut heads = Vec::with_capacity(iris.len());
-    for iri in iris {
-        let subject = NamedNode::new(&iri).map_err(store_err)?;
-        // A subject under the prefix with no content hash is not a pass this
-        // crate wrote; it cannot be anyone's current reading.
-        let Some(hash) = literal(&subject, "contentHash")? else {
-            continue;
+        let literal = |subject: &NamedNode, term: &str| -> Result<Option<String>> {
+            let predicate = ik(term);
+            match archive
+                .quads_for_pattern(
+                    Some(subject.as_ref().into()),
+                    Some(predicate.as_ref()),
+                    None,
+                )
+                .next()
+            {
+                Some(quad) => Ok(match quad.map_err(store_err)?.object {
+                    Term::Literal(l) => Some(l.value().to_string()),
+                    _ => None,
+                }),
+                None => Ok(None),
+            }
         };
-        heads.push(PassHead {
-            derived_at: literal(&subject, "derivedAt")?,
-            iri,
-            hash,
-        });
+        let mut paths: BTreeMap<String, Vec<PassHead>> = BTreeMap::new();
+        for iri in iris {
+            let subject = NamedNode::new(&iri).map_err(store_err)?;
+            // A subject under the prefix with no content hash is not a pass this
+            // crate wrote; it cannot be anyone's current reading.
+            let Some(hash) = literal(&subject, "contentHash")? else {
+                continue;
+            };
+            let Some(rel) = literal(&subject, "path")? else {
+                continue;
+            };
+            paths.entry(rel).or_default().push(PassHead {
+                derived_at: literal(&subject, "derivedAt")?,
+                iri,
+                hash,
+            });
+        }
+        Ok(Self(paths))
     }
-    Ok(heads)
+
+    /// With only one archived hash, both the current-hash choice and the
+    /// fallback select the same passes. No file read is necessary to decide.
+    pub(crate) fn needs_hash(&self, rel: &str) -> bool {
+        self.0.get(rel).is_some_and(|heads| {
+            heads
+                .first()
+                .is_some_and(|first| heads.iter().any(|p| p.hash != first.hash))
+        })
+    }
+
+    fn standing(
+        &self,
+        archive: &Archive,
+        rel: &str,
+        current_hash: Option<&str>,
+    ) -> Result<Option<Standing>> {
+        standing_from(
+            archive,
+            self.0.get(rel).map_or(&[], Vec::as_slice),
+            current_hash,
+        )
+    }
 }
 
-/// The reading of `(repo, rel)` that stands, given the file's current content
-/// hash (`None` when the content could not be read) — or `None` when no pass
-/// over the file is on record, in which case nothing is superseded.
-pub(crate) fn standing(
+fn standing_from(
     archive: &Archive,
-    repo: &str,
-    rel: &str,
+    heads: &[PassHead],
     current_hash: Option<&str>,
 ) -> Result<Option<Standing>> {
-    let heads = passes_on(archive, repo, rel)?;
     // Newest first: derivation time, then IRI — a total order, so the choice
     // (and `superseded_by`) is deterministic. `None` sorts oldest.
     // By TIME, not text (ledger #736).
@@ -225,6 +245,22 @@ pub(crate) fn mark(
     findings: &mut [Annotation],
     current_hash: impl Fn(&Annotation) -> Option<String>,
 ) -> Result<()> {
+    let mut indexes = BTreeMap::new();
+    for f in findings.iter().filter(|f| eligible(f)) {
+        if !indexes.contains_key(&f.repo) {
+            indexes.insert(f.repo.clone(), Passes::of(archive, &f.repo)?);
+        }
+    }
+    mark_indexed(archive, findings, current_hash, &indexes)
+}
+
+/// Apply request-local repository indexes, sharing each file's standing set.
+pub(crate) fn mark_indexed(
+    archive: &Archive,
+    findings: &mut [Annotation],
+    current_hash: impl Fn(&Annotation) -> Option<String>,
+    indexes: &BTreeMap<String, Passes>,
+) -> Result<()> {
     let mut readings: BTreeMap<(String, String), Option<Standing>> = BTreeMap::new();
     for finding in findings.iter_mut() {
         if !eligible(finding) {
@@ -233,7 +269,8 @@ pub(crate) fn mark(
         let key = (finding.repo.clone(), finding.rel.clone());
         if !readings.contains_key(&key) {
             let hash = current_hash(finding);
-            let reading = standing(archive, &finding.repo, &finding.rel, hash.as_deref())?;
+            let reading =
+                indexes[&finding.repo].standing(archive, &finding.rel, hash.as_deref())?;
             readings.insert(key.clone(), reading);
         }
         if let Some(reading) = &readings[&key] {

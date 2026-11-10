@@ -107,6 +107,22 @@ pub(crate) struct Archive {
     committed_on: Arc<Mutex<Vec<std::thread::ThreadId>>>,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Default, Debug)]
+pub(crate) struct ReadWork {
+    pub(crate) queries: usize,
+    pub(crate) unscoped_paths: usize,
+    pub(crate) burst_scans: usize,
+    pub(crate) repo_scans: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static READ_WORK: std::cell::Cell<ReadWork> = const { std::cell::Cell::new(ReadWork {
+        queries: 0, unscoped_paths: 0, burst_scans: 0, repo_scans: 0,
+    }) };
+}
+
 impl Archive {
     /// Bind `store`'s `graph` — `GraphName::DefaultGraph` for a host that has
     /// not asked for a named one — writing through a writer of browse's OWN (see the module
@@ -289,6 +305,24 @@ impl Archive {
         predicate: Option<NamedNodeRef<'_>>,
         object: Option<TermRef<'_>>,
     ) -> QuadIter<'static> {
+        #[cfg(test)]
+        READ_WORK.with(|work| {
+            let mut n = work.get();
+            n.queries += 1;
+            if subject.is_none() {
+                n.repo_scans += usize::from(
+                    predicate.is_some_and(|p| p.as_str() == "https://ikigai-rs.dev/ns#repo"),
+                );
+                n.unscoped_paths += usize::from(
+                    predicate.is_some_and(|p| p.as_str() == "https://ikigai-rs.dev/ns#path"),
+                );
+                n.burst_scans += usize::from(object.is_some_and(|o| {
+                    matches!(o,
+                    TermRef::NamedNode(node) if node.as_str() == "urn:iki:finding:outcome:declined")
+                }));
+            }
+            work.set(n);
+        });
         self.store
             .quads_for_pattern(subject, predicate, object, Some(self.graph.as_ref()))
     }
