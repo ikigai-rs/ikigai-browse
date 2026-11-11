@@ -684,6 +684,8 @@ impl Outcome {
 /// offsets into the target's text at `hash`.
 #[derive(Clone, Debug)]
 pub(crate) struct Annotation {
+    /// Inventory rows omit stored body and selector data and must never be refreshed.
+    pub(crate) complete: bool,
     /// Which family this record is in. ⚠ Every IRI it owns derives from this;
     /// a record loaded from one family and stored into the other would MOVE
     /// it, which is what promotion does deliberately and nothing else may.
@@ -1274,6 +1276,7 @@ fn load_record_for_listing(
     verdict: bool,
 ) -> Result<Option<Annotation>> {
     let mut ann = Annotation {
+        complete,
         family,
         id: id.to_string(),
         body: String::new(),
@@ -1679,8 +1682,8 @@ pub(crate) fn list_findings(
 /// Request-local inventory for paging: state, target and (when requested)
 /// verdict, plus the declined quotes needed by the listing's summaries.
 /// Selectors, recurrence histories and judge details for served rows are
-/// loaded only after the cursor has selected them. Nothing is cached across
-/// requests: edits, decisions and host writes remain immediately visible.
+/// loaded only after the cursor has selected them. Inventory construction reads
+/// the archive; any host caching of the listing follows its archive threads.
 pub(crate) fn listing_inventory(
     archive: &Archive,
     repo: &str,
@@ -2226,6 +2229,7 @@ pub(crate) fn refresh(
     ann: &mut Annotation,
     current: &CurrentContent,
 ) -> Result<Option<u64>> {
+    debug_assert!(ann.complete, "cannot refresh an inventory record");
     match current {
         // Served exactly as recorded, flags untouched: no content was in
         // hand, so nothing can honestly be said about drift.
@@ -2823,6 +2827,7 @@ impl AnnotationEndpoint {
             _ => inv.now().map(|t| iso8601(t.as_millis())),
         };
         let ann = Annotation {
+            complete: true,
             family: Family::Annotation,
             id: id.clone(),
             body,
@@ -4031,6 +4036,7 @@ pub(crate) fn mint_pending_finding_within(
         finding: twin.iri(),
     });
     let ann = Annotation {
+        complete: true,
         family: Family::Finding,
         id,
         body: note.to_string(),
@@ -6434,6 +6440,7 @@ mod tests {
         }
         // A PR-family annotation: no path, keyed to the PR record.
         let pr = Annotation {
+            complete: true,
             family: Family::Annotation,
             id: "pr-note".to_string(),
             body: "a PR note".to_string(),

@@ -599,6 +599,7 @@ mod tests {
 
         pub(super) fn annotation(family: Family, id: &str, body: &str) -> Annotation {
             Annotation {
+                complete: true,
                 family,
                 id: id.to_string(),
                 body: body.to_string(),

@@ -1777,6 +1777,11 @@ impl Endpoint for FindingsEndpoint {
                             )
                         })?;
                     row.superseded_by = entry.superseded_by;
+                    if !selected(&row) {
+                        return Err(Error::Conflict(
+                            "finding changed while paging; retry the page".to_string(),
+                        ));
+                    }
                     Ok(row)
                 })
                 .collect::<Result<Vec<_>>>()?
@@ -6273,6 +6278,100 @@ mod paging_tests {
                 .unwrap();
             }
         }
+    }
+
+    /// A decision committed during the supersession content read must not
+    /// let a reloaded row contradict the selection used for the page total.
+    #[test]
+    fn a_page_rejects_a_row_published_during_the_content_read() {
+        use crate::annotate::{append_decision, Decision, Made, Outcome};
+        use ikigai_core::{EndpointSpace, Exact, Fallback, FnEndpoint};
+
+        let s = synthetic(80, 40);
+        seed_passes(&s);
+        let archive = Archive::new(Arc::clone(&s.store), GraphName::DefaultGraph);
+        let findings = crate::annotate::list_findings(&archive, "demo", None).unwrap();
+        let finding = findings.iter().find(|f| f.rel == "src/f0.rs").unwrap();
+        let published = finding.iri();
+        let annotation = super::promoted(finding, "major");
+        let beside = crate::annotate::record_quads(&archive, &annotation).unwrap();
+        let decision = Decision {
+            iri: crate::annotate::decision_iri(&finding.id),
+            outcome: Outcome::Published,
+            severity: Some("major".to_string()),
+            at: None,
+            revises: None,
+            made: Some(Made::Single),
+            confirmed: false,
+            burst: None,
+            note: None,
+            reason: None,
+            minted: Some(annotation.iri()),
+            reproduced: false,
+        };
+        // A second archived hash forces supersession to consult current content.
+        let pass = crate::review::pass_iri("demo", "src/f0.rs", &finding.hash, "tag-two");
+        let query = format!(
+            "DELETE {{ <{pass}> <https://ikigai-rs.dev/ns#contentHash> ?hash }} \
+             INSERT {{ <{pass}> <https://ikigai-rs.dev/ns#contentHash> \"sha256:other\" }} \
+             WHERE {{ <{pass}> <https://ikigai-rs.dev/ns#contentHash> ?hash }}"
+        );
+        s.store.update(&query).unwrap();
+        let file = s.root.join("src/f0.rs");
+        let files = EndpointSpace::new().bind(
+            Exact::new("urn:repo:demo:file:src/f0.rs"),
+            FnEndpoint::new("publish-while-reading", move |_| {
+                assert!(append_decision(
+                    &archive,
+                    &published,
+                    &decision,
+                    beside.clone()
+                )?);
+                Ok(crate::repr_utf8(
+                    "text/plain",
+                    std::fs::read_to_string(&file).unwrap(),
+                ))
+            }),
+        );
+        let cfg = ExplainConfig::new(Arc::clone(&s.store)).no_judge();
+        let browse = crate::space_with_explain(vec![("demo".to_string(), s.root.clone())], cfg);
+        let kernel = Kernel::new(Arc::new(Fallback::new(vec![
+            Arc::new(files),
+            Arc::new(browse),
+        ])));
+        let request = Request::new(
+            Verb::Source,
+            Iri::parse("urn:repo:demo:findings:src/f0.rs").unwrap(),
+        )
+        .with_arg("state", ArgRef::Inline(b"pending".to_vec()))
+        .with_arg("limit", ArgRef::Inline(b"10".to_vec()));
+        let answer = block_on(kernel.issue(request, &cap()));
+        match answer {
+            Err(ikigai_core::Error::Conflict(message)) => {
+                assert_eq!(message, "finding changed while paging; retry the page")
+            }
+            Ok(answer) => panic!(
+                "expected paging conflict, got {}",
+                String::from_utf8_lossy(&answer.bytes)
+            ),
+            Err(error) => panic!("expected paging conflict, got {error}"),
+        }
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "cannot refresh an inventory record")]
+    fn drift_rejects_an_inventory_record() {
+        let s = synthetic(1, 40);
+        let archive = Archive::new(Arc::clone(&s.store), GraphName::DefaultGraph);
+        let mut inventory =
+            crate::annotate::listing_inventory(&archive, "demo", None, false, false).unwrap();
+        crate::annotate::refresh(
+            &archive,
+            &mut inventory[0],
+            &crate::annotate::CurrentContent::Unavailable,
+        )
+        .unwrap();
     }
 
     /// A walk hydrates only the rows it serves, rather than every record on
