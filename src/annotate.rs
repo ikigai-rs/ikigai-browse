@@ -5002,6 +5002,51 @@ mod tests {
     }
 
     #[test]
+    fn a_renamed_file_orphans_its_annotation_without_retargeting_it() {
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "fn target() {\n    work();\n}\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        let created = annotate(
+            &k,
+            "rename",
+            "a.rs",
+            "fn target() {\n    work();",
+            "two lines",
+        );
+        std::fs::rename(root.join("a.rs"), root.join("b.rs")).unwrap();
+        let read = json_of(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:iki:annotation:rename",
+                &[("as", "application/json")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(read["orphaned"], true);
+        assert_eq!(read["annotates"], created["annotates"]);
+        assert_eq!(read["start"], created["start"]);
+        assert_eq!(read["end"], created["end"]);
+        assert_eq!(read["exact"], created["exact"]);
+        assert_eq!(read["line"], serde_json::Value::Null);
+        let reloaded = kernel(&root, &store);
+        let again = json_of(
+            &issue(
+                &reloaded,
+                Verb::Source,
+                "urn:iki:annotation:rename",
+                &[("as", "application/json")],
+                &cap(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(again, read);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn an_edited_away_quote_is_orphaned_never_dropped() {
         let root = temp_dir();
         std::fs::write(root.join("a.rs"), "fn target() {}\n").unwrap();

@@ -831,7 +831,8 @@ impl Endpoint for PrsScopedEndpoint {
                 let files =
                     facade(inv, FACADE_FILES, &[("pr", n.to_string()), dir_arg(root)]).await?;
                 let files = String::from_utf8_lossy(&files.bytes).into_owned();
-                if !files.lines().any(|f| under_scope(f.trim(), &scope)) {
+                // Leading and trailing whitespace belong to the path, not the framing.
+                if !files.lines().any(|f| under_scope(f, &scope)) {
                     continue;
                 }
                 let text = |key: &str| {
@@ -2407,6 +2408,37 @@ mod tests {
     }
 
     #[test]
+    fn scoped_prs_preserve_whitespace_in_changed_paths() {
+        let root = temp_dir();
+        let store = Arc::new(Store::new().unwrap());
+        let state = FakeRepo::new();
+        let k = pages_kernel(&root, &store, &state);
+
+        for path in [" leading/file.rs", "trailing.rs ", "sp ace/naïve.rs"] {
+            state.set_files(3, &format!("{path}\n"));
+            let iri = prs_scoped_iri("demo", path);
+            let rows = json(&k, &iri, &[("state", "open")]);
+            assert_eq!(
+                rows.as_array().unwrap().len(),
+                1,
+                "missing {path:?}: {rows}"
+            );
+            assert_eq!(rows[0]["number"], 3);
+        }
+
+        // A whitespace-bearing path must not be attributed to its trimmed neighbor.
+        state.set_files(3, " leading/file.rs\ntrailing.rs \n");
+        for scope in ["leading", "trailing.rs"] {
+            let rows = json(&k, &prs_scoped_iri("demo", scope), &[("state", "open")]);
+            assert!(
+                rows.as_array().unwrap().is_empty(),
+                "false match for {scope:?}: {rows}"
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn the_scoped_html_labels_its_scope_and_embed_stays_rows_only() {
         let root = temp_dir();
         let store = Arc::new(Store::new().unwrap());
@@ -2617,6 +2649,41 @@ mod tests {
             Some(&root.to_string_lossy().into_owned())
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn pr_pages_refresh_closed_and_merged_states_and_keep_repository_links() {
+        let root = temp_dir();
+        let store = Arc::new(Store::new().unwrap());
+        let state = FakeRepo::new();
+        let k = pages_kernel(&root, &store, &state);
+        for status in ["OPEN", "CLOSED", "MERGED"] {
+            state.view.lock().unwrap()["state"] = serde_json::json!(status);
+            let row = json(&k, "urn:repo:demo:pr:3", &[]);
+            assert_eq!(row["state"], status);
+            assert_eq!(row["number"], 3);
+            assert_eq!(row["url"], "https://github.com/demo/demo/pull/3");
+            let html = body(&source(&k, "urn:repo:demo:pr:3", &[("as", "text/html")]).unwrap());
+            assert!(
+                html.contains(&format!("{} · alice", status.to_lowercase())),
+                "{html}"
+            );
+            let plain = body(&source(&k, "urn:repo:demo:pr:3", &[]).unwrap());
+            assert!(
+                plain.contains("https://github.com/demo/demo/pull/3\n"),
+                "{plain}"
+            );
+            assert!(html.contains("urn:repo:demo:prs state=all"), "{html}");
+            assert_eq!(
+                state.calls_to(FACADE_VIEW).last().unwrap().get("dir"),
+                Some(&root.to_string_lossy().into_owned())
+            );
+            assert_eq!(
+                state.calls_to(FACADE_VIEW).last().unwrap().get("pr"),
+                Some(&"3".to_string())
+            );
+        }
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

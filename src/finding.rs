@@ -3546,6 +3546,48 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    #[test]
+    fn finding_decisions_survive_a_fresh_mount_and_anchor_rewrite() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        let findings = pass(&k);
+        for (iri, decision) in findings.iter().zip(["publish", "decline"]) {
+            let mut args = vec![
+                ("decision", decision),
+                ("severity", "minor"),
+                ("content", "human note"),
+            ];
+            if decision == "decline" {
+                args.push(("reason", "no-issue"));
+            }
+            issue(&k, Verb::Sink, iri, &args).unwrap();
+        }
+        let before: Vec<_> = findings.iter().map(|iri| of(&k, iri)).collect();
+        drop(k);
+        let fresh = kernel(&root, &store);
+        for (iri, expected) in findings.iter().zip(&before) {
+            assert_eq!(of(&fresh, iri), *expected);
+        }
+        // Drift rewrites selectors but must preserve both recorded decisions.
+        std::fs::write(root.join("a.rs"), format!("// inserted\n{CONTENT}")).unwrap();
+        for (iri, expected) in findings.iter().zip(&before) {
+            let moved = of(&fresh, iri);
+            assert_eq!(moved["reanchored"], true);
+            for field in [
+                "state",
+                "decision",
+                "decisions",
+                "severity",
+                "effective_severity",
+            ] {
+                assert_eq!(moved[field], expected[field], "{field}: {moved}");
+            }
+            assert_eq!(of(&kernel(&root, &store), iri), moved);
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     /// A decline KEEPS the finding, with the human's reason, and mints
     /// nothing — so a re-run knows a person looked and said no.
     #[test]
