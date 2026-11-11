@@ -1674,6 +1674,33 @@ impl Endpoint for FindingsEndpoint {
                 &indexes,
             )?;
         }
+        let selected = |f: &Annotation| {
+            (state == "all" || f.state() == Some(state.as_str()))
+                && verdict
+                    .as_deref()
+                    .is_none_or(|word| f.judges.last().map(|v| v.verdict.as_str()) == Some(word))
+        };
+        // Every ordinary face includes each selected note in full. Raw note
+        // bytes are a conservative lower bound (escaping only adds bytes).
+        // Refuse a certainly oversized answer before reconciliation, burst
+        // work, summary rendering, or construction of any output rows.
+        if page.is_none() && group.is_none() {
+            let (rows, bytes) = all
+                .iter()
+                .filter(|f| selected(f))
+                .fold((0usize, 0usize), |(n, bytes), f| {
+                    (n + 1, bytes.saturating_add(f.body.len()))
+                });
+            if bytes > ANSWER_MAX_BYTES {
+                return Err(ceiling_error(
+                    format!("at least {bytes}"),
+                    repo,
+                    &rel,
+                    rows,
+                    false,
+                ));
+            }
+        }
         // These views render declines only where pending findings re-raise
         // them. Read those targets, not every declined file in the repository.
         // Refresh before caching: another read can persist drift after the
@@ -1710,33 +1737,6 @@ impl Endpoint for FindingsEndpoint {
         // the reading that makes a recurring claim legible.
         let declined = DeclinedSummary::of(&all);
         let states = supersession.then(|| StateCounts::of(&all));
-        let selected = |f: &Annotation| {
-            (state == "all" || f.state() == Some(state.as_str()))
-                && verdict
-                    .as_deref()
-                    .is_none_or(|word| f.judges.last().map(|v| v.verdict.as_str()) == Some(word))
-        };
-        // Every ordinary face includes each selected note in full. Raw note
-        // bytes are a conservative lower bound (escaping only adds bytes).
-        // Refuse a certainly oversized answer before reconciliation, burst
-        // work, summary rendering, or construction of any output rows.
-        if page.is_none() && group.is_none() {
-            let (rows, bytes) = all
-                .iter()
-                .filter(|f| selected(f))
-                .fold((0usize, 0usize), |(n, bytes), f| {
-                    (n + 1, bytes.saturating_add(f.body.len()))
-                });
-            if bytes > ANSWER_MAX_BYTES {
-                return Err(ceiling_error(
-                    format!("at least {bytes}"),
-                    repo,
-                    &rel,
-                    rows,
-                    false,
-                ));
-            }
-        }
         // Whole-list views need confirmation before filtering. Ordinary
         // pages need it only for the selected rows and their recurrence marks.
         let bursts = if summary.as_deref() == Some("unconfirmed") || group.is_some() {
@@ -6718,6 +6718,62 @@ mod paging_tests {
             .map(|p| p["rows"].as_array().unwrap().len())
             .sum();
         assert_eq!(served, 400, "every row, across the cut pages");
+    }
+
+    /// The unconfirmed walk refreshes declined twins on pending targets. Even
+    /// that early refresh must wait until the raw-note preflight accepts the read.
+    #[test]
+    fn an_oversized_unconfirmed_view_does_not_persist_drift() {
+        use crate::annotate::{append_decision, Decision, Made, Outcome};
+
+        let s = synthetic(400, 100_000);
+        let archive = Archive::new(Arc::clone(&s.store), GraphName::DefaultGraph);
+        let finding = crate::annotate::list_findings(&archive, "demo", None)
+            .unwrap()
+            .into_iter()
+            .find(|f| f.rel == "src/f0.rs")
+            .unwrap();
+        let decision = Decision {
+            iri: crate::annotate::decision_iri(&finding.id),
+            outcome: Outcome::Declined,
+            severity: None,
+            at: None,
+            revises: None,
+            made: Some(Made::Single),
+            confirmed: false,
+            burst: None,
+            note: None,
+            reason: None,
+            minted: None,
+            reproduced: false,
+        };
+        assert!(append_decision(&archive, &finding.iri(), &decision, Vec::new()).unwrap());
+        let file = s.root.join(&finding.rel);
+        let before = std::fs::read_to_string(&file).unwrap();
+        std::fs::write(&file, format!("// inserted line\n{before}")).unwrap();
+        let stored_before = s
+            .store
+            .iter()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+        for face in ["application/json", "text/plain", "text/html", "text/turtle"] {
+            let answer = read(&s.kernel, &[("summary", "unconfirmed"), ("as", face)]);
+            assert!(
+                matches!(answer, Err(ikigai_core::Error::Conflict(ref m))
+                    if m.contains("past the 32 MiB") && m.contains("limit=")),
+                "{face}"
+            );
+            let stored_after = s
+                .store
+                .iter()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(
+                stored_after == stored_before,
+                "{face}: a refused answer persisted drift"
+            );
+        }
     }
 
     /// The paging arguments refuse what they cannot honor, by name.
