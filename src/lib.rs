@@ -179,14 +179,20 @@
 //! but only to ADD what they derived, archived under a key that changes when
 //! their input does; their families say so where they are documented above.
 //!
-//! It cannot be a golden-thread cut instead: an endpoint cuts a thread by
-//! resolving `urn:kernel:cut`, which needs `urn:cap:kernel:cut`, and a reader
-//! holds the browse grant, not that one. So the fact is DECLARED here for the
-//! host, and the consequence is the host's: a host that caches any of these
-//! reads in front of browse must not, or must cut its entries on a write to
-//! the store. Every browse Source declares itself uncacheable but
-//! `urn:repo:style` and `urn:repo:style:layout`, so a kernel that only honors
-//! browse's own declarations is already right.
+//! Findings and groups opt into caching under an archive-graph thread, cut by the
+//! decision, review and judge writers through a browse-scoped notification Sink.
+//! Their kernel-sourced file dependencies still control expiry: an unwatched file
+//! makes a populated listing live. Recurrence groups and the unconfirmed walk reconcile
+//! their declined twins before rendering as well as their queue rows. A file cut happens
+//! before lazy drift writes; depending on that file while rendering a twin's unreconciled
+//! stored selectors would let another read rewrite the twin after the view was cached.
+//! Reviews announce committed findings before awaiting judges, and each committed verdict
+//! is announced before any further await, so cancellation cannot skip those cuts.
+//! A host writing findings through a raw store handle must also sink the notification
+//! thread (reported in the listing's representation) before and after its writes.
+//! Store update/load/graph-update doors are covered by their own threads too.
+//! Other re-anchoring reads remain uncacheable; a host caching them in front of browse
+//! must invalidate its entries when the store changes.
 //!
 //! ## Platforms
 //!

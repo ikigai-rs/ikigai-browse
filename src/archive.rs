@@ -75,6 +75,9 @@
 use std::sync::Mutex;
 use std::sync::{Arc, OnceLock};
 
+use ikigai_core::{Invocation, Iri, Request, Result as CoreResult, Verb};
+use sha2::{Digest, Sha256};
+
 use ikigai_store::{DeclaredTransaction, SharedWriter, SharerWrites};
 use oxigraph::model::{GraphName, NamedNodeRef, NamedOrBlankNodeRef, Quad, TermRef};
 use oxigraph::store::{QuadIter, StorageError, Store};
@@ -212,6 +215,62 @@ impl Archive {
                 .push(std::thread::current().id());
             record(&mut Record { txn, graph: &graph })
         })
+    }
+
+    /// A graph-wide thread: confirmation bursts can join decisions from different roots.
+    pub(crate) fn findings_thread(&self) -> String {
+        format!(
+            "urn:ikigai:browse:findings-written:{:x}",
+            Sha256::digest(self.graph.to_string().as_bytes())
+        )
+    }
+
+    /// Announce before work so a missing/refused notification door prevents the write.
+    /// Announce afterward even on error: a pass may have committed some records before failing.
+    /// The second cut also drops answers computed while the write was in progress.
+    /// Writers that await more work after committing must also announce immediately
+    /// after those commits: a caller can drop this future before the final cut.
+    pub(crate) async fn changing<T>(
+        &self,
+        inv: &Invocation<'_>,
+        work: impl std::future::Future<Output = CoreResult<T>>,
+    ) -> CoreResult<T> {
+        self.announce(inv).await?;
+        let answer = work.await;
+        self.announce(inv).await?;
+        answer
+    }
+
+    pub(crate) async fn announce(&self, inv: &Invocation<'_>) -> CoreResult<()> {
+        let thread = Iri::parse(self.findings_thread()).expect("a digest makes a valid IRI");
+        match inv.issue(Request::new(Verb::Sink, thread)).await {
+            // A detached invocation has no cache to invalidate.
+            Err(ikigai_core::Error::Endpoint(detail))
+                if detail == "sub-requests require a kernel context" =>
+            {
+                Ok(())
+            }
+            answer => answer.map(drop),
+        }
+    }
+
+    /// Cache the archive portion while retaining the expiry of kernel-sourced files.
+    /// Store doors can also change this graph; their threads cover those writes.
+    pub(crate) fn cache_findings(
+        &self,
+        answer: ikigai_core::Representation,
+    ) -> ikigai_core::Representation {
+        let answer = answer
+            .cacheable()
+            .depends_on(self.findings_thread())
+            .depends_on(ikigai_store::UPDATE_THREAD)
+            .depends_on(ikigai_store::LOAD_THREAD);
+        match &self.graph {
+            GraphName::NamedNode(graph) => {
+                answer.depends_on(ikigai_store::graph_thread(graph.as_str()))
+            }
+            _ => answer.depends_on(ikigai_store::GRAPH_UPDATE_THREAD),
+        }
     }
 
     /// Store `quads` — one record's, each built with [`Archive::graph`] — as one transaction.

@@ -1903,9 +1903,8 @@ struct ReviewEndpoint {
     config: Arc<ExplainConfig>,
 }
 
-#[async_trait]
-impl Endpoint for ReviewEndpoint {
-    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+impl ReviewEndpoint {
+    async fn run(&self, inv: &Invocation<'_>) -> Result<Representation> {
         if inv.request.verb != Verb::Source {
             return Err(Error::Endpoint(format!(
                 "browse-review does not support the {:?} verb",
@@ -2470,6 +2469,9 @@ impl Endpoint for ReviewEndpoint {
         for memo in &memos {
             store_region(&config.archive, memo, repo, &rel, &entry.model)?;
         }
+        // A caller can drop the review while the judge waits. Invalidate answers
+        // cached during derivation now that the findings and pass have committed.
+        config.archive.announce(inv).await?;
         // ★ The judge (ledger #483): one more call per SERIOUS finding this
         // pass MINTED, with the context the reviewer's region did not have
         // (the enclosing item, the comments at the site, whether it is test
@@ -2488,6 +2490,13 @@ impl Endpoint for ReviewEndpoint {
         entry.superseded =
             crate::supersede::superseded_on(&config.archive, repo, &rel, &entry.hash)?;
         face(inv, repo, &rel, &entry, true, &included)
+    }
+}
+
+#[async_trait]
+impl Endpoint for ReviewEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        self.config.archive.changing(inv, self.run(inv)).await
     }
 
     fn name(&self) -> &str {

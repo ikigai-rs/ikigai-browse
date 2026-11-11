@@ -1548,9 +1548,8 @@ struct PrReviewEndpoint {
     config: Arc<ExplainConfig>,
 }
 
-#[async_trait]
-impl Endpoint for PrReviewEndpoint {
-    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+impl PrReviewEndpoint {
+    async fn run(&self, inv: &Invocation<'_>) -> Result<Representation> {
         if inv.request.verb != Verb::Source {
             return Err(Error::Endpoint(format!(
                 "browse-pr-review does not support the {:?} verb",
@@ -1723,6 +1722,13 @@ impl Endpoint for PrReviewEndpoint {
         store_pass(&config.archive, &entry)?;
         let included = annotate::included_for_ids(&config.archive, &entry.minted, &diff)?;
         pr_review_face(inv, repo, n, &entry, true, &included)
+    }
+}
+
+#[async_trait]
+impl Endpoint for PrReviewEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        self.config.archive.changing(inv, self.run(inv)).await
     }
 
     fn name(&self) -> &str {
