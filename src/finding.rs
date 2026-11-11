@@ -1642,10 +1642,6 @@ impl Endpoint for FindingsEndpoint {
             !inventory,
             verdict.is_some(),
         )?;
-        // The file grain is read BEFORE the state filter: a pending-only
-        // listing still says how many declines the file carries, which is
-        // the reading that makes a recurring claim legible.
-        let declined = DeclinedSummary::of(&all);
         // Supersession precedes the state filter because it defines pending.
         // Only files with competing archived hashes need current content to
         // choose their standing set. Share those reads with reconciliation;
@@ -1678,23 +1674,41 @@ impl Endpoint for FindingsEndpoint {
                 &indexes,
             )?;
         }
-        // These views render declined records outside the selected queue rows.
-        // Reconcile them before rendering too: a file cut precedes lazy drift
-        // writes, so a dependency on the file alone cannot repair a cached view
-        // of a stored twin that another read subsequently rewrites.
+        // These views render declines only where pending findings re-raise
+        // them. Read those targets, not every declined file in the repository.
+        // Refresh before caching: another read can persist drift after the
+        // file's cut, leaving a cached twin stale without a second file cut.
+        // Include all quotes on each relevant target: a PR target's refresh
+        // can rewrite its stored exact quote. File NotFound stays unavailable;
+        // other host errors propagate only when the view needs that target.
         if group == Some("recurrence") || summary.as_deref() == Some("unconfirmed") {
+            let targets: std::collections::BTreeSet<String> = all
+                .iter()
+                .filter(|f| {
+                    f.state() == Some("pending")
+                        && (summary.as_deref() == Some("unconfirmed")
+                            || verdict.as_deref().is_none_or(|word| {
+                                f.judges.last().map(|v| v.verdict.as_str()) == Some(word)
+                            }))
+                })
+                .map(|f| f.target_iri.clone())
+                .collect();
             let declined: Vec<&Annotation> = all
                 .iter()
-                .filter(|f| f.state() == Some("declined"))
+                .filter(|f| f.state() == Some("declined") && targets.contains(&f.target_iri))
                 .collect();
             annotate::fetch_contents(inv, &self.roots, repo, declined, &mut contents).await?;
             for finding in &mut all {
-                if finding.state() == Some("declined") {
+                if finding.state() == Some("declined") && targets.contains(&finding.target_iri) {
                     let current = contents.get(&finding.target_iri).expect("fetched above");
                     annotate::refresh(&self.archive, finding, current)?;
                 }
             }
         }
+        // The file grain is read BEFORE the state filter: a pending-only
+        // listing still says how many declines the file carries, which is
+        // the reading that makes a recurring claim legible.
+        let declined = DeclinedSummary::of(&all);
         let states = supersession.then(|| StateCounts::of(&all));
         let selected = |f: &Annotation| {
             (state == "all" || f.state() == Some(state.as_str()))
@@ -3277,6 +3291,143 @@ mod tests {
             2,
             "committed findings must replace cached []: {rows}"
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A committed verdict needs its own cut: the wrapper never finishes if
+    /// the caller drops the review while the next judge call waits.
+    #[test]
+    fn a_review_dropped_after_one_verdict_invalidates_cached_judge_fields() {
+        use std::future::Future;
+        use std::task::{Context, Poll};
+
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let cfg = ExplainConfig::new(Arc::clone(&store))
+            .review_model_label("r1")
+            .judge_provider("urn:test:two-step-judge");
+        let browse = crate::space_with_explain(vec![("demo".into(), root.clone())], cfg);
+        let calls = Arc::new(AtomicU32::new(0));
+        let count = Arc::clone(&calls);
+        let llm = EndpointSpace::new()
+            .bind(
+                Exact::new(PROVIDER),
+                FnEndpoint::new("reviewer", |_| {
+                    Ok(repr_utf8(
+                        "text/plain",
+                        FINDINGS.replace("urgent!!", "major"),
+                    ))
+                }),
+            )
+            .bind(
+                Exact::new("urn:test:two-step-judge"),
+                ikigai_core::AsyncFnEndpoint::new("two-step-judge", move |inv| {
+                    let count = Arc::clone(&count);
+                    Box::pin(async move {
+                        if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                            for args in [vec![], vec![("verdict", "refuted")]] {
+                                let rows = inv.issue(queue_request(&args)).await?;
+                                assert_eq!(rows.expiry, ikigai_core::Expiry::Never);
+                            }
+                            Ok(repr_utf8(
+                                "text/plain",
+                                "CODE: no\nDISCLOSED: no\nOCCURS: no\nTEST: no\nVERDICT: refuted\n"
+                                    .into(),
+                            ))
+                        } else {
+                            futures::future::pending().await
+                        }
+                    })
+                }),
+            );
+        // File reads are cacheable so the queue can survive unless its graph
+        // thread is cut; this test has no working-tree edits.
+        let file = root.join("a.rs");
+        let files = EndpointSpace::new().bind(
+            Exact::new("urn:repo:demo:file:a.rs"),
+            FnEndpoint::new("watched-file", move |_| {
+                Ok(repr_utf8("text/plain", std::fs::read_to_string(&file).unwrap()).cacheable())
+            }),
+        );
+        let k = Kernel::new(Arc::new(Fallback::new(vec![
+            Arc::new(files),
+            Arc::new(browse),
+            Arc::new(llm),
+        ])));
+        let capability = cap();
+        let request = Request::new(
+            Verb::Source,
+            Iri::parse("urn:repo:demo:review:a.rs").unwrap(),
+        );
+        let mut review = Box::pin(k.issue(request, &capability));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(matches!(review.as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        drop(review);
+        let rows = of(&k, "urn:repo:demo:findings");
+        assert_eq!(rows.as_array().unwrap().len(), 2);
+        assert_eq!(
+            rows.as_array()
+                .unwrap()
+                .iter()
+                .filter(|r| r["judge"]["verdict"] == "refuted")
+                .count(),
+            1,
+            "{rows}"
+        );
+        let filtered = json(&k, "urn:repo:demo:findings", &[("verdict", "refuted")]);
+        assert_eq!(filtered.as_array().unwrap().len(), 1, "{filtered}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn twin_views_do_not_read_an_unrendered_declined_file() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let initial = kernel(&root, &store);
+        let minted = pass(&initial);
+        for iri in &minted {
+            sink(
+                &initial,
+                iri,
+                &[
+                    ("decision", "decline"),
+                    ("made", "batch"),
+                    ("batch", "hidden"),
+                    ("severity", "major"),
+                ],
+            )
+            .unwrap();
+        }
+        // Another target still has pending rows; neither view needs a.rs.
+        std::fs::write(root.join("b.rs"), CONTENT).unwrap();
+        issue(&initial, Verb::Source, "urn:repo:demo:review:b.rs", &[]).unwrap();
+        let cfg = ExplainConfig::new(Arc::clone(&store)).no_judge();
+        let browse = crate::space_with_explain(vec![("demo".into(), root.clone())], cfg);
+        let denied = EndpointSpace::new().bind(
+            Exact::new("urn:repo:demo:file:a.rs"),
+            FnEndpoint::new("denied-file", |_| Err(Error::Denied("host ACL".into()))),
+        );
+        let k = Kernel::new(Arc::new(Fallback::new(vec![
+            Arc::new(denied),
+            Arc::new(browse),
+        ])));
+        for args in [
+            vec![("group", "recurrence")],
+            vec![("summary", "unconfirmed")],
+        ] {
+            issue(&k, Verb::Source, "urn:repo:demo:findings", &args).unwrap();
+        }
+        // Reading a rendered decline still propagates the host's denial.
+        assert!(matches!(
+            issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:findings",
+                &[("state", "declined")]
+            ),
+            Err(Error::Denied(_))
+        ));
         std::fs::remove_dir_all(root).unwrap();
     }
 

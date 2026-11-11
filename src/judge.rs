@@ -2779,7 +2779,6 @@ impl JudgeFindingEndpoint {
                                             &finding.iri(),
                                             &verdict,
                                         )?;
-                                        self.config.archive.announce(inv).await?;
                                         answer["judge"] = verdict_json(&verdict);
                                         ("judged", None, 1, false, Some(iri))
                                     }
