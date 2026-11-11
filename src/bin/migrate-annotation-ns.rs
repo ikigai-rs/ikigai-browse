@@ -27,6 +27,9 @@
 //! the lock refusal, and the table. Keeping the split there is what lets the
 //! transform be tested in ordinary CI without a C++ toolchain.
 
+#[path = "migration/preconditions.rs"]
+mod preconditions;
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -163,11 +166,11 @@ fn parse_args() -> Result<(PathBuf, bool, Option<GraphName>), String> {
 /// Open the store, refusing every way this can go quietly wrong.
 ///
 /// The two refusals — "that is not a store" and "someone has it open" — live in
-/// [`ikigai_browse::migrate`] so that this binary and `migrate-archive-roots`
+/// the shared `migration/preconditions.rs` so this binary and `migrate-archive-roots`
 /// cannot drift apart about what a safe store to touch looks like.
 fn open(path: &Path) -> Result<Store, String> {
-    migrate::require_store_dir(path)?;
-    if let Some(holder) = migrate::lock_holder(path) {
+    preconditions::require_store_dir(path)?;
+    if let Some(holder) = preconditions::lock_holder(path) {
         return Err(format!(
             "the store is open: {holder}\n\
              RocksDB holds an exclusive lock, so this migration needs the server stopped. \

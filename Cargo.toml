@@ -546,7 +546,15 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # `put_for`. No resource name, capability, face or stored term moves.
 # 0.21.1 (ledger #3234): additive Mount::pull_request_roots host option; tree
 # PR sections require exec:gh and an eligible root. No endpoint contract changes.
-version = "0.22.0"
+# 0.22.0 (ledger #3348): moves to ikigai-store 0.5.0.
+# 0.23.0 — MINOR (ledger #2887): removes migrate::require_store_dir and
+# migrate::lock_holder from the public library. Their filesystem and process
+# access now belongs to shared migration-tool code under src/bin/migration/.
+# The binaries and root-migration rehearsal retain the same checks. Hosts on
+# 0.20.x (cli, gonk, tutorial in the original report) must move their browse
+# pins alongside the intervening core/store upgrades; a patch cannot remove
+# these exports. No resource name, capability, face or stored term moves.
+version = "0.23.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]

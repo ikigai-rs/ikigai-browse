@@ -41,6 +41,9 @@
 //! `ikigai_browse::migrate::RootScope`, whose two ablations are how the suite
 //! demonstrates each of those failures instead of asserting a comment.
 
+#[path = "migration/preconditions.rs"]
+mod preconditions;
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -282,8 +285,8 @@ fn parse_args() -> Result<Args, String> {
 /// read is a point-in-time snapshot, and the transfer is idempotent — anything
 /// the holder writes afterwards is picked up by running this again.
 fn open_source(path: &Path) -> Result<Store, String> {
-    migrate::require_store_dir(path)?;
-    if let Some(holder) = migrate::lock_holder(path) {
+    preconditions::require_store_dir(path)?;
+    if let Some(holder) = preconditions::lock_holder(path) {
         eprintln!("  note     : the source is open ({holder}).");
         eprintln!("             Reading a snapshot; re-run to pick up anything written since.");
     }
@@ -293,12 +296,12 @@ fn open_source(path: &Path) -> Result<Store, String> {
 /// The target is WRITTEN, so it must be closed for a commit. A dry run opens it
 /// read-only, which is what lets the whole survey run against a live host.
 fn open_target(path: &Path, commit: bool) -> Result<Store, String> {
-    migrate::require_store_dir(path)?;
+    preconditions::require_store_dir(path)?;
     if !commit {
         return Store::open_read_only(path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()));
     }
-    if let Some(holder) = migrate::lock_holder(path) {
+    if let Some(holder) = preconditions::lock_holder(path) {
         return Err(format!(
             "the target store is open: {holder}\n\
              RocksDB holds an exclusive writer lock, so the commit needs that server stopped. \

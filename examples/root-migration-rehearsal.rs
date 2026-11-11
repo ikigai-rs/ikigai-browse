@@ -28,6 +28,13 @@
 //! how much of a migrated archive is live, and it is a number worth knowing
 //! before a one-shot.
 
+#[allow(
+    dead_code,
+    reason = "lock-holder discovery is used by the binaries only"
+)]
+#[path = "../src/bin/migration/preconditions.rs"]
+mod preconditions;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -97,7 +104,7 @@ fn run() -> Result<(), String> {
         ));
     }
 
-    migrate::require_store_dir(&source_path)?;
+    preconditions::require_store_dir(&source_path)?;
     let source = Store::open_read_only(&source_path)
         .map_err(|e| format!("cannot read {}: {e}", source_path.display()))?;
     let transfer = migrate::plan_transfer(&source, &map, &graph).map_err(|e| e.to_string())?;
