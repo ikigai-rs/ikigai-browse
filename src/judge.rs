@@ -1895,6 +1895,8 @@ pub(crate) async fn judge_findings(
             raw,
         };
         store_verdict(&config.archive, &finding.iri(), &verdict)?;
+        // The next judge call can wait indefinitely or be canceled.
+        config.archive.announce(inv).await?;
         judged += 1;
     }
     Ok((judged, failed))
@@ -2777,6 +2779,7 @@ impl JudgeFindingEndpoint {
                                             &finding.iri(),
                                             &verdict,
                                         )?;
+                                        self.config.archive.announce(inv).await?;
                                         answer["judge"] = verdict_json(&verdict);
                                         ("judged", None, 1, false, Some(iri))
                                     }

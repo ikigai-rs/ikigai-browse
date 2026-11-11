@@ -182,8 +182,12 @@
 //! Findings and groups opt into caching under an archive-graph thread, cut by the
 //! decision, review and judge writers through a browse-scoped notification Sink.
 //! Their kernel-sourced file dependencies still control expiry: an unwatched file
-//! makes a populated listing live. Drift rewrites selectors only; views exposing those
-//! selectors already depend on the same file, so a host's file cut invalidates them.
+//! makes a populated listing live. Recurrence groups and the unconfirmed walk reconcile
+//! their declined twins before rendering as well as their queue rows. A file cut happens
+//! before lazy drift writes; depending on that file while rendering a twin's unreconciled
+//! stored selectors would let another read rewrite the twin after the view was cached.
+//! Reviews announce committed findings before awaiting judges, and each committed verdict
+//! is announced before any further await, so cancellation cannot skip those cuts.
 //! A host writing findings through a raw store handle must also sink the notification
 //! thread (reported in the listing's representation) before and after its writes.
 //! Store update/load/graph-update doors are covered by their own threads too.

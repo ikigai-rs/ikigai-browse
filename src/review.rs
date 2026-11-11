@@ -2469,6 +2469,9 @@ impl ReviewEndpoint {
         for memo in &memos {
             store_region(&config.archive, memo, repo, &rel, &entry.model)?;
         }
+        // A caller can drop the review while the judge waits. Invalidate answers
+        // cached during derivation now that the findings and pass have committed.
+        config.archive.announce(inv).await?;
         // ★ The judge (ledger #483): one more call per SERIOUS finding this
         // pass MINTED, with the context the reviewer's region did not have
         // (the enclosing item, the comments at the site, whether it is test

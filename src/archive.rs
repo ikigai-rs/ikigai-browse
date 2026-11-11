@@ -228,6 +228,8 @@ impl Archive {
     /// Announce before work so a missing/refused notification door prevents the write.
     /// Announce afterward even on error: a pass may have committed some records before failing.
     /// The second cut also drops answers computed while the write was in progress.
+    /// Writers that await more work after committing must also announce immediately
+    /// after those commits: a caller can drop this future before the final cut.
     pub(crate) async fn changing<T>(
         &self,
         inv: &Invocation<'_>,
@@ -239,7 +241,7 @@ impl Archive {
         answer
     }
 
-    async fn announce(&self, inv: &Invocation<'_>) -> CoreResult<()> {
+    pub(crate) async fn announce(&self, inv: &Invocation<'_>) -> CoreResult<()> {
         let thread = Iri::parse(self.findings_thread()).expect("a digest makes a valid IRI");
         match inv.issue(Request::new(Verb::Sink, thread)).await {
             // A detached invocation has no cache to invalidate.

@@ -1655,6 +1655,23 @@ impl Endpoint for FindingsEndpoint {
                     .map(str::to_string)
             })?;
         }
+        // These views render declined records outside the selected queue rows.
+        // Reconcile them before rendering too: a file cut precedes lazy drift
+        // writes, so a dependency on the file alone cannot repair a cached view
+        // of a stored twin that another read subsequently rewrites.
+        if group == Some("recurrence") || summary.as_deref() == Some("unconfirmed") {
+            let declined: Vec<&Annotation> = all
+                .iter()
+                .filter(|f| f.state() == Some("declined"))
+                .collect();
+            annotate::fetch_contents(inv, &self.roots, repo, declined, &mut contents).await?;
+            for finding in &mut all {
+                if finding.state() == Some("declined") {
+                    let current = contents.get(&finding.target_iri).expect("fetched above");
+                    annotate::refresh(&self.archive, finding, current)?;
+                }
+            }
+        }
         let states = supersession.then(|| StateCounts::of(&all));
         // Confirmation (ledger #653), once over everything loaded — the rows,
         // the declined twins a group names, and every recurrence mark.
