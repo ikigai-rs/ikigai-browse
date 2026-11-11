@@ -2799,6 +2799,16 @@ mod tests {
         reply: &str,
         watched: bool,
     ) -> Kernel {
+        kernel_reading_files_as(root, store, reply, watched, "r1")
+    }
+
+    fn kernel_reading_files_as(
+        root: &std::path::Path,
+        store: &Arc<Store>,
+        reply: &str,
+        watched: bool,
+        model: &str,
+    ) -> Kernel {
         let reply = reply.to_string();
         let llm = EndpointSpace::new().bind(
             Exact::new(PROVIDER),
@@ -2814,7 +2824,7 @@ mod tests {
         // The judge is off: these tests count decision nodes and model calls,
         // and a verdict is neither (its own tests are in `review` and `judge`).
         let cfg = ExplainConfig::new(Arc::clone(store))
-            .review_model_label("r1")
+            .review_model_label(model)
             .no_judge();
         let browse = crate::space_with_explain(vec![("demo".to_string(), root.to_path_buf())], cfg);
         let file = root.join("a.rs");
@@ -3105,6 +3115,141 @@ mod tests {
             let rows = of(&k, "urn:repo:demo:findings");
             assert_eq!(rows.as_array().unwrap().len(), if fails { 0 } else { 2 });
             std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    /// Dropping a review while the judge waits must not preserve the empty queue
+    /// cached by the reviewer before its findings committed (ledger #528 B).
+    #[test]
+    fn a_review_dropped_after_commit_invalidates_the_intermediate_empty_queue() {
+        use std::future::Future;
+        use std::task::{Context, Poll};
+
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let cfg = ExplainConfig::new(Arc::clone(&store))
+            .review_model_label("r1")
+            .judge_provider("urn:test:hanging-judge");
+        let browse = crate::space_with_explain(vec![("demo".into(), root.clone())], cfg);
+        let judging = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = Arc::clone(&judging);
+        let llm = EndpointSpace::new()
+            .bind(
+                Exact::new(PROVIDER),
+                ikigai_core::AsyncFnEndpoint::new("reading-reviewer", |inv| {
+                    Box::pin(async move {
+                        let rows = inv
+                            .source(&Iri::parse("urn:repo:demo:findings").unwrap())
+                            .await?;
+                        assert_eq!(rows.bytes, b"[]");
+                        assert_eq!(rows.expiry, ikigai_core::Expiry::Never);
+                        Ok(repr_utf8("text/plain", FINDINGS.into()))
+                    })
+                }),
+            )
+            .bind(
+                Exact::new("urn:test:hanging-judge"),
+                ikigai_core::AsyncFnEndpoint::new("hanging-judge", move |_| {
+                    let started = Arc::clone(&started);
+                    Box::pin(async move {
+                        started.store(true, Ordering::SeqCst);
+                        futures::future::pending().await
+                    })
+                }),
+            );
+        let k = Kernel::new(Arc::new(Fallback::new(vec![
+            Arc::new(browse),
+            Arc::new(llm),
+        ])));
+        let capability = cap();
+        let request = Request::new(
+            Verb::Source,
+            Iri::parse("urn:repo:demo:review:a.rs").unwrap(),
+        );
+        let mut review = Box::pin(k.issue(request, &capability));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(matches!(review.as_mut().poll(&mut cx), Poll::Pending));
+        assert!(judging.load(Ordering::SeqCst), "review reached the judge");
+        let archive = crate::archive::Archive::new(
+            Arc::clone(&store),
+            oxigraph::model::GraphName::DefaultGraph,
+        );
+        assert_eq!(
+            annotate::list_findings(&archive, "demo", None)
+                .unwrap()
+                .len(),
+            2
+        );
+        drop(review);
+        let rows = of(&k, "urn:repo:demo:findings");
+        assert_eq!(
+            rows.as_array().unwrap().len(),
+            2,
+            "committed findings must replace cached []: {rows}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A twin may drift on a different read after a recurrence or unconfirmed
+    /// view was cached. Compare that view with a fresh kernel (ledger #528 A).
+    #[test]
+    fn cached_twin_views_agree_with_drift_from_other_reads() {
+        for via_listing in [false, true] {
+            for args in [
+                vec![("group", "recurrence")],
+                vec![("summary", "unconfirmed")],
+            ] {
+                let root = demo_root();
+                let store = Arc::new(Store::new().unwrap());
+                let initial = kernel(&root, &store);
+                let minted = pass(&initial);
+                let alpha = finding_on(&initial, &minted, "fn alpha() {}");
+                sink(
+                    &initial,
+                    &alpha,
+                    &[
+                        ("decision", "decline"),
+                        ("made", "batch"),
+                        ("batch", "test-twins"),
+                    ],
+                )
+                .unwrap();
+                let k = kernel_reading_files_as(&root, &store, REWORDED, true, "r2");
+                assert_eq!(pass(&k).len(), 2);
+                std::fs::write(root.join("a.rs"), format!("// inserted\n{CONTENT}")).unwrap();
+                k.cut("urn:repo:demo:file:a.rs");
+                let archive = crate::archive::Archive::new(
+                    Arc::clone(&store),
+                    oxigraph::model::GraphName::DefaultGraph,
+                );
+                let id = alpha.strip_prefix("urn:iki:finding:").unwrap();
+                assert!(
+                    !annotate::load_record(&archive, annotate::Family::Finding, id)
+                        .unwrap()
+                        .unwrap()
+                        .reanchored
+                );
+                let before = json(&k, "urn:repo:demo:findings", &args);
+                let mut cached_args = args.clone();
+                cached_args.push(("as", "application/json"));
+                assert!(
+                    k.is_cached(&queue_request(&cached_args), &cap()),
+                    "{before}"
+                );
+                if via_listing {
+                    json(&k, "urn:repo:demo:findings", &[("state", "declined")]);
+                } else {
+                    assert_eq!(of(&k, &alpha)["reanchored"], true);
+                }
+                let after = json(&k, "urn:repo:demo:findings", &args);
+                let fresh = kernel_reading_files(&root, &store, REWORDED, true);
+                let expected = json(&fresh, "urn:repo:demo:findings", &args);
+                assert_eq!(
+                    after, expected,
+                    "stale twin; listing={via_listing}, args={args:?}"
+                );
+                std::fs::remove_dir_all(root).unwrap();
+            }
         }
     }
 
