@@ -3484,6 +3484,61 @@ mod finding_tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// Ledger #3492 (the class of ikigai-repo PR 31): two TRACKED files,
+    /// `HEAD` and `commondir`, make a root below its work tree's top a git
+    /// directory whose refs and objects are a repository OUTSIDE every root.
+    /// The jail confines names, not git's discovery, so the judge's history
+    /// reads (`rev-list --all`, `cat-file --batch`) would list the
+    /// commits from that outside repository (the `rev:./path` blob lookup
+    /// needs a work tree, so it is the commit list that leaks).
+    #[test]
+    fn an_embedded_commondir_cannot_reach_a_repository_outside_the_roots() {
+        let outside = temp_dir();
+        git(&outside, &["init", "-q"]);
+        commit(&outside, "outside secret\n", "outside");
+        let branch = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&outside)
+            .args(["symbolic-ref", "HEAD"])
+            .output()
+            .unwrap();
+        let branch = String::from_utf8_lossy(&branch.stdout).trim().to_string();
+        let secret = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&outside)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let secret = String::from_utf8_lossy(&secret.stdout).trim().to_string();
+        let top = temp_dir();
+        git(&top, &["init", "-q"]);
+        let peek = top.join("peek");
+        std::fs::create_dir_all(&peek).unwrap();
+        std::fs::write(peek.join("HEAD"), format!("ref: {branch}\n")).unwrap();
+        std::fs::write(
+            peek.join("commondir"),
+            format!("{}\n", outside.join(".git").display()),
+        )
+        .unwrap();
+        git(&top, &["add", "-A"]);
+        git(&top, &["commit", "-q", "-m", "content"]);
+
+        let hash = annotate::content_hash(b"outside secret\n");
+        let history = history(&peek, "a.rs");
+        let recovered = recover_version(&peek, "a.rs", &hash).map_err(|e| format!("{e:?}"));
+        std::fs::remove_dir_all(&top).ok();
+        std::fs::remove_dir_all(&outside).ok();
+        assert!(
+            !matches!(&recovered, Ok(Some((text, _))) if text.contains("outside secret")),
+            "recovered a file from a repository outside the roots: {recovered:?}"
+        );
+        assert!(
+            !matches!(&history, Ok(commits) if commits.contains(&secret)),
+            "listed the history of a repository outside the roots: {history:?}"
+        );
+        assert!(history.is_err(), "{history:?}");
+    }
+
     /// ★ When the file has MOVED, the judge reads the version the reviewer
     /// saw, recovered from git history by its hash, at the offset the id was
     /// minted at — after a read has re-anchored the stored selector onto the

@@ -4386,6 +4386,61 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// Commit `files` into the work tree at `top`: repository CONTENT, which
+    /// anyone who lands a pull request in a served repository controls.
+    fn commit_content(top: &Path, files: &[(&str, &str)]) {
+        for (rel, content) in files {
+            let file = top.join(rel);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, content).unwrap();
+        }
+        run_git(top, &["add", "-A"]);
+        run_git(top, &["commit", "-q", "-m", "content"]);
+    }
+
+    /// Ledger #3492 (the class of ikigai-repo PR 31): a root below its work
+    /// tree's top whose TRACKED files spell a bare repository (`HEAD`,
+    /// `config`, `objects/`, `refs/`). git, discovering from the root, finds no
+    /// `.git` there and adopts the root itself, then runs ITS configuration:
+    /// here `core.fsmonitor`, a shell command, on `state`'s `git status`. The
+    /// host chose the root; a pull request's author chose the command.
+    #[test]
+    fn an_embedded_bare_repository_in_a_root_runs_none_of_its_config() {
+        let top = temp_dir();
+        run_git(&top, &["init", "-q"]);
+        let marker = top.with_extension("fsmonitor-ran");
+        let config = format!(
+            "[core]\n\trepositoryformatversion = 0\n\tbare = false\n\tworktree = .\n\
+             \tfsmonitor = \"touch '{}'; false\"\n",
+            marker.display()
+        );
+        commit_content(
+            &top,
+            &[
+                ("pub/HEAD", "ref: refs/heads/main\n"),
+                ("pub/config", &config),
+                ("pub/objects/.keep", ""),
+                ("pub/refs/.keep", ""),
+            ],
+        );
+        let k = kernel(vec![("pub".to_string(), top.join("pub"))]);
+        let cap = Capability::scoped(["urn:cap:browse:read:pub"]);
+        let out = source(&k, "urn:repo:pub:state", &[], &cap);
+        let ran = marker.exists();
+        std::fs::remove_file(&marker).ok();
+        std::fs::remove_dir_all(&top).ok();
+        assert!(
+            !ran,
+            "state ran the embedded repository's core.fsmonitor: {:?}",
+            out.as_ref().map(body)
+        );
+        assert!(
+            matches!(out, Err(Error::Endpoint(_))),
+            "{:?}",
+            out.map(|r| body(&r))
+        );
+    }
+
     /// A root BELOW its work tree's top (ledger #736): `state` reports only
     /// paths under the root, root-relative, never a dirty path outside it —
     /// which the root's jail refuses to serve. Ported from the review-value
