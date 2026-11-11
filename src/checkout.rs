@@ -20,6 +20,9 @@
 //! hard links, mount changes, or an attacker controlling the configured root's
 //! ancestors when the root is initially opened. Git's own repository reads are
 //! outside this filesystem jail; its working directory is pinned separately.
+//! Every git run also refuses a bare repository it would discover (tracked
+//! files can spell one), and drops inherited repository-selecting variables and
+//! GitHub tokens: see [`harden_git`] (ledger #3492).
 //! Platforms without the Unix handle-relative implementation refuse checkout
 //! access explicitly; they never fall back to pathname-based reads.
 
@@ -257,6 +260,7 @@ impl Jailed {
     fn git_command(&self) -> std::io::Result<Command> {
         let directory = self.open()?;
         let mut command = Command::new("git");
+        harden_git(&mut command);
         // SAFETY: the child callback only calls async-signal-safe fchdir and
         // converts its errno without allocation or locks. The captured File
         // keeps the directory descriptor alive until exec.
@@ -305,6 +309,54 @@ impl Jailed {
         child.wait().map_err(|e| format!("git: {e}"))?;
         Ok(out)
     }
+}
+
+/// Variables that make git use a repository, index or object store other than
+/// the one it discovers from the jailed root. Removed so the root decides.
+const REPOSITORY_ENV: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+];
+
+/// GitHub credentials. browse's git reads local history only, so neither git
+/// nor anything a repository's configuration starts ever needs them.
+const TOKEN_ENV: &[&str] = &[
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+];
+
+/// Keep repository content and the host's inherited environment from choosing
+/// what browse's git reads or runs (ledger #3492).
+///
+/// MIRRORS ikigai-repo PR 31 (`refuse_implicit_bare` and its `REPOSITORY_ENV` /
+/// `TOKEN_ENV`), which exposes no helper to reuse; the two copies must move
+/// together until a shared one exists. A root below its work tree's top can be
+/// tracked content whose files spell a bare repository (`HEAD`, `config`,
+/// `objects/`, `refs/`, or a `commondir` naming a repository outside every
+/// root); git, finding no `.git` in the root, would adopt it, run its
+/// configuration (`core.fsmonitor`) and read the repository it names.
+/// `safe.bareRepository=explicit` refuses that, and is honored only from
+/// protected configuration, which the command scope (`GIT_CONFIG_COUNT`, after
+/// any entries the host already passes) is.
+fn harden_git(command: &mut Command) {
+    for name in REPOSITORY_ENV.iter().chain(TOKEN_ENV) {
+        command.env_remove(name);
+    }
+    let count = std::env::var("GIT_CONFIG_COUNT")
+        .ok()
+        .and_then(|count| count.parse::<usize>().ok())
+        .unwrap_or(0);
+    command
+        .env(format!("GIT_CONFIG_KEY_{count}"), "safe.bareRepository")
+        .env(format!("GIT_CONFIG_VALUE_{count}"), "explicit")
+        .env("GIT_CONFIG_COUNT", (count + 1).to_string());
 }
 
 /// Missing names and refused symlink loops share the missing-path response.
