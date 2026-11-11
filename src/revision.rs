@@ -91,6 +91,7 @@ pub(crate) fn confirmed(decision: &Decision, in_burst: bool) -> bool {
 
 /// Every burst in the graph: which decline nodes are in one, and each
 /// burst's first timestamp and size.
+#[derive(Default)]
 pub(crate) struct Bursts {
     /// Decision node IRI → the first timestamp of its burst.
     start_of: BTreeMap<String, String>,
@@ -99,6 +100,23 @@ pub(crate) struct Bursts {
 }
 
 impl Bursts {
+    /// The graph-wide calculation is necessary only when the answer carries
+    /// a legacy decline. Recorded provenance never depends on a burst.
+    pub(crate) fn for_findings(archive: &Archive, findings: &[Annotation]) -> Result<Self> {
+        let legacy = |d: &Decision| d.outcome == Outcome::Declined && d.made.is_none();
+        if findings.iter().any(|f| {
+            f.history.iter().any(legacy)
+                || f.prior
+                    .as_ref()
+                    .and_then(|p| p.decision.as_ref())
+                    .is_some_and(legacy)
+        }) {
+            Self::of(archive)
+        } else {
+            Ok(Self::default())
+        }
+    }
+
     /// Find them: every DECLINED decision node in the archive's graph with no
     /// recorded provenance and a timestamp. One indexed pattern for the
     /// declines plus one subject lookup each — never a walk over findings.

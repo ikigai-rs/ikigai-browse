@@ -3877,6 +3877,22 @@ mod finding_tests {
         let refuted = rows(REFUTED);
         assert_eq!(refuted.len(), 1, "{refuted:?}");
         assert_eq!(refuted[0]["id"], id.as_str());
+        let page: serde_json::Value = serde_json::from_str(
+            &issue(
+                &k,
+                Verb::Source,
+                "urn:repo:demo:findings",
+                &[("verdict", REFUTED), ("limit", "1")],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            page["rows"],
+            serde_json::json!(refuted),
+            "paging preserves judge records"
+        );
+        assert_eq!(page["total"], 1);
         assert!(rows(CONFIRMED).is_empty());
         assert!(rows(UNSURE).is_empty());
         let all = json(&k, "urn:repo:demo:findings");

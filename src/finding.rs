@@ -791,6 +791,16 @@ fn within_ceiling(
     if answer.bytes.len() <= ANSWER_MAX_BYTES {
         return Ok(answer);
     }
+    Err(ceiling_error(answer.bytes.len(), repo, rel, rows, paged))
+}
+
+fn ceiling_error(
+    bytes: impl std::fmt::Display,
+    repo: &str,
+    rel: &str,
+    rows: usize,
+    paged: bool,
+) -> Error {
     let advice = match paged {
         true => "ask for a smaller page with a lower `limit`".to_string(),
         false => format!(
@@ -798,13 +808,13 @@ fn within_ceiling(
              `next`, or narrow it with `state=`, `verdict=` or a path"
         ),
     };
-    Err(Error::Conflict(format!(
+    Error::Conflict(format!(
         "`{}` is {} bytes in {rows} rows, past the {} MiB one findings answer carries (the \
          transports refuse a frame past 64 MiB); {advice}",
         findings_iri(repo, rel),
-        answer.bytes.len(),
+        bytes,
         ANSWER_MAX_BYTES / (1024 * 1024),
-    )))
+    ))
 }
 
 // --- binding ----------------------------------------------------------------
@@ -1624,36 +1634,49 @@ impl Endpoint for FindingsEndpoint {
                 ));
             }
         }
-        let mut all = annotate::list_findings(&self.archive, repo, filter)?;
+        let inventory = page.is_some() && summary.as_deref() != Some("unconfirmed");
+        let mut all = annotate::listing_inventory(
+            &self.archive,
+            repo,
+            filter,
+            !inventory,
+            verdict.is_some(),
+        )?;
         // The file grain is read BEFORE the state filter: a pending-only
         // listing still says how many declines the file carries, which is
         // the reading that makes a recurring claim legible.
         let declined = DeclinedSummary::of(&all);
-        // ★ Supersession (ledger #504) is decided BEFORE the state filter,
-        // because it is what `pending` now means. It needs each undecided
-        // file finding's CURRENT content hash — which the drift pass below
-        // fetches anyway, so it is fetched once here and the same map is
-        // handed on: a pending listing reads exactly the files it read
-        // before. A listing of decided findings needs none of it (a decision
-        // never changes state), unless the caller asked for the counts.
+        // Supersession precedes the state filter because it defines pending.
+        // Only files with competing archived hashes need current content to
+        // choose their standing set. Share those reads with reconciliation;
+        // every other file is consulted only if its rows reach this page.
         let supersession = !matches!(state.as_str(), "published" | "declined")
             || matches!(summary.as_deref(), Some("states" | "unconfirmed"));
         let mut contents = std::collections::BTreeMap::new();
         if supersession {
+            let passes = crate::supersede::Passes::of(&self.archive, repo)?;
             let undecided_files: Vec<&Annotation> = all
                 .iter()
                 .filter(|f| {
-                    f.decision.is_none() && matches!(f.target_ref(), annotate::TargetRef::File(_))
+                    f.decision.is_none()
+                        && matches!(f.target_ref(), annotate::TargetRef::File(_))
+                        && passes.needs_hash(&f.rel)
                 })
                 .collect();
             annotate::fetch_contents(inv, &self.roots, repo, undecided_files, &mut contents)
                 .await?;
-            crate::supersede::mark(&self.archive, &mut all, |f| {
-                contents
-                    .get(&f.target_iri)
-                    .and_then(|c| c.hash())
-                    .map(str::to_string)
-            })?;
+            let indexes = std::collections::BTreeMap::from([(repo.to_string(), passes)]);
+            crate::supersede::mark_indexed(
+                &self.archive,
+                &mut all,
+                |f| {
+                    contents
+                        .get(&f.target_iri)
+                        .and_then(|c| c.hash())
+                        .map(str::to_string)
+                },
+                &indexes,
+            )?;
         }
         // These views render declined records outside the selected queue rows.
         // Reconcile them before rendering too: a file cut precedes lazy drift
@@ -1673,10 +1696,42 @@ impl Endpoint for FindingsEndpoint {
             }
         }
         let states = supersession.then(|| StateCounts::of(&all));
-        // Confirmation (ledger #653), once over everything loaded — the rows,
-        // the declined twins a group names, and every recurrence mark.
-        let bursts = crate::revision::Bursts::of(&self.archive)?;
-        bursts.apply(&mut all);
+        let selected = |f: &Annotation| {
+            (state == "all" || f.state() == Some(state.as_str()))
+                && verdict
+                    .as_deref()
+                    .is_none_or(|word| f.judges.last().map(|v| v.verdict.as_str()) == Some(word))
+        };
+        // Every ordinary face includes each selected note in full. Raw note
+        // bytes are a conservative lower bound (escaping only adds bytes).
+        // Refuse a certainly oversized answer before reconciliation, burst
+        // work, summary rendering, or construction of any output rows.
+        if page.is_none() && group.is_none() {
+            let (rows, bytes) = all
+                .iter()
+                .filter(|f| selected(f))
+                .fold((0usize, 0usize), |(n, bytes), f| {
+                    (n + 1, bytes.saturating_add(f.body.len()))
+                });
+            if bytes > ANSWER_MAX_BYTES {
+                return Err(ceiling_error(
+                    format!("at least {bytes}"),
+                    repo,
+                    &rel,
+                    rows,
+                    false,
+                ));
+            }
+        }
+        // Whole-list views need confirmation before filtering. Ordinary
+        // pages need it only for the selected rows and their recurrence marks.
+        let bursts = if summary.as_deref() == Some("unconfirmed") || group.is_some() {
+            let bursts = crate::revision::Bursts::for_findings(&self.archive, &all)?;
+            bursts.apply(&mut all);
+            Some(bursts)
+        } else {
+            None
+        };
         // The walk (`summary=unconfirmed`) reads every state, so it is read
         // here, before the state filter, and rendered in the face asked for.
         let face = inv
@@ -1684,7 +1739,8 @@ impl Endpoint for FindingsEndpoint {
             .unwrap_or("application/json")
             .to_string();
         let walk = (summary.as_deref() == Some("unconfirmed")).then(|| {
-            let view = crate::revision::Unconfirmed::of(&all, &bursts);
+            let view =
+                crate::revision::Unconfirmed::of(&all, bursts.as_ref().expect("walk needs bursts"));
             match face.as_str() {
                 t if t.starts_with("text/html") => Walk::Text(view.html()),
                 t if t.starts_with("text/plain") => Walk::Text(view.plain()),
@@ -1701,15 +1757,7 @@ impl Endpoint for FindingsEndpoint {
                 .collect(),
             None => Vec::new(),
         };
-        let findings: Vec<Annotation> = all
-            .into_iter()
-            .filter(|f| state == "all" || f.state() == Some(state.as_str()))
-            .filter(|f| {
-                verdict
-                    .as_deref()
-                    .is_none_or(|word| f.judges.last().map(|v| v.verdict.as_str()) == Some(word))
-            })
-            .collect();
+        let findings: Vec<Annotation> = all.into_iter().filter(selected).collect();
         // A page is cut BEFORE the drift pass, so a page reconciles (and may
         // re-anchor) only its own rows. Nothing in the drift pass changes an
         // id, so the cut stands.
@@ -1718,6 +1766,31 @@ impl Endpoint for FindingsEndpoint {
             Some(page) => page.slice(findings),
             None => (findings, false),
         };
+        let mut findings = if inventory {
+            findings
+                .into_iter()
+                .map(|entry| {
+                    let mut row = annotate::load_record(&self.archive, Family::Finding, &entry.id)?
+                        .ok_or_else(|| {
+                            Error::Conflict(
+                                "finding changed while paging; retry the page".to_string(),
+                            )
+                        })?;
+                    row.superseded_by = entry.superseded_by;
+                    if !selected(&row) {
+                        return Err(Error::Conflict(
+                            "finding changed while paging; retry the page".to_string(),
+                        ));
+                    }
+                    Ok(row)
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            findings
+        };
+        if bursts.is_none() {
+            crate::revision::Bursts::for_findings(&self.archive, &findings)?.apply(&mut findings);
+        }
         let mut rows =
             annotate::reconcile_findings(inv, &self.archive, &self.roots, repo, findings, contents)
                 .await?;
@@ -4716,6 +4789,7 @@ mod tests {
         std::fs::write(root.join("a.rs"), format!("// moved\n{CONTENT}")).unwrap();
         assert_eq!(of(&k, &alpha)["decisions"].as_array().unwrap().len(), 2);
         assert_eq!(nodes(&store, &alpha).len(), 2);
+        assert_page_rows_and_summaries(&k);
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -5176,6 +5250,7 @@ mod tests {
         assert_eq!(groups[0]["by"], "burst");
         assert_eq!(groups[0]["key"], burst);
         assert_eq!(groups[0]["size"], 3, "the burst is counted graph-wide");
+        assert_page_rows_and_summaries(&k);
         assert_eq!(groups[0]["first_decided_at"], burst);
         let declines = groups[0]["declines"].as_array().unwrap();
         assert_eq!(declines[0]["iri"], alpha.as_str(), "oldest first");
@@ -5251,6 +5326,36 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    fn assert_page_rows_and_summaries(k: &Kernel) {
+        let iri = "urn:repo:demo:findings";
+        for state in ["pending", "declined", "superseded", "published", "all"] {
+            for summary in ["declined", "states", "unconfirmed"] {
+                let args = [("state", state), ("summary", summary)];
+                let whole = json(k, iri, &args);
+                let mut expected = whole["rows"].as_array().unwrap().clone();
+                expected.sort_by_key(|r| r["id"].as_str().unwrap().to_string());
+                let mut actual = Vec::new();
+                let mut after = None;
+                loop {
+                    let mut args = args.to_vec();
+                    args.push(("limit", "1"));
+                    if let Some(after) = after.as_deref() {
+                        args.push(("after", after));
+                    }
+                    let page = json(k, iri, &args);
+                    assert_eq!(page["total"], expected.len(), "{state}, {summary}");
+                    assert_eq!(page[summary], whole[summary], "{state}, {summary}");
+                    actual.extend(page["rows"].as_array().unwrap().clone());
+                    after = page["next"].as_str().map(str::to_string);
+                    if after.is_none() {
+                        break;
+                    }
+                }
+                assert_eq!(actual, expected, "{state}, {summary}");
+            }
+        }
+    }
+
     /// ★ The loader is PESSIMISTIC and every face runs the burst pass: a
     /// wordless decline with no provenance that is in NO burst reads
     /// `confirmed: true` on the single read, the Sink's json ack, the listing,
@@ -5293,6 +5398,7 @@ mod tests {
             .find(|g| g["twin"]["iri"] == alpha.as_str())
             .unwrap_or_else(|| panic!("{groups}"));
         assert_eq!(twin["twin"]["decision"]["confirmed"], true, "{groups}");
+        assert_page_rows_and_summaries(&k);
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -6135,6 +6241,166 @@ mod paging_tests {
         }
     }
 
+    /// Plant two reviewers on the same bytes of every file. Choosing a
+    /// standing set must not read forty files for a ten-row page.
+    fn seed_passes(s: &Synthetic) {
+        use crate::review::{store_pass, PassEntry};
+        let archive = Archive::new(Arc::clone(&s.store), GraphName::DefaultGraph);
+        let findings = crate::annotate::list_findings(&archive, "demo", None).unwrap();
+        for file in 0..FILES {
+            let rel = format!("src/f{file}.rs");
+            let members: Vec<_> = findings.iter().filter(|f| f.rel == rel).collect();
+            let first = members[0];
+            for tag in ["tag-one", "tag-two"] {
+                store_pass(
+                    &archive,
+                    &PassEntry {
+                        iri: crate::review::pass_iri("demo", &rel, &first.hash, tag),
+                        repo: "demo".to_string(),
+                        rel: rel.clone(),
+                        target_iri: first.target_iri.clone(),
+                        hash: first.hash.clone(),
+                        tag: tag.to_string(),
+                        model: "fixture-model".to_string(),
+                        minted: members.iter().map(|f| f.iri()).collect(),
+                        carried: Vec::new(),
+                        reused_regions: Vec::new(),
+                        derived_regions: Vec::new(),
+                        memo_bytes: 0,
+                        orphaned_items: 0,
+                        suppressed_items: 0,
+                        reviewed_bytes: None,
+                        total_bytes: None,
+                        derived_at: None,
+                        superseded: 0,
+                    },
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    /// A decision committed during the supersession content read must not
+    /// let a reloaded row contradict the selection used for the page total.
+    #[test]
+    fn a_page_rejects_a_row_published_during_the_content_read() {
+        use crate::annotate::{append_decision, Decision, Made, Outcome};
+        use ikigai_core::{EndpointSpace, Exact, Fallback, FnEndpoint};
+
+        let s = synthetic(80, 40);
+        seed_passes(&s);
+        let archive = Archive::new(Arc::clone(&s.store), GraphName::DefaultGraph);
+        let findings = crate::annotate::list_findings(&archive, "demo", None).unwrap();
+        let finding = findings.iter().find(|f| f.rel == "src/f0.rs").unwrap();
+        let published = finding.iri();
+        let annotation = super::promoted(finding, "major");
+        let beside = crate::annotate::record_quads(&archive, &annotation).unwrap();
+        let decision = Decision {
+            iri: crate::annotate::decision_iri(&finding.id),
+            outcome: Outcome::Published,
+            severity: Some("major".to_string()),
+            at: None,
+            revises: None,
+            made: Some(Made::Single),
+            confirmed: false,
+            burst: None,
+            note: None,
+            reason: None,
+            minted: Some(annotation.iri()),
+            reproduced: false,
+        };
+        // A second archived hash forces supersession to consult current content.
+        let pass = crate::review::pass_iri("demo", "src/f0.rs", &finding.hash, "tag-two");
+        let query = format!(
+            "DELETE {{ <{pass}> <https://ikigai-rs.dev/ns#contentHash> ?hash }} \
+             INSERT {{ <{pass}> <https://ikigai-rs.dev/ns#contentHash> \"sha256:other\" }} \
+             WHERE {{ <{pass}> <https://ikigai-rs.dev/ns#contentHash> ?hash }}"
+        );
+        s.store.update(&query).unwrap();
+        let file = s.root.join("src/f0.rs");
+        let files = EndpointSpace::new().bind(
+            Exact::new("urn:repo:demo:file:src/f0.rs"),
+            FnEndpoint::new("publish-while-reading", move |_| {
+                assert!(append_decision(
+                    &archive,
+                    &published,
+                    &decision,
+                    beside.clone()
+                )?);
+                Ok(crate::repr_utf8(
+                    "text/plain",
+                    std::fs::read_to_string(&file).unwrap(),
+                ))
+            }),
+        );
+        let cfg = ExplainConfig::new(Arc::clone(&s.store)).no_judge();
+        let browse = crate::space_with_explain(vec![("demo".to_string(), s.root.clone())], cfg);
+        let kernel = Kernel::new(Arc::new(Fallback::new(vec![
+            Arc::new(files),
+            Arc::new(browse),
+        ])));
+        let request = Request::new(
+            Verb::Source,
+            Iri::parse("urn:repo:demo:findings:src/f0.rs").unwrap(),
+        )
+        .with_arg("state", ArgRef::Inline(b"pending".to_vec()))
+        .with_arg("limit", ArgRef::Inline(b"10".to_vec()));
+        let answer = block_on(kernel.issue(request, &cap()));
+        match answer {
+            Err(ikigai_core::Error::Conflict(message)) => {
+                assert_eq!(message, "finding changed while paging; retry the page")
+            }
+            Ok(answer) => panic!(
+                "expected paging conflict, got {}",
+                String::from_utf8_lossy(&answer.bytes)
+            ),
+            Err(error) => panic!("expected paging conflict, got {error}"),
+        }
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "cannot refresh an inventory record")]
+    fn drift_rejects_an_inventory_record() {
+        let s = synthetic(1, 40);
+        let archive = Archive::new(Arc::clone(&s.store), GraphName::DefaultGraph);
+        let mut inventory =
+            crate::annotate::listing_inventory(&archive, "demo", None, false, false).unwrap();
+        crate::annotate::refresh(
+            &archive,
+            &mut inventory[0],
+            &crate::annotate::CurrentContent::Unavailable,
+        )
+        .unwrap();
+    }
+
+    /// A walk hydrates only the rows it serves, rather than every record on
+    /// every page. The inventory needed for totals is not a complete load.
+    #[test]
+    fn a_page_walk_loads_each_complete_record_once() {
+        let s = synthetic(80, 40);
+        seed_passes(&s);
+        crate::annotate::FINDING_LOADS.with(|n| n.set(0));
+        crate::annotate::FINDING_CONTENTS.with(|n| n.set(0));
+        crate::archive::READ_WORK.with(|n| n.set(Default::default()));
+        let pages = walk(&s.kernel, "10", &[]);
+        assert_eq!(pages.len(), 8);
+        let loads = crate::annotate::FINDING_LOADS.with(|n| n.get());
+        assert_eq!(loads, 80, "complete finding loads across eight pages");
+        let contents = crate::annotate::FINDING_CONTENTS.with(|n| n.get());
+        assert!(
+            contents <= 80,
+            "at most one content read per served row: {contents}"
+        );
+        let work = crate::archive::READ_WORK.with(|n| n.get());
+        assert_eq!(
+            work.repo_scans, 16,
+            "one finding inventory and one pass index per request: {work:?}"
+        );
+        assert_eq!(work.burst_scans, 0, "no legacy decisions: {work:?}");
+        assert_eq!(work.unscoped_paths, 0, "repository-scoped passes: {work:?}");
+    }
+
     /// ★ Ledger #1663: the pages, joined, are EXACTLY the unpaged listing's
     /// rows — every finding once, none twice — in id order, each page within
     /// its limit and each carrying the same total.
@@ -6159,6 +6425,13 @@ mod paging_tests {
         assert!(pages.last().unwrap()["next"].is_null());
         assert_eq!(pages[0]["after"], serde_json::Value::Null);
         assert_eq!(pages[1]["after"], pages[0]["next"]);
+        let mut expected_rows = whole.as_array().unwrap().clone();
+        expected_rows.sort_by_key(|r| r["id"].as_str().unwrap().to_string());
+        let actual_rows: Vec<_> = pages
+            .iter()
+            .flat_map(|p| p["rows"].as_array().unwrap().clone())
+            .collect();
+        assert_eq!(actual_rows, expected_rows, "every row field is unchanged");
 
         // `after=` alone pages at the stated default.
         let rest = json(&read(&s.kernel, &[("state", "all"), ("after", &expected[0])]).unwrap());
@@ -6255,6 +6528,8 @@ mod paging_tests {
     fn the_default_answer_fits_the_frame() {
         // ~100 KB a row, 400 rows: about 40 MB, past the 32 MiB ceiling.
         let s = synthetic(400, 100_000);
+        crate::annotate::FINDING_RECONCILES.with(|n| n.set(0));
+        crate::annotate::FINDING_CONTENTS.with(|n| n.set(0));
         // `.err()`, not `unwrap_err`: a failure must not print 40 MB of rows.
         let Err(refused) = read(&s.kernel, &[]) else {
             panic!("an unpaged answer past the ceiling must be refused");
@@ -6265,6 +6540,16 @@ mod paging_tests {
             "{refused}"
         );
 
+        assert_eq!(
+            crate::annotate::FINDING_RECONCILES.with(|n| n.get()),
+            0,
+            "oversized unpaged notes are refused before reconciliation and rendering"
+        );
+        assert_eq!(
+            crate::annotate::FINDING_CONTENTS.with(|n| n.get()),
+            0,
+            "no content is read just to refuse the unpaged answer"
+        );
         let page = read(&s.kernel, &[("limit", "2000")]).unwrap();
         assert!(
             page.bytes.len() <= super::ANSWER_MAX_BYTES,

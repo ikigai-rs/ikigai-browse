@@ -684,6 +684,8 @@ impl Outcome {
 /// offsets into the target's text at `hash`.
 #[derive(Clone, Debug)]
 pub(crate) struct Annotation {
+    /// Inventory rows omit stored body and selector data and must never be refreshed.
+    pub(crate) complete: bool,
     /// Which family this record is in. ⚠ Every IRI it owns derives from this;
     /// a record loaded from one family and stored into the other would MOVE
     /// it, which is what promotion does deliberately and nothing else may.
@@ -1246,14 +1248,35 @@ pub(crate) fn load_annotation(archive: &Archive, id: &str) -> Result<Option<Anno
     load_record(archive, Family::Annotation, id)
 }
 
-/// Load one record of either family by id — `None` when the store holds no
-/// body for it (`oa:bodyValue` / `dcterms:description`, per family).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FINDING_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static FINDING_CONTENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static FINDING_RECONCILES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Load one complete record, including selectors, decisions and judge records.
 pub(crate) fn load_record(
     archive: &Archive,
     family: Family,
     id: &str,
 ) -> Result<Option<Annotation>> {
+    #[cfg(test)]
+    if family == Family::Finding {
+        FINDING_LOADS.with(|n| n.set(n.get() + 1));
+    }
+    load_record_for_listing(archive, family, id, true, true)
+}
+
+fn load_record_for_listing(
+    archive: &Archive,
+    family: Family,
+    id: &str,
+    complete: bool,
+    verdict: bool,
+) -> Result<Option<Annotation>> {
     let mut ann = Annotation {
+        complete,
         family,
         id: id.to_string(),
         body: String::new(),
@@ -1295,7 +1318,9 @@ pub(crate) fn load_record(
         let quad = quad.map_err(store_err)?;
         let predicate = quad.predicate.as_str();
         if predicate == DCTERMS_DESCRIPTION && family == Family::Finding {
-            ann.body = literal(&quad.object);
+            if complete {
+                ann.body = literal(&quad.object);
+            }
             found = true;
         } else if predicate == SH_RESULT_SEVERITY {
             if let Term::NamedNode(node) = &quad.object {
@@ -1373,16 +1398,35 @@ pub(crate) fn load_record(
         return Ok(None);
     }
     if family == Family::Finding {
-        ann.history = load_decisions(archive, id)?;
+        ann.history = if complete {
+            load_decisions(archive, id)?
+        } else {
+            let mut head = Vec::new();
+            for (_, node) in decision_nodes(archive, id)?.into_iter().rev() {
+                if let Some(decision) = load_decision(archive, &node)? {
+                    head.push(decision);
+                    break;
+                }
+            }
+            head
+        };
         ann.settle();
-        ann.judges = crate::judge::load_verdicts(archive, &record_iri(family, id))?;
-        ann.cannots = crate::judge::load_cannots(archive, &record_iri(family, id))?;
-        if let Some(twin) = prior_id {
+        if complete || verdict {
+            ann.judges = crate::judge::load_verdicts(archive, &record_iri(family, id))?;
+        }
+        if complete {
+            ann.cannots = crate::judge::load_cannots(archive, &record_iri(family, id))?;
+        }
+        if let Some(twin) = prior_id.filter(|_| complete) {
             ann.prior = Some(Prior {
                 finding: record_iri(Family::Finding, &twin),
                 decision: effective(&load_decisions(archive, &twin)?),
             });
         }
+    }
+    // Declined summaries need quotes in triage order even outside the page.
+    if !complete && ann.state() != Some("declined") {
+        return Ok(Some(ann));
     }
     for (iri, is_quote) in [
         (quote_iri(family, id), true),
@@ -1420,6 +1464,16 @@ pub(crate) fn effective(history: &[Decision]) -> Option<Decision> {
 /// however the store iterates. A node without an outcome is not a decision
 /// and is skipped.
 pub(crate) fn load_decisions(archive: &Archive, id: &str) -> Result<Vec<Decision>> {
+    let mut out = Vec::new();
+    for (_, node) in decision_nodes(archive, id)? {
+        if let Some(decision) = load_decision(archive, &node)? {
+            out.push(decision);
+        }
+    }
+    Ok(out)
+}
+
+fn decision_nodes(archive: &Archive, id: &str) -> Result<Vec<(u32, String)>> {
     let finding_iri = record_iri(Family::Finding, id);
     let Ok(finding) = NamedNode::new(&finding_iri) else {
         return Ok(Vec::new());
@@ -1437,13 +1491,7 @@ pub(crate) fn load_decisions(archive: &Archive, id: &str) -> Result<Vec<Decision
     }
     nodes.sort();
     nodes.dedup();
-    let mut out = Vec::new();
-    for (_, node) in nodes {
-        if let Some(decision) = load_decision(archive, &node)? {
-            out.push(decision);
-        }
-    }
-    Ok(out)
+    Ok(nodes)
 }
 
 /// One decision node, by IRI — `None` when it carries no outcome.
@@ -1628,6 +1676,21 @@ pub(crate) fn list_findings(
     repo: &str,
     rel: Option<&str>,
 ) -> Result<Vec<Annotation>> {
+    listing_inventory(archive, repo, rel, true, true)
+}
+
+/// Request-local inventory for paging: state, target and (when requested)
+/// verdict, plus the declined quotes needed by the listing's summaries.
+/// Selectors, recurrence histories and judge details for served rows are
+/// loaded only after the cursor has selected them. Inventory construction reads
+/// the archive; any host caching of the listing follows its archive threads.
+pub(crate) fn listing_inventory(
+    archive: &Archive,
+    repo: &str,
+    rel: Option<&str>,
+    complete: bool,
+    verdict: bool,
+) -> Result<Vec<Annotation>> {
     use oxigraph::model::vocab::rdf;
     use oxigraph::model::NamedOrBlankNode;
     let entity = NamedNode::new(format!("{PROV}Entity")).map_err(store_err)?;
@@ -1657,7 +1720,12 @@ pub(crate) fn list_findings(
         if !typed {
             continue;
         }
-        let Some(finding) = load_record(archive, Family::Finding, id)? else {
+        let finding = if complete {
+            load_record(archive, Family::Finding, id)?
+        } else {
+            load_record_for_listing(archive, Family::Finding, id, false, verdict)?
+        };
+        let Some(finding) = finding else {
             continue;
         };
         // Kept: a node carrying two `ik:repo` values reads back as the one
@@ -2161,6 +2229,7 @@ pub(crate) fn refresh(
     ann: &mut Annotation,
     current: &CurrentContent,
 ) -> Result<Option<u64>> {
+    debug_assert!(ann.complete, "cannot refresh an inventory record");
     match current {
         // Served exactly as recorded, flags untouched: no content was in
         // hand, so nothing can honestly be said about drift.
@@ -2248,6 +2317,10 @@ pub(crate) async fn fetch_contents<'a>(
 ) -> Result<()> {
     for ann in anns {
         if !contents.contains_key(&ann.target_iri) {
+            #[cfg(test)]
+            if ann.family == Family::Finding {
+                FINDING_CONTENTS.with(|n| n.set(n.get() + 1));
+            }
             let current = current_content_for(inv, roots, repo, &ann.target_ref()).await?;
             contents.insert(ann.target_iri.clone(), current);
         }
@@ -2293,6 +2366,8 @@ pub(crate) async fn reconcile_findings(
     findings: Vec<Annotation>,
     contents: BTreeMap<String, CurrentContent>,
 ) -> Result<Vec<(Annotation, Option<u64>)>> {
+    #[cfg(test)]
+    FINDING_RECONCILES.with(|n| n.set(n.get() + 1));
     reconcile_with(inv, archive, roots, repo, findings, contents).await
 }
 
@@ -2752,6 +2827,7 @@ impl AnnotationEndpoint {
             _ => inv.now().map(|t| iso8601(t.as_millis())),
         };
         let ann = Annotation {
+            complete: true,
             family: Family::Annotation,
             id: id.clone(),
             body,
@@ -3960,6 +4036,7 @@ pub(crate) fn mint_pending_finding_within(
         finding: twin.iri(),
     });
     let ann = Annotation {
+        complete: true,
         family: Family::Finding,
         id,
         body: note.to_string(),
@@ -6363,6 +6440,7 @@ mod tests {
         }
         // A PR-family annotation: no path, keyed to the PR record.
         let pr = Annotation {
+            complete: true,
             family: Family::Annotation,
             id: "pr-note".to_string(),
             body: "a PR note".to_string(),
