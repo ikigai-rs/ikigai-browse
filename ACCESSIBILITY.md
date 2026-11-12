@@ -10,7 +10,7 @@ the [ACCESSIBILITY.md template](https://github.com/mgifford/ACCESSIBILITY.md) (M
 | Status | Evaluation in progress. No conformance claim. |
 | Owner | the maintainers of this repository |
 | Report a barrier | [a GitHub issue](https://github.com/ikigai-rs/ikigai-browse/issues/new) with the `accessibility` label; anything security-sensitive through [private vulnerability reporting](https://github.com/ikigai-rs/ikigai-browse/security/advisories/new) |
-| Last reviewed | 2026-11-02 |
+| Last reviewed | 2026-11-12 |
 
 ## What is ours, and what is the host's
 
@@ -67,57 +67,59 @@ the [ACCESSIBILITY.md template](https://github.com/mgifford/ACCESSIBILITY.md) (M
 
 ## How it is tested
 
-- `src/lib.rs`: the style tests (both scheme blocks present, no theme rule outside one, the floor
-  pass complete on both and its two unrepairable dark rules named, every syntax color and the
-  gutter clearing the floor on the line tints, a raised floor in `a11y.toml` reaching the sheet);
-  the file face's gutter links out of the tab order; `src/watch.rs`: an edited `a11y.toml`
-  reaching the next read. `src/layout.rs`: every emitted `browse-*` class has a rule, the
-  palette's five foreground colors per scheme clear 4.5:1 on an assumed white and `#0d1117`
-  ground, no rule uses `opacity`, and the tints parse. `src/annotate.rs`: a mark's name in words
-  and the note field's visible label. `src/progress.rs`: the live regions and `aria-describedby`; `src/annotate.rs`
-  and `src/pr.rs`: the new card focused, and the annotate acknowledgement focused with no live
-  role; `src/finding.rs`: every decision form's answer is HTML
-  with the answer line focused, and hostile text in it is escaped. All ran on main at `528192f` on 2026-10-15 and passed,
-  with and without feature `migrate`; CI runs them on every pull request.
-- Once, by hand, on 2026-10-15 (not a gate): axe-core 4.10.3 in Chrome 153.0.8010.54 over
-  `cargo run --example page-preview`, light and dark, with the page ground set to white and
-  `#0d1117`.
-- Again by hand on 2026-11-02 (not a gate, ledger #1653): axe-core 4.13.0 in Playwright 1.64.0's
-  headless Chromium over the same preview and grounds, WCAG 2.x A and AA plus best practice.
-  Before the fix: 2,131 color-contrast nodes light and 2,117 dark, 6 link-in-text-block, unnamed
-  crumbs, and 2,224 tab stops on the page (708 in one file's `<pre>`). After: no color-contrast or
-  link-in-text-block failure in either scheme, 106 tab stops (2 in that `<pre>`), and no repeated
-  landmark within one view. What remains is the preview page's own shell (no `<main>`, content
-  outside landmarks, a heading level skipped by the stacked views), which a host owns.
-- On 2026-11-02 (ledger #2929), axe-core 4.10.3 in Playwright 1.58.0 with Chromium
-  156.0.8078.4: the real preview tree fragment placed in the live gonk server's captured browse
-  shell with its captured stylesheet, followed by browse's layout. Before: `?` targets about
-  6.95 × 24 CSS pixels and 8 target-size violations; after: 24 × 24 and no target-size violations
-  or incomplete results. The live tree required sign-in, so this was a composed reproduction,
-  **not an authenticated live-page audit**.
-- `tests/browser/explain-targets.py` is a repeatable manual regression (not a CI gate): axe's `target-size` rule and actual bounding
-  boxes of every explain control on the real preview tree, at a 320px viewport, 12/16/20px root
-  fonts, light/dark, with gonk's relevant button defaults loaded before browse and with an
-  unstyled host. It checks header and row controls; it is not a full accessibility audit.
-  To repeat locally (Python 3.12, Playwright 1.58.0, axe-core 4.10.3):
+Every named check has a result: Pass, Fail or Blocked, with its evidence. A Pass covers only the
+stated check, not overall accessibility. Every Pass below was run on main at `6f5e8f2` on
+2026-11-12 on macOS (arm64), with rustc and cargo 1.99.1; the `cargo test` rows ran with and
+without feature `migrate`, and CI runs them on every pull request on Linux and macOS
+(`.github/workflows/ci.yml`). The unit tests read the emitted markup and CSS as text and compute
+contrast ratios; they render nothing. A historical run CI does not repeat is Blocked with its
+date, kept as context, not as current verification.
 
-  ```sh
-  python3 -m venv target/browser-venv
-  target/browser-venv/bin/python -m pip install playwright==1.58.0
-  target/browser-venv/bin/python -m playwright install --with-deps chromium
-  cargo run --example page-preview -- target/browse-preview.html
-  curl --fail --location https://cdnjs.cloudflare.com/ajax/libs/axe-core/4.10.3/axe.min.js --output target/axe.min.js
-  target/browser-venv/bin/python tests/browser/explain-targets.py target/browse-preview.html target/axe.min.js
-  ```
+| Check | Result | Evidence |
+|---|---|---|
+| Style sheet: both scheme blocks, no theme rule outside one, floor pass complete, every syntax color and the gutter clearing the floor on the line tints, a raised `a11y.toml` floor reaching the sheet | Pass | `cargo test`: `src/lib.rs` (`the_style_face_serves_both_scheme_blocks_and_is_cacheable`, `no_theme_rule_sits_outside_a_scheme_block`, `the_floor_pass_is_complete_on_both_blocks`, `every_syntax_color_clears_the_floor_on_the_line_tints`, `a_raised_contrast_floor_reaches_the_stylesheet`) and `src/watch.rs` (`an_edited_a11y_toml_reaches_the_next_read_through_the_watcher`). Ratios are computed against the theme's own ground and this sheet's tints, not a host's. |
+| Layout sheet: every emitted `browse-*` class styled, no selector outside browse's markup, palette at 4.5:1 per scheme, no `opacity`, tints parse | Pass | `cargo test`: `src/layout.rs` (`every_emitted_class_is_styled`, `no_selector_reaches_outside_the_browse_markup`, `the_palette_clears_the_contrast_floor`, `no_rule_dims_text_with_opacity`, `the_line_tints_are_readable_colors_in_both_schemes`). The palette is measured on an assumed white and `#0d1117` ground; a host's real ground is not. |
+| One tab stop per file: gutter links `tabindex="-1"`, the `<pre>` `tabindex="0"` | Pass | `cargo test`: `src/lib.rs` `file_html_face_is_line_anchored`. Checks the markup; no browser tabbed through it. |
+| Marks named in words; the note field's visible label | Pass | `cargo test`: `src/annotate.rs` `anchored_markers_appear_at_their_lines_and_orphans_keep_their_card`. |
+| Cost line named by `aria-describedby`; the polite live region in the markup before its note | Pass | `cargo test`: `src/progress.rs` (`a_control_names_its_region_and_its_cost_line`, `the_region_is_a_polite_live_region_even_when_silent`). Whether a screen reader announces it is the Screen reader row. |
+| New annotation card focused; the annotate acknowledgement focused with no live role | Pass | `cargo test`: `src/annotate.rs` `annotating_from_the_file_view_returns_to_that_view_with_the_new_card_focused`, `src/pr.rs` `annotating_a_pr_returns_to_the_pr_page_with_the_new_card_focused`. Checks `tabindex` and `autofocus` in the markup; that focus moves in a browser under htmx is not tested. |
+| Finding decisions answer HTML with the answer line focused; hostile text escaped | Pass | `cargo test`: `src/finding.rs` (`every_decision_form_answers_a_page_not_an_iri`, `the_html_acknowledgement_escapes_and_the_plain_one_is_the_iri`). |
+| Explain controls at least 24 × 24 CSS pixels (SC 2.5.8) | Pass | `tests/browser/explain-targets.py` (a manual regression, not a CI gate), Python 3.15.2, Playwright 1.58.0 driving Chrome for Testing 156.0.8078.4 (`--chromium`), axe-core 4.10.3 (`target-size` rule only), over `cargo run --example page-preview`: 17 controls, 0 undersized, 0 violations, 0 incomplete in all 12 combinations (gonk-default fixture and unstyled host, light and dark, 12/16/20 px root font, 320 px viewport). Covers explain-control size only. |
+| Explain controls with the captured full gonk stylesheet (`--host-css`) | Blocked | Last run 2026-11-02 ([PR 141](https://github.com/ikigai-rs/ikigai-browse/pull/141)), all 12 combinations passed. The captured stylesheet is not in this repository and was not re-run. |
+| Automated checker (axe, WCAG 2.x A and AA plus best practice) over the whole preview, light and dark, white and `#0d1117` grounds | Blocked | Not re-run for this update; no repeatable script for it is in this repository. Last runs: 2026-10-15 (axe-core 4.10.3, Chrome 153.0.8010.54) and 2026-11-02 ([PR 140](https://github.com/ikigai-rs/ikigai-browse/pull/140), axe-core 4.13.0, Playwright 1.64.0's headless Chromium). After the 2026-11-02 fix: no color-contrast or link-in-text-block failure in either scheme, 106 tab stops (2 in one file's `<pre>`, down from 2,224 and 708), no repeated landmark within one view; what remained was the preview page's own shell, which a host owns. |
+| Fragments inside a live, signed-in gonk page | Blocked | Never audited: the live tree requires sign-in. The 2026-11-02 target-size run placed the preview tree in gonk's captured shell, a composed reproduction, not a live-page audit. |
+| Manual keyboard | Blocked | No person has done a keyboard pass; no interactive browser session was available for this update. |
+| Text and Turtle faces | Blocked | No check of these faces for people (for example a screen reader reading the text face) has been defined or run. |
+| Screen reader | Blocked | No screen reader has been used on this output; no screen-reader session was available, and no screen-reader job runs in CI. |
+| Screen magnifier | Blocked | No screen magnifier has been used on this output; no magnifier session was available. |
+| Speech input | Blocked | No speech-input software has been used on this output; no speech-input session was available. |
+| Switch access | Blocked | No switch-access software has been used on this output; no switch-access session was available. |
+| Braille display | Blocked | No braille display has been used on this output; none was available. |
 
-  Optional `--chromium PATH` uses an installed browser; `--host-css PATH` substitutes a full
-  host stylesheet for the small gonk-default fixture. All 12 combinations also passed with
-  the captured full gonk stylesheet in the manual run above.
-- **No screen reader, magnifier or other assistive technology has been used**.
+To repeat the explain-target regression (Python 3.12 or later, Playwright 1.58.0, axe-core
+4.10.3):
+
+```sh
+python3 -m venv target/browser-venv
+target/browser-venv/bin/python -m pip install playwright==1.58.0
+target/browser-venv/bin/python -m playwright install --with-deps chromium
+cargo run --example page-preview -- target/browse-preview.html
+curl --fail --location https://cdnjs.cloudflare.com/ajax/libs/axe-core/4.10.3/axe.min.js --output target/axe.min.js
+target/browser-venv/bin/python tests/browser/explain-targets.py target/browse-preview.html target/axe.min.js
+```
+
+Optional `--chromium PATH` uses an installed browser; `--host-css PATH` substitutes a full host
+stylesheet for the small gonk-default fixture.
+
+**ikigai-ui's per-kind criteria.** This repository does not depend on `ikigai-ui` and relies on
+none of its per-kind accessibility criteria (`urn:iki:ui:criterion:kind:{kind}:target:{target}`):
+its fragments are not ikigai-ui kinds, so its tests verify none of their SEE checks, and their
+HEAR checks would be Blocked in any case (no screen-reader job runs yet). The only thing it takes
+from ikigai-ui is the `--muted` token, read when the host defines it.
 
 ## Known limitations
 
-From that axe run and from reading the source on 2026-10-15:
+From the axe runs above and from reading the source on 2026-10-15:
 
 - Rules the floor pass cannot repair remain in some themes, the default dark one included:
   `.hl-meta.hl-separator` (4.0:1) and `.hl-invalid.hl-illegal` (3.2:1) on base16-ocean.dark, which
@@ -129,6 +131,10 @@ From that axe run and from reading the source on 2026-10-15:
   (`#L{n}`) and a screen reader's links list still reach it.
 - Two views stacked on one page (the preview does this; gonk shows one at a time) repeat their
   landmarks' names.
+- The 24 × 24 explain-control target is checked only by the manual browser regression; no
+  `cargo test` gate measures it.
+- Nothing here has been tried with a screen reader, magnifier, speech input, switch access or a
+  braille display.
 
 ## Change history
 
@@ -138,15 +144,19 @@ From that axe run and from reading the source on 2026-10-15:
 | 2026-08-15 | Each theme in its own scheme block; the floor pass from `ikigai-a11y` ([PR 15](https://github.com/ikigai-rs/ikigai-browse/pull/15), [PR 17](https://github.com/ikigai-rs/ikigai-browse/pull/17)). |
 | 2026-10-05 | Cost lines and live progress notes ([PR 78](https://github.com/ikigai-rs/ikigai-browse/pull/78)). |
 | 2026-10-15 | This file ([PR 111](https://github.com/ikigai-rs/ikigai-browse/pull/111)). |
-| 2026-11-01 | Finding decisions answer an HTML page with the answer focused, not a bare IRI (0.20.5, ledger #1988). |
-| 2026-11-02 | Explain controls keep a 24 × 24 CSS pixel minimum after the layout reset (0.20.7, ledger #2929). |
-| 2026-11-02 | Muted text by color, not opacity; the floor kept on line tints; one tab stop per file; marks named in words; in-text links underlined; fields labeled; navs named (0.20.6, ledger #1653). |
+| 2026-11-01 | Finding decisions answer an HTML page with the answer focused, not a bare IRI (0.20.5, [PR 136](https://github.com/ikigai-rs/ikigai-browse/pull/136)). |
+| 2026-11-02 | Explain controls keep a 24 × 24 CSS pixel minimum after the layout reset (0.20.7, [PR 141](https://github.com/ikigai-rs/ikigai-browse/pull/141)). |
+| 2026-11-02 | Muted text by color, not opacity; the floor kept on line tints; one tab stop per file; marks named in words; in-text links underlined; fields labeled; navs named (0.20.6, [PR 140](https://github.com/ikigai-rs/ikigai-browse/pull/140)). |
+| 2026-11-12 | "How it is tested" as a Pass / Fail / Blocked table, each Pass re-run on main at `6f5e8f2`. |
 
 ## Contributing
 
 Read this file before changing any face's markup or either stylesheet. Keep meaning in words or
 shapes, not color; give a new control a visible label; check a new color in both schemes, and with
-any `opacity` applied. Say in the pull request what was tested, with what, and what was not.
+any `opacity` applied. In the pull request, give each check a row in a Check | Result | Evidence
+table: Pass, Fail or Blocked, with the test or command, the tool and its version, or why it
+could not run. Keep an unrun check as Blocked, a screen reader nobody ran included; never omit it
+or call it "not applicable".
 
 ## Reporting a barrier
 
