@@ -291,8 +291,9 @@ const STUB_OID: &str = "0123456789abcdef0123456789abcdef01234567";
 ///
 /// ★ Nothing here spawns a process or opens a socket: the five facades are
 /// bound IN the fixture, so the walk fires the pull-request family against them
-/// instead of against `gh`. Each declares `urn:cap:exec:gh`, as the real module
-/// does, so the capability that reaches them is the real composition's.
+/// instead of against `gh`. Each declares the grant the real module (ikigai-repo >=
+/// 0.6.0) does — `urn:cap:exec:read:gh` for the pr facades, `urn:cap:exec:read:git`
+/// for `urn:repo:log` — so the capability that reaches them is the real composition's.
 fn stub_repo() -> EndpointSpace {
     const LIST: &str = "1\tAdd demo\tfeature/demo\t2026-10-01T12:00:00Z\n";
     const LIST_JSON: &str = r#"[{"number":1,"title":"Add demo","state":"OPEN","headRefName":"feature/demo","updatedAt":"2026-10-01T12:00:00Z"}]"#;
@@ -349,7 +350,11 @@ fn stub_repo() -> EndpointSpace {
             .with_description(
                 Description::new("stub-repo")
                     .verb(Verb::Source)
-                    .requires("urn:cap:exec:gh")
+                    .requires(if facade == "urn:repo:log" {
+                        "urn:cap:exec:read:git"
+                    } else {
+                        "urn:cap:exec:read:gh"
+                    })
                     .output("text/plain;charset=utf-8")
                     .output("application/json"),
             ),

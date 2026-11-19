@@ -36,8 +36,9 @@
 //! The family declares the browse read wildcard (per-root grant enforced
 //! here), plus net (explain/review call a model) and annotate (review writes
 //! annotations). The pr facades additionally enforce their own capability
-//! (`urn:cap:exec:gh` in ikigai-repo) when the sub-request dispatches — the
-//! composition's concern, surfaced honestly by attenuation.
+//! (`urn:cap:exec:read:gh` in ikigai-repo ≥ 0.6.0, and `urn:cap:exec:read:git`
+//! for the `urn:repo:log` the contextual listing mines) when the sub-request
+//! dispatches — the composition's concern, surfaced honestly by attenuation.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -65,7 +66,13 @@ use crate::{
     CAP_WILDCARD,
 };
 
-// --- the facade contract (ikigai-repo ≥ 0.1.3; the scoped listing ≥ 0.1.5) ----
+// --- the facade contract (ikigai-repo ≥ 0.6.0) ------------------------------------
+// The shapes date from 0.1.3 (the scoped listing from 0.1.5). 0.6.0 is the true
+// minimum because of the exec split (ledger #3818): the pr facades enforce
+// `urn:cap:exec:read:gh` and `urn:repo:log` enforces `urn:cap:exec:read:git`, and
+// they refuse the old `urn:cap:exec:gh` / `urn:cap:exec:git` spellings. Older
+// releases enforce only the old spellings, so a grant made for 0.6.0 cannot
+// reach them.
 
 /// `number⇥title⇥branch⇥updated` per line; empty body + success = no open PRs.
 const FACADE_LIST: &str = "urn:repo:pr:list";
@@ -1998,9 +2005,10 @@ mod tests {
         }
     }
 
-    /// Bind the pr + log facades as deterministic fakes. Each declares
-    /// `urn:cap:exec:gh` like the real ikigai-repo module, so attenuation is
-    /// exercised for real.
+    /// Bind the pr + log facades as deterministic fakes. Each declares the
+    /// grant the real ikigai-repo (>= 0.6.0) module does — `urn:cap:exec:read:gh`
+    /// for the pr facades, `urn:cap:exec:read:git` for `urn:repo:log` — so
+    /// attenuation is exercised under the narrow published grants.
     fn fake_repo_space(state: &Arc<FakeRepo>) -> EndpointSpace {
         let mut space = EndpointSpace::new();
         for iri in [
@@ -2052,9 +2060,13 @@ mod tests {
                     }
                 })
                 .with_description(
-                    Description::new("fake-repo")
-                        .verb(Verb::Source)
-                        .requires("urn:cap:exec:gh"),
+                    Description::new("fake-repo").verb(Verb::Source).requires(
+                        if iri == FACADE_LOG {
+                            "urn:cap:exec:read:git"
+                        } else {
+                            "urn:cap:exec:read:gh"
+                        },
+                    ),
                 ),
             );
         }
@@ -2143,7 +2155,8 @@ mod tests {
     fn cap() -> Capability {
         Capability::scoped([
             "urn:cap:browse:read:demo",
-            "urn:cap:exec:gh",
+            "urn:cap:exec:read:gh",
+            "urn:cap:exec:read:git",
             "urn:cap:net:localhost",
             CAP_ANNOTATE,
         ])
@@ -3267,7 +3280,7 @@ index 3f9c2d1..8a41b77 100644
         // No browse grant on this root: denied by the per-root check.
         let wrong_root = Capability::scoped([
             "urn:cap:browse:read:other",
-            "urn:cap:exec:gh",
+            "urn:cap:exec:read:gh",
             "urn:cap:net:localhost",
             CAP_ANNOTATE,
         ]);
@@ -3284,7 +3297,7 @@ index 3f9c2d1..8a41b77 100644
 
         // No net grant: the explain layer is denied at the baseline before
         // any ask leaves.
-        let no_net = Capability::scoped(["urn:cap:browse:read:demo", "urn:cap:exec:gh"]);
+        let no_net = Capability::scoped(["urn:cap:browse:read:demo", "urn:cap:exec:read:gh"]);
         let err = issue(&k, Verb::Source, "urn:repo:demo:pr:3:explain", &[], &no_net).unwrap_err();
         assert!(matches!(err, Error::Denied(_)), "{err:?}");
         assert_eq!(log.count(), 0, "no ask ever left");
