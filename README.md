@@ -97,7 +97,7 @@ This mount-level allowlist lets hosts pass their source configuration without
 changing the existing root pairs. Both the root's recent-PR section and a
 subdirectory's scoped section (and the root's PR navigation button) appear only
 when the root is eligible and the viewer's capability allows
-`urn:cap:exec:gh`. Sections still load lazily through htmx `load`; the option
+`urn:cap:exec:read:gh`. Sections still load lazily through htmx `load`; the option
 controls presentation and does not change endpoint authorization.
 
 **The explanation archive (S1).** `space_with_explain` takes an
@@ -162,8 +162,12 @@ to source trees what `ikigai-repo` is to dev tooling. No wasm face.
 `:diff` THROUGH THE KERNEL at runtime, passing `dir=` so they run in the
 root's directory. A composition without those facades answers a typed
 `NotFound` naming the gap (the rest of browse is untouched), and the facades
-enforce their own capability (`urn:cap:exec:gh`) on dispatch — attenuation
-means a caller of the PR rows must hold it too.
+enforce their own capability on dispatch: `urn:cap:exec:read:gh` for the
+`urn:repo:pr:*` facades and `urn:cap:exec:read:git` for the `urn:repo:log` the
+contextual listing (`urn:repo:{repo}:prs:{path}`) mines. Attenuation means a
+caller of the PR rows must hold them too. **ikigai-repo ≥ 0.6.0 is the true
+minimum** (the exec split, ledger #3818): earlier releases enforce only the old
+`urn:cap:exec:gh` / `urn:cap:exec:git` spellings, which 0.6.0 refuses.
 
 ```rust
 use ikigai_core::Kernel;

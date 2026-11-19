@@ -554,6 +554,11 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # 0.20.x (cli, gonk, tutorial in the original report) must move their browse
 # pins alongside the intervening core/store upgrades; a patch cannot remove
 # these exports. No resource name, capability, face or stored term moves.
+# Also in 0.23.0 (the exec split, ledger #3819): the tree page's PR sections are shown
+# to viewers whose capability allows `urn:cap:exec:read:gh` (was `urn:cap:exec:gh`), the
+# scope ikigai-repo 0.6.0's pr facades enforce; the contextual listing also needs
+# `urn:cap:exec:read:git` for `urn:repo:log`. ikigai-repo >= 0.6.0 is the true minimum for
+# the PR family. Browse links no ikigai-repo crate, so the minimum is documented, not pinned here.
 version = "0.23.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"

@@ -440,7 +440,7 @@ impl Mount {
     /// By default every root is eligible. An empty iterator disables tree-page
     /// pull-request sections for all roots. Unknown names have no effect.
     /// Eligible roots show their lazy section only to viewers whose capability
-    /// allows `urn:cap:exec:gh`. This controls presentation, not endpoint access.
+    /// allows `urn:cap:exec:read:gh`. This controls presentation, not endpoint access.
     pub fn pull_request_roots(
         mut self,
         names: impl IntoIterator<Item = impl Into<String>>,
@@ -1392,7 +1392,7 @@ fn tree_endpoint(
                     &rel,
                     &entries,
                     explain,
-                    inv.capability.allows("urn:cap:exec:gh")
+                    inv.capability.allows("urn:cap:exec:read:gh")
                         && pull_request_roots
                             .as_ref()
                             .is_none_or(|names| names.contains(repo)),
@@ -3093,13 +3093,20 @@ mod tests {
             assert!(!html.contains("browse-recent-prs"), "{html}");
             assert!(!html.contains("pull requests"), "{html}");
         }
+        // The pre-split spelling is not the gate: ikigai-repo 0.6.0 refuses
+        // `urn:cap:exec:gh`, so a section it would load must not be offered.
+        let old = Capability::scoped(["urn:cap:browse:read:demo", "urn:cap:exec:gh"]);
+        for iri in ["urn:repo:demo:tree", "urn:repo:demo:tree:src"] {
+            let html = body(&source(&k, iri, &[("as", "text/html")], &old).unwrap());
+            assert!(!html.contains("browse-recent-prs"), "{html}");
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn tree_pull_request_roots_preserve_lazy_sections_only_where_enabled() {
         let root = demo_root();
-        let cap = Capability::scoped(["urn:cap:browse:read:demo", "urn:cap:exec:gh"]);
+        let cap = Capability::scoped(["urn:cap:browse:read:demo", "urn:cap:exec:read:gh"]);
         for (names, enabled) in [
             (None, true),
             (Some(vec!["demo"]), true),
