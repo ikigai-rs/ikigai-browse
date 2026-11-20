@@ -109,6 +109,8 @@ use oxigraph::store::Store;
 
 use crate::annotate::{self, Included, TargetFilter};
 use crate::archive::Archive;
+use crate::checkout::Jailed;
+use crate::file_read::MAX_FILE_BYTES;
 use crate::hash::hash_iri;
 use crate::{
     crumbs_html, file_iri, granted, human_size, include_annotations, iri_encode, media_type_for,
@@ -522,7 +524,9 @@ impl ExplainConfig {
 
     /// Entry names excluded from the hierarchy — from directory hashing,
     /// rollups, and tree-feeding (default: `.git`, `target`, `node_modules`,
-    /// `venv`, `.venv`, `dist`, `__pycache__`).
+    /// `venv`, `.venv`, `dist`, `__pycache__`). The repository's own ignore
+    /// rules apply as well, whatever this holds (`.gitignore`, `.git/info/exclude`,
+    /// `core.excludesFile`, as git reports them).
     pub fn ignore(mut self, names: impl IntoIterator<Item = String>) -> Self {
         self.ignore = names.into_iter().collect();
         self
@@ -1095,7 +1099,7 @@ impl Endpoint for ExplainEndpoint {
 
         // Miss under the current tag: derive, archive, serve.
         let text = match grain {
-            Grain::Directory => self.derive_dir(inv, repo, &rel, &provider).await?,
+            Grain::Directory => self.derive_dir(inv, repo, &rel, &target, &provider).await?,
             Grain::Binary => {
                 let (content, _) = material.as_ref().expect("file grains carry material");
                 format!(
@@ -1276,6 +1280,12 @@ impl ExplainEndpoint {
     /// that bottoms out at files, and the reason one edit recomputes exactly
     /// one path up the tree (unchanged children are archive hits).
     ///
+    /// The filter is the directory hash's: the name policy AND the
+    /// repository's own ignore rules ([`crate::hash::git_ignored`]), so the
+    /// rollup never recurses into what the hash leaves out. A child over the
+    /// per-file limit cannot be explained; it is listed as such rather than
+    /// failing the rollup, as its hash row marks only itself (ledger #3839).
+    ///
     /// `provider` selects the backend for THIS rollup only. The children are
     /// plain sub-resolutions of their own `explain` IRIs and carry no
     /// argument, so they derive (or hit) under their own tier's tag — the
@@ -1286,9 +1296,11 @@ impl ExplainEndpoint {
         inv: &Invocation<'_>,
         repo: &str,
         rel: &str,
+        target: &Jailed,
         provider: &str,
     ) -> Result<String> {
         let config = &self.config;
+        let git_ignored = crate::hash::git_ignored(target);
         let tree = inv.source(&parse_iri(&tree_iri(repo, rel))?).await?;
         let listing = String::from_utf8_lossy(&tree.bytes).to_string();
         let mut kept: Vec<(String, String)> = Vec::new(); // (name, kind)
@@ -1297,7 +1309,7 @@ impl ExplainEndpoint {
             let (Some(name), Some(kind)) = (cols.next(), cols.next()) else {
                 continue;
             };
-            if config.ignore.contains(name) || kind == "link" {
+            if config.ignore.contains(name) || kind == "link" || git_ignored.contains(name) {
                 continue;
             }
             kept.push((name.to_string(), kind.to_string()));
@@ -1309,10 +1321,16 @@ impl ExplainEndpoint {
             } else {
                 format!("{rel}/{name}")
             };
-            let child = inv
+            let text = match inv
                 .source(&parse_iri(&explain_iri(repo, &child_rel))?)
-                .await?;
-            let text = String::from_utf8_lossy(&child.bytes).trim().to_string();
+                .await
+            {
+                Ok(child) => String::from_utf8_lossy(&child.bytes).trim().to_string(),
+                Err(Error::OverBudget { .. }) => {
+                    format!("Not explained: larger than the {MAX_FILE_BYTES}-byte per-file limit.")
+                }
+                Err(e) => return Err(e),
+            };
             sections.push_str(&format!("### {name} ({kind})\n{text}\n\n"));
         }
         let entries: Vec<String> = kept
