@@ -559,7 +559,11 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # scope ikigai-repo 0.6.0's pr facades enforce; the contextual listing also needs
 # `urn:cap:exec:read:git` for `urn:repo:log`. ikigai-repo >= 0.6.0 is the true minimum for
 # the PR family. Browse links no ikigai-repo crate, so the minimum is documented, not pinned here.
-version = "0.23.0"
+# 0.23.1 — PATCH (ledger #3839): directory hashes and the explanation hierarchy skip paths the
+# repository's own git ignore rules exclude (git ls-files --others --ignored --exclude-standard, through
+# the hardened git call), and a file over MAX_FILE_BYTES marks only its own entry (`over-budget:{size}`)
+# instead of failing every ancestor's hash. Only directories holding git-ignored paths re-key; no API change.
+version = "0.23.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
