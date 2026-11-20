@@ -5,8 +5,13 @@
 //! - A **directory** hashes its entries' `(name, kind, child-hash)` rows —
 //!   a **merkle** construction, so one file edit re-keys exactly the path from
 //!   that file to the root and nothing else. Entries named in the **ignore
-//!   policy** (`.git`, `target`, …), symlinks, and non-UTF-8 names are
-//!   excluded — churn under `target/` must not re-key the tree.
+//!   policy** (`.git`, `target`, …), entries the repository's own ignore rules
+//!   exclude ([`git_ignored`]), symlinks, and non-UTF-8 names are excluded —
+//!   churn under `target/` or an ignored build directory must not re-key the
+//!   tree.
+//! - A file over [`MAX_FILE_BYTES`] inside a directory marks only itself: its
+//!   row carries `over-budget:{size}` in place of a content hash, so the rest
+//!   of the tree still hashes (ledger #3839).
 //!
 //! sha-256 (the `sha2` crate) over blake3: pure Rust, so CI needs no C
 //! toolchain. The hash is a live read — deliberately uncacheable, like
@@ -19,6 +24,7 @@ use std::sync::Arc;
 use ikigai_core::{ArgSpec, Description, FnEndpoint, Invocation, Result, Verb};
 
 use crate::checkout::Jailed;
+use crate::file_read::MAX_FILE_BYTES;
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -59,19 +65,84 @@ fn hash_file(path: &Jailed) -> Result<String> {
     Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
+/// The paths below `dir` that the repository's own ignore rules exclude, as
+/// git itself judges them: every `.gitignore` level, `.git/info/exclude` and
+/// the configured `core.excludesFile` (`--exclude-standard`). Relative to
+/// `dir`, `/`-separated, without a trailing slash; a wholly ignored directory
+/// is one entry (`--directory`), not its contents. Only untracked paths are
+/// listed (`--others`), so a tracked file matching a pattern is still hashed.
+///
+/// Asked of git rather than matched here, through the same hardened
+/// invocation every browse git run uses ([`Jailed::git`]). A root that is not
+/// in a work tree, or a host without git, gets the empty set: the name policy
+/// ([`default_ignore`]) still applies. When `dir` is itself ignored git
+/// answers `./` alone, which is dropped, so hashing an ignored directory by
+/// its own path still describes its contents.
+pub(crate) fn git_ignored(dir: &Jailed) -> BTreeSet<String> {
+    let args = [
+        "ls-files",
+        "-z",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "--directory",
+    ];
+    let Ok(out) = dir.git(&args) else {
+        return BTreeSet::new();
+    };
+    if !out.status.success() {
+        return BTreeSet::new();
+    }
+    out.stdout
+        .split(|byte| *byte == 0)
+        .filter_map(|path| std::str::from_utf8(path).ok())
+        .map(|path| path.trim_end_matches('/'))
+        .filter(|path| !path.is_empty() && *path != ".")
+        .map(str::to_string)
+        .collect()
+}
+
+/// The child-hash column for a file over [`MAX_FILE_BYTES`]: its size. It is
+/// what the walk knows without reading the file, it is the same on every probe
+/// until the file changes length, and no `sha256:` hash can spell it.
+fn over_budget_marker(size: u64) -> String {
+    format!("over-budget:{size}")
+}
+
 /// Hash a directory: one row per kept entry — `name NUL kind NUL child-hash LF`
-/// in name order — hashed together. Ignored names, symlinks (never followed,
-/// so no cycles), and non-UTF-8 names are excluded. An empty directory is the
-/// hash of the empty input: stable, and distinct from any file.
-fn hash_dir(dir: &Jailed, ignore: &BTreeSet<String>) -> Result<String> {
+/// in name order — hashed together. Ignored names, paths in `git_ignored`
+/// (relative to the directory first hashed; `prefix` is this one's place in
+/// it), symlinks (never followed, so no cycles), and non-UTF-8 names are
+/// excluded. A file over the per-file limit hashes as its
+/// [`over_budget_marker`], so it fails only its own `hash:` path. An empty
+/// directory is the hash of the empty input: stable, and distinct from any
+/// file.
+fn hash_dir(
+    dir: &Jailed,
+    ignore: &BTreeSet<String>,
+    git_ignored: &BTreeSet<String>,
+    prefix: &str,
+) -> Result<String> {
+    let rel_of = |name: &str| {
+        if prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{prefix}/{name}")
+        }
+    };
     let mut entries = dir.list()?;
-    entries.retain(|e| !ignore.contains(&e.name) && e.kind != crate::Kind::Link);
+    entries.retain(|e| {
+        !ignore.contains(&e.name)
+            && e.kind != crate::Kind::Link
+            && !git_ignored.contains(&rel_of(&e.name))
+    });
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     let mut hasher = Sha256::new();
     for entry in entries {
         let child = dir.child(&entry.name)?;
-        let child_hash = match entry.kind {
-            crate::Kind::Dir => hash_dir(&child, ignore)?,
+        let child_hash = match (entry.kind, entry.size) {
+            (crate::Kind::Dir, _) => hash_dir(&child, ignore, git_ignored, &rel_of(&entry.name))?,
+            (_, Some(size)) if size > MAX_FILE_BYTES => over_budget_marker(size),
             _ => hash_file(&child)?,
         };
         hasher.update(entry.name.as_bytes());
@@ -92,7 +163,7 @@ fn hash_dir(dir: &Jailed, ignore: &BTreeSet<String>) -> Result<String> {
 pub(crate) fn hash_of(root: &Path, rel: &str, ignore: &BTreeSet<String>) -> Result<String> {
     let target = resolve(root, rel)?;
     if target.is_dir() {
-        hash_dir(&target, ignore)
+        hash_dir(&target, ignore, &git_ignored(&target), "")
     } else {
         hash_file(&target)
     }
@@ -136,10 +207,13 @@ fn hash_description() -> Description {
              urn:repo:{repo}:hash[:{path}]. Files hash their bytes; directories hash their \
              entries' (name, kind, child-hash) rows — a merkle construction, so one file \
              edit re-keys exactly the path to the root. The ignore policy (.git, target, \
-             node_modules, …), symlinks, and non-UTF-8 names are excluded. text/plain \
-             (default) is `sha256:{hex}`; as=application/json adds algorithm and target. \
-             Each file is limited to 16 MiB (16,777,216 bytes); larger files fail with \
-             OverBudget, including within directories, without returning a partial hash. \
+             node_modules, …), paths the repository's own ignore rules exclude (as git \
+             ls-files --others --ignored --exclude-standard reports them), symlinks, and \
+             non-UTF-8 names are excluded. text/plain (default) is `sha256:{hex}`; \
+             as=application/json adds algorithm and target. Each file is limited to 16 MiB \
+             (16,777,216 bytes): a larger file's own hash fails with OverBudget, never a \
+             partial hash, and within a directory its row records `over-budget:{size}` in \
+             place of a content hash, so the directory still hashes. \
              Live and uncacheable: this is the cheap probe the explanation archive keys on.",
         )
         .verb(Verb::Source)

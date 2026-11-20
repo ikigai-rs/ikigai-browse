@@ -8,7 +8,8 @@ use crate::checkout::Jailed;
 
 /// Maximum file input for browse content and hashing: 16 MiB (16,777,216 bytes).
 /// Larger files fail with `Error::OverBudget`; content and hashes are never truncated.
-/// Directory hashing applies this limit to each file, not the aggregate tree.
+/// Directory hashing applies this limit to each file, not the aggregate tree, and records
+/// a file over it as `over-budget:{size}` rather than failing the directory.
 pub const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 pub(crate) fn over_budget(path: &Path) -> Error {

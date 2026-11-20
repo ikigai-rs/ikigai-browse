@@ -1,4 +1,5 @@
-//! File content and hashes must refuse oversized files without returning a prefix.
+//! File content and hashes must refuse oversized files without returning a prefix;
+//! a directory holding one records it as over budget and still hashes.
 use std::sync::Arc;
 
 use futures::executor::block_on;
@@ -23,7 +24,6 @@ fn one_byte_over_file_budget_is_refused() {
         ("urn:repo:demo:file:large.bin", "text/html"),
         ("urn:repo:demo:hash:large.bin", "text/plain"),
         ("urn:repo:demo:hash:large.bin", "application/json"),
-        ("urn:repo:demo:hash", "text/plain"),
     ] {
         let request = Request::new(Verb::Source, Iri::parse(iri).unwrap())
             .with_arg("as", ArgRef::Inline(face.as_bytes().to_vec()));
@@ -35,6 +35,23 @@ fn one_byte_over_file_budget_is_refused() {
     assert!(
         accepted.is_empty(),
         "must refuse oversized input: {accepted:?}"
+    );
+
+    // Its directory hashes, recording a marker row in place of the content
+    // hash it cannot take: the file fails only its own entry (ledger #3839).
+    use sha2::{Digest, Sha256};
+    let marker = format!(
+        "large.bin\0f\0over-budget:{}\n",
+        ikigai_browse::MAX_FILE_BYTES + 1
+    );
+    let dir = block_on(kernel.issue(
+        Request::new(Verb::Source, Iri::parse("urn:repo:demo:hash").unwrap()),
+        &cap,
+    ))
+    .unwrap();
+    assert_eq!(
+        dir.bytes,
+        format!("sha256:{:x}", Sha256::digest(marker.as_bytes())).as_bytes()
     );
 
     // At the boundary, preserve every byte and hash the complete content.
@@ -57,7 +74,6 @@ fn one_byte_over_file_budget_is_refused() {
         &cap,
     ))
     .unwrap();
-    use sha2::{Digest, Sha256};
     assert_eq!(
         hash.bytes,
         format!("sha256:{:x}", Sha256::digest(&content.bytes)).as_bytes()
