@@ -1041,9 +1041,9 @@ pub(crate) fn granted(inv: &Invocation<'_>, repo: &str) -> Result<()> {
     }
     // Typed `Denied` — a permanent authority failure the trace, manifold, and
     // wire recognize as a 403-equivalent without sniffing message text.
-    Err(Error::Denied(format!(
-        "browse: capability does not grant `{scope}`"
-    )))
+    Err(Error::Denied(
+        format!("browse: capability does not grant `{scope}`").into(),
+    ))
 }
 
 /// The decoded `path` binding, or `""` (the root) when the grammar captured

@@ -1027,11 +1027,14 @@ impl Endpoint for ExplainEndpoint {
         if let Some(provider) = &requested_provider {
             let selectable = config.selectable();
             if !selectable.contains(provider) {
-                return Err(Error::Denied(format!(
-                    "browse: `{provider}` is not a provider this host offers to explain \
+                return Err(Error::Denied(
+                    format!(
+                        "browse: `{provider}` is not a provider this host offers to explain \
                      with; selectable here: {}",
-                    selectable.into_iter().collect::<Vec<_>>().join(", ")
-                )));
+                        selectable.into_iter().collect::<Vec<_>>().join(", ")
+                    )
+                    .into(),
+                ));
             }
             if let Ok(version) = inv.inline_str("version") {
                 return Err(Error::Endpoint(format!(

@@ -861,7 +861,9 @@ impl Endpoint for FindingsWritten {
         // changed, so a browse-family grant is sufficient (as at the kernel floor).
         if !inv.capability.satisfies(CAP_WILDCARD) {
             return Err(Error::Denied(
-                "invalidating findings needs a browse read grant".to_string(),
+                "invalidating findings needs a browse read grant"
+                    .to_string()
+                    .into(),
             ));
         }
         Ok(repr_utf8(
