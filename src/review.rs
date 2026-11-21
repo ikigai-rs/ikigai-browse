@@ -1941,11 +1941,14 @@ impl ReviewEndpoint {
             Ok(requested) => {
                 let selectable = config.selectable();
                 if !selectable.contains(requested) {
-                    return Err(Error::Denied(format!(
-                        "browse: `{requested}` is not a provider this host offers to review \
+                    return Err(Error::Denied(
+                        format!(
+                            "browse: `{requested}` is not a provider this host offers to review \
                          with; selectable here: {}",
-                        selectable.into_iter().collect::<Vec<_>>().join(", ")
-                    )));
+                            selectable.into_iter().collect::<Vec<_>>().join(", ")
+                        )
+                        .into(),
+                    ));
                 }
                 requested.to_string()
             }
@@ -3442,7 +3445,7 @@ mod tests {
                     .unwrap_or_else(|| panic!("the model was asked {} times", asks.len()));
                 match reply.as_str() {
                     "ERROR" => Err(Error::Endpoint("the backend dropped the call".to_string())),
-                    "DENIED" => Err(Error::Denied("no net grant".to_string())),
+                    "DENIED" => Err(Error::Denied("no net grant".to_string().into())),
                     // ikigai-llm 0.16's typing of an origin 401/403 and 429.
                     "REFUSED" => Err(Error::Refused("llm backend returned 401".to_string())),
                     "RATE-LIMITED" => Err(Error::RetryAfter {

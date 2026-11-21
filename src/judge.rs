@@ -2079,11 +2079,14 @@ impl Endpoint for JudgeEndpoint {
             Ok(requested) => {
                 let selectable = self.config.selectable();
                 if !selectable.contains(requested) {
-                    return Err(Error::Denied(format!(
-                        "browse: `{requested}` is not a provider this host offers to judge \
+                    return Err(Error::Denied(
+                        format!(
+                            "browse: `{requested}` is not a provider this host offers to judge \
                          with; selectable here: {}",
-                        selectable.into_iter().collect::<Vec<_>>().join(", ")
-                    )));
+                            selectable.into_iter().collect::<Vec<_>>().join(", ")
+                        )
+                        .into(),
+                    ));
                 }
                 requested.to_string()
             }
@@ -2527,11 +2530,14 @@ impl JudgeFindingEndpoint {
             Ok(requested) => {
                 let selectable = self.config.selectable();
                 if !selectable.contains(requested) {
-                    return Err(Error::Denied(format!(
-                        "browse: `{requested}` is not a provider this host offers to judge \
+                    return Err(Error::Denied(
+                        format!(
+                            "browse: `{requested}` is not a provider this host offers to judge \
                          with; selectable here: {}",
-                        selectable.into_iter().collect::<Vec<_>>().join(", ")
-                    )));
+                            selectable.into_iter().collect::<Vec<_>>().join(", ")
+                        )
+                        .into(),
+                    ));
                 }
                 requested.to_string()
             }
