@@ -568,7 +568,10 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # public API (`Error`, `EndpointSpace`, the store's `SharedWriter`) now speaks core 0.4 types, and a host
 # still on core 0.3 cannot mix them. No behavior change: each `Error::Denied` built from a string
 # now converts it into a `Denial` with `.into()`, the only edit `src/` needed.
-version = "0.24.0"
+# 0.24.1 — PATCH (ledger #3988): every browse git read also gets command-scope core.fsmonitor=false and
+# core.hooksPath=/dev/null, so a repository's own .git/config can no longer start an fsmonitor or a
+# post-index-change hook from `git status` / `git ls-files`. No API, resource, face or stored term moves.
+version = "0.24.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
