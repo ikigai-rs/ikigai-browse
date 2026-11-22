@@ -55,21 +55,28 @@ fn the_host_environment_neither_redirects_nor_leaks() {
     let seen = served.with_extension("token-seen");
     git(&served, &["init", "-q"]);
     std::fs::write(served.join("a.txt"), "served\n").unwrap();
-    git(&served, &["add", "a.txt"]);
+    std::fs::write(served.join(".gitattributes"), "a.txt filter=probe\n").unwrap();
+    git(&served, &["add", "a.txt", ".gitattributes"]);
     git(&served, &["commit", "-q", "-m", "served"]);
     // The host's OWN configuration of the repository it serves (trusted): a
-    // probe standing in for any program git starts.
+    // probe standing in for any program git starts. A clean filter, because
+    // browse turns the fsmonitor and hooks off (ledger #3988) while git still
+    // runs a filter when `status` rehashes a stat-dirty file; it passes the
+    // content through, so the file stays clean.
     git(
         &served,
         &[
             "config",
-            "core.fsmonitor",
-            &format!(
-                "echo \"${{GH_TOKEN:-unset}}\" > '{}'; false",
-                seen.display()
-            ),
+            "filter.probe.clean",
+            &format!("echo \"${{GH_TOKEN:-unset}}\" > '{}'; cat", seen.display()),
         ],
     );
+    std::fs::File::options()
+        .write(true)
+        .open(served.join("a.txt"))
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+        .unwrap();
     git(&outside, &["init", "-q"]);
     git(
         &outside,

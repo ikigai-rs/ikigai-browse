@@ -21,8 +21,9 @@
 //! ancestors when the root is initially opened. Git's own repository reads are
 //! outside this filesystem jail; its working directory is pinned separately.
 //! Every git run also refuses a bare repository it would discover (tracked
-//! files can spell one), and drops inherited repository-selecting variables and
-//! GitHub tokens: see [`harden_git`] (ledger #3492).
+//! files can spell one), starts no fsmonitor or hook the repository's own
+//! configuration names, and drops inherited repository-selecting variables and
+//! GitHub tokens: see [`harden_git`] (ledgers #3492, #3988).
 //! Platforms without the Unix handle-relative implementation refuse checkout
 //! access explicitly; they never fall back to pathname-based reads.
 
@@ -332,8 +333,34 @@ const TOKEN_ENV: &[&str] = &[
     "GITHUB_ENTERPRISE_TOKEN",
 ];
 
-/// Keep repository content and the host's inherited environment from choosing
-/// what browse's git reads or runs (ledger #3492).
+/// Command-scope configuration every browse git run gets, after any entries
+/// the host already passes (`GIT_CONFIG_COUNT`), so these win over every other
+/// scope (git-config(1), "CONFIGURATION FILE": the command scope is read last).
+///
+/// - `safe.bareRepository=explicit`: refuse a bare repository git would
+///   discover in tracked content (ledger #3492); honored only from protected
+///   configuration, which the command scope is.
+/// - `core.fsmonitor=false`: `git status` and `git ls-files --others` start
+///   the configured fsmonitor hook (a program path) or daemon before they scan
+///   the work tree (ledger #3988).
+/// - `core.hooksPath=/dev/null`: `git status` refreshes a stat-dirty index and
+///   writes it back, which fires `post-index-change` (githooks(5)); a hooks
+///   directory that cannot hold a file covers `core.hooksPath` and the default
+///   `$GIT_DIR/hooks` alike (ledger #3988).
+///
+/// Every spawn browse makes is a read (`status`, `rev-parse`, `ls-files`,
+/// `rev-list`, `cat-file --batch[-check]`), so none needs a hook or an
+/// fsmonitor. Both settings reach the git a `status` starts in each submodule,
+/// since the command scope is carried in the environment.
+const PROTECTED_CONFIG: &[(&str, &str)] = &[
+    ("safe.bareRepository", "explicit"),
+    ("core.fsmonitor", "false"),
+    ("core.hooksPath", "/dev/null"),
+];
+
+/// Keep repository content, the repository's own configuration and the host's
+/// inherited environment from choosing what browse's git reads or runs
+/// (ledgers #3492, #3988).
 ///
 /// MIRRORS ikigai-repo PR 31 (`refuse_implicit_bare` and its `REPOSITORY_ENV` /
 /// `TOKEN_ENV`), which exposes no helper to reuse; the two copies must move
@@ -341,22 +368,29 @@ const TOKEN_ENV: &[&str] = &[
 /// tracked content whose files spell a bare repository (`HEAD`, `config`,
 /// `objects/`, `refs/`, or a `commondir` naming a repository outside every
 /// root); git, finding no `.git` in the root, would adopt it, run its
-/// configuration (`core.fsmonitor`) and read the repository it names.
-/// `safe.bareRepository=explicit` refuses that, and is honored only from
-/// protected configuration, which the command scope (`GIT_CONFIG_COUNT`, after
-/// any entries the host already passes) is.
+/// configuration and read the repository it names. A repository's own
+/// `.git/config` is not tracked content, but it can still name programs a read
+/// would start: see [`PROTECTED_CONFIG`] for what is turned off.
+///
+/// Not covered: a filter driver (`filter.<driver>.clean` or `.process`, chosen
+/// by `.gitattributes`) runs when `git status` rehashes a stat-dirty file. Its
+/// name is the repository's own, so no fixed key turns it off, and git-lfs
+/// repositories need it for a correct status.
 fn harden_git(command: &mut Command) {
     for name in REPOSITORY_ENV.iter().chain(TOKEN_ENV) {
         command.env_remove(name);
     }
-    let count = std::env::var("GIT_CONFIG_COUNT")
+    let mut count = std::env::var("GIT_CONFIG_COUNT")
         .ok()
         .and_then(|count| count.parse::<usize>().ok())
         .unwrap_or(0);
-    command
-        .env(format!("GIT_CONFIG_KEY_{count}"), "safe.bareRepository")
-        .env(format!("GIT_CONFIG_VALUE_{count}"), "explicit")
-        .env("GIT_CONFIG_COUNT", (count + 1).to_string());
+    for (key, value) in PROTECTED_CONFIG {
+        command
+            .env(format!("GIT_CONFIG_KEY_{count}"), key)
+            .env(format!("GIT_CONFIG_VALUE_{count}"), value);
+        count += 1;
+    }
+    command.env("GIT_CONFIG_COUNT", count.to_string());
 }
 
 /// Missing names and refused symlink loops share the missing-path response.
@@ -654,5 +688,150 @@ mod tests {
         assert!(!out.status.success());
         assert!(String::from_utf8_lossy(&out.stderr).contains("not a git repository"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `git -C dir` for fixture setup, unhardened and with a throwaway identity.
+    fn setup_git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .env_remove("GIT_DIR")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    /// Every argument vector browse passes to [`Jailed::git`] or
+    /// [`Jailed::git_batch`]: `git_state` (lib.rs), `git_ignored` (hash.rs),
+    /// `history` and the reviewed-version lookup (judge.rs).
+    const READ_SPAWNS: &[&[&str]] = &[
+        &["status", "--porcelain", "-z", "--", "."],
+        &["rev-parse", "--show-prefix"],
+        &["rev-parse", "HEAD"],
+        &[
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+        ],
+        &["rev-list", "--all", "--", "a.txt"],
+    ];
+
+    /// A repository whose OWN `.git/config` (not tracked content: whoever can
+    /// write it is on the host) names programs git would start: an fsmonitor,
+    /// and a `core.hooksPath` holding `post-index-change`, which `git status`
+    /// fires when it refreshes and rewrites a stat-dirty index. Each writes
+    /// its name to the returned marker directory. Ledger #3988.
+    ///
+    /// Git starts these through a shell, so the paths stay shell-plain (no
+    /// `ThreadId(..)` as in [`scratch`]). Returns the base holding everything,
+    /// the repository and the marker directory.
+    fn hooked_repository(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let base =
+            std::env::temp_dir().join(format!("browse-checkout-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (root, marks, hooks) = (base.join("root"), base.join("marks"), base.join("hooks"));
+        for dir in [&root, &marks, &hooks] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        setup_git(&root, &["init", "-q"]);
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        setup_git(&root, &["add", "a.txt"]);
+        setup_git(&root, &["commit", "-q", "-m", "first"]);
+        let probe = |name: &str, path: &Path| {
+            let script = format!(
+                "#!/bin/sh\ntouch '{}'\nexit 1\n",
+                marks.join(name).display()
+            );
+            std::fs::write(path, script).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let fsmonitor = hooks.join("fsmonitor");
+        probe("fsmonitor", &fsmonitor);
+        for hook in ["post-index-change", "reference-transaction"] {
+            probe(hook, &hooks.join(hook));
+            // The default hooks directory too: `core.hooksPath` is only one
+            // way to name a hook.
+            probe(hook, &root.join(".git/hooks").join(hook));
+        }
+        setup_git(
+            &root,
+            &["config", "core.fsmonitor", fsmonitor.to_str().unwrap()],
+        );
+        setup_git(
+            &root,
+            &["config", "core.hooksPath", hooks.to_str().unwrap()],
+        );
+        (base, root, marks)
+    }
+
+    /// Make `a.txt` stat-dirty (same content, later mtime), so `git status`
+    /// refreshes the index entry and writes the index back.
+    fn touch_tracked(root: &Path) {
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(root.join("a.txt"))
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+    }
+
+    fn marks(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn repository_configured_programs_do_not_run_on_reads() {
+        let (base, root, marked) = hooked_repository("repo-programs");
+        // The fixture is not vacuous: unhardened, the same reads run them.
+        touch_tracked(&root);
+        for args in READ_SPAWNS {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(*args)
+                .env_remove("GIT_DIR")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        }
+        assert_eq!(marks(&marked), ["fsmonitor", "post-index-change"]);
+        for name in marks(&marked) {
+            std::fs::remove_file(marked.join(name)).unwrap();
+        }
+
+        let top = Jailed::root(&root).unwrap();
+        for args in READ_SPAWNS {
+            touch_tracked(&root);
+            let out = top.git(args).unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+            assert!(
+                marks(&marked).is_empty(),
+                "git {args:?} ran {:?} from the repository's configuration",
+                marks(&marked)
+            );
+        }
+        for args in [
+            &["cat-file", "--batch-check"][..],
+            &["cat-file", "--batch"][..],
+        ] {
+            touch_tracked(&root);
+            let out = top.git_batch(args, "HEAD:./a.txt\n".to_string()).unwrap();
+            assert!(!out.is_empty(), "{args:?}");
+            assert!(marks(&marked).is_empty(), "{args:?}: {:?}", marks(&marked));
+        }
+        std::fs::remove_dir_all(base).unwrap();
     }
 }
