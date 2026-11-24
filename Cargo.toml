@@ -597,6 +597,11 @@ exclude = ["tests/corpus/judge/"]
 # module's transform is feature-free and tested against the in-memory store,
 # so ordinary CI proves the transform without ever building RocksDB.
 migrate = ["oxigraph/rocksdb"]
+# Research spike only (ledger #2496, docs/research/gix-reads.md): builds the
+# `gix-read-spike` example, which times browse's git reads in-process through
+# gitoxide against the git CLI. No library code uses it; default behavior is
+# unchanged.
+gix-spike = ["dep:gix"]
 
 # The migration binary is gated: a default `cargo build` of this crate must
 # stay pure-Rust (the same reason syntect uses fancy-regex and the hash is
@@ -619,6 +624,11 @@ required-features = ["migrate"]
 # The rehearsal fixture: a throwaway on-disk store in the PRE-0.3.0 shape, so
 # the migration can be run end-to-end against real RocksDB before it is run
 # against the real store. Same gate, same reason.
+[[example]]
+name = "gix-read-spike"
+path = "examples/gix-read-spike.rs"
+required-features = ["gix-spike"]
+
 [[example]]
 name = "migration-rehearsal"
 path = "examples/migration-rehearsal.rs"
@@ -781,6 +791,7 @@ uuid = { version = "1", features = ["v4"] }
 # embedded host uses for its workspace, at the same major, so a host linking
 # both builds one copy. Native by construction, like the rest of this crate.
 notify = "6.1"
+gix = { version = "0.90", default-features = false, features = ["sha1", "sha256", "status", "revision"], optional = true }
 
 [dev-dependencies]
 # The module recipe as one test (`tests/conformance.rs`): the suite walks every

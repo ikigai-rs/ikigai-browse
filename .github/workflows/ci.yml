@@ -9,7 +9,9 @@ jobs:
   ci:
     uses: ikigai-rs/.github/.github/workflows/rust.yml@main
     with:
-      features: migrate
+      # `gix-spike` builds the gitoxide read spike (examples/gix-read-spike.rs, ledger #2496),
+      # which `required-features` hides from every other job (rule 9c).
+      features: migrate gix-spike
       # Every live browse host runs on macOS, whose default volume is
       # case-insensitive: there `.GIT/config` opens the real `.git/config`, and
       # tests/git_dir.rs proves it is refused on the volume it is deployed on,
