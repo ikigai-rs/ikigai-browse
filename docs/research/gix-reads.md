@@ -133,7 +133,9 @@ filters on success and gets `head: None`. gix's `head_id()` is an error, which a
      marker file.
    - `git status` ran it and the marker appeared.
    - gix's status alone (`SPIKE_GIX_STATUS_ONLY=1`) did not run it, and the marker was absent.
-   - This also shows that browse's current CLI hardening (`harden_git`: environment scrubbing and
+   - (Since fixed: browse PR 163, ledger #3988, turned these hooks off on the CLI path; the
+     paragraph below describes the hardening as it was when the spike ran.)
+   - This also shows that browse's then-current CLI hardening (`harden_git`: environment scrubbing and
      `safe.bareRepository=explicit`) does not stop a non-bare repository's **own** config from
      starting a hook on `status`. That config is not tracked content, so this is a host-trust
      question rather than a remote-content one, but it is a real difference between the two
@@ -173,7 +175,9 @@ filters on success and gets `head: None`. gix's `head_id()` is an error, which a
 4. **Write a status parity test between gix and `git status --porcelain -z`.** Compare full
    porcelain records, not counts, on renames, submodules (dirty and new commits), sparse
    checkouts, ignored files and a root below its work tree's top. Run it before status moves.
-5. **Decide whether the CLI path should neutralize repo-configured hooks.** For browse's read
+5. **Done since this spike ran:** browse PR 163 (ledger #3988, browse 0.24.1) turns off repo-configured
+   `core.fsmonitor` and hooks on browse's git reads, and ikigai-repo 0.7.1 does the same.
+   The original proposal follows. **Decide whether the CLI path should neutralize repo-configured hooks.** For browse's read
    spawns, consider `core.fsmonitor=false` (and similar) in the protected command-scope config
    next to `safe.bareRepository`. Mirror whatever is decided in ikigai-repo's copy of the
    hardening.
