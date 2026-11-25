@@ -571,7 +571,9 @@ description = "Repository browsing as ikigai resources: per-root tree / file / g
 # 0.24.1 — PATCH (ledger #3988): every browse git read also gets command-scope core.fsmonitor=false and
 # core.hooksPath=/dev/null, so a repository's own .git/config can no longer start an fsmonitor or a
 # post-index-change hook from `git status` / `git ls-files`. No API, resource, face or stored term moves.
-version = "0.24.1"
+# 0.24.2 — PATCH (ledger #4372): optional arguments with invalid values now produce a named
+# refusal instead of silently selecting a default. No persisted state changes.
+version = "0.24.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -687,7 +689,8 @@ required-features = ["migrate"]
 # the cascade). `Error::Denied` carries a `Denial` now; `src/` builds it from a
 # `String` through `.into()`. Every ikigai crate below moves with it, so the graph links ONE core.
 # ⚠ A ceiling in turn: `<0.5.0`.
-ikigai-core = "0.4.0"
+# 0.4.3 is the first 0.4 release with optional_str and optional_arg.
+ikigai-core = "0.4.3"
 # The accessibility config and the contrast-floor pass: `urn:repo:style`'s
 # themes and its contrast floor are read from the layered `a11y.toml` rather
 # than hard-coded, and each theme's own sub-floor colours are lifted to that
@@ -862,7 +865,7 @@ ikigai-vocab = "0.4.1"
 # `"0.2.3"` meant `<0.3.0`, which `[dependencies]` above no longer admits; the two lines agree now.
 # "0.4.0" (the core 0.4.0 cascade, ledger #3936): core 0.4.0 (scope opacity, structured denials;
 # the cascade), matching `[dependencies]` above.
-ikigai-core = "0.4.0"
+ikigai-core = "0.4.3"
 futures = "0.3"
 # Validates the Turtle face in tests — the graph must actually parse.
 oxttl = "0.2"

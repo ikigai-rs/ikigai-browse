@@ -1135,7 +1135,7 @@ pub(crate) fn repr_utf8(media: &str, body: String) -> Representation {
 /// response; `false` (the default) leaves it untouched. Anything else is a
 /// typed argument error — the manifold declares exactly these values.
 pub(crate) fn include_annotations(inv: &Invocation<'_>) -> Result<bool> {
-    match inv.inline_str("annotations").unwrap_or("false") {
+    match inv.optional_str("annotations")?.unwrap_or("false") {
         "include" | "true" => Ok(true),
         "" | "false" => Ok(false),
         other => Err(Error::InvalidArgument {
@@ -1158,7 +1158,7 @@ pub(crate) fn include_annotations(inv: &Invocation<'_>) -> Result<bool> {
 pub(crate) fn proposal_severities(inv: &Invocation<'_>) -> Result<Vec<String>> {
     let mut out: Vec<String> = Vec::new();
     for word in inv
-        .inline_str("proposals")
+        .optional_str("proposals")?
         .unwrap_or("")
         .split(',')
         .map(str::trim)
@@ -1381,7 +1381,7 @@ fn tree_endpoint(
                 Err(_) => false,
             }
         });
-        match inv.inline_str("as").unwrap_or("text/plain") {
+        match inv.optional_str("as")?.unwrap_or("text/plain") {
             t if t.starts_with("text/turtle") => {
                 Ok(repr("text/turtle", tree_turtle(repo, &rel, &entries)))
             }
@@ -1852,7 +1852,11 @@ impl FileEndpoint {
     fn is_raw(inv: &Invocation<'_>) -> Result<bool> {
         let include = include_annotations(inv)?;
         let proposals = proposal_severities(inv)?;
-        let html = inv.inline_str("as").unwrap_or("").starts_with("text/html");
+        inv.optional_str("focus")?;
+        let html = inv
+            .optional_str("as")?
+            .unwrap_or("")
+            .starts_with("text/html");
         Ok(!html && !include && proposals.is_empty())
     }
 
@@ -1863,6 +1867,7 @@ impl FileEndpoint {
         let bytes = file_read::read_file(&target)?;
         let include = include_annotations(inv)?;
         let proposals = proposal_severities(inv)?;
+        let focus = inv.optional_str("focus")?;
         // Both folds need a mounted store. Checked before the face is chosen
         // so an unmounted `proposals=` fails loud on the html face too — an
         // opt-in that silently drew nothing would be indistinguishable from
@@ -1876,7 +1881,7 @@ impl FileEndpoint {
                     .to_string(),
             });
         }
-        match inv.inline_str("as").unwrap_or("") {
+        match inv.optional_str("as")?.unwrap_or("") {
             // The HTML face already renders the annotations panel when the
             // store is mounted — `annotations=include` changes nothing there.
             t if t.starts_with("text/html") => Ok(repr_utf8(
@@ -1888,7 +1893,7 @@ impl FileEndpoint {
                     archive.as_deref(),
                     explain,
                     &proposals,
-                    inv.inline_str("focus").ok(),
+                    focus,
                 )?,
             )),
             _ if include || !proposals.is_empty() => {
@@ -2806,7 +2811,7 @@ fn state_endpoint(roots: &Roots) -> FnEndpoint {
         let (repo, root) = repo_root(inv, &held)?;
         granted(inv, repo)?;
         let state = git_state(root)?;
-        match inv.inline_str("as").unwrap_or("text/plain") {
+        match inv.optional_str("as")?.unwrap_or("text/plain") {
             t if t.starts_with("application/json") => {
                 let json = serde_json::json!({ "head": state.head, "dirty": state.dirty });
                 Ok(repr("application/json", json.to_string()))
@@ -2855,6 +2860,57 @@ fn state_description() -> Description {
         .output("application/json")
 }
 
+#[cfg(test)]
+pub(crate) mod optional_arg_tests {
+    use futures::executor::block_on;
+    use ikigai_core::{ArgRef, Capability, ContentId, Error, Iri, Kernel, Request, Verb};
+
+    pub(crate) fn check(
+        kernel: &Kernel,
+        cap: &Capability,
+        verb: Verb,
+        iri: &str,
+        fixed: &[(&str, &str)],
+        name: &str,
+        valid: &str,
+    ) {
+        let request = || {
+            let mut r = Request::new(verb, Iri::parse(iri).unwrap());
+            for (key, value) in fixed {
+                r = r.with_arg(*key, ArgRef::Inline(value.as_bytes().to_vec()));
+            }
+            r
+        };
+        block_on(kernel.issue(request(), cap))
+            .unwrap_or_else(|e| panic!("{iri}, absent {name}: {e}"));
+        block_on(kernel.issue(
+            request().with_arg(name, ArgRef::Inline(valid.as_bytes().to_vec())),
+            cap,
+        ))
+        .unwrap_or_else(|e| panic!("{iri}, valid {name}: {e}"));
+        for value in [
+            ArgRef::Inline(vec![0xff]),
+            ArgRef::Content(ContentId::of(b"body")),
+        ] {
+            let error = block_on(kernel.issue(request().with_arg(name, value), cap))
+                .expect_err("unreadable argument must be refused");
+            match error {
+                Error::InvalidArgument {
+                    name: actual,
+                    detail,
+                } => {
+                    assert_eq!(actual, name, "{iri}");
+                    assert!(
+                        !detail.is_empty(),
+                        "{iri}: refusal must explain the problem"
+                    );
+                }
+                other => panic!("{iri}, invalid {name}: {other:?}"),
+            }
+        }
+    }
+}
+
 // --- tests ------------------------------------------------------------------
 
 #[cfg(test)]
@@ -2864,6 +2920,87 @@ mod tests {
     use ikigai_core::{ArgRef, Capability, Kernel, Request};
     use std::process::Command;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn non_inline_optional_arguments_are_refused() {
+        use ikigai_core::ContentId;
+        let bindings = Bindings::new();
+        let cap = demo_cap();
+        for value in [
+            ArgRef::Reference(Iri::parse("urn:example:value").unwrap()),
+            ArgRef::Content(ContentId::of(b"value")),
+        ] {
+            for name in ["annotations", "proposals"] {
+                let request = Request::new(Verb::Source, Iri::parse("urn:example").unwrap())
+                    .with_arg(name, value.clone());
+                let inv = Invocation::detached(&request, &bindings, &cap);
+                let err = if name == "annotations" {
+                    include_annotations(&inv).map(|_| ())
+                } else {
+                    proposal_severities(&inv).map(|_| ())
+                }
+                .unwrap_err();
+                assert!(
+                    matches!(err, Error::InvalidArgument { name: ref actual, ref detail } if actual == name && !detail.is_empty()),
+                    "{err:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn optional_arguments_on_basic_faces() {
+        use crate::optional_arg_tests::check;
+        let root = demo_root();
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        let k = kernel(vec![("demo".to_string(), root.clone())]);
+        let cap = demo_cap();
+        for (iri, name, valid, fixed) in [
+            ("urn:repo:demo:tree", "as", "text/html", vec![]),
+            ("urn:repo:demo:state", "as", "application/json", vec![]),
+            (
+                "urn:repo:demo:hash:src/lib.rs",
+                "as",
+                "application/json",
+                vec![],
+            ),
+            ("urn:repo:demo:file:src/lib.rs", "as", "text/html", vec![]),
+            (
+                "urn:repo:demo:file:src/lib.rs",
+                "annotations",
+                "false",
+                vec![],
+            ),
+            ("urn:repo:demo:file:src/lib.rs", "proposals", "", vec![]),
+            (
+                "urn:repo:demo:file:src/lib.rs",
+                "focus",
+                "abc",
+                vec![("as", "text/html")],
+            ),
+            ("urn:repo:demo:file:src/lib.rs", "focus", "abc", vec![]),
+        ] {
+            check(&k, &cap, Verb::Source, iri, &fixed, name, valid);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_optional_annotations_are_refused() {
+        let k = kernel(vec![("demo".to_string(), demo_root())]);
+        let request = Request::new(
+            Verb::Source,
+            Iri::parse("urn:repo:demo:file:src/lib.rs").unwrap(),
+        )
+        .with_arg("annotations", ArgRef::Inline(vec![0xff]));
+        let err = block_on(k.issue(request, &demo_cap())).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument { ref name, .. } if name == "annotations"));
+    }
 
     fn temp_dir() -> PathBuf {
         static COUNTER: AtomicU32 = AtomicU32::new(0);

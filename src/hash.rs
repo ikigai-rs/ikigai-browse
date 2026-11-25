@@ -177,7 +177,7 @@ pub(crate) fn hash_endpoint(roots: &Roots, ignore: &Arc<BTreeSet<String>>) -> Fn
         granted(inv, repo)?;
         let rel = path_binding(inv)?;
         let hash = hash_of(root, &rel, &ignore)?;
-        match inv.inline_str("as").unwrap_or("text/plain") {
+        match inv.optional_str("as")?.unwrap_or("text/plain") {
             t if t.starts_with("application/json") => {
                 let target = if resolve(root, &rel)?.is_dir() {
                     tree_iri(repo, &rel)

@@ -2713,12 +2713,13 @@ impl AnnotationEndpoint {
     /// check gates on the ANNOTATION'S repo — reading an annotation is
     /// reading (about) its target.
     async fn read(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let face = inv.optional_str("as")?.unwrap_or("text/plain");
         let id = Self::id_binding(inv)?;
         let mut ann = self.load_required(&id)?;
         granted(inv, &ann.repo)?;
         let current = current_content_for(inv, &self.roots, &ann.repo, &ann.target_ref()).await?;
         let line = refresh(&self.archive, &mut ann, &current)?;
-        match inv.inline_str("as").unwrap_or("text/plain") {
+        match face {
             t if t.starts_with("application/json") => Ok(repr(
                 "application/json",
                 annotation_json(&ann, line).to_string(),
@@ -2741,6 +2742,7 @@ impl AnnotationEndpoint {
     /// fresh and clears any orphan/re-anchor flags; its `dcterms:created`
     /// survives from the first creation.
     async fn write(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let face = inv.optional_str("as")?.unwrap_or("text/plain");
         let (id, minted) = match inv.bindings.get("id") {
             Some(id) => (validate_id(id)?, false),
             None => (uuid::Uuid::new_v4().to_string(), true),
@@ -2769,10 +2771,10 @@ impl AnnotationEndpoint {
         }
         // Pipeline citizenship: the note text is the `body` arg, with the
         // piped `content` as fallback.
-        let body = inv
-            .inline_str("body")
-            .ok()
-            .or_else(|| inv.inline_str("content").ok())
+        let body_arg = inv.optional_str("body")?;
+        let content_arg = inv.optional_str("content")?;
+        let body = body_arg
+            .or(content_arg)
             .map(str::trim)
             .filter(|b| !b.is_empty())
             .map(str::to_string)
@@ -2784,8 +2786,8 @@ impl AnnotationEndpoint {
                 detail: "the quoted text must be non-empty".to_string(),
             });
         }
-        let hint_prefix = inv.inline_str("prefix").unwrap_or("");
-        let hint_suffix = inv.inline_str("suffix").unwrap_or("");
+        let hint_prefix = inv.optional_str("prefix")?.unwrap_or("");
+        let hint_suffix = inv.optional_str("suffix")?.unwrap_or("");
 
         let tref = match &parsed {
             SinkTarget::File { rel, .. } => TargetRef::File(rel),
@@ -2863,7 +2865,7 @@ impl AnnotationEndpoint {
             cannots: Vec::new(),
         };
         rewrite_annotation(&self.archive, &ann)?;
-        match inv.inline_str("as").unwrap_or("text/plain") {
+        match face {
             t if t.starts_with("application/json") => {
                 let mut json = annotation_json(&ann, Some(anchor.line));
                 json["minted"] = serde_json::Value::Bool(minted);
@@ -3036,6 +3038,7 @@ impl Endpoint for AnnotationsEndpoint {
                 inv.request.verb
             )));
         }
+        let face = inv.optional_str("as")?.unwrap_or("application/json");
         let (repo, _root) = repo_root(inv, &self.roots)?;
         granted(inv, repo)?;
         let rel = path_binding(inv)?;
@@ -3044,7 +3047,7 @@ impl Endpoint for AnnotationsEndpoint {
         // One content fetch per distinct target, then the drift pass each.
         let rows = reconcile(inv, &self.archive, &self.roots, repo, anns).await?;
 
-        match inv.inline_str("as").unwrap_or("application/json") {
+        match face {
             t if t.starts_with("text/html") => Ok(repr_utf8(
                 "text/html",
                 annotations_listing_html(repo, &rel, &rows),
@@ -4276,6 +4279,90 @@ mod tests {
     // reproductions (ledger #723, led arm b7), which fail on 0b1ec3e.
     const OVERLAPPING: &str = "a\n    }\n    }\n    }\nb";
     const OVERLAPPING_EXACT: &str = "    }\n    }";
+
+    #[test]
+    fn optional_arguments_on_annotation_faces() {
+        use crate::optional_arg_tests::check;
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "fn alpha() {}\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        let target = "urn:repo:demo:file:a.rs";
+        let base = [
+            ("target", target),
+            ("exact", "fn alpha() {}"),
+            ("body", "note"),
+        ];
+        check(
+            &k,
+            &cap(),
+            Verb::Sink,
+            "urn:iki:annotation:n",
+            &base,
+            "as",
+            "application/json",
+        );
+        check(
+            &k,
+            &cap(),
+            Verb::Sink,
+            "urn:iki:annotation:n",
+            &base,
+            "prefix",
+            "fn ",
+        );
+        check(
+            &k,
+            &cap(),
+            Verb::Sink,
+            "urn:iki:annotation:n",
+            &base,
+            "suffix",
+            "\n",
+        );
+        check(
+            &k,
+            &cap(),
+            Verb::Sink,
+            "urn:iki:annotation:n",
+            &base,
+            "content",
+            "piped",
+        );
+        let fallback = [
+            ("target", target),
+            ("exact", "fn alpha() {}"),
+            ("content", "piped"),
+        ];
+        check(
+            &k,
+            &cap(),
+            Verb::Sink,
+            "urn:iki:annotation:n",
+            &fallback,
+            "body",
+            "note",
+        );
+        check(
+            &k,
+            &cap(),
+            Verb::Source,
+            "urn:iki:annotation:n",
+            &[],
+            "as",
+            "application/json",
+        );
+        check(
+            &k,
+            &cap(),
+            Verb::Source,
+            "urn:repo:demo:annotations:a.rs",
+            &[],
+            "as",
+            "text/html",
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn an_overlapping_occurrence_is_scored() {

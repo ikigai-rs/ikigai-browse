@@ -720,8 +720,8 @@ impl Page {
     /// `None` when neither argument was given: the unpaged listing, byte for
     /// byte the answer it always was (up to [`ANSWER_MAX_BYTES`]).
     fn of(inv: &Invocation<'_>) -> Result<Option<Page>> {
-        let limit = match inv.inline_str("limit") {
-            Ok(value) => Some(
+        let limit = match inv.optional_str("limit")? {
+            Some(value) => Some(
                 value
                     .trim()
                     .parse::<usize>()
@@ -732,10 +732,10 @@ impl Page {
                         detail: format!("`{value}` is not a whole number from 1 to {PAGE_MAX}"),
                     })?,
             ),
-            Err(_) => None,
+            None => None,
         };
-        let after = match inv.inline_str("after") {
-            Ok(value) if value.is_empty() || value.contains(':') => {
+        let after = match inv.optional_str("after")? {
+            Some(value) if value.is_empty() || value.contains(':') => {
                 return Err(Error::InvalidArgument {
                     name: "after".to_string(),
                     detail: format!(
@@ -744,8 +744,8 @@ impl Page {
                     ),
                 })
             }
-            Ok(value) => Some(value.to_string()),
-            Err(_) => None,
+            Some(value) => Some(value.to_string()),
+            None => None,
         };
         Ok((limit.is_some() || after.is_some()).then(|| Page {
             limit: limit.unwrap_or(PAGE_DEFAULT),
@@ -959,6 +959,7 @@ impl FindingEndpoint {
     }
 
     async fn read(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        inv.optional_str("as")?;
         let id = Self::id_binding(inv)?;
         let mut finding = self.load_required(&id)?;
         granted(inv, &finding.repo)?;
@@ -989,6 +990,7 @@ impl FindingEndpoint {
     /// file now — so of two answers at once, one is recorded and the other is the double click
     /// or the refusal a sequential second answer is, never a second outcome on the same node.
     async fn decide(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        inv.optional_str("as")?;
         loop {
             if let Some(answer) = self.decide_once(inv)? {
                 return Ok(answer);
@@ -1016,18 +1018,18 @@ impl FindingEndpoint {
                 })
             }
         };
-        let stated = |name: &str| {
-            inv.inline_str(name)
-                .ok()
+        let stated = |name: &str| -> Result<Option<String>> {
+            Ok(inv
+                .optional_str(name)?
                 .map(str::trim)
                 .filter(|v| !v.is_empty())
-                .map(str::to_string)
+                .map(str::to_string))
         };
         // "A defect, proven" (ledger #696): only beside a publish, refused by
         // name anywhere else — a decline says the claim is NOT a defect, and
         // an accepted-then-ignored argument is invisible from the caller's
         // side. An EMPTY value is omitted, as for `reason`.
-        let reproduced = match stated("reproduced") {
+        let reproduced = match stated("reproduced")? {
             Some(word) => {
                 if outcome != Outcome::Published {
                     return Err(Error::InvalidArgument {
@@ -1067,7 +1069,7 @@ impl FindingEndpoint {
         // finding is never touched by any path. A retraction states none, and
         // is refused one by name rather than accepting a rating it would not
         // record.
-        let severity = match (outcome, stated("severity")) {
+        let severity = match (outcome, stated("severity")?) {
             (Outcome::Retracted, Some(chosen)) => {
                 return Err(Error::InvalidArgument {
                     name: "severity".to_string(),
@@ -1112,7 +1114,7 @@ impl FindingEndpoint {
         // ⚠ A real word beside anything but a decline IS refused, by name —
         // it has no consumer, and an argument accepted and then ignored is
         // the failure that is invisible from the caller's side.
-        let reason = match stated("reason") {
+        let reason = match stated("reason")? {
             Some(word) => {
                 if outcome != Outcome::Declined {
                     return Err(Error::InvalidArgument {
@@ -1138,7 +1140,9 @@ impl FindingEndpoint {
             None => None,
         };
         let made = made_arg(inv)?;
-        let revises_arg = stated("revises");
+        let revises_arg = stated("revises")?;
+        // Validate the piped note even when this decision is an idempotent repeat.
+        let note = stated("content")?;
         let head = finding.history.last().cloned();
         // A repeat that states no reason (or no mark) does not contradict one
         // on file; one that states a different reason, or the mark where none
@@ -1251,8 +1255,6 @@ impl FindingEndpoint {
             }
         };
 
-        // Pipeline citizenship: a piped value is the human's reason.
-        let note = stated("content");
         let at = inv.now().map(|t| iso8601(t.as_millis()));
         // The annotation a publish mints is written in the decision's own transaction, so it
         // lands exactly when the decision does.
@@ -1409,18 +1411,18 @@ fn on_file(d: &Decision) -> String {
 /// batch's group key, required beside `made=batch` and refused beside
 /// `made=single` — an argument accepted and ignored is invisible.
 fn made_arg(inv: &Invocation<'_>) -> Result<Option<Made>> {
-    let stated = |name: &str| {
-        inv.inline_str(name)
-            .ok()
+    let stated = |name: &str| -> Result<Option<String>> {
+        Ok(inv
+            .optional_str(name)?
             .map(str::trim)
             .filter(|v| !v.is_empty())
-            .map(str::to_string)
+            .map(str::to_string))
     };
     let refuse = |name: &str, detail: String| Error::InvalidArgument {
         name: name.to_string(),
         detail,
     };
-    match (stated("made").as_deref(), stated("batch")) {
+    match (stated("made")?.as_deref(), stated("batch")?) {
         (None, None) => Ok(None),
         (None, Some(key)) => Err(refuse(
             "batch",
@@ -1453,7 +1455,7 @@ fn made_arg(inv: &Invocation<'_>) -> Result<Option<Made>> {
 /// itself on a decline — so either pipes straight into a Source. The HTML
 /// form is [`decided_html`], what browse's own decision forms ask for.
 fn ack(inv: &Invocation<'_>, finding: &Annotation) -> Result<Representation> {
-    match inv.inline_str("as").unwrap_or("text/plain") {
+    match inv.optional_str("as")?.unwrap_or("text/plain") {
         t if t.starts_with("application/json") => Ok(repr(
             "application/json",
             annotate::annotation_json(finding, None).to_string(),
@@ -1516,11 +1518,12 @@ impl Endpoint for FindingsEndpoint {
                 inv.request.verb
             )));
         }
+        inv.optional_str("as")?;
         let (repo, _root) = repo_root(inv, &self.roots)?;
         granted(inv, repo)?;
         let rel = path_binding(inv)?;
         let filter = (!rel.is_empty()).then_some(rel.as_str());
-        let state = inv.inline_str("state").unwrap_or("pending").to_string();
+        let state = inv.optional_str("state")?.unwrap_or("pending").to_string();
         if !STATES.contains(&state.as_str()) {
             return Err(Error::InvalidArgument {
                 name: "state".to_string(),
@@ -1533,9 +1536,9 @@ impl Endpoint for FindingsEndpoint {
         // `summary=` widens the json face from the rows to an object that
         // also carries a count — a NEW shape under a NEW argument, so the
         // array every existing consumer reads is byte-identical without it.
-        let summary = match inv.inline_str("summary") {
-            Ok(word) if SUMMARIES.contains(&word) => Some(word.to_string()),
-            Ok(other) => {
+        let summary = match inv.optional_str("summary")? {
+            Some(word) if SUMMARIES.contains(&word) => Some(word.to_string()),
+            Some(other) => {
                 return Err(Error::InvalidArgument {
                     name: "summary".to_string(),
                     detail: format!(
@@ -1544,14 +1547,14 @@ impl Endpoint for FindingsEndpoint {
                     ),
                 })
             }
-            Err(_) => None,
+            None => None,
         };
         // `verdict=` (ledger #702) narrows the rows to those whose LATEST
         // verdict (the row's `judge`) is that word — the closed set a
         // consumer reads from this input's `one_of`, never from prose.
-        let verdict = match inv.inline_str("verdict") {
-            Ok(word) if crate::judge::VERDICTS.contains(&word) => Some(word.to_string()),
-            Ok(other) => {
+        let verdict = match inv.optional_str("verdict")? {
+            Some(word) if crate::judge::VERDICTS.contains(&word) => Some(word.to_string()),
+            Some(other) => {
                 return Err(Error::InvalidArgument {
                     name: "verdict".to_string(),
                     detail: format!(
@@ -1560,7 +1563,7 @@ impl Endpoint for FindingsEndpoint {
                     ),
                 })
             }
-            Err(_) => None,
+            None => None,
         };
         // `group=` (ledger #506) is a different read of the SAME pending set:
         // it narrows nothing new and decides nothing, so it rides this face
@@ -1569,9 +1572,9 @@ impl Endpoint for FindingsEndpoint {
         // group something other than pending, or to be a second shape at once
         // — an argument accepted and then ignored is the failure invisible
         // from the caller's side.
-        let group = match inv.inline_str("group") {
-            Ok(word) => Some(crate::group::kind_arg(word)?),
-            Err(_) => None,
+        let group = match inv.optional_str("group")? {
+            Some(word) => Some(crate::group::kind_arg(word)?),
+            None => None,
         };
         // `limit=` / `after=` (ledger #1663) page the rows. The turtle face is
         // refused a page: a graph has nowhere to say there is more, and a
@@ -1580,8 +1583,8 @@ impl Endpoint for FindingsEndpoint {
         let page = Page::of(inv)?;
         if page.is_some()
             && inv
-                .inline_str("as")
-                .is_ok_and(|t| t.starts_with("text/turtle"))
+                .optional_str("as")?
+                .is_some_and(|t| t.starts_with("text/turtle"))
         {
             return Err(Error::InvalidArgument {
                 name: "as".to_string(),
@@ -1624,8 +1627,8 @@ impl Endpoint for FindingsEndpoint {
                 ));
             }
             if inv
-                .inline_str("as")
-                .is_ok_and(|t| t.starts_with("text/turtle"))
+                .optional_str("as")?
+                .is_some_and(|t| t.starts_with("text/turtle"))
             {
                 return Err(conflict(
                     "as",
@@ -1751,7 +1754,7 @@ impl Endpoint for FindingsEndpoint {
         // The walk (`summary=unconfirmed`) reads every state, so it is read
         // here, before the state filter, and rendered in the face asked for.
         let face = inv
-            .inline_str("as")
+            .optional_str("as")?
             .unwrap_or("application/json")
             .to_string();
         let walk = (summary.as_deref() == Some("unconfirmed")).then(|| {
@@ -1817,7 +1820,7 @@ impl Endpoint for FindingsEndpoint {
         if let Some(kind) = group {
             let groups = crate::group::groups(kind, &rows, &declined_records);
             let counts = crate::group::counts(&rows, &declined_records);
-            let answer = match inv.inline_str("as").unwrap_or("application/json") {
+            let answer = match inv.optional_str("as")?.unwrap_or("application/json") {
                 t if t.starts_with("text/html") => repr_utf8(
                     "text/html",
                     crate::group::html(repo, &rel, kind, &groups, &counts),
@@ -1848,7 +1851,7 @@ impl Endpoint for FindingsEndpoint {
 
         let shown = rows.len();
         let paged = page.is_some();
-        let answer = match inv.inline_str("as").unwrap_or("application/json") {
+        let answer = match inv.optional_str("as")?.unwrap_or("application/json") {
             t if t.starts_with("text/html") => {
                 let paging = page.as_ref().map(|page| {
                     let next = more
@@ -2021,7 +2024,7 @@ fn face_one(
     finding: &Annotation,
     line: Option<u64>,
 ) -> Result<Representation> {
-    match inv.inline_str("as").unwrap_or("text/plain") {
+    match inv.optional_str("as")?.unwrap_or("text/plain") {
         t if t.starts_with("application/json") => Ok(repr(
             "application/json",
             annotate::annotation_json(finding, line).to_string(),
@@ -3001,6 +3004,97 @@ mod tests {
 
     fn of(k: &Kernel, iri: &str) -> serde_json::Value {
         json(k, iri, &[])
+    }
+
+    #[test]
+    fn optional_arguments_on_finding_faces() {
+        use crate::optional_arg_tests::check;
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        let findings = pass(&k);
+        for (name, valid) in [
+            ("as", "text/html"),
+            ("state", "pending"),
+            ("summary", "states"),
+            ("verdict", "refuted"),
+            ("group", "file"),
+            ("limit", "1"),
+            ("after", "abc"),
+        ] {
+            check(
+                &k,
+                &cap(),
+                Verb::Source,
+                "urn:repo:demo:findings",
+                &[],
+                name,
+                valid,
+            );
+        }
+        check(
+            &k,
+            &cap(),
+            Verb::Source,
+            &findings[0],
+            &[],
+            "as",
+            "text/html",
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_decision_arguments_do_not_record_a_decision() {
+        let root = demo_root();
+        let store = Arc::new(Store::new().unwrap());
+        let k = kernel(&root, &store);
+        let finding = pass(&k).remove(0);
+        for name in [
+            "as",
+            "reproduced",
+            "severity",
+            "reason",
+            "made",
+            "batch",
+            "revises",
+            "content",
+        ] {
+            for value in [
+                ikigai_core::ArgRef::Inline(vec![0xff]),
+                ikigai_core::ArgRef::Content(ikigai_core::ContentId::of(b"body")),
+            ] {
+                let mut request = Request::new(Verb::Sink, Iri::parse(&finding).unwrap())
+                    .with_arg("decision", ikigai_core::ArgRef::Inline(b"decline".to_vec()));
+                if name != "severity" {
+                    request = request
+                        .with_arg("severity", ikigai_core::ArgRef::Inline(b"major".to_vec()));
+                }
+                let err = block_on(k.issue(request.with_arg(name, value), &cap())).unwrap_err();
+                assert!(
+                    matches!(err, Error::InvalidArgument { name: ref actual, .. } if actual == name),
+                    "{name}: {err:?}"
+                );
+                assert!(
+                    of(&k, &finding)["decision"].is_null(),
+                    "{name} recorded a decision"
+                );
+            }
+        }
+        check_decision_as(&k, &finding);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn check_decision_as(k: &Kernel, finding: &str) {
+        crate::optional_arg_tests::check(
+            k,
+            &cap(),
+            Verb::Sink,
+            finding,
+            &[("decision", "decline"), ("severity", "major")],
+            "as",
+            "application/json",
+        );
     }
 
     /// Ledger #528: unchanged empty queues have no live file dependency.

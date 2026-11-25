@@ -1005,6 +1005,8 @@ struct Served {
 #[async_trait]
 impl Endpoint for ExplainEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        inv.optional_str("as")?;
+        include_annotations(inv)?;
         if inv.request.verb != Verb::Source {
             return Err(Error::Endpoint(format!(
                 "browse-explain does not support the {:?} verb",
@@ -1023,7 +1025,7 @@ impl Endpoint for ExplainEndpoint {
         // for one model, got another, and had it archived under that other
         // model's tag has been lied to durably — the entry is thereafter
         // indistinguishable from a legitimate one.
-        let requested_provider = inv.inline_str("provider").ok().map(str::to_string);
+        let requested_provider = inv.optional_str("provider")?.map(str::to_string);
         if let Some(provider) = &requested_provider {
             let selectable = config.selectable();
             if !selectable.contains(provider) {
@@ -1036,7 +1038,7 @@ impl Endpoint for ExplainEndpoint {
                     .into(),
                 ));
             }
-            if let Ok(version) = inv.inline_str("version") {
+            if let Some(version) = inv.optional_str("version")? {
                 return Err(Error::Endpoint(format!(
                     "browse: `version={version}` and `provider={provider}` both name the \
                      model for this explain, and they can disagree — a version tag addresses \
@@ -1073,7 +1075,7 @@ impl Endpoint for ExplainEndpoint {
             _ => Some(self.model_label(inv, tier, &provider).await),
         };
         let current_tag = version_tag(grain, model.as_deref().unwrap_or(""));
-        let requested = inv.inline_str("version").ok().map(str::to_string);
+        let requested = inv.optional_str("version")?.map(str::to_string);
         let tag = requested.clone().unwrap_or_else(|| current_tag.clone());
 
         let iri = entry_iri(repo, &rel, &hash, &tag);
@@ -1404,7 +1406,7 @@ fn face(
     included: Option<&Included>,
 ) -> Result<Representation> {
     let entry = &served.entry;
-    match inv.inline_str("as").unwrap_or("text/plain") {
+    match inv.optional_str("as")?.unwrap_or("text/plain") {
         t if t.starts_with("application/json") => {
             let mut json = serde_json::json!({
                 "text": entry.text,
@@ -2078,7 +2080,7 @@ impl Endpoint for VersionsEndpoint {
         // list both (no filesystem touch, so deleted paths still answer).
         let mut entries = list_versions(&self.config.archive, &file_iri(repo, &rel))?;
         entries.extend(list_versions(&self.config.archive, &tree_iri(repo, &rel))?);
-        match inv.inline_str("as").unwrap_or("text/plain") {
+        match inv.optional_str("as")?.unwrap_or("text/plain") {
             t if t.starts_with("application/json") => {
                 let rows: Vec<serde_json::Value> = entries
                     .iter()
@@ -2352,7 +2354,7 @@ impl Endpoint for StatusEndpoint {
             model,
             provider,
         };
-        match inv.inline_str("as").unwrap_or("text/plain") {
+        match inv.optional_str("as")?.unwrap_or("text/plain") {
             t if t.starts_with("application/json") => Ok(repr(
                 "application/json",
                 serde_json::json!({
@@ -2561,6 +2563,35 @@ mod tests {
         let mut args = vec![("as", "application/json")];
         args.extend_from_slice(extra);
         serde_json::from_str(&body(&source(kernel, iri, &args, &cap()).unwrap())).unwrap()
+    }
+
+    #[test]
+    fn optional_arguments_on_explanation_faces() {
+        use crate::optional_arg_tests::check;
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), "fn main() {}\n").unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, |c| c);
+        for (iri, name, valid) in [
+            ("urn:repo:demo:explain:a.rs", "as", "application/json"),
+            ("urn:repo:demo:explain:a.rs", "provider", FILE_PROVIDER),
+            ("urn:repo:demo:explain:a.rs", "annotations", "false"),
+            ("urn:repo:demo:explain:a.rs", "version", "code-v1@m1"),
+            (
+                "urn:repo:demo:explain-versions:a.rs",
+                "as",
+                "application/json",
+            ),
+            (
+                "urn:repo:demo:explain-status:a.rs",
+                "as",
+                "application/json",
+            ),
+        ] {
+            check(&k, &cap(), Verb::Source, iri, &[], name, valid);
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
