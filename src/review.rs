@@ -473,7 +473,7 @@ pub(crate) const LENSES: &[(&str, &str)] = &[("intent", INTENT_LENS)];
 /// The lens a request named, if any, resolved against [`LENSES`] — or a
 /// refusal that names what exists.
 fn requested_lens(inv: &Invocation<'_>) -> Result<Option<(&'static str, &'static str)>> {
-    let Ok(name) = inv.inline_str("lens") else {
+    let Some(name) = inv.optional_str("lens")? else {
         return Ok(None);
     };
     match LENSES.iter().find(|(known, _)| *known == name) {
@@ -1937,8 +1937,8 @@ impl ReviewEndpoint {
         // Review has no `version=`: nothing here addresses an archived pass
         // without deriving one, so unlike explain's there is no argument for
         // this one to be exclusive with.
-        let provider = match inv.inline_str("provider") {
-            Ok(requested) => {
+        let provider = match inv.optional_str("provider")? {
+            Some(requested) => {
                 let selectable = config.selectable();
                 if !selectable.contains(requested) {
                     return Err(Error::Denied(
@@ -1952,7 +1952,7 @@ impl ReviewEndpoint {
                 }
                 requested.to_string()
             }
-            Err(_) => config.review_provider.clone(),
+            None => config.review_provider.clone(),
         };
 
         // The archive key's backbone, THROUGH the kernel (dependency-recorded)
@@ -2014,15 +2014,15 @@ impl ReviewEndpoint {
         // `debug=raw` is the diagnosis face: derive one fresh answer and
         // return it UNPARSED — nothing minted, nothing archived, the archive
         // neither consulted nor written (a probe must never poison a key).
-        let debug_raw = match inv.inline_str("debug") {
-            Ok("raw") => true,
-            Ok(other) => {
+        let debug_raw = match inv.optional_str("debug")? {
+            Some("raw") => true,
+            Some(other) => {
                 return Err(Error::InvalidArgument {
                     name: "debug".to_string(),
                     detail: format!("unknown debug face `{other}` (the one face is `raw`)"),
                 })
             }
-            Err(_) => false,
+            None => false,
         };
         // What sits between the instruction and the file: a lens's text (in the
         // key), or the probe seam's (NOT in the key). ⚠ The seam is outside the
@@ -2499,6 +2499,7 @@ impl ReviewEndpoint {
 #[async_trait]
 impl Endpoint for ReviewEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        inv.optional_str("as")?;
         self.config.archive.changing(inv, self.run(inv)).await
     }
 
@@ -2521,7 +2522,7 @@ fn face(
     derived: bool,
     included: &Included,
 ) -> Result<Representation> {
-    match inv.inline_str("as").unwrap_or("text/plain") {
+    match inv.optional_str("as")?.unwrap_or("text/plain") {
         t if t.starts_with("application/json") => {
             let json = serde_json::json!({
                 "about": entry.target_iri,
@@ -2903,7 +2904,7 @@ impl Endpoint for OptionsEndpoint {
         // asks a model anything — opening a menu must not cost what the menu
         // exists to let you decide about.
         let options = menu_options(inv, &self.config, &review_tiers(&self.config)).await;
-        match inv.inline_str("as").unwrap_or("text/plain") {
+        match inv.optional_str("as")?.unwrap_or("text/plain") {
             t if t.starts_with("application/json") => {
                 let rows: Vec<serde_json::Value> = options
                     .iter()
@@ -3194,7 +3195,7 @@ impl Endpoint for StatusEndpoint {
                 (state, Some(tag), Some(model))
             }
         };
-        match inv.inline_str("as").unwrap_or("text/plain") {
+        match inv.optional_str("as")?.unwrap_or("text/plain") {
             t if t.starts_with("application/json") => Ok(repr(
                 "application/json",
                 serde_json::json!({
@@ -3573,6 +3574,31 @@ mod tests {
     }
 
     const CLEAN: &str = NOTHING_ABOVE_THRESHOLD;
+
+    #[test]
+    fn optional_arguments_on_review_faces() {
+        use crate::optional_arg_tests::check;
+        let root = temp_dir();
+        std::fs::write(root.join("a.rs"), CONTENT).unwrap();
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let k = kernel_with(&root, &store, &log, CLEAN);
+        for (iri, name, valid) in [
+            ("urn:repo:demo:review:a.rs", "as", "application/json"),
+            ("urn:repo:demo:review:a.rs", "provider", PROVIDER),
+            ("urn:repo:demo:review:a.rs", "lens", "intent"),
+            ("urn:repo:demo:review:a.rs", "debug", "raw"),
+            (
+                "urn:repo:demo:review-options:a.rs",
+                "as",
+                "application/json",
+            ),
+            ("urn:repo:demo:review-status:a.rs", "as", "application/json"),
+        ] {
+            check(&k, &cap(), Verb::Source, iri, &[], name, valid);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     /// ★ A REPEATED quote anchors in the region the model was SHOWN (ledger
     /// #695). Line 1 and line 5 are byte-identical; region 3 (lines 5–6)

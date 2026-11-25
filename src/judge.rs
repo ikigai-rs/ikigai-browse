@@ -1976,8 +1976,8 @@ impl Endpoint for JudgeTagEndpoint {
             }),
         };
         if inv
-            .inline_str("as")
-            .is_ok_and(|a| a.starts_with("text/plain"))
+            .optional_str("as")?
+            .is_some_and(|a| a.starts_with("text/plain"))
         {
             let line = answer["tag"].as_str().unwrap_or("none");
             return Ok(repr_utf8("text/plain", format!("{line}\n")));
@@ -2045,6 +2045,7 @@ impl Endpoint for JudgeEndpoint {
                 inv.request.verb
             )));
         }
+        inv.optional_str("as")?;
         let (repo, root) = repo_root(inv, &self.roots)?;
         granted(inv, repo)?;
         let rel = path_binding(inv)?;
@@ -2065,18 +2066,18 @@ impl Endpoint for JudgeEndpoint {
             .inline_str("claim")
             .map_err(|_| Error::MissingArgument("claim".to_string()))?
             .to_string();
-        let severity = match inv.inline_str("severity") {
-            Ok(s) if crate::finding::is_severity(s) => Some(s.to_string()),
-            Ok(other) => {
+        let severity = match inv.optional_str("severity")? {
+            Some(s) if crate::finding::is_severity(s) => Some(s.to_string()),
+            Some(other) => {
                 return Err(Error::InvalidArgument {
                     name: "severity".to_string(),
                     detail: format!("`{other}` is not one of {}", SEVERITIES.join(", ")),
                 })
             }
-            Err(_) => None,
+            None => None,
         };
-        let provider = match inv.inline_str("provider") {
-            Ok(requested) => {
+        let provider = match inv.optional_str("provider")? {
+            Some(requested) => {
                 let selectable = self.config.selectable();
                 if !selectable.contains(requested) {
                     return Err(Error::Denied(
@@ -2093,7 +2094,7 @@ impl Endpoint for JudgeEndpoint {
             // ★ Never the review tier in the judge's place (ledger #709), as
             // judge-finding refuses (ledger #702): a host that turned the judge
             // off gets a typed refusal, not a judgment it did not ask for.
-            Err(_) => match self.config.judge_provider.clone() {
+            None => match self.config.judge_provider.clone() {
                 Some(provider) => provider,
                 None => return Err(no_judge(&file_iri(repo, &rel))),
             },
@@ -2107,12 +2108,12 @@ impl Endpoint for JudgeEndpoint {
         };
         // Which occurrence: `start` (a character offset, as a finding row
         // carries it), else the first.
-        let char_start = match inv.inline_str("start") {
-            Ok(s) => s.parse::<u64>().map_err(|_| Error::InvalidArgument {
+        let char_start = match inv.optional_str("start")? {
+            Some(s) => s.parse::<u64>().map_err(|_| Error::InvalidArgument {
                 name: "start".to_string(),
                 detail: format!("`{s}` is not a character offset"),
             })?,
-            Err(_) => match text.find(&quote) {
+            None => match text.find(&quote) {
                 Some(at) => text[..at].chars().count() as u64,
                 None => {
                     return Err(Error::InvalidArgument {
@@ -2148,8 +2149,8 @@ impl Endpoint for JudgeEndpoint {
             raw,
         };
         let as_text = inv
-            .inline_str("as")
-            .is_ok_and(|a| a.starts_with("text/plain"));
+            .optional_str("as")?
+            .is_some_and(|a| a.starts_with("text/plain"));
         if as_text {
             let mut out = format!("{} ({})\n", verdict.verdict, verdict.tag);
             for a in &verdict.answers {
@@ -2526,8 +2527,8 @@ impl JudgeFindingEndpoint {
     /// place — a host that turned the judge off must not get verdicts it did
     /// not ask for, archived under a tag that reads like a judge's.
     async fn judge(&self, inv: &Invocation<'_>) -> Result<Option<(String, String, String)>> {
-        let provider = match inv.inline_str("provider") {
-            Ok(requested) => {
+        let provider = match inv.optional_str("provider")? {
+            Some(requested) => {
                 let selectable = self.config.selectable();
                 if !selectable.contains(requested) {
                     return Err(Error::Denied(
@@ -2541,7 +2542,7 @@ impl JudgeFindingEndpoint {
                 }
                 requested.to_string()
             }
-            Err(_) => match self.config.judge_provider.clone() {
+            None => match self.config.judge_provider.clone() {
                 Some(provider) => provider,
                 None => return Ok(None),
             },
@@ -2801,8 +2802,8 @@ impl JudgeFindingEndpoint {
         answer["archived"] = from_archive.into();
         answer["record"] = record.into();
         if inv
-            .inline_str("as")
-            .is_ok_and(|a| a.starts_with("text/plain"))
+            .optional_str("as")?
+            .is_some_and(|a| a.starts_with("text/plain"))
         {
             let line = match (status, &reason) {
                 (CANNOT, Some(why)) => format!("cannot judge {}: {why}\n", finding.iri()),
@@ -2824,6 +2825,7 @@ impl JudgeFindingEndpoint {
 #[async_trait]
 impl Endpoint for JudgeFindingEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        inv.optional_str("as")?;
         if inv.request.verb == Verb::Exists {
             return self.run(inv).await;
         }
@@ -3439,6 +3441,50 @@ mod finding_tests {
         assert!(json(&k, iri)["judge"].is_null(), "the pass judged nothing");
         assert!(log.judge_calls().is_empty());
         iri.strip_prefix("urn:iki:finding:").unwrap().to_string()
+    }
+
+    #[test]
+    fn optional_arguments_on_judge_faces() {
+        use crate::optional_arg_tests::check;
+        let root = temp_dir();
+        git(&root, &["init", "-q"]);
+        commit(&root, V1, "one");
+        let store = Arc::new(Store::new().unwrap());
+        let log = Arc::new(Log::default());
+        let id = queued(&root, &store, &log);
+        let k = kernel(&root, &store, &log, true);
+        check(
+            &k,
+            &cap(),
+            Verb::Source,
+            "urn:repo:demo:judge-tag",
+            &[],
+            "as",
+            "text/plain",
+        );
+        let args = [("quote", "let x = 1;"), ("claim", "This overflows.")];
+        let start = V1.find("let x = 1;").unwrap().to_string();
+        for (name, valid) in [
+            ("as", "text/plain"),
+            ("severity", "major"),
+            ("provider", PROVIDER),
+            ("start", start.as_str()),
+        ] {
+            check(
+                &k,
+                &cap(),
+                Verb::Source,
+                "urn:repo:demo:judge:a.rs",
+                &args,
+                name,
+                valid,
+            );
+        }
+        let resource = format!("urn:repo:demo:judge-finding:{id}");
+        for (name, valid) in [("as", "text/plain"), ("provider", PROVIDER)] {
+            check(&k, &cap(), Verb::Source, &resource, &[], name, valid);
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// ★★ A queued finding is judged ONCE: the first read asks the model and

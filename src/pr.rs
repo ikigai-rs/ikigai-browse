@@ -535,13 +535,14 @@ impl Endpoint for PrsEndpoint {
         // so `state` always arrives (`open` when the caller named none, the same
         // default the facade declares for itself) and is always forwarded; `limit`
         // declares no default and still reaches the facade only when supplied.
+        let embed = inv.optional_str("chrome")?.is_some_and(|c| c == "embed");
         let mut args = vec![dir_arg(root)];
         for name in ["state", "limit"] {
-            if let Ok(value) = inv.inline_str(name) {
+            if let Some(value) = inv.optional_str(name)? {
                 args.push((name, value.to_string()));
             }
         }
-        match inv.inline_str("as").unwrap_or("text/plain") {
+        match inv.optional_str("as")?.unwrap_or("text/plain") {
             // The structured face is the facade's own `--json` export, passed
             // through verbatim (number/title/headRefName/updatedAt/state rows).
             t if t.starts_with("application/json") => {
@@ -555,8 +556,7 @@ impl Endpoint for PrsEndpoint {
                 // chrome=embed: the rows-only fragment another face folds in
                 // (the root tree's lazy recent-PRs block) — no crumbs, no
                 // wrapper, the embedding page already carries both.
-                let embed = inv.inline_str("chrome").is_ok_and(|c| c == "embed");
-                let state = inv.inline_str("state").unwrap_or("open");
+                let state = inv.optional_str("state")?.unwrap_or("open");
                 Ok(repr_utf8("text/html", prs_html(repo, &text, state, embed)))
             }
             // The default face is the facade's text contract, untouched:
@@ -789,7 +789,8 @@ impl Endpoint for PrsScopedEndpoint {
         crate::lexical_jail(&rel)?;
         let scope = rel.trim_end_matches('/').to_string();
 
-        let state = match inv.inline_str("state").unwrap_or("all") {
+        let embed = inv.optional_str("chrome")?.is_some_and(|c| c == "embed");
+        let state = match inv.optional_str("state")?.unwrap_or("all") {
             s @ ("open" | "merged" | "all") => s.to_string(),
             other => {
                 return Err(Error::InvalidArgument {
@@ -801,12 +802,12 @@ impl Endpoint for PrsScopedEndpoint {
                 })
             }
         };
-        let limit: Option<usize> = match inv.inline_str("limit") {
-            Ok(value) => Some(value.parse().map_err(|_| Error::InvalidArgument {
+        let limit: Option<usize> = match inv.optional_str("limit")? {
+            Some(value) => Some(value.parse().map_err(|_| Error::InvalidArgument {
                 name: "limit".to_string(),
                 detail: format!("`{value}` is not a number"),
             })?),
-            Err(_) => None,
+            None => None,
         };
 
         let mut rows: Vec<ScopedRow> = Vec::new();
@@ -909,7 +910,7 @@ impl Endpoint for PrsScopedEndpoint {
             rows.truncate(limit);
         }
 
-        match inv.inline_str("as").unwrap_or("text/plain") {
+        match inv.optional_str("as")?.unwrap_or("text/plain") {
             t if t.starts_with("application/json") => {
                 let rows: Vec<serde_json::Value> = rows
                     .iter()
@@ -934,7 +935,7 @@ impl Endpoint for PrsScopedEndpoint {
                     .map(|r| pr_row_li(repo, r.number, &r.title, &r.state, &r.branch, &r.updated))
                     .collect();
                 let body = prs_list_body(lis);
-                if inv.inline_str("chrome").is_ok_and(|c| c == "embed") {
+                if embed {
                     // The rows-only fragment: the embedding page (a tree
                     // page's lazy block) already carries crumbs and a
                     // scope-naming heading.
@@ -1079,11 +1080,12 @@ impl Endpoint for PrEndpoint {
         let (repo, root) = repo_root(inv, &self.roots)?;
         granted(inv, repo)?;
         let n = pr_binding(inv)?;
+        let focus = inv.optional_str("focus")?;
         let view = view(inv, root, n).await?;
         let diff = diff_text(inv, root, n).await?;
         let include = crate::include_annotations(inv)?;
         let target = pr_iri(repo, n);
-        match inv.inline_str("as").unwrap_or("text/plain") {
+        match inv.optional_str("as")?.unwrap_or("text/plain") {
             t if t.starts_with("text/html") => {
                 // The overlay when the annotation store is mounted: markers on
                 // annotated diff lines plus the panel with its create form
@@ -1091,14 +1093,7 @@ impl Endpoint for PrEndpoint {
                 let overlay = self
                     .archive
                     .as_deref()
-                    .map(|archive| {
-                        annotate::target_overlay(
-                            archive,
-                            &target,
-                            &diff,
-                            inv.inline_str("focus").ok(),
-                        )
-                    })
+                    .map(|archive| annotate::target_overlay(archive, &target, &diff, focus))
                     .transpose()?;
                 let (marked, panel) = overlay.unwrap_or_default();
                 let status = match &self.config {
@@ -1353,6 +1348,7 @@ struct PrExplainEndpoint {
 #[async_trait]
 impl Endpoint for PrExplainEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        inv.optional_str("as")?;
         if inv.request.verb != Verb::Source {
             return Err(Error::Endpoint(format!(
                 "browse-pr-explain does not support the {:?} verb",
@@ -1369,7 +1365,7 @@ impl Endpoint for PrExplainEndpoint {
         let view = view(inv, root, n).await?;
         let model = model_label(inv, &config.pr_provider, &config.pr_model_label).await;
         let current_tag = format!("{PR_PROMPT_VERSION}@{model}");
-        let requested = inv.inline_str("version").ok().map(str::to_string);
+        let requested = inv.optional_str("version")?.map(str::to_string);
         let tag = requested.clone().unwrap_or_else(|| current_tag.clone());
 
         let iri = entry_iri(repo, &pr_rel(n), &view.head_oid, &tag);
@@ -1452,7 +1448,7 @@ fn pr_explain_face(
     entry: &ArchiveEntry,
     derived: bool,
 ) -> Result<Representation> {
-    match inv.inline_str("as").unwrap_or("text/plain") {
+    match inv.optional_str("as")?.unwrap_or("text/plain") {
         t if t.starts_with("application/json") => Ok(repr(
             "application/json",
             serde_json::json!({
@@ -1579,15 +1575,15 @@ impl PrReviewEndpoint {
         // `debug=raw` is the diagnosis face: derive one fresh answer and
         // return it UNPARSED — nothing minted, nothing archived, the archive
         // neither consulted nor written (a probe must never poison a key).
-        let debug_raw = match inv.inline_str("debug") {
-            Ok("raw") => true,
-            Ok(other) => {
+        let debug_raw = match inv.optional_str("debug")? {
+            Some("raw") => true,
+            Some(other) => {
                 return Err(Error::InvalidArgument {
                     name: "debug".to_string(),
                     detail: format!("unknown debug face `{other}` (the one face is `raw`)"),
                 })
             }
-            Err(_) => false,
+            None => false,
         };
 
         let iri = pass_iri(repo, &pr_rel(n), &view.head_oid, &tag);
@@ -1736,6 +1732,7 @@ impl PrReviewEndpoint {
 #[async_trait]
 impl Endpoint for PrReviewEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        inv.optional_str("as")?;
         self.config.archive.changing(inv, self.run(inv)).await
     }
 
@@ -1756,7 +1753,7 @@ fn pr_review_face(
     derived: bool,
     included: &Included,
 ) -> Result<Representation> {
-    match inv.inline_str("as").unwrap_or("text/plain") {
+    match inv.optional_str("as")?.unwrap_or("text/plain") {
         t if t.starts_with("application/json") => Ok(repr(
             "application/json",
             serde_json::json!({
@@ -2188,6 +2185,76 @@ mod tests {
         let mut args = vec![("as", "application/json")];
         args.extend_from_slice(extra);
         serde_json::from_str(&body(&source(kernel, iri, &args).unwrap())).unwrap()
+    }
+
+    #[test]
+    fn optional_arguments_on_pull_request_faces() {
+        use crate::optional_arg_tests::check;
+        let root = temp_dir();
+        let store = Arc::new(Store::new().unwrap());
+        let state = FakeRepo::new();
+        let log = Arc::new(Log::default());
+        let k = explain_kernel(&root, &store, &state, &log, TWO_FINDINGS);
+        for (iri, name, valid, fixed) in [
+            ("urn:repo:demo:prs", "as", "application/json", vec![]),
+            ("urn:repo:demo:prs", "state", "open", vec![]),
+            ("urn:repo:demo:prs", "limit", "2", vec![]),
+            ("urn:repo:demo:prs", "chrome", "embed", vec![]),
+            (
+                "urn:repo:demo:prs",
+                "chrome",
+                "embed",
+                vec![("as", "text/html")],
+            ),
+            ("urn:repo:demo:prs:src", "as", "application/json", vec![]),
+            ("urn:repo:demo:prs:src", "state", "open", vec![]),
+            ("urn:repo:demo:prs:src", "limit", "2", vec![]),
+            ("urn:repo:demo:prs:src", "chrome", "embed", vec![]),
+            (
+                "urn:repo:demo:prs:src",
+                "chrome",
+                "embed",
+                vec![("as", "text/html")],
+            ),
+            ("urn:repo:demo:pr:3", "as", "application/json", vec![]),
+            ("urn:repo:demo:pr:3", "annotations", "false", vec![]),
+            ("urn:repo:demo:pr:3", "focus", "abc", vec![]),
+            (
+                "urn:repo:demo:pr:3",
+                "focus",
+                "abc",
+                vec![("as", "text/html")],
+            ),
+            (
+                "urn:repo:demo:pr:3:explain",
+                "as",
+                "application/json",
+                vec![],
+            ),
+            (
+                "urn:repo:demo:pr:3:review",
+                "as",
+                "application/json",
+                vec![],
+            ),
+            ("urn:repo:demo:pr:3:review", "debug", "raw", vec![]),
+        ] {
+            check(&k, &cap(), Verb::Source, iri, &fixed, name, valid);
+        }
+        let tag = json(&k, "urn:repo:demo:pr:3:explain", &[])["version_tag"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        check(
+            &k,
+            &cap(),
+            Verb::Source,
+            "urn:repo:demo:pr:3:explain",
+            &[],
+            "version",
+            &tag,
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
